@@ -1,0 +1,19 @@
+{
+  "used_queries": [
+    "Vision-Language-Action Model latest research paper 2026",
+    "Vision-Language-Action Model 2026 latest research paper",
+    "Vision-Language-Action model recent news 2026",
+    "Cross-embodiment generalization VLA 2026",
+    "WAV latent-space inference robotic control loop 2026"
+  ],
+  "cycles_executed": 4,
+  "updated_at": "2026-05-07T18:29:54",
+  "last_phase": "main-3",
+  "last_consumed_queries": [
+    "WAV latent-space inference robotic control loop 2026"
+  ],
+  "last_new_doc_ids": [
+    "014",
+    "015"
+  ]
+}

@@ -1,0 +1,88 @@
+{
+  "event_id": "20260507_183421_222027",
+  "captured_at": "2026-05-07T18:34:21",
+  "window": {
+    "hwnd": 853962,
+    "pid": 18280,
+    "process_name": "WindowsTerminal.exe",
+    "process_path": "C:\\Program Files\\WindowsApps\\Microsoft.WindowsTerminal_1.23.20211.0_x64__8wekyb3d8bbwe\\WindowsTerminal.exe",
+    "window_title": "C:\\Windows\\System32\\cmd.exe - python  main.py \"Vision-Language-Action Model 에 대한 최신 연구 논문 및 동향에 대해 자세히 파악하여 조사해줘\" --output-dir ./runs/research-vla --phase all --embed-port 8081",
+    "rect": {
+      "x": 46,
+      "y": 58,
+      "width": 1129,
+      "height": 635
+    },
+    "error": null
+  },
+  "ocr": {
+    "text": "",
+    "language": "ko-KR",
+    "lines": [],
+    "image_size": null,
+    "error": "Windows OCR bridge package is not installed. Install a Python WinRT bridge such as `winsdk` to use Windows.Media.Ocr."
+  },
+  "app_text": {
+    "text": "",
+    "text_source": "",
+    "source_quality": "rejected",
+    "metadata": {},
+    "error": "skipped: no app-specific text reader."
+  },
+  "ui_automation": {
+    "top_window_title": "",
+    "focused_name": "",
+    "control_type": "",
+    "automation_id": "",
+    "class_name": "",
+    "bounding_rect": null,
+    "text": "",
+    "text_source": "",
+    "selection_text": "",
+    "current_paragraph_text": "",
+    "current_paragraph_source": "",
+    "current_paragraph_rect": null,
+    "hover_text": "",
+    "hover_rect": null,
+    "mouse_position": null,
+    "source_quality": "rejected",
+    "reject_reason": null,
+    "error": "skipped: foreground app is not a text extraction target."
+  },
+  "filtered": {
+    "active_app_type": "unknown",
+    "active_editor_text": "",
+    "current_paragraph_text": "",
+    "current_paragraph_source": "",
+    "current_paragraph_rect": null,
+    "visible_context": "",
+    "changed_text": "",
+    "confidence": 0.0,
+    "noise_removed": []
+  },
+  "intervention": {
+    "should_consider_llm": false,
+    "score": 0.25,
+    "priority": "low",
+    "reason_codes": [
+      "not_editing_app",
+      "unstable_current_paragraph",
+      "not_continuing_paragraph_edit",
+      "cooldown_or_duplicate"
+    ],
+    "metadata": {
+      "history_window": 10,
+      "history_count": 10,
+      "same_document_count": 9,
+      "dwell_ratio": 0.9,
+      "document_key": "windowsterminal.exe|c:\\windows\\system32\\cmd.exe - python main.py \"vision-language-action model 에 대한 최신 연구 논문 및 동향에 대해 자세히 파악하여 조사해줘\" --output-dir ./runs/research-vla --phase all --embed-port 8081",
+      "paragraph_fingerprint": "",
+      "blockers": [
+        "not_editing_app",
+        "unstable_current_paragraph",
+        "not_continuing_paragraph_edit",
+        "cooldown_or_duplicate"
+      ]
+    }
+  }
+}

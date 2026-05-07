@@ -1,0 +1,3 @@
+VLM4VLA: Revisiting Vision-Language-Models in Vision-Language-Action Models
+Jianke Zhang , Xiaoyu Chen , Yanjiang Guo , Yucheng Hu , Jianyu Chen
+OpenReview is a long-term project to advance science through improved peer review with legal nonprofit status. We gratefully acknowledge the support of the OpenReview Sponsors . © 2026 OpenReview

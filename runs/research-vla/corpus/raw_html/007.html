@@ -1,0 +1,146 @@
+<body>
+<dialog aria-labelledby="modal-title" closedby="any" id="modal-form">
+
+</dialog>
+
+<div class="ltx_page_main">
+<div class="infobox" id="infobox">
+<a href="https://info.arxiv.org/help/license/index.html#licenses-available" id="license-tr">
+    License: arXiv.org perpetual non-exclusive license
+  </a>
+<div id="watermark-tr">
+arXiv:2604.14732v2 [cs.RO] 19 Apr 2026</div>
+</div><div class="ltx_page_content">
+<article class="ltx_document ltx_authors_1line">
+<h1 class="ltx_title ltx_title_document">World–Value–Action Model: Implicit Planning for Vision–Language–Action Systems
+</h1>
+<div class="ltx_authors">
+<span class="ltx_creator ltx_role_author">
+<span class="ltx_personname">
+Runze Li 
+<br class="ltx_break"/>Westlake University 
+<br class="ltx_break"/>Hangzhou, China 
+<br class="ltx_break"/>&amp;Hongyin Zhang<span class="ltx_note ltx_role_footnotemark" id="footnotex1"><sup class="ltx_note_mark">1</sup><span class="ltx_note_outer"><span class="ltx_note_content"><sup class="ltx_note_mark">1</sup><span class="ltx_note_type">footnotemark: </span><span class="ltx_tag ltx_tag_note">1</span></span></span></span>
+<br class="ltx_break"/>Westlake University 
+<br class="ltx_break"/>Hangzhou, China 
+<br class="ltx_break"/>&amp;Junxi Jin 
+<br class="ltx_break"/>Westlake University 
+<br class="ltx_break"/>Hangzhou, China 
+<br class="ltx_break"/>Qixin Zeng 
+<br class="ltx_break"/>Westlake University 
+<br class="ltx_break"/>Hangzhou, China 
+<br class="ltx_break"/>&amp;Zifeng Zhuang 
+<br class="ltx_break"/>Westlake University 
+<br class="ltx_break"/>Hangzhou, China 
+<br class="ltx_break"/>&amp;Yiqi Tang 
+<br class="ltx_break"/>Westlake University 
+<br class="ltx_break"/>Hangzhou, China 
+<br class="ltx_break"/>Shangke Lyu 
+<br class="ltx_break"/>Nanjing University Suzhou Campus, 
+<br class="ltx_break"/>1520 Taihu Avenue, Suzhou, China 
+<br class="ltx_break"/>&amp;Donglin Wang 
+<br class="ltx_break"/>Westlake University 
+<br class="ltx_break"/>Hangzhou, China 
+<br class="ltx_break"/>
+</span><span class="ltx_author_notes">Equal contribution.Corresponding author. wangdonglin@westlake.edu.cn</span></span>
+</div>
+<div class="ltx_abstract" id="abstract1">
+<h6 class="ltx_title ltx_title_abstract">Abstract</h6>
+<p class="ltx_p">Vision–Language–Action (VLA) models have emerged as a promising paradigm for building embodied agents that ground perception and language into action.
+However, most existing approaches rely on direct action prediction, lacking the ability to reason over long-horizon trajectories and evaluate their consequences, which limits performance in complex decision-making tasks.
+In this work, we introduce <span class="ltx_text ltx_font_bold">World–Value–Action (WAV)</span> model, a unified framework that enables implicit planning in VLA systems.
+Rather than performing explicit trajectory optimization, WAV model learn a structured latent representation of future trajectories conditioned on visual observations and language instructions.
+A learned world model predicts future states, while a trajectory value function evaluates their long-horizon utility.
+Action generation is then formulated as inference in this latent space, where the model progressively concentrates probability mass on high-value and dynamically feasible trajectories.
+We provide a theoretical perspective showing that planning directly in action space suffers from an exponential decay in the probability of feasible trajectories as the horizon increases.
+In contrast, latent-space inference reshapes the search distribution toward feasible regions, enabling efficient long-horizon decision making.
+Extensive simulations and real-world experiments demonstrate that the WAV model consistently outperforms state-of-the-art methods, achieving significant improvements in task success rate, generalization ability, and robustness, especially in long-horizon and compositional scenarios.
+</p>
+</div>
+<div class="ltx_para" id="p1">
+<p class="ltx_p ltx_align_center" id="p1.1"><span class="ltx_text ltx_font_bold" id="p1.1.1">Project Page:</span> <a class="ltx_ref ltx_url ltx_font_typewriter" href="https://win-commit.github.io/wavpage/" title="">https://win-commit.github.io/wavpage/</a></p>
+</div>
+<section class="ltx_section" id="S1">
+<h2 class="ltx_title ltx_title_section">
+<span class="ltx_tag ltx_tag_section">1 </span>Introduction</h2>
+<div class="ltx_para" id="S1.p1">
+<p class="ltx_p" id="S1.p1.1">Building embodied agents that can robustly perceive, reason, and act in complex physical environments remains a central challenge in artificial intelligence <cite class="ltx_cite ltx_citemacro_citep">(Mason, <a class="ltx_ref" href="#bib.bib55" title="Mechanics of robotic manipulation">2001</a>)</cite>.
+Vision–Language–Action (VLA) models have recently made significant progress by leveraging large-scale pre-trained vision–language models to map multimodal observations and natural language instructions to robot actions, enabling strong semantic generalization <cite class="ltx_cite ltx_citemacro_citep">(Brohan<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib68" title="Rt-1: robotics transformer for real-world control at scale">2022</a>; Zitkovich<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib145" title="Rt-2: vision-language-action models transfer web knowledge to robotic control">2023</a>; Kim<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib78" title="OpenVLA: an open-source vision-language-action model">2024</a>; Black<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib156" title="⁢157(157)pi0: a vision-language-action flow model for general robot control">2024</a>)</cite>.
+However, most existing VLA approaches rely on direct action prediction, treating each decision step independently and lacking mechanisms to reason over long-horizon trajectories or evaluate their outcomes.
+This limitation hinders their ability to perform coherent multi-step decision making in complex environments.</p>
+</div>
+<div class="ltx_para" id="S1.p2">
+<p class="ltx_p" id="S1.p2.1">In parallel, world models aim to capture environment dynamics by predicting future observations, providing a structured representation of how the world evolves over time <cite class="ltx_cite ltx_citemacro_citep">(Wu<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib200" title="Ivideogpt: interactive videogpts are scalable world models">2024</a>; Agarwal<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib199" title="Cosmos world foundation model platform for physical ai">2025</a>)</cite>.
+While such models enable reasoning about future states, they typically do not provide a principled mechanism for evaluating trajectories or selecting actions.
+Recent works attempt to unify world modeling and policy learning within a single architecture <cite class="ltx_cite ltx_citemacro_citep">(Cen<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib198" title="WorldVLA: towards autoregressive action world model">2025c</a>; Liao<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib18" title="Genie envisioner: a unified world foundation platform for robotic manipulation">2025</a>; Bi<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib201" title="Motus: a unified latent action world model">2025b</a>; Ye<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib222" title="World action models are zero-shot policies">2026</a>; Li<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib219" title="Causal world modeling for robot control">2026</a>)</cite>, but largely rely on supervised learning over static datasets, resulting in limited ability to capture fine-grained dynamics and assess long-horizon trajectory quality.
+Another line of research leverages learned world models as simulators for data augmentation in RL <cite class="ltx_cite ltx_citemacro_citep">(Guo<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib221" title="Ctrl-world: a controllable generative world model for robot manipulation">2025</a>; Li<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib14" title="Vla-rft: vision-language-action reinforcement fine-tuning with verified rewards in world simulators">2025</a>; Zhu<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib220" title="Wmpo: world model-based policy optimization for vision-language-action models">2025</a>)</cite>.
+However, this paradigm is fundamentally constrained by the generalization capability of the world model, leading to compounding errors and unreliable simulated data in complex or out-of-distribution scenarios.
+In contrast, model-based RL suggests that effective long-horizon decision making arises from the combination of predictive modeling and trajectory evaluation, where planning can be viewed as iteratively refining candidate futures based on their expected value <cite class="ltx_cite ltx_citemacro_citep">(Hansen<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib52" title="Temporal difference learning for model predictive control">2022</a>, <a class="ltx_ref" href="#bib.bib53" title="Td-mpc2: scalable, robust world models for continuous control">2023</a>, <a class="ltx_ref" href="#bib.bib51" title="Learning massively multitask world models for continuous control">2025</a>)</cite>.
+This perspective raises a fundamental question: <em class="ltx_emph ltx_font_italic" id="S1.p2.1.1">can planning be learned as an implicit inference process, rather than implemented as an explicit optimization module?</em></p>
+</div>
+<div class="ltx_para" id="S1.p3">
+<p class="ltx_p" id="S1.p3.1">In this work, we answer this question affirmatively by proposing <span class="ltx_text ltx_font_bold" id="S1.p3.1.1">World–Value–Action (WAV<span class="ltx_note ltx_role_footnote" id="footnote1"><sup class="ltx_note_mark">1</sup><span class="ltx_note_outer"><span class="ltx_note_content"><sup class="ltx_note_mark">1</sup><span class="ltx_tag ltx_tag_note"><span class="ltx_text ltx_font_medium" id="footnote1.1.1.1">1</span></span><span class="ltx_text ltx_font_medium" id="footnote1.9">We refer to this model as WAV, emphasizing the WAVe-like propagation of value through predicted futures.</span></span></span></span>)</span> model, a unified framework that endows VLA systems with implicit planning capabilities.
+Instead of performing explicit search in the high-dimensional action space, the WAV learns a latent distribution over future trajectories conditioned on visual observations and language instructions.
+A learned world model predicts future states, while a trajectory value function evaluates their long-horizon utility.
+Crucially, action generation is formulated as inference in this latent space, where the model progressively concentrates probability mass on trajectories that are both dynamically feasible and high-value.
+We further provide a theoretical analysis showing that direct planning in action space suffers from an exponential decay in the probability of feasible trajectories as the planning horizon increases.
+In contrast, latent-space inference reshapes the search distribution toward feasible regions, while iterative refinement enables efficient optimization within this restricted domain.
+This perspective explains how planning can emerge implicitly from the joint learning of world dynamics and value estimation.
+Our results demonstrate consistent improvements over strong baselines in task success rate, generalization, and robustness, with particularly large gains in long-horizon and compositional scenarios.
+Our contributions are summarized as follows:</p>
+<ul class="ltx_itemize" id="S1.I1">
+<li class="ltx_item" id="S1.I1.i1" style="list-style-type:none;">
+<span class="ltx_tag ltx_tag_item">•</span>
+<div class="ltx_para" id="S1.I1.i1.p1">
+<p class="ltx_p" id="S1.I1.i1.p1.1">We introduce <span class="ltx_text ltx_font_bold" id="S1.I1.i1.p1.1.1">World–Value–Action (WAV)</span> model, a unified framework that enables implicit planning in VLA systems through joint modeling of dynamics and trajectory value.</p>
+</div>
+</li>
+<li class="ltx_item" id="S1.I1.i2" style="list-style-type:none;">
+<span class="ltx_tag ltx_tag_item">•</span>
+<div class="ltx_para" id="S1.I1.i2.p1">
+<p class="ltx_p" id="S1.I1.i2.p1.1">We provide a theoretical perspective showing that latent planning mitigates the exponential decay of feasible trajectory probability inherent in action-space planning.</p>
+</div>
+</li>
+<li class="ltx_item" id="S1.I1.i3" style="list-style-type:none;">
+<span class="ltx_tag ltx_tag_item">•</span>
+<div class="ltx_para" id="S1.I1.i3.p1">
+<p class="ltx_p" id="S1.I1.i3.p1.1">The WAV demonstrates state-of-the-art performance in simulated benchmarks and real-world scenarios, achieving significant improvements in long-horizon reasoning and generalization.</p>
+</div>
+</li>
+</ul>
+</div>
+</section>
+<section class="ltx_section" id="S2">
+<h2 class="ltx_title ltx_title_section">
+<span class="ltx_tag ltx_tag_section">2 </span>Related Work</h2>
+<section class="ltx_subsection" id="S2.SS1">
+<h3 class="ltx_title ltx_title_subsection">
+<span class="ltx_tag ltx_tag_subsection">2.1 </span>World Models for VLA</h3>
+<div class="ltx_para" id="S2.SS1.p1">
+<p class="ltx_p" id="S2.SS1.p1.1">World models have emerged as a core paradigm for equipping VLA models with predictive imagination and physical reasoning capabilities for robotic manipulation tasks.
+A large body of work focuses on unified architecture design, enabling joint modeling of policy execution and future state prediction within a shared transformer backbone, thereby bridging the gap between visual dynamics modeling and end-to-end robotic control in VLA systems <cite class="ltx_cite ltx_citemacro_cite">Bi<span class="ltx_text ltx_bib_etal"> et al.</span> (<a class="ltx_ref" href="#bib.bib9" title="Motus: a unified latent action world model">2025a</a>); Cen<span class="ltx_text ltx_bib_etal"> et al.</span> (<a class="ltx_ref" href="#bib.bib10" title="RynnVLA-002: a unified vision-language-action and world model">2025a</a>); Bu<span class="ltx_text ltx_bib_etal"> et al.</span> (<a class="ltx_ref" href="#bib.bib11" title="Learning to Act Anywhere with Task-centric Latent Actions">2025a</a>); Cen<span class="ltx_text ltx_bib_etal"> et al.</span> (<a class="ltx_ref" href="#bib.bib12" title="WorldVLA: towards autoregressive action world model">2025b</a>); Zhang<span class="ltx_text ltx_bib_etal"> et al.</span> (<a class="ltx_ref" href="#bib.bib17" title="Dreamvla: a vision-language-action model dreamed with comprehensive world knowledge">2025c</a>); Zhao<span class="ltx_text ltx_bib_etal"> et al.</span> (<a class="ltx_ref" href="#bib.bib224" title="EvoEmpirBench: dynamic spatial reasoning with agent-expver">2026</a>); Zhang<span class="ltx_text ltx_bib_etal"> et al.</span> (<a class="ltx_ref" href="#bib.bib19" title="Gevrm: goal-expressive video generation model for robust visual manipulation">2025a</a>); Liao<span class="ltx_text ltx_bib_etal"> et al.</span> (<a class="ltx_ref" href="#bib.bib18" title="Genie envisioner: a unified world foundation platform for robotic manipulation">2025</a>)</cite>.
+Subsequent efforts further improve the modeling capacity and policy–dynamics synergy of this paradigm, such as DreamVLA <cite class="ltx_cite ltx_citemacro_citep">(Zhang<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib17" title="Dreamvla: a vision-language-action model dreamed with comprehensive world knowledge">2025c</a>)</cite>, GEVRM <cite class="ltx_cite ltx_citemacro_citep">(Zhang<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib19" title="Gevrm: goal-expressive video generation model for robust visual manipulation">2025a</a>)</cite>, and Bu et al. <cite class="ltx_cite ltx_citemacro_citep">(Bu<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib11" title="Learning to Act Anywhere with Task-centric Latent Actions">2025a</a>)</cite>, which enhance long-horizon prediction accuracy and manipulation performance within integrated VLA–world model systems.
+Beyond architectural unification, another line of work explores world model-driven virtual environments for VLA post-training.
+NORA <cite class="ltx_cite ltx_citemacro_citep">(Hung<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib15" title="NORA-1.5: a vision-language-action model trained using world model-and action-based preference rewards">2025</a>)</cite> and RoboScape <cite class="ltx_cite ltx_citemacro_citep">(Tang<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib13" title="RoboScape-r: unified reward-observation world models for generalizable robotics training via rl">2025</a>)</cite> develop scalable pipelines for policy learning in simulation, while Xiao et al. <cite class="ltx_cite ltx_citemacro_citep">(Xiao<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib16" title="World-env: leveraging world model as a virtual environment for vla post-training">2025</a>)</cite> and Li et al. <cite class="ltx_cite ltx_citemacro_citep">(Li<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib14" title="Vla-rft: vision-language-action reinforcement fine-tuning with verified rewards in world simulators">2025</a>)</cite> leverage world models to generate synthetic rewards for RL or preference optimization, enabling further policy refinement.
+Rather than scaling model capacity or relying on external simulation, our work introduces implicit planning as an internal inference mechanism, offering a fundamentally different approach to long-horizon decision making in VLA systems.</p>
+</div>
+</section>
+<section class="ltx_subsection" id="S2.SS2">
+<h3 class="ltx_title ltx_title_subsection">
+<span class="ltx_tag ltx_tag_subsection">2.2 </span>Model-Based Reinforcement Learning</h3>
+<div class="ltx_para" id="S2.SS2.p1">
+<p class="ltx_p" id="S2.SS2.p1.1">Model-based RL improves sample efficiency and long-horizon decision making by learning environment models for planning or policy optimization.
+Early work follows the Dyna paradigm and probabilistic dynamics modeling <cite class="ltx_cite ltx_citemacro_citep">(Sutton, <a class="ltx_ref" href="#bib.bib38" title="Dyna, an integrated architecture for learning, planning, and reacting">1991</a>; Deisenroth and Rasmussen, <a class="ltx_ref" href="#bib.bib39" title="PILCO: a model-based and data-efficient approach to policy search">2011</a>)</cite>, and is later extended with neural dynamics, uncertainty-aware model predictive control, and hybrid model-based (or model-free) optimization <cite class="ltx_cite ltx_citemacro_citep">(Chua<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib40" title="Deep reinforcement learning in a handful of trials using probabilistic dynamics models">2018</a>; Williams<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib41" title="Information-theoretic model predictive control: theory and applications to autonomous driving">2018</a>; Janner<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib42" title="When to trust your model: model-based policy optimization">2019</a>)</cite>.
+Latent world models further enable imagined rollouts from high-dimensional observations, as demonstrated in PlaNet, Dreamer, and MuZero <cite class="ltx_cite ltx_citemacro_citep">(Hafner<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib43" title="Learning latent dynamics for planning from pixels">2019b</a>, <a class="ltx_ref" href="#bib.bib44" title="Dream to control: learning behaviors by latent imagination">a</a>; Schrittwieser<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib46" title="Mastering atari, go, chess and shogi by planning with a learned model">2020</a>)</cite>.
+More recent approaches emphasize scalability and task generalization, where methods such as TD-MPC and TD-MPC2 <cite class="ltx_cite ltx_citemacro_citep">(Hansen<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib52" title="Temporal difference learning for model predictive control">2022</a>, <a class="ltx_ref" href="#bib.bib53" title="Td-mpc2: scalable, robust world models for continuous control">2023</a>)</cite> integrate latent planning with value learning, and subsequent work <cite class="ltx_cite ltx_citemacro_citep">(Hansen<span class="ltx_text ltx_bib_etal"> et al.</span>, <a class="ltx_ref" href="#bib.bib51" title="Learning massively multitask world models for continuous control">2025</a>)</cite> shows that large-scale world models can generalize across diverse tasks and dynamics.
+Rather than relying on explicit planning or iterative policy optimization, our approach treats planning as an emergent property of inference in a structured generative model, offering a fundamentally different perspective on long-horizon control.</p>
+</div>
+</section>
+</section>
+<section class="ltx_section" id="S3">
+<h2 class="ltx_title ltx_title_section">
+<span class="ltx_tag ltx_tag_section">3 </span>Preliminaries</h2>
+<section class="ltx_paragraph" id="S3.SS0.SSS0.Px1">
+<h4 class="ltx_title ltx_title_paragraph">Vision–Language–Action (VLA) Models.</h4>
+<div class="ltx_para" id="S3.SS0.SSS0.Px1.p1">
+<p class="ltx_p" id="S3.SS0.SSS0.Px1.p1.10">We consider language-conditioned robotic manipulation, where at each timestep the model receives a visual observation <math alttext="o_{t}\in\mathcal{O}" class="ltx_Math" display="inline" id="S3.SS0.SSS0.Px1.p1.1.m1" intent=":literal"><semantics><mrow><msub><mi>o</mi><mi>t</mi></msub><mo>∈</mo><mi class="ltx_font_mathcaligraphic">𝒪</mi></mrow><annotation encoding="application/x-tex">o_{t}\in\mathcal{O}</annotation></semantics></math>, a language instruction <math alttext="g\in\mathcal{G}" class="ltx_Math" display="inline" id="S3.SS0.SSS0.Px1.p1.2.m2" intent=":literal"><semantics><mrow><mi>g</mi><mo>∈</mo><mi class="ltx_font_mathcaligraphic">𝒢</mi></mrow><annotation encoding="application/x-tex">g\in\mathcal{G}</annotation></semantics></math>, and optionally proprioceptive state <math alttext="p_{t}\in\mathcal{P}" class="ltx_Math" display="inline" id="S3.SS0.SSS0.Px1.p1.3.m3" intent=":literal"><semantics><mrow><msub><mi>p</mi><mi>t</mi></msub><mo>∈</mo><mi class="ltx_font_mathcaligraphic">𝒫</mi></mrow><annotation encoding="application/x-tex">p_{t}\in\mathcal{P}</annotation></semantics></math>, and outputs an action <math alttext="a_{t}\in\mathcal{A}" class="ltx_Math" display="inline" id="S3.SS0.SSS0.Px1.p1.4.m4" intent=":literal"><semantics><mrow><msub><mi>a</mi><mi>t</mi></msub><mo>∈</mo><mi class="ltx_font_mathcaligraphic">𝒜</mi></mrow><annotation encoding="application/x-tex">a_{t}\in\mathcal{A}</annotation></semantics></math>. Given an expert dataset <math alttext="\mathcal{D}_{\text{expert}}=\{(g,\tau)\}" class="ltx_Math" display="inline" id="S3.SS0.SSS0.Px1.p1.5.m5" intent=":literal"><semantics><mrow><msub><mi class="ltx_font_mathcaligraphic">𝒟</mi><mtext>expert</mtext></msub><mo>=</mo><mrow><mo stretchy="false">{</mo><mrow><mo stretchy="false">(</mo><mi>g</mi><mo>,</mo><mi>τ</mi><mo stretchy="false">)</mo></mrow><mo stretchy="false">}</mo></mrow></mrow><annotation encoding="application/x-tex">\mathcal{D}_{\text{expert}}=\{(g,\tau)\}</annotation></semantics></math>, where </p></div></section></section></article></div></div></body>

@@ -9,6 +9,7 @@ import re
 import time
 from typing import Any, Callable
 
+import httpx
 from openai import OpenAI
 
 
@@ -156,7 +157,7 @@ class LLMClient:
                 "extra_body": extra_body,
             }
             if timeout_sec is not None:
-                stream_kwargs["timeout"] = timeout_sec
+                stream_kwargs["timeout"] = self._request_timeout(timeout_sec)
 
             chunks = self.client.chat.completions.create(**stream_kwargs)
             text = self._consume_stream(
@@ -483,8 +484,19 @@ class LLMClient:
             request_kwargs["tools"] = tools
             request_kwargs["tool_choice"] = "auto"
         if timeout_sec is not None:
-            request_kwargs["timeout"] = timeout_sec
+            request_kwargs["timeout"] = self._request_timeout(timeout_sec)
         return request_kwargs
+
+    def _request_timeout(self, timeout_sec: float) -> httpx.Timeout:
+        timeout = max(float(timeout_sec), 1.0)
+        short_timeout = min(timeout, 10.0)
+        return httpx.Timeout(
+            timeout=timeout,
+            connect=short_timeout,
+            read=timeout,
+            write=short_timeout,
+            pool=short_timeout,
+        )
 
     def _coerce_message_content(self, content: Any) -> str:
         if content is None:

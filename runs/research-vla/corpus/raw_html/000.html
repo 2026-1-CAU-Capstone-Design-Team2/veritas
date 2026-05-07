@@ -1,0 +1,266 @@
+<body>
+<table style="width:100%; max-width:800px; margin:auto;">
+<tr>
+<td>
+<h1 style="text-align:center;">State of VLA Research at ICLR 2026</h1>
+<p style="text-align:center; color:gray;">October 2025 • by Moritz Reuss</p>
+<hr/>
+<figure class="figure-container">
+<img alt="Vision-Language-Action (VLA) models research overview and trends at ICLR 2026" src="images/blog_header.png"/>
+</figure>
+<p>
+          ICLR’s open submission policy gives a rare, real-time view of what the community is actually building. 
+          This post distills the state of <strong>Vision-Language-Action (VLA) Models</strong> research slice of ICLR 2026: what ‘counts’ as a VLA (and why that definition matters), what people are working on in the VLA field (discrete diffusion, embodied reasoning, new tokenizers), how to read benchmark results in VLA research, and the not-so-invisible frontier gap that sim leaderboards hide.
+        </p>
+<p>
+          Each autumn, the ICLR publicly releases all anonymous submissions a few weeks after the deadline, 
+          providing a unique real-time snapshot of ongoing research around the world without the typical six-month delay of other top ML conferences.  
+          Given my personal research interests, I wanted to analyze <strong>Vision-Language-Action (VLA) Models</strong> research and share insights from this year's submissions.<br/><br/>
+
+          In this blog post, I briefly explain what VLAs are, share my findings about current trends and challenges in VLA research, highlighting some interesting papers submitted to ICLR 2026.
+          To help researchers and practitioners better understand the current state of VLA research, I've also included a practical guide on how to interpret benchmark results in VLA papers.
+          Finally, there is a discussion about the hidden gap between frontier labs and academic research labs in the VLA field—a gap that isn't visible from reading papers alone.<br/><br/>
+
+          Below is a summary of general research trends with highlighted papers for each category that I found interesting from this year's submissions.
+          Please note that this represents only my personal selection and opinion of papers and research, and I may have missed other excellent work.
+          If you know of noteworthy papers that I missed, please let me know.<br/><br/>
+</p>
+<h2>Table of Contents</h2>
+
+<hr/>
+<h2 id="definition-vla">What is a Vision-Language-Action Model?</h2>
+<figure class="figure-container">
+<img alt="Flowchart for determining if your model is a VLA" src="images/vla_or_not_chart.png"/>
+<figcaption>Figure 1: Decision flowchart to determine if your model qualifies as a VLA based on my vision-language internet-scale pretraining criteria.</figcaption>
+</figure>
+<p>
+        The definition of VLAs is surprisingly contentious, with no clear consensus in the community.
+        A <a href="https://arxiv.org/pdf/2510.07077" target="_blank">recent survey paper</a> defines it broadly: 
+        "A Vision-Language-Action (VLA) model is a system that takes visual observations and natural language instructions as required inputs and may incorporate additional sensory modalities. 
+        It produces robot actions by directly generating control commands."
+      </p>
+<p>
+        While this is a valid definition, in my personal opinion it misses what I consider the crucial distinguishing feature compared to other multimodal policies: <strong>internet-scale pretraining on some type of vision-language data</strong>.
+      </p>
+<p>
+<strong>My personal definition:</strong> A VLA is a model that uses a pretrained backbone, which was trained on large-scale vision-language data and is subsequently trained with generating control commands.
+        This control commands can be robot joints, end-effector poses, steering angle for a car, latent actions or mouse and keyboard commands for a virtual agent.
+        This definition also includes Video-Action Policies that use pretrained video-generation models as their backbone. 
+        Without internet-scale pretraining, I refer to these as <strong>multimodal policies</strong> rather than VLAs.
+        Where it becomes a bit fuzzy is when a model uses a pretrained text encoder like CLIP-text or T5 and a separately pretrained vision encoder like DINOv2 or SigLIP-Vision.
+        In my personal opinion, I like to group these as multimodal policies and not VLAs since they are lacking the joint vision-language pretraining.
+        For reference I also included a flowchart (Figure 1) to help you determine if your model is a VLA or not based on my definition.
+      </p>
+<p>
+        This distinction matters because internet-scale pretraining is what theoretically gives VLAs their moat: stronger language-instruction following and better generalization across tasks and environments.
+        That's the promise, at least.
+        The reality? Most current VLAs still struggle with zero-shot generalization and complex tasks, making them better described as "less dumb multi-modal policies" rather than truly general robot brains.
+        But the potential is there and it has many exciting open problems for researchers to tackle.
+      </p>
+<figure class="figure-container">
+<img alt="Taxonomy diagram to determine if your model is a LBM" src="images/lbm_flow_chart.png"/>
+<figcaption>Figure 2: Visual taxonomy showing if your policy is a LBM or not.</figcaption>
+</figure>
+<p>
+<strong>Related and complementary:</strong> Large Behavior Models (LBMs), a term from Toyota Research Institute (TRI) defined in their <a href="https://arxiv.org/pdf/2507.05331" target="_blank">recent paper</a>, represent another category.
+        LBMs are robot policies trained on large-scale multitask robotic demonstration data, but they don't require internet-scale vision-language pretraining or a VLM backbone.
+        Think of it this way: all VLAs trained on large-scale robotic data are also LBMs, but not all LBMs are VLAs. 
+        Together these two terms cover all types of robot foundation policies. 
+        I also included a flowchart (Figure 2) to help you determine if your model is a LBM or not based on my understanding
+      </p>
+<p>
+        What's your personal definition of a VLA? Do you agree with my take on internet-scale pretraining as the key differentiator?  Let me know your thoughts!
+      </p>
+<h2 id="growth-vla">The Explosive Growth of VLA Research</h2>
+<div style="display: flex; gap: 20px; align-items: flex-start; margin: 20px 0; flex-wrap: wrap;">
+<div style="flex: 1; min-width: 350px;">
+</div>
+<p>
+          The Vision-Language-Action field has experienced remarkable growth over the past two years. 
+          Based on keyword searches on OpenReview, the numbers tell an interesting story based on ICLR submissions openreview keyword search for "Vision-Language-Action":
+        </p>
+<ul>
+<li><strong>ICLR 2024:</strong> Only 1 rejected submission with "Vision-Language-Action" keyword</li>
+<li><strong>ICLR 2025:</strong> 6 accepted papers and 3 rejected submissions with the same keyword</li>
+<li><strong>ICLR 2026:</strong> 164 submissions with the same keyword—an 18x increase in just one year!</li>
+</ul>
+<p>
+          This exponential growth trajectory shows that Vision-Language-Action models are rapidly gaining popularity with many new people from other domains like Vision coming into the exciting field of robot learning. 
+          Given this trend, I'm both excited and a bit terrified to review the projected 2,100+ VLA submissions at ICLR 2027, though I suspect the growth rate may stabilize as the field matures. 
+        </p>
+<!-- Growth Visualization -->
+<div style="flex: 0 0 320px; min-width: 280px; max-width: 350px;">
+
+</div>
+</div>
+<h2 id="practitioners-guide">Practitioner's Guide to Understanding Benchmark Results in VLA Research</h2>
+<figure class="figure-container">
+<img alt="VLA Simulation Setups Overview" src="images/vla_sim_setups.png"/>
+<figcaption>Figure 3: Overview of the most popular VLA simulation benchmarks: <a href="https://arxiv.org/abs/2306.03310" target="_blank">LIBERO</a>, <a href="https://openreview.net/pdf?id=LZh48DTg71" target="_blank">SIMPLER</a> and <a href="https://arxiv.org/abs/2112.03227" target="_blank">CALVIN</a>
+</figcaption>
+</figure>
+<p>
+          I want to provide a quick guide for practitioners on how to interpret benchmark results in VLA papers.
+          So you are reading a new VLA paper and want to understand if the claimed results are actually good or not?
+          In order to better understand the VLA results, it is important to have some context on the current state of popular VLA benchmarks and what good performance looks like.<br/><br/>
+
+          Given the current benchmarks, there is no clear statement possible to say which model is the best, as most papers only compare against each other on the usual simulation benchmarks.
+          90% of papers mentioned in this post all test in either <a href="https://arxiv.org/abs/2306.03310" target="_blank">LIBERO</a>, <a href="https://openreview.net/pdf?id=LZh48DTg71" target="_blank">SIMPLER</a> or <a href="https://arxiv.org/abs/2112.03227" target="_blank">CALVIN</a>.<br/><br/>
+          LIBERO is basically solved and showing 99% vs 98% is not very helpful and you don't need VLAs and large-scale pretraining to get competitive results.
+          E.g. all mentioned concurrent discrete diffusion policies below test on LIBERO and all achieve between 95-98% average over the 4 versions (Goal, Spatial, Long, Object).
+          It's also funny to note that LIBERO was designed as a life-long learning benchmark but 99% of models reporting results on it just train on the full dataset and don't do any continual learning.
+          Based on these results it is impossible to say which model is better, as they are all very close to the ceiling anyways and you don't need internet scale pretraining to solve these.<br/><br/>
+
+          Rule of thumb for getting a impression a VLA is decent or near sota levels on these: LIBERO: &gt;95% is expected for Spatial, Goal and Object, 90-95% is required for Long and 90, lower than 90% is only fine for static-camera-only or few-shot stuff.
+          A properly tuned Diffusion Policy can get you there without VLAs although the most cited DP baselines is showing worse results. 
+          CALVIN is also almost saturated by current sota models like <a href="https://arxiv.org/pdf/2509.04996">FLOWER</a>.
+          The benchmark has 3 main version: D (train on setup D and test on setup D), ABC (train on A,B,C and test on D) and ABCD (train on A,B,C, D and test on D).
+          ABC is the most relevant one, as it tests generalization to unseen setups, ABCD test how well methods benefit from more diverse data and D tests fine-tuning.
+          For CALVIN higher than 4 score for ABC is standard now and above 4.5 is sota regime. 
+          For the D version 3.75 is standard and above 4 is very good. 
+          For the ABCD version results above 4.5 are relevant.<br/><br/>
+
+          SIMPLER is hard to interpret across setups; success spans 40–99% on Bridge, making cross-paper comparison noisy.
+          For the Google Robot version current sota models achieve around 70%-80% success rate. 
+          Somehow, <a href="https://arxiv.org/abs/1909.12271" target="_blank">RLBench</a> (the most popular 3d policy benchmark) has gained more popularity in VLA benchmarking, but all VLAs are still far away from 3D SOTA methods like <a href="https://arxiv.org/abs/2402.10885" target="_blank">3DDA</a>. 
+          Most VLA policies try to avoid comparing against all relevant 3D baselines for some reason. 
+          Any real world results are very important and more is better, as sim-only is hard to trust especially with VLA papers that use models with 7B+ parameters and are very good in overfitting successfully on these benchmarks.<br/><br/>
+</p>
+<hr/>
+<h2 id="research-trends">ICLR 2026 VLA Research Trends</h2>
+<p>
+          After scanning most ICLR 2026 submissions with the VLA keyword, I identified the following key trends in VLA research. 
+          There is significant overlap between these categories, as many papers combine multiple ideas—for example, discrete diffusion with embodied reasoning, or efficient architectures with new tokenizers. 
+          Below, I highlight some notable papers in each category along with brief comments.
+          Please note that this is not an exhaustive list, and I may have missed many excellent works.
+        </p>
+<h3 id="discrete-diffusion">1. Discrete Diffusion VLAs</h3>
+<figure class="figure-container">
+<img alt="Discrete Diffusion VLA Architecture" src="images/discrete_diff_comp.png"/>
+<figcaption>Figure 4: Overview of discrete diffusion paradigm for action generation. Image from <a href="https://openreview.net/attachment?id=YWeNCMxdhM&amp;name=pdf">DISCRETE DIFFUSION VLA</a></figcaption>
+</figure>
+<p>
+          Given the success of discrete diffusion models in other domains like text (e.g. <a href="https://proceedings.neurips.cc/paper_files/paper/2024/file/eb0b13cc515724ab8015bc978fdde0ad-Paper-Conference.pdf">(MDLM</a>) and VLMs (e.g. <a href="https://arxiv.org/pdf/2505.16933">LLaDA-V</a>), it is no surprise that this trend is also making its way into VLA research. 
+          Why discrete diffusion? Compared to autoregressive models, diffusion models can generate sequences in parallel, which is a big advantage for discrete action token generation. 
+          Instead of having to run your policy 100 times, you can generate long action sequences in a few forward passes. 
+          In addition, you can combine it with ideas from Embodied Chain-of-Thought (see next section) to generate sub-goals and reasoning together with actions in parallel. 
+          This tackles some of the biggest limitations of ECoT from prior work, which was extremely slow due to the autoregressive nature of the VLM models.
+          Current attempts for discrete Diffusion either finetune an autoregressive VLM with discrete diffusion because the variety of discrete diffusion VLMs is very limited.
+          Other work uses LLaDA-V as a pretrained backbone with good success. 
+          Below are 4 concurrent papers that all propose different discrete diffusion VLAs with promising results on LIBERO and SIMPLER.
+        </p>
+<p><strong>Notable papers:</strong></p>
+<ul>
+<li>
+<a href="https://openreview.net/attachment?id=YWeNCMxdhM&amp;name=pdf">
+              DISCRETE DIFFUSION VLA: BRINGING DISCRETE DIFFUSION TO ACTION DECODING IN VISION-LANGUAGE-ACTION POLICIES
+            </a><br/>
+<em>TL;DR:</em> Take OpenVLA and apply Discrete Diffusion Action Prediction for fast action chunk-based generation of discrete action tokens. Also proposes adaptive decoding for inference.
+            Strong results on LIBERO + SIMPLER.
+          </li>
+<li>
+<a href="https://openreview.net/attachment?id=2rxgospB5s&amp;name=pdf">
+              dVLA: DIFFUSION VISION-LANGUAGE-ACTION MODEL WITH MULTIMODAL CHAIN-OF-THOUGHT
+            </a><br/>
+<em>TL;DR:</em> Another Discrete Diffusion VLA using Co-Generation for Future Frames and text + actions given the advantage of fast parallel sampling of Discrete Diffusion over AR models. 
+            Basically ECoT + Discrete Diffusion done well. 
+            Also good results in LIBERO + real world experiments.
+          </li>
+<li>
+<a href="https://openreview.net/attachment?id=mNya9d1DA2&amp;name=pdf">
+              DIVA: DISCRETE DIFFUSION VISION-LANGUAGE-ACTION MODELS FOR PARALLELIZED ACTION GENERATION
+            </a><br/>
+<em>TL;DR:</em> Another discrete Diffusion VLA that also focuses on how to substitute tokens during inference for better performance.
+          </li>
+<li>
+<a href="https://openreview.net/attachment?id=UvQOcw2oCD&amp;name=pdf">
+              UNIFIED DIFFUSION VLA: VISION-LANGUAGE-ACTION MODEL VIA JOINT DISCRETE DENOISING DIFFUSION PROCESS
+            </a><br/>
+<em>TL;DR:</em> Generates future frames and discrete actions together with block-wise causal masking. Results on CALVIN, LIBERO and SIMPLER are good.
+          </li>
+</ul>
+<h3 id="embodied-cot">2. Reasoning VLAs and Embodied Chain-of-Thought (ECoT)</h3>
+<p>
+          Reasoning holds strong promise for improving the generalization and performance of VLAs, which still struggle with complex tasks and out-of-distribution scenarios.
+          Inspired by the success of Chain-of-Thought prompting in LLMs, there is growing interest in applying similar ideas to VLAs.
+          The core idea is to bridge action generation with intermediate visual and textual reasoning steps that help the VLA better ground and understand the task and environment.
+          These reasoning traces are also more interpretable and can be used for debugging and understanding a VLA’s behavior.
+        </p>
+<p>
+          Since <a href="https://arxiv.org/abs/2407.08693" target="_blank">the first ECoT paper</a> (CoRL 2024), interest has grown in combining spatially grounded reasoning with action prediction to improve VLAs.
+          By combining subtasks, bounding-box predictions for task-relevant objects, and 2D motion trajectories, VLMs learn better representations for embodied tasks and show improved performance on generalization benchmarks.
+          Prior analyses of <a href="https://arxiv.org/abs/2505.08243" target="_blank">ECoT training</a> indicate that these objectives help bridge the representation gap between VLM static pretraining and robotics tasks.
+          However, a key limitation of prior ECoT work is the autoregressive nature of VLAs and the increased token count, which results in slower training and inference.
+        </p>
+<p>
+          Overall, it remains an open question how to best implement grounded reasoning for VLAs.
+          Recent work has explored additional modalities like depth prediction in <a href="https://arxiv.org/pdf/2508.07917" target="_blank">MolmoAct</a>.
+          A major bottleneck is the limited availability of diverse training data: many ECoT studies still rely on the same BRIDGE and LIBERO labeled datasets.
+          More diverse datasets with more complex tasks and environments are needed to push this direction further; however, labeling large-scale sources like DROID is tough.
+
+        </p>
+<p><strong>Notable papers:</strong></p>
+<ul>
+<li>
+<a href="https://openreview.net/attachment?id=sFO9d6XSlf&amp;name=pdf">
+              ACTIONS AS LANGUAGE: FINE-TUNING VLMS INTO VLAS WITHOUT CATASTROPHIC FORGETTING
+            </a><br/>
+<em>TL;DR:</em> Instead of directly fine-tuning VLMs with discrete action tokens to become VLAs, which results in catastrophic forgetting, they relabel robot datasets with subtasks, actions as text and intermediate motion-planning like "move left".
+            This training method is able to bridge the domain gap of VLMs without reducing performance on other VQA benchmarks from pretraining. 
+            Finally cheap LORA finetuning is enough to get strong results for action prediction while maintaining VLM reasoning capabilities.
+          </li>
+<li>
+<a href="https://openreview.net/attachment?id=tsxwloasw5&amp;name=pdf">
+              VISION-LANGUAGE-ACTION INSTRUCTION TUNING: FROM UNDERSTANDING TO MANIPULATION
+            </a><br/>
+<em>TL;DR:</em> InstructVLA proposes a two-stage Vision-Language-Action Instruction Tuning pipeline that tries to preserves a pretrained VLM’s multimodal reasoning while adding precise manipulation: (1) pretrain an action expert and latent action interface, then (2) instruction-tune a MoE-adapted VLM to switch between textual reasoning and latent action generation.
+                   It puts emphasis on decoupling multimodal reasoning and action generation to avoid catastrophic forgetting with an action expert, and introduces an instructed-based SIMPLER benchmark to test instruction-following VLAs.
+          
+          <li>
+<a href="https://openreview.net/attachment?id=i5wlozMFsQ&amp;name=pdf">EMBODIED-R1: REINFORCED EMBODIED REASONING FOR GENERAL ROBOTIC MANIPULATION</a><br/>
+<em>TL;DR:</em> R1 is a pointing VLM for embodied reasoning: it trains Qwen2.5-VL base with a two-stage Reinforced Fine-Tuning (RFT) curriculum on the new Embodied-Points-200K dataset.
+            It uses an embodiment-agnostic intermediate REG (point to the referred object), RRG (point to a relation-defined place), OFG (point to a functional part, e.g., a handle), VTG (output a sequence of points as a visual trace/trajectory).
+            Strong performance on embodied benchmarks and pointing ones with good generalization to SIMPLER as planner with intermediate waypoints.
+          </li>
+<li>
+<a href="https://openreview.net/attachment?id=IBJtOltTbx&amp;name=pdf">
+              HYBRID TRAINING FOR VISION-LANGUAGE-ACTION MODELS
+            </a><br/>
+<em>TL;DR:</em> Decomposes ECoT pretraining in several subtasks of think act and follow, that enable to maintain the performance benefits with fast inference. 
+            Similar findings, that Co-Training with ECoT stuff results in better representations for action prediction.
+          </li>
+</li></ul>
+<h3 id="tokenizers">3. New Tokenizers</h3>
+<figure class="figure-container">
+<img alt="FASTer Tokenizer Overview" src="images/faster_tokenizer.png"/>
+<figcaption>Figure 5: FASTer Tokenizer Overview. The tokenizer combines RVQ quantization with frequency and time domain losses. Image from <a href="https://openreview.net/attachment?id=k6nTUFoqeT&amp;name=pdf">FASTer</a>.</figcaption>
+</figure>
+<p>
+          We command robots with high-frequency, continuous control values (e.g., joint angles, gripper state). Vision-Language models, however, operate most effectively on discrete tokens. Naively fine-tuning a VLM to regress continuous actions tends to underperform and often induces catastrophic forgetting, because the new objective misaligns with the model’s pretrained representations.
+        </p>
+<p></p>
+          The core idea of these tokenizers is to convert continuous action sequences into compact discrete tokens that a VLM can predict—retaining accuracy and smoothness while minimizing compute and integration overhead. 
+          An ideal action tokenizer is fast, achieves a high compression ratio for long action-chunks, produces smooth long-horizon outputs, and drops into existing VLM architectures without modification.
+        
+<p>
+          Prior work used discrete binning (e.g., <a href="https://arxiv.org/pdf/2212.06817" target="_blank">RT-1</a>) and <a href="https://arxiv.org/pdf/2403.03181" target="_blank">VQ-VAE</a> codebooks, but both struggle with either coarse precision or long-sequence efficiency. 
+          <a href="https://arxiv.org/abs/2501.09747" target="_blank">FAST</a> introduced action-chunk tokenizers tailored for VLA prediction, demonstrating that discrete tokens can replace more complex diffusion/flow experts for integration. 
+          Building on this, newer tokenizers submitted to ICLR combine Residual Vector Quantization (RVQ) (e.g., <a href="https://arxiv.org/abs/2107.03312" target="_blank">SoundStream</a>) for higher compression, spline-based parameterizations inspired by <a href="https://arxiv.org/pdf/2506.06072" target="_blank">BEAST tokenizer</a> for smooth, long trajectories, and DCT-style objectives (as in <a href="https://arxiv.org/abs/2501.09747" target="_blank">FAST</a>) to bias toward low-frequency, physically plausible motion. 
+          I’m excited to test these tokenizers myself when they release.
+        </p>
+<p><strong>Notable papers:</strong></p>
+<ul>
+<li>
+<a href="https://openreview.net/attachment?id=k6nTUFoqeT&amp;name=pdf">
+              FASTER: TOWARD POWERFUL AND EFFICIENT AUTOREGRESSIVE VISION–LANGUAGE–ACTION MODELS WITH LEARNABLE ACTION TOKENIZER AND BLOCK-WISE DECODING
+            </a><br/>
+<em>TL;DR:</em> Introduces a novel discrete action tokenizer called FASTer, that combines Residual Vector Quantification (RVQ) with a frequency L1 loss using DCT and time domain L1 loss for improved performance. 
+            Also patchifies action tokens along the temporal axis and grouped action dimension axis (e.g. base motion, arm joints). It has a higher compression ratio than <a href="https://arxiv.org/abs/2501.09747" target="_blank">FAST</a> and results on SIMPLER and LIBERO are strong.
+          </li>
+<li>
+<a href="https://openreview.net/attachment?id=CuzTXLB7Jz&amp;name=pdf">
+              OMNISAT: COMPACT ACTION TOKEN, FASTER AUTOREGRESSION FOR VISION-LANGUAGE-ACTION MODELS
+            </a><br/>
+<em>TL;DR:</em> Another tokenizer for VLAs that uses our <a href="https://arxiv.org/pdf/2506.06072" target="_blank">BEAST</a> paper idea of B-Splines for compact representation of continuous action chunks.
+            It uses a two stage encoding process: First, aligning the different action chunk lengths of different embodiments into a normalized, fixed-length representation.
+            Next, it uses a B-Spline based encoder to get a compact representation of the normalized 

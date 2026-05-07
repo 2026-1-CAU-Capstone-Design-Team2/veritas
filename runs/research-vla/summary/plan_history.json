@@ -1,0 +1,331 @@
+{
+  "entries": [
+    {
+      "timestamp": "2026-05-07T18:27:52",
+      "reason": "initial",
+      "changed": true,
+      "gap_directions": [],
+      "previous_plan": {},
+      "plan": {
+        "topic": "Vision-Language-Action Model",
+        "goal": "최신 연구 논문 및 동향에 대해 상세히 조사하여 최신 동향을 파악하고, 관련 주요 논문 및 동향 문서들을 찾아야 합니다.",
+        "search_queries": [
+          "Vision-Language-Action Model latest research paper 2026",
+          "Vision-Language-Action model recent news 2026",
+          "Vision-Language-Action model latest update 2026",
+          "Vision-Language-Action model comparison 2026",
+          "Vision-Language-Action model implementation details 2026"
+        ],
+        "must_cover": [
+          "latest research papers",
+          "recent news and updates",
+          "comparison between models",
+          "implementation details",
+          "academic literature"
+        ],
+        "keywords": [
+          "Vision-Language-Action Model",
+          "latest research",
+          "recent news",
+          "update",
+          "implementation",
+          "comparison",
+          "academic literature",
+          "2026",
+          "동향"
+        ],
+        "plan_mode": "initial",
+        "used_query_count": 0
+      },
+      "previous_query_count": 0,
+      "query_count": 5
+    },
+    {
+      "timestamp": "2026-05-07T18:28:29",
+      "reason": "replan",
+      "changed": true,
+      "gap_directions": [
+        "Missing Historical Context**: The user requested to find \"latest\" research but Document 0 provides a 26-year history (from 2018 onwards). Since the search implies recent trends, there is a significant gap between the current snapshot and the historical baseline required for understanding the full landscape of VLA evolution.",
+        "Model vs. Algorithm Distinction**: Document 0's clear definition distinguishes pre-trained models (which are rare in recent research) from multimodal policy-based models. Recent research focuses heavily on *cross-embodiment* generalization and agentic adaptation, creating a gap in the literature between \"static VLA policies\" and dynamic agent architectures like those discussed in Documents 1 & 2.",
+        "Real-Time Performance**: While Document 2 mentions \"real-time control,\" Document 0 highlights its challenges (\"slow inference\"). A critical gap exists regarding the performance of current VLA models in *low-latency* real-world scenarios compared to their SOTA counterparts on simulation benchmarks (as seen in Documents 1 & 2)."
+      ],
+      "previous_plan": {
+        "topic": "Vision-Language-Action Model",
+        "goal": "최신 연구 논문 및 동향에 대해 상세히 조사하여 최신 동향을 파악하고, 관련 주요 논문 및 동향 문서들을 찾아야 합니다.",
+        "search_queries": [
+          "Vision-Language-Action Model latest research paper 2026",
+          "Vision-Language-Action model recent news 2026",
+          "Vision-Language-Action model latest update 2026",
+          "Vision-Language-Action model comparison 2026",
+          "Vision-Language-Action model implementation details 2026"
+        ],
+        "must_cover": [
+          "latest research papers",
+          "recent news and updates",
+          "comparison between models",
+          "implementation details",
+          "academic literature"
+        ],
+        "keywords": [
+          "Vision-Language-Action Model",
+          "latest research",
+          "recent news",
+          "update",
+          "implementation",
+          "comparison",
+          "academic literature",
+          "2026",
+          "동향"
+        ],
+        "plan_mode": "initial",
+        "used_query_count": 0
+      },
+      "plan": {
+        "topic": "Vision-Language-Action Model",
+        "goal": "최신 연구 논문 및 동향에 대해 상세히 조사하여 최신 동향을 파악하고, 관련 주요 논문 및 동향 문서들을 찾아야 합니다.",
+        "search_queries": [
+          "Vision-Language-Action Model 2026 latest research paper",
+          "Vision-Language-Action model recent news 2026",
+          "Vision-Language-Action model comparison 2026",
+          "Vision-Language-Action model implementation details 2026",
+          "Cross-embodiment generalization VLA 2026"
+        ],
+        "must_cover": [
+          "Missing Historical Context**: The user requested to find \"latest\" research but Document 0 provides a 26-year history (from 2018 onwards). Since the search implies recent trends, there is a significant gap between the current snapshot and the historical baseline required for understanding the full landscape of VLA evolution.",
+          "Model vs. Algorithm Distinction**: Document 0's clear definition distinguishes pre-trained models (which are rare in recent research) from multimodal policy-based models. Recent research focuses heavily on *cross-embodiment* generalization and agentic adaptation, creating a gap in the literature between \"static VLA policies\" and dynamic agent architectures like those discussed in Documents 1 & 2.",
+          "Real-Time Performance**: While Document 2 mentions \"real-time control,\" Document 0 highlights its challenges (\"slow inference\"). A critical gap exists regarding the performance of current VLA models in *low-latency* real-world scenarios compared to their SOTA counterparts on simulation benchmarks (as seen in Documents 1 & 2).",
+          "latest research papers",
+          "recent news and updates",
+          "comparison between models",
+          "implementation details",
+          "academic literature"
+        ],
+        "keywords": [
+          "latest",
+          "Missing Historical Context**",
+          "static VLA policies",
+          "Model vs. Algorithm Distinction**",
+          "real-time control,",
+          "slow inference",
+          "Real-Time Performance**",
+          "Vision-Language-Action Model",
+          "latest research",
+          "recent news",
+          "update",
+          "implementation",
+          "comparison",
+          "academic literature",
+          "2026",
+          "동향"
+        ],
+        "plan_mode": "replan",
+        "used_query_count": 1
+      },
+      "previous_query_count": 5,
+      "query_count": 5
+    },
+    {
+      "timestamp": "2026-05-07T18:29:10",
+      "reason": "replan",
+      "changed": true,
+      "gap_directions": [
+        "Gap:** The existing literature on `WAV` (Document 007) excels at implicit planning and theoretical reasoning but lacks explicit, runnable prototypes for generalist robots. Document 005 confirms that \"robust visual perception\" combined with *practical* action planning is the key bottleneck in successful deployment, rather than just advanced architectures.",
+        "Action:** The user should investigate recent work (post-2024) specifically focusing on translating `WAV`'s latent-space inference into standard robotic control loops for generalist environments."
+      ],
+      "previous_plan": {
+        "topic": "Vision-Language-Action Model",
+        "goal": "최신 연구 논문 및 동향에 대해 상세히 조사하여 최신 동향을 파악하고, 관련 주요 논문 및 동향 문서들을 찾아야 합니다.",
+        "search_queries": [
+          "Vision-Language-Action Model 2026 latest research paper",
+          "Vision-Language-Action model recent news 2026",
+          "Vision-Language-Action model comparison 2026",
+          "Vision-Language-Action model implementation details 2026",
+          "Cross-embodiment generalization VLA 2026"
+        ],
+        "must_cover": [
+          "Missing Historical Context**: The user requested to find \"latest\" research but Document 0 provides a 26-year history (from 2018 onwards). Since the search implies recent trends, there is a significant gap between the current snapshot and the historical baseline required for understanding the full landscape of VLA evolution.",
+          "Model vs. Algorithm Distinction**: Document 0's clear definition distinguishes pre-trained models (which are rare in recent research) from multimodal policy-based models. Recent research focuses heavily on *cross-embodiment* generalization and agentic adaptation, creating a gap in the literature between \"static VLA policies\" and dynamic agent architectures like those discussed in Documents 1 & 2.",
+          "Real-Time Performance**: While Document 2 mentions \"real-time control,\" Document 0 highlights its challenges (\"slow inference\"). A critical gap exists regarding the performance of current VLA models in *low-latency* real-world scenarios compared to their SOTA counterparts on simulation benchmarks (as seen in Documents 1 & 2).",
+          "latest research papers",
+          "recent news and updates",
+          "comparison between models",
+          "implementation details",
+          "academic literature"
+        ],
+        "keywords": [
+          "latest",
+          "Missing Historical Context**",
+          "static VLA policies",
+          "Model vs. Algorithm Distinction**",
+          "real-time control,",
+          "slow inference",
+          "Real-Time Performance**",
+          "Vision-Language-Action Model",
+          "latest research",
+          "recent news",
+          "update",
+          "implementation",
+          "comparison",
+          "academic literature",
+          "2026",
+          "동향"
+        ],
+        "plan_mode": "replan",
+        "used_query_count": 1
+      },
+      "plan": {
+        "topic": "Vision-Language-Action Model (VLA) 최신 연구 논문 및 동향",
+        "goal": "2026 년 현재 VLA 모델의 최신 연구 논문, 주요 동향 및 관련 주요 논문 및 동향 문서들을 찾아야 합니다.",
+        "search_queries": [
+          "Cross-embodiment generalization VLA 2026",
+          "WAV latent-space inference robotic control loop 2026",
+          "Real-time performance VLA low latency 2026"
+        ],
+        "must_cover": [
+          "Gap:** The existing literature on `WAV` (Document 007) excels at implicit planning and theoretical reasoning but lacks explicit, runnable prototypes for generalist robots. Document 005 confirms that \"robust visual perception\" combined with *practical* action planning is the key bottleneck in successful deployment, rather than just advanced architectures.",
+          "Action:** The user should investigate recent work (post-2024) specifically focusing on translating `WAV`'s latent-space inference into standard robotic control loops for generalist environments.",
+          "Missing Historical Context**: The user requested to find \"latest\" research but Document 0 provides a 26-year history (from 2018 onwards). Since the search implies recent trends, there is a significant gap between the current snapshot and the historical baseline required for understanding the full landscape of VLA evolution.",
+          "Model vs. Algorithm Distinction**: Document 0's clear definition distinguishes pre-trained models (which are rare in recent research) from multimodal policy-based models. Recent research focuses heavily on *cross-embodiment* generalization and agentic adaptation, creating a gap in the literature between \"static VLA policies\" and dynamic agent architectures like those discussed in Documents 1 & 2.",
+          "Real-Time Performance**: While Document 2 mentions \"real-time control,\" Document 0 highlights its challenges (\"slow inference\"). A critical gap exists regarding the performance of current VLA models in *low-latency* real-world scenarios compared to their SOTA counterparts on simulation benchmarks (as seen in Documents 1 & 2).",
+          "latest research papers",
+          "recent news and updates",
+          "comparison between models",
+          "implementation details",
+          "academic literature"
+        ],
+        "keywords": [
+          "robust visual perception",
+          "Gap",
+          "Action",
+          "latest",
+          "Missing Historical Context**",
+          "static VLA policies",
+          "Model vs. Algorithm Distinction**",
+          "real-time control,",
+          "slow inference",
+          "Real-Time Performance**",
+          "Vision-Language-Action Model",
+          "latest research",
+          "recent news",
+          "update",
+          "implementation",
+          "comparison",
+          "academic literature",
+          "2026",
+          "동향"
+        ],
+        "plan_mode": "replan",
+        "used_query_count": 3
+      },
+      "previous_query_count": 5,
+      "query_count": 3
+    },
+    {
+      "timestamp": "2026-05-07T18:29:50",
+      "reason": "replan",
+      "changed": true,
+      "gap_directions": [
+        "Gap**: Lack of direct experimental comparisons between `Being-H0.5` (Human-centric, UniHand), `LAP`, and `XL-VLA` regarding **generalization performance** on **real-world robots**. The paper summaries mention success rates but do not explicitly compare the actual generalization quality on external datasets compared to existing open-source baselines.",
+        "Correction/Refinement:* While papers claim high results, a deeper gap exists for understanding how well these architectures generalize to **new, previously unseen robot embodiments** that may differ significantly from human-like control paradigms (e.g., complex grasping vs. simple reaching). `LAP`'s LATiP is promising but needs further evaluation on novel robot datasets not available in the current literature.",
+        "Reason:* Directly needed to distinguish technical innovations from practical generalization success in real-world deployment scenarios."
+      ],
+      "previous_plan": {
+        "topic": "Vision-Language-Action Model (VLA) 최신 연구 논문 및 동향",
+        "goal": "2026 년 현재 VLA 모델의 최신 연구 논문, 주요 동향 및 관련 주요 논문 및 동향 문서들을 찾아야 합니다.",
+        "search_queries": [
+          "Cross-embodiment generalization VLA 2026",
+          "WAV latent-space inference robotic control loop 2026",
+          "Real-time performance VLA low latency 2026"
+        ],
+        "must_cover": [
+          "Gap:** The existing literature on `WAV` (Document 007) excels at implicit planning and theoretical reasoning but lacks explicit, runnable prototypes for generalist robots. Document 005 confirms that \"robust visual perception\" combined with *practical* action planning is the key bottleneck in successful deployment, rather than just advanced architectures.",
+          "Action:** The user should investigate recent work (post-2024) specifically focusing on translating `WAV`'s latent-space inference into standard robotic control loops for generalist environments.",
+          "Missing Historical Context**: The user requested to find \"latest\" research but Document 0 provides a 26-year history (from 2018 onwards). Since the search implies recent trends, there is a significant gap between the current snapshot and the historical baseline required for understanding the full landscape of VLA evolution.",
+          "Model vs. Algorithm Distinction**: Document 0's clear definition distinguishes pre-trained models (which are rare in recent research) from multimodal policy-based models. Recent research focuses heavily on *cross-embodiment* generalization and agentic adaptation, creating a gap in the literature between \"static VLA policies\" and dynamic agent architectures like those discussed in Documents 1 & 2.",
+          "Real-Time Performance**: While Document 2 mentions \"real-time control,\" Document 0 highlights its challenges (\"slow inference\"). A critical gap exists regarding the performance of current VLA models in *low-latency* real-world scenarios compared to their SOTA counterparts on simulation benchmarks (as seen in Documents 1 & 2).",
+          "latest research papers",
+          "recent news and updates",
+          "comparison between models",
+          "implementation details",
+          "academic literature"
+        ],
+        "keywords": [
+          "robust visual perception",
+          "Gap",
+          "Action",
+          "latest",
+          "Missing Historical Context**",
+          "static VLA policies",
+          "Model vs. Algorithm Distinction**",
+          "real-time control,",
+          "slow inference",
+          "Real-Time Performance**",
+          "Vision-Language-Action Model",
+          "latest research",
+          "recent news",
+          "update",
+          "implementation",
+          "comparison",
+          "academic literature",
+          "2026",
+          "동향"
+        ],
+        "plan_mode": "replan",
+        "used_query_count": 3
+      },
+      "plan": {
+        "topic": "Vision-Language-Action Model (VLA) 최신 연구 논문 및 동향",
+        "goal": "2026 년 현재 VLA 모델의 최신 연구 논문, 주요 동향 및 관련 주요 논문 및 동향 문서들을 찾아야 합니다.",
+        "search_queries": [
+          "WAV latent-space inference robotic control loop 2026",
+          "Real-time performance VLA low latency 2026",
+          "Being-H0.5 LAP XL-VLA generalization real-world robots",
+          "LAP LATiP novel robot dataset evaluation",
+          "Cross-embodiment generalization VLA 2026 latest news"
+        ],
+        "must_cover": [
+          "Gap**: Lack of direct experimental comparisons between `Being-H0.5` (Human-centric, UniHand), `LAP`, and `XL-VLA` regarding **generalization performance** on **real-world robots**. The paper summaries mention success rates but do not explicitly compare the actual generalization quality on external datasets compared to existing open-source baselines.",
+          "Correction/Refinement:* While papers claim high results, a deeper gap exists for understanding how well these architectures generalize to **new, previously unseen robot embodiments** that may differ significantly from human-like control paradigms (e.g., complex grasping vs. simple reaching). `LAP`'s LATiP is promising but needs further evaluation on novel robot datasets not available in the current literature.",
+          "Reason:* Directly needed to distinguish technical innovations from practical generalization success in real-world deployment scenarios.",
+          "Gap:** The existing literature on `Being-H0.5` (Human-centric, UniHand), `LAP`, and `XL-VLA` regarding **generalization performance** on **real-world robots**. The paper summaries mention success rates but do not explicitly compare the actual generalization quality on external datasets compared to existing open-source baselines.",
+          "Gap:** The existing literature on `WAV` (Document 007) excels at implicit planning and theoretical reasoning but lacks explicit, runnable prototypes for generalist robots. Document 005 confirms that \"robust visual perception\" combined with *practical* action planning is the key bottleneck in successful deployment, rather than just advanced architectures.",
+          "Action:** The user should investigate recent work (post-2024) specifically focusing on translating `WAV`'s latent-space inference into standard robotic control loops for generalist environments.",
+          "Missing Historical Context**: The user requested to find \"latest\" research but Document 0 provides a 26-year history (from 2018 onwards). Since the search implies recent trends, there is a significant gap between the current snapshot and the historical baseline required for understanding the full landscape of VLA evolution.",
+          "Model vs. Algorithm Distinction**: Document 0's clear definition distinguishes pre-trained models (which are rare in recent research) from multimodal policy-based models. Recent research focuses heavily on *cross-embodiment* generalization and agentic adaptation, creating a gap in the literature between \"static VLA policies\" and dynamic agent architectures like those discussed in Documents 1 & 2.",
+          "Real-Time Performance**: While Document 2 mentions \"real-time control,\" Document 0 highlights its challenges (\"slow inference\"). A critical gap exists regarding the performance of current VLA models in *low-latency* real-world scenarios compared to their SOTA counterparts on simulation benchmarks (as seen in Documents 1 & 2).",
+          "latest research papers",
+          "recent news and updates",
+          "comparison between models",
+          "implementation details",
+          "academic literature"
+        ],
+        "keywords": [
+          "Gap**",
+          "Correction/Refinement",
+          "Reason",
+          "robust visual perception",
+          "Gap",
+          "Action",
+          "latest",
+          "Missing Historical Context**",
+          "static VLA policies",
+          "Model vs. Algorithm Distinction**",
+          "real-time control,",
+          "slow inference",
+          "Real-Time Performance**",
+          "Vision-Language-Action Model",
+          "latest research",
+          "recent news",
+          "update",
+          "implementation",
+          "comparison",
+          "academic literature"
+        ],
+        "plan_mode": "replan",
+        "used_query_count": 4
+      },
+      "previous_query_count": 3,
+      "query_count": 5
+    }
+  ]
+}

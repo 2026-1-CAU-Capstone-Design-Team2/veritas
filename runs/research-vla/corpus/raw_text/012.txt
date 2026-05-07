@@ -1,0 +1,40 @@
+LAP: Language-Action Pre-training Enables Zero-Shot Cross-Embodiment Transfer
+We introduce LAP-3B , the first VLA that achieves substantial zero-shot generalization to unseen embodiments .
+We introduce Language-Action Pre-training (LAP), a general VLA pre-training recipe that represents low-level actions in natural language to supervise a vision-language backbone, unifying action learning and VQA. We instantiate this approach as LAP-3B, the first VLA to demonstrate strong zero-shot transfer to novel embodiments. Compared to state-of-the-art VLAs, LAP-3B learns more generalizable embodiment representations and exhibits favorable scaling behavior.
+Zero-shot Cross-Embodiment Generalization
+LAP-3B achieves over 50% average success when deployed zero-shot on previously unseen robot embodiments , delivering roughly a 2x improvement over the strongest prior baseline. In contrast, all other open-source VLAs fail to transfer, collapsing to 0% success under the same evaluation.
+"Sort things into the basket"
+"Take out a tissue and put it on table"
+"Cover the carrot with towel"
+"Put towel into the basket"
+"Put carrot into the basket"
+"Put marker into the bowl"
+"Sort things into the basket"
+"Put the mug into the basket"
+"Put carrot into the bowl"
+"Put marker into the cup"
+"Pour things onto the table"
+We further compare LAP-3B against state-of-the-art open-source vision-language-action models—including \(\pi_0\), \(\pi_{0.5}\)-DROID, X-VLA, and \(\pi_{0.5}\)-replicated—on the same tasks across multiple embodiments under zero-shot transfer. The qualitative rollouts demonstrate LAP-3B's superior ability to generalize to novel robots without any embodiment-specific fine-tuning, while baseline policies struggle or fail entirely on these unseen platforms.
+\(\pi_{0.5}\)-DROID ❌
+\(\pi_{0.5}\)-replicated ⚠️
+LAP-3B ✅
+\(\pi_{0}\)-replicated ⚠️
+\(\pi_{0.5}\)-replicated ⚠️
+LAP-3B ✅
+\(\pi_{0.5}\)-DROID ❌
+LAP-3B ✅
+\(\pi_{0.5}\)-DROID ⚠️
+\(\pi_{0.5}\)-replicated ⚠️
+LAP-3B ✅
+Superior Fine-tuning Efficiency
+LAP-3B fine-tunes more efficiently than baseline policies across both the LIBERO benchmark and real-world manipulation. On LIBERO, LAP-3B reaches near-optimal success with only a fraction of the training steps required by prior methods. On real robots, it achieves comparable performance using approximately 2.5x fewer demonstrations , demonstrating substantially improved data and compute efficiency when transferring to new embodiments.
+Franka: Fold Towel and Place in Basket
+Analysis of LAP's Cross-Embodiment Generalization
+Left: T-SNE visualizations of learned embodiment representations for LAP-3B and \(\pi_{0.5}\)-replicated. LAP-3B exhibits substantial overlap between training and unseen embodiments, whereas \(\pi_{0.5}\)-replicated shows limited alignment, indicating that LAP-3B learns more transferable, embodiment-agnostic control representations.
+Right: Action prediction error on unseen embodiments during pre-training. LAP-3B achieves consistently lower action prediction error on held-out unseen embodiments throughout training, compared to \(\pi_{0.5}\)-replicated and \(\pi_{0}\)-replicated baselines. This indicates that language-action supervision enables the model to learn control representations that generalize across embodiments, allowing more accurate action prediction on novel robots as well as smoother training dynamics.
+Beyond Cross-Embodiment: Additional Benefits of LAP
+Enhanced language following ability. While our primary focus is cross-embodiment generalization, we also demonstrate strong language-following capability by pre-training with language-actions. In cluttered scenes with multiple objects, the policy correctly identifies the instructed target and reliably completes the task.
+Left: Better alignment with VQA co-training. Because language-actions share the same natural-language output space as standard VQA tasks, LAP enables seamless co-training with vision-language objectives. We introduce a motion-prediction task where the model describes the robot's movement between two frames using a language-action. This unified interface leads to more precise action generation and stronger spatial generalization across embodiments.
+Right: Favorable scaling with model size. LAP improves consistently as model capacity increases. Scaling from 4B to 27B parameters reduces both token and action validation losses, while comparable baselines saturate or degrade. These results demonstrate stable large-model scaling and increasing performance gains from additional capacity under language-action supervision.
+@misc{zha2026laplanguageactionpretrainingenables, title={LAP: Language-Action Pre-Training Enables Zero-shot Cross-Embodiment Transfer}, author={Lihan Zha and Asher J. Hancock and Mingtong Zhang and Tenny Yin and Yixuan Huang and Dhruv Shah and Allen Z. Ren and Anirudha Majumdar}, year={2026}, eprint={2602.10556}, archivePrefix={arXiv}, primaryClass={cs.RO}, url={https://arxiv.org/abs/2602.10556}, }
+This website is based on the PolaRiS template .

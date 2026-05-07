@@ -11,10 +11,10 @@ from tools.tool import BaseTool, ToolResult
 
 
 class QueryPlanTool(BaseTool):
-    PLAN_REASONING_ENABLED = True
+    PLAN_REASONING_ENABLED = False
     LLM_EXPOSED_TOOL_NAMES = ()
-    PLAN_TIMEOUT_SEC = 90
-    REPLAN_TIMEOUT_SEC = 90
+    PLAN_TIMEOUT_SEC = 45
+    REPLAN_TIMEOUT_SEC = 45
 
     def __init__(self, schema: dict[str, Any], llm, run_store_service, tool_registry=None) -> None:
         super().__init__(schema=schema)
@@ -101,7 +101,7 @@ class QueryPlanTool(BaseTool):
                     planner_prompt,
                     json.dumps(planner_input, ensure_ascii=False, indent=2),
                     reasoning=(self.PLAN_REASONING_ENABLED and mode != "replan"),
-                    max_retries=(0 if mode == "replan" else 2),
+                    max_retries=(1 if mode == "initial" else 0),
                     stream=False,
                     stream_label=f"plan:{mode}",
                     tools=llm_tools,
@@ -162,7 +162,51 @@ class QueryPlanTool(BaseTool):
                     content="Replan failed or timed out; continued with fallback plan.",
                     data=fallback_plan,
                 )
-            return ToolResult(success=False, error=f"Failed to build query plan: {e}")
+            fallback_plan = self._fallback_initial(
+                user_request=user_request,
+                grounding=grounding,
+                used_queries=used_queries,
+                reason=str(e),
+            )
+            if save:
+                self._run_store_service.save_plan(fallback_plan)
+            print("[plan][fallback] initial plan failed or timed out; continuing with fallback plan")
+            return ToolResult(
+                success=True,
+                content="Initial plan failed or timed out; continued with fallback plan.",
+                data=fallback_plan,
+            )
+
+    def _fallback_initial(
+        self,
+        *,
+        user_request: str,
+        grounding: dict[str, Any] | None,
+        used_queries: list[str],
+        reason: str,
+    ) -> dict[str, Any]:
+        queries = [user_request]
+        if isinstance(grounding, dict):
+            queries.extend(self._normalize_list(grounding.get("grounded_terms"), max_items=8))
+            queries.extend(self._normalize_list(grounding.get("candidate_entities"), max_items=8))
+
+        plan = {
+            "topic": user_request,
+            "goal": "Fallback plan generated after planner failure.",
+            "search_queries": queries,
+            "must_cover": self._normalize_list(queries, max_items=20),
+            "keywords": self._normalize_list(queries[1:], max_items=20),
+            "plan_mode": "initial_fallback",
+            "plan_fallback": True,
+            "plan_fallback_reason": str(reason)[:500],
+        }
+        return self._normalize_plan(
+            plan,
+            user_request=user_request,
+            mode="initial",
+            used_queries=used_queries,
+            allow_empty_search_queries=False,
+        )
 
     def _normalize_plan(
         self,

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
+from typing import Any, Callable
 
 from core.prompts import (
+    SCREEN_INTERVENTION_SYSTEM_PROMPT,
+    SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE,
     SYSTEM_PROMPT,
     TOOL_CHAT_FINAL_PROMPT_TEMPLATE,
     TOOL_CHAT_SYSTEM_PROMPT,
@@ -29,9 +33,12 @@ class ChatAgent:
         "current_time",
         "rag_search",
         "autosurvey",
+        "screen_context",
     )
     TOOL_DECISION_TIMEOUT_SEC = 45
     FINAL_ANSWER_TIMEOUT_SEC = 180
+    SCREEN_INTERVENTION_POLL_SEC = 2.0
+    SCREEN_INTERVENTION_TIMEOUT_SEC = 180
 
     def __init__(
         self,
@@ -50,38 +57,44 @@ class ChatAgent:
         self.max_history_turns = max_history_turns
         self.max_tool_calls = max(1, int(max_tool_calls))
         self.chat_history: list[tuple[str, str]] = []
+        self._conversation_lock = threading.RLock()
+        self._screen_stop_event = threading.Event()
+        self._screen_monitor_thread: threading.Thread | None = None
+        self._screen_answer_callback: Callable[[str, dict[str, Any]], None] | None = None
 
     def ask_rag(self, question: str, *, stream: bool = False) -> str:
         """Strict document-grounded Q&A mode for explicit --phase rag sessions."""
-        answer = self.rag_service.answer(question, stream=stream, use_history=True)
-        self._append_history(question, answer)
-        return answer
+        with self._conversation_lock:
+            answer = self.rag_service.answer(question, stream=stream, use_history=True)
+            self._append_history(question, answer)
+            return answer
 
     def ask_auto(self, question: str, *, stream: bool = False) -> str:
         """General chat mode with schema-driven optional tool use."""
-        explicit_command = self._parse_explicit_command(question)
-        if explicit_command:
-            command, command_text = explicit_command
-            tool_outputs = self._run_explicit_tool_command(
-                command=command,
-                command_text=command_text,
-            )
+        with self._conversation_lock:
+            explicit_command = self._parse_explicit_command(question)
+            if explicit_command:
+                command, command_text = explicit_command
+                tool_outputs = self._run_explicit_tool_command(
+                    command=command,
+                    command_text=command_text,
+                )
+                answer = self._answer_from_current_turn(
+                    question=command_text or question,
+                    tool_outputs=tool_outputs,
+                    stream=stream,
+                )
+                self._append_history(question, answer)
+                return answer
+
+            tool_outputs = self._collect_tool_outputs(question)
             answer = self._answer_from_current_turn(
-                question=command_text or question,
+                question=question,
                 tool_outputs=tool_outputs,
                 stream=stream,
             )
             self._append_history(question, answer)
             return answer
-
-        tool_outputs = self._collect_tool_outputs(question)
-        answer = self._answer_from_current_turn(
-            question=question,
-            tool_outputs=tool_outputs,
-            stream=stream,
-        )
-        self._append_history(question, answer)
-        return answer
 
     def _append_history(self, question: str, answer: str) -> None:
         self.chat_history.append((question, answer))
@@ -114,7 +127,7 @@ class ChatAgent:
 
         head, _, tail = text.partition(" ")
         command = head[1:].strip().lower()
-        if command not in {"autosurvey", "rag"}:
+        if command not in {"autosurvey", "rag", "screen"}:
             return None
 
         return command, tail.strip()
@@ -136,7 +149,7 @@ class ChatAgent:
                 }
             ]
 
-        if not command_text:
+        if command in {"autosurvey", "rag"} and not command_text:
             return [
                 {
                     "name": command,
@@ -158,6 +171,13 @@ class ChatAgent:
                 "rag_search",
                 query=command_text,
                 use_history=True,
+            )
+
+        if command == "screen":
+            action = command_text or "capture_once"
+            return self._call_registry_tool(
+                "screen_context",
+                action=action,
             )
 
         return []
@@ -278,35 +298,201 @@ class ChatAgent:
         except Exception:
             return text
 
-    def chat_loop(self, *, mode: str = "auto") -> None:
+    def has_screen_context(self) -> bool:
+        return bool(self.tool_registry is not None and self.tool_registry.has("screen_context"))
+
+    def start_screen_monitoring(
+        self,
+        *,
+        on_answer: Callable[[str, dict[str, Any]], None] | None = None,
+        stream: bool = False,
+    ) -> bool:
+        """Start screen polling and proactive intervention consumption."""
+        if not self.has_screen_context():
+            return False
+        if self._screen_monitor_thread and self._screen_monitor_thread.is_alive():
+            self._screen_answer_callback = on_answer
+            return True
+
+        start_result = self.tool_registry.call("screen_context", action="start_polling")
+        if not start_result.success:
+            print(f"[screen_context][warn] failed to start polling: {start_result.error}")
+            return False
+
+        self._screen_answer_callback = on_answer
+        self._screen_stop_event.clear()
+        self._screen_monitor_thread = threading.Thread(
+            target=self._screen_intervention_loop,
+            kwargs={"stream": stream},
+            daemon=True,
+        )
+        self._screen_monitor_thread.start()
+        return True
+
+    def stop_screen_monitoring(self) -> None:
+        self._screen_stop_event.set()
+        if self._screen_monitor_thread and self._screen_monitor_thread.is_alive():
+            self._screen_monitor_thread.join(timeout=self.SCREEN_INTERVENTION_POLL_SEC + 1)
+        self._screen_monitor_thread = None
+        self._screen_answer_callback = None
+        if self.has_screen_context():
+            result = self.tool_registry.call("screen_context", action="stop_polling")
+            if not result.success:
+                print(f"[screen_context][warn] failed to stop polling: {result.error}")
+
+    def answer_screen_intervention(
+        self,
+        intervention: dict[str, Any],
+        *,
+        stream: bool = False,
+    ) -> str:
+        """Generate a proactive answer from one queued screen intervention."""
+        with self._conversation_lock:
+            query = self._screen_intervention_query(intervention)
+            knowledge_context = self._screen_knowledge_context(query)
+            prompt = SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE.format(
+                history=self._format_recent_history(),
+                app_context=self._pretty_payload(
+                    intervention.get("app_context") or intervention.get("app") or {}
+                ),
+                writing_context=self._pretty_payload(intervention.get("writing_context") or {}),
+                routing_hint=self._pretty_payload(intervention.get("tool_routing_hint") or {}),
+                knowledge_context=knowledge_context,
+            )
+            try:
+                answer = self.llm.ask(
+                    SCREEN_INTERVENTION_SYSTEM_PROMPT,
+                    prompt,
+                    reasoning=False,
+                    stream=stream,
+                    stream_label="screen_context",
+                    timeout_sec=self.SCREEN_INTERVENTION_TIMEOUT_SEC,
+                )
+            except Exception as e:
+                answer = f"[screen_context][error] failed to generate answer: {e}"
+                print(answer)
+
+            history_question = self._screen_history_question(intervention)
+            self._append_history(history_question, answer)
+            return answer.strip()
+
+    def _screen_intervention_loop(self, *, stream: bool) -> None:
+        while not self._screen_stop_event.wait(self.SCREEN_INTERVENTION_POLL_SEC):
+            interventions = self._consume_screen_interventions(limit=1)
+            for intervention in interventions:
+                answer = self.answer_screen_intervention(intervention, stream=stream)
+                if self._screen_answer_callback is not None:
+                    self._screen_answer_callback(answer, intervention)
+                else:
+                    print("\n[Screen Assist]")
+                    print(answer)
+                    print()
+
+    def _consume_screen_interventions(self, *, limit: int) -> list[dict[str, Any]]:
+        if not self.has_screen_context():
+            return []
+        try:
+            result = self.tool_registry.call(
+                "screen_context",
+                action="consume_interventions",
+                limit=limit,
+            )
+        except Exception as e:
+            print(f"[screen_context][warn] failed to consume interventions: {e}")
+            return []
+        if not result.success:
+            print(f"[screen_context][warn] failed to consume interventions: {result.error}")
+            return []
+        data = result.data if isinstance(result.data, dict) else {}
+        interventions = data.get("interventions", [])
+        return [item for item in interventions if isinstance(item, dict)]
+
+    def _screen_intervention_query(self, intervention: dict[str, Any]) -> str:
+        writing = intervention.get("writing_context") if isinstance(intervention, dict) else {}
+        if not isinstance(writing, dict):
+            writing = {}
+        candidates = [
+            writing.get("focused_sentence"),
+            writing.get("current_paragraph"),
+            writing.get("changed_text"),
+            writing.get("full_text"),
+        ]
+        for candidate in candidates:
+            text = " ".join(str(candidate or "").split()).strip()
+            if text:
+                return text[:1000]
+        return "screen writing context"
+
+    def _screen_history_question(self, intervention: dict[str, Any]) -> str:
+        app = intervention.get("app_context") or intervention.get("app") or {}
+        writing = intervention.get("writing_context") or {}
+        title = app.get("title") if isinstance(app, dict) else ""
+        focused = writing.get("focused_sentence") if isinstance(writing, dict) else ""
+        focused_text = " ".join(str(focused or "").split()).strip()
+        title_text = " ".join(str(title or "").split()).strip()
+        if focused_text:
+            return f"[screen_context] {focused_text[:200]}"
+        if title_text:
+            return f"[screen_context] active window: {title_text[:200]}"
+        return "[screen_context] proactive intervention"
+
+    def _screen_knowledge_context(self, query: str) -> str:
+        if self.rag_service is None:
+            return "(No knowledge base service is available.)"
+        try:
+            if self.rag_service.get_document_count() <= 0:
+                return "(The knowledge base is empty.)"
+            documents = self.rag_service.retrieve(query, use_history=False)
+            context = self.rag_service.format_retrieved_documents(documents)
+            return context if context.strip() else "(No relevant knowledge-base documents found.)"
+        except Exception as e:
+            return f"(Knowledge-base lookup failed: {e})"
+
+    def _pretty_payload(self, payload: Any) -> str:
+        try:
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(payload)
+
+    def chat_loop(self, *, mode: str = "auto", enable_screen_context: bool = False) -> None:
         doc_count = self.rag_service.get_document_count() if self.rag_service is not None else 0
         mode_label = "RAG" if mode == "rag" else "schema-driven tool chat"
         allowed = ", ".join(self.optional_tool_names)
         print(f"\n[Chat] {mode_label}. {doc_count} RAG chunks indexed. Type 'exit' to quit.")
         if mode == "auto":
             print(f"[Chat] Exposed tools: {allowed}\n")
-            print("[Chat] Explicit commands: /autosurvey <request>, /rag <question>\n")
+            print("[Chat] Explicit commands: /autosurvey <request>, /rag <question>, /screen [action]\n")
         else:
             print()
 
-        while True:
-            try:
-                question = input("User: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\n[Chat] Goodbye!")
-                break
+        screen_monitoring_started = False
+        if enable_screen_context and mode == "auto":
+            screen_monitoring_started = self.start_screen_monitoring(stream=False)
+            if screen_monitoring_started:
+                print("[Chat] Screen context monitoring is active.\n")
 
-            if not question:
-                continue
-            if question.lower() in ("exit", "quit", "q"):
-                print("[Chat] Goodbye!")
-                break
+        try:
+            while True:
+                try:
+                    question = input("User: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n[Chat] Goodbye!")
+                    break
 
-            print()
-            if mode == "rag":
-                self.ask_rag(question, stream=True)
-            elif mode == "auto":
-                self.ask_auto(question, stream=True)
-            else:
-                raise ValueError(f"Unsupported chat mode: {mode}")
-            print()
+                if not question:
+                    continue
+                if question.lower() in ("exit", "quit", "q"):
+                    print("[Chat] Goodbye!")
+                    break
+
+                print()
+                if mode == "rag":
+                    self.ask_rag(question, stream=True)
+                elif mode == "auto":
+                    self.ask_auto(question, stream=True)
+                else:
+                    raise ValueError(f"Unsupported chat mode: {mode}")
+                print()
+        finally:
+            if screen_monitoring_started:
+                self.stop_screen_monitoring()

@@ -1,0 +1,60 @@
+<body>
+
+<div class="ltx_page_main">
+<div class="ltx_page_content">
+<article class="ltx_document ltx_authors_1line">
+<div class="ltx_para" id="p1">
+<span class="ltx_ERROR undefined" id="p1.1">\webpage</span>
+<p class="ltx_p" id="p1.2"><a class="ltx_ref ltx_url ltx_font_typewriter" href="https://research.beingbeyond.com/being-h05" title="">https://research.beingbeyond.com/being-h05</a><span class="ltx_ERROR undefined" id="p1.2.1">\firstfig</span>[width=][]
+fig/first_nar.pdf
+<span class="ltx_text ltx_font_bold" id="p1.2.2">Being-H0.5 at a Glance.</span> We scale <span class="ltx_text ltx_font_bold" id="p1.2.3">human-centric robot learning</span> with Being-H0.5 toward cross-embodiment generalization. We introduce UniHand-2.0, a large-scale corpus exceeding <span class="ltx_text ltx_font_bold" id="p1.2.4">35,000 hours</span> that spans both cross-Embodiment physical control and general visual-text understanding. Building on this data, we unify human hand motion and diverse robot embodiments with a <span class="ltx_text ltx_font_bold" id="p1.2.5">Unified Action Space</span>, and train all heterogeneous supervision through <span class="ltx_text ltx_font_bold" id="p1.2.6">unified sequence modeling</span> under a single framework. This yields a single foundation model that can <em class="ltx_emph ltx_font_italic" id="p1.2.7">perceive, describe, and act</em> within one framework, enabling robust cross-embodiment generalization and real-world deployment across diverse robots and tasks. We empirically deploy a <span class="ltx_text ltx_font_italic" id="p1.2.8">single</span> checkpoint of Being-H0.5 to control PND Adam-U, Franka+Inspire, Unitree G1, BeingBeyond D1, and LeRobot SO-101 to accomplish diverse tasks.
+fig:first_fig_label</p>
+</div>
+<h1 class="ltx_title ltx_title_document" lang="en">Being-H0.5: Scaling Human-Centric Robot Learning 
+<br class="ltx_break"/>for Cross-Embodiment Generalization</h1>
+<div class="ltx_authors">
+<span class="ltx_creator ltx_role_author">
+<span class="ltx_personname" lang="en"><span class="ltx_text ltx_font_bold" id="id1.1.id1">BeingBeyond Team</span>
+</span></span>
+</div>
+<div class="ltx_abstract">
+<h6 class="ltx_title ltx_title_abstract">Abstract</h6>
+<p class="ltx_p" id="id2.id1">We introduce Being-H0.5, a foundational Vision-Language-Action (VLA) model designed for robust cross-embodiment generalization across diverse robotic platforms.
+While existing VLAs often struggle with morphological heterogeneity and data scarcity, we propose a human-centric learning paradigm that treats human interaction traces as a universal “mother tongue” for physical interaction.
+To support this, we present UniHand-2.0, the largest embodied pre-training recipe to date, comprising over 35,000 hours of multimodal data across 30 distinct robotic embodiments.
+Our approach introduces a Unified Action Space that maps heterogeneous robot controls into semantically aligned slots, enabling low-resource robots to bootstrap skills from human data and high-resource platforms.
+Built upon this human-centric foundation, we design a unified sequential modeling and multi-task pre-training paradigm to bridge human demonstrations and robotic execution.
+Architecturally, Being-H0.5 utilizes a Mixture-of-Transformers design featuring a novel Mixture-of-Flow (MoF) framework to decouple shared motor primitives from specialized embodiment-specific experts.
+Finally, to make cross-embodiment policies stable in the real world, we introduce Manifold-Preserving Gating for robustness under sensory shift and Universal Async Chunking to universalize chunked control across embodiments with different latency and control profiles.
+We empirically demonstrate that Being-H0.5 achieves state-of-the-art results on simulated benchmarks such as LIBERO (98.9%) and RoboCasa (53.9%), meanwhile performing strong cross-embodiment capabilities on five robotic platforms.</p>
+</div>
+<div class="ltx_para" id="p2">
+<span class="ltx_ERROR undefined" id="p2.1">\checkdata</span>
+<p class="ltx_p" id="p2.2">[Date]Jan 20, 2026</p>
+</div>
+
+<div class="ltx_pagination ltx_role_newpage"></div>
+<section class="ltx_section" id="S1" lang="en">
+<h2 class="ltx_title ltx_title_section">
+<span class="ltx_tag ltx_tag_section">1 </span>Introduction</h2>
+<div class="ltx_para" id="S1.p1">
+<p class="ltx_p" id="S1.p1.1">True intelligence is characterized by the fluid expression of knowledge across diverse media.
+In Natural Language Processing (NLP) <cite class="ltx_cite ltx_citemacro_cite">[<a class="ltx_ref" href="https://arxiv.org/html/2601.12993v1#bib.bib1" title="">1</a>, <a class="ltx_ref" href="https://arxiv.org/html/2601.12993v1#bib.bib2" title="">2</a>]</cite>, multilingual pre-training <cite class="ltx_cite ltx_citemacro_cite">[<a class="ltx_ref" href="https://arxiv.org/html/2601.12993v1#bib.bib3" title="">3</a>, <a class="ltx_ref" href="https://arxiv.org/html/2601.12993v1#bib.bib4" title="">4</a>, <a class="ltx_ref" href="https://arxiv.org/html/2601.12993v1#bib.bib5" title="">5</a>]</cite> has transcended linguistic boundaries by distilling a “universal semantics”, facilitating seamless knowledge transfer from high-resource to low-resource languages.
+Today, general-purpose robotics stands at a similar crossroads: the motor spaces of heterogeneous robots are, in essence, distinct physical languages.
+Consequently, a primary challenge in scaling robotic intelligence is cross-embodiment translation:</p>
+</div>
+<div class="ltx_para ltx_noindent ltx_align_center" id="S1.1.p1">
+<span class="ltx_inline-block"></span>
+</div>
+<div class="ltx_para" id="S1.p2">
+<p class="ltx_p" id="S1.p2.1">While Vision-Language-Action (VLA) models show promise toward a general robotic policy, they are hindered by a profound “physical gap”.
+Current VLAs function as monolingual speakers that are highly proficient on specific hardware but effectively incompatible when deployed on different morphologies.
+This fragmentation is well-known exacerbated by the scarcity of robot-specific data <cite class="ltx_cite ltx_citemacro_cite">[<a class="ltx_ref" href="https://arxiv.org/html/2601.12993v1#bib.bib6" title="">6</a>, <a class="ltx_ref" href="https://arxiv.org/html/2601.12993v1#bib.bib7" title="">7</a>]</cite>.
+Unlike the trillions of tokens available in NLP, robotics lacks large-scale demonstration corpora for most individual platforms.
+For diffusion-based VLAs <cite class="ltx_cite ltx_citemacro_cite">[<a class="ltx_ref" href="https://arxiv.org/html/2601.12993v1#bib.bib8" title="">8</a>, <a class="ltx_ref" href="https://arxiv.org/html/2601.12993v1#bib.bib9" title="">9</a>]</cite>, this is particularly acute: a model pre-trained on simpler hardware (e.g., parallel grippers) suffers from severe distribution shift especially when encountering the high-dimensional vector fields of complex entities (e.g., dexterous hands).
+This mismatch causes inference trajectories to “drift” from the valid motion manifold, resulting in unstable behaviors.</p>
+</div>
+<div class="ltx_para" id="S1.p3">
+<p class="ltx_p" id="S1.p3.1">To overcome these hurdles, we propose a paradigm shift toward embodiment-agnostic VLAs via two core concepts:</p>
+<ul class="ltx_itemize" id="S1.I1">
+</ul></div></section></article></div></div></body>

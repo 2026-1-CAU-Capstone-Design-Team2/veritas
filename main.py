@@ -41,6 +41,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--markdown-root", default=None, help="Root directory for markdown indexing")
     parser.add_argument("--no-rag", action="store_true", help="Skip RAG chat after survey completes")
     parser.add_argument("--reindex", action="store_true", help="Force re-indexing of documents into vector store")
+    parser.add_argument(
+        "--no-screen-context",
+        action="store_true",
+        help="Disable screen-context polling and proactive chat interventions.",
+    )
+    parser.add_argument(
+        "--screen-interval",
+        type=float,
+        default=5.0,
+        help="Seconds between foreground-window context captures in chat mode.",
+    )
     return parser.parse_args()
 
 
@@ -117,7 +128,10 @@ def run_chat(
         rag_service=rag_service,
         tool_registry=registry,
     )
-    chat_agent.chat_loop(mode=mode)
+    chat_agent.chat_loop(
+        mode=mode,
+        enable_screen_context=(mode == "auto" and not args.no_screen_context),
+    )
 
 
 
@@ -162,6 +176,8 @@ def main() -> None:
         run_root=output_dir,
         batch_size=args.batch_size,
         max_context=args.max_context,
+        enable_screen_context=not args.no_screen_context,
+        screen_interval_sec=args.screen_interval,
     )
 
     workflow = AutoSurveyWorkflow(

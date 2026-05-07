@@ -1,0 +1,22 @@
+{
+  "type": "function",
+  "function": {
+    "name": "screen_context",
+    "description": "Collect, monitor, or read the user's current foreground-window context. It captures active window metadata plus app/UIA/OCR text, stores latest/recent events, and manages queued screen interventions for proactive chat assistance after the knowledge base is built.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["capture_once", "latest", "recent", "pending_interventions", "consume_interventions", "start_polling", "stop_polling", "status"],
+          "description": "Screen context action to run. capture_once reads the current foreground window now; start_polling/stop_polling control background capture; pending_interventions/consume_interventions read proactive assistance candidates."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Number of recent events or queued interventions to return."
+        }
+      },
+      "required": ["action"]
+    }
+  }
+}
