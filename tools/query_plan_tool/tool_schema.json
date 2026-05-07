@@ -1,0 +1,52 @@
+{
+  "type": "function",
+  "function": {
+    "name": "query_plan",
+    "description": "Build a structured web research plan from a user's request, including topic, goal, search queries, coverage points, and keywords.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "user_request": {
+          "type": "string",
+          "description": "The user's natural language research request."
+        },
+        "force": {
+          "type": "boolean",
+          "default": false
+        },
+        "mode": {
+          "type": "string",
+          "description": "Planning mode: initial or replan.",
+          "default": "initial"
+        },
+        "grounding": {
+          "type": "object",
+          "description": "Optional term grounding payload used for anchored planning."
+        },
+        "prior_plan": {
+          "type": "object",
+          "description": "Previous active plan used for replanning."
+        },
+        "gap_directions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Gap directions derived from evidence summaries."
+        },
+        "used_queries": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Queries already consumed in previous cycles."
+        },
+        "save": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": ["user_request"]
+    }
+  }
+}

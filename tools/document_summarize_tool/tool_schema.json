@@ -1,0 +1,30 @@
+{
+  "type": "function",
+  "function": {
+    "name": "document_summarize",
+    "description": "Summarize collected documents into per-document markdown summaries and generate batch summaries.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "overwrite": {
+          "type": "boolean",
+          "description": "Whether to overwrite existing document summaries and batch summaries.",
+          "default": false
+        },
+        "doc_ids": {
+          "type": "array",
+          "description": "Optional cycle-scoped document IDs to summarize. If provided, only these docs are summarized.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rebuild_batches": {
+          "type": "boolean",
+          "description": "Whether to generate batch summaries after document summarization. If doc_ids are provided, only cycle-scoped batches are generated.",
+          "default": true
+        }
+      },
+      "required": []
+    }
+  }
+}

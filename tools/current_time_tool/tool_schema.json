@@ -1,0 +1,16 @@
+{
+  "type": "function",
+  "function": {
+    "name": "current_time",
+    "description": "Return the current local date/time context for time-sensitive planning and query generation.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "timezone": {
+          "type": "string",
+          "description": "Optional IANA timezone name (for example, Asia/Seoul). If omitted, local system timezone is used."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "type": "function",
+  "function": {
+    "name": "fetch_webpage",
+    "description": "Fetch a webpage from a URL, extract the main readable text content, and return the cleaned result along with metadata such as title and final URL.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "The webpage URL to fetch."
+        },
+        "timeout_sec": {
+          "type": "integer",
+          "description": "HTTP request timeout in seconds.",
+          "default": 15
+        },
+        "max_chars": {
+          "type": "integer",
+          "description": "Maximum number of characters to keep from the extracted text.",
+          "default": 12000
+        }
+      },
+      "required": ["url"]
+    }
+  }
+}

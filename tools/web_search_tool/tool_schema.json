@@ -1,0 +1,22 @@
+{
+  "type": "function",
+  "function": {
+    "name": "web_search",
+    "description": "Search the web and return relevant search results.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The search query."
+        },
+        "num_results": {
+          "type": "integer",
+          "description": "Maximum number of results to return.",
+          "default": 5
+        }
+      },
+      "required": ["query"]
+    }
+  }
+}
