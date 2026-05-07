@@ -10,10 +10,12 @@ from fastapi.responses import JSONResponse
 from .api_common import new_id
 from .api_routes import (
     dashboard_router,
+    document_assist_router,
     documents_router,
     draft_chat_router,
     feedback_router,
     frontend_router,
+    research_router,
     system_router,
     verify_router,
     workspaces_router,
@@ -66,9 +68,11 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError) 
 app.include_router(system_router)
 app.include_router(dashboard_router)
 app.include_router(workspaces_router)
+app.include_router(research_router)
 app.include_router(verify_router)
 app.include_router(draft_chat_router)
 app.include_router(documents_router)
 app.include_router(feedback_router)
 app.include_router(write_router)
+app.include_router(document_assist_router)
 app.include_router(frontend_router)

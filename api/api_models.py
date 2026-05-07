@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class WorkspaceSwitchRequest(BaseModel):
@@ -25,6 +25,23 @@ class ChatMessageRequest(BaseModel):
 
 class FeedbackAnalyzeRequest(BaseModel):
     fileIds: list[str]
+
+
+class ResearchJobCreateRequest(BaseModel):
+    workspaceId: str | None = None
+    instruction: str
+    referenceUrls: list[str] = Field(default_factory=list)
+
+
+class DocumentAssistAnalyzeRequest(BaseModel):
+    workspaceId: str
+    text: str
+    cursor: int | None = None
+
+
+class DocumentAssistChatRequest(BaseModel):
+    workspaceId: str
+    message: str
 
 
 class TypingContextRequest(BaseModel):

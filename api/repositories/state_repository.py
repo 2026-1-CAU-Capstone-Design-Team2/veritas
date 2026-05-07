@@ -61,11 +61,12 @@ def get_document(workspace_id: str) -> dict[str, Any] | None:
     return STATE["documents"].get(workspace_id)
 
 
-def save_feedback_file(file_id: str, name: str, content_type: str) -> None:
+def save_feedback_file(file_id: str, name: str, content_type: str, text: str = "") -> None:
     STATE["feedback_files"][file_id] = {
         "fileId": file_id,
         "name": name,
         "contentType": content_type,
+        "text": text,
     }
 
 
@@ -83,6 +84,26 @@ def clear_feedback_session(session_id: str) -> None:
 
 def save_prediction_state(key: str, payload: dict[str, Any]) -> None:
     STATE["prediction_state"][key] = payload
+
+
+def save_research_job(job_id: str, job: dict[str, Any]) -> None:
+    STATE["research_jobs"][job_id] = job
+
+
+def get_research_job(job_id: str) -> dict[str, Any] | None:
+    return STATE["research_jobs"].get(job_id)
+
+
+def list_research_jobs() -> list[dict[str, Any]]:
+    return list(STATE["research_jobs"].values())
+
+
+def save_document_assist_session(session_id: str, payload: dict[str, Any]) -> None:
+    STATE["document_assist_sessions"][session_id] = payload
+
+
+def get_document_assist_session(session_id: str) -> dict[str, Any] | None:
+    return STATE["document_assist_sessions"].get(session_id)
 
 
 def get_ui_state() -> dict[str, Any]:

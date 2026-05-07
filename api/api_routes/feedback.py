@@ -18,7 +18,7 @@ async def feedback_upload(
     selected_files = files or files_bracket or []
     if not selected_files:
         raise HTTPException(status_code=400, detail="at least one feedback file is required")
-    return feedback_service.upload_feedback_files(selected_files)
+    return await feedback_service.upload_feedback_files(selected_files)
 
 
 @router.post("/api/v1/feedback/analyze")
