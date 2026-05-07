@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from agent import ChatAgent
 from llm.llama_server_llm import LLMClient
 from services.rag_service import RAGService
-from storage.vector_store import VectorStore
-from tools.loader import build_registry
+from tools.loader import build_registry, load_schema
+from tools.autosurvey_tool import AutoSurveyTool
 from workflows import AutoSurveyWorkflow
 
 
@@ -25,9 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rag-results", type=int, default=5)
     parser.add_argument(
         "--phase",
-        choices=["all", "plan", "collect", "summarize", "final", "rag"],
+        choices=["all", "plan", "collect", "summarize", "final", "rag", "chat"],
         default="all",
-        help="Which phase to run (rag = enter RAG chat only)",
+        help=(
+            "Which phase to run. rag = force document-grounded RAG chat; "
+            "chat = normal chat with schema-driven tool use."
+        ),
     )
     parser.add_argument("--force-plan", action="store_true")
     parser.add_argument("--overwrite-summaries", action="store_true")
@@ -40,24 +44,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_rag_service(llm: LLMClient, output_dir: Path) -> RAGService:
-    vector_store = VectorStore(
-        persist_dir=output_dir / "chromadb",
-        collection_name="research_docs",
-    )
-    return RAGService(
-        llm=llm,
-        vector_store=vector_store,
-    )
-
-
-def run_rag_chat(
+def ensure_rag_index(
     args: argparse.Namespace,
     rag_service: RAGService,
     output_dir: Path,
     run_store_service,
-) -> None:
-    existing_chunks = rag_service.vector_store.get_document_count()
+    *,
+    require_documents: bool = True,
+) -> bool:
+    existing_chunks = rag_service.get_document_count()
 
     if args.reindex or existing_chunks == 0:
         markdown_root = (
@@ -84,12 +79,68 @@ def run_rag_chat(
             )
 
         if indexed == 0:
-            print("[error] No documents were indexed. Check --output-dir/--markdown-root and generated summaries.")
-            return
+            message = "No documents were indexed. Check --output-dir/--markdown-root and generated summaries."
+            if require_documents:
+                print(f"[error] {message}")
+                return False
+            print(f"[warn] {message} Continuing chat without RAG documents.")
     else:
         print(f"[info] Using existing index ({existing_chunks} chunks)")
 
-    rag_service.chat_loop()
+    # CLI option should control service retrieval count even when service was built
+    # with defaults in tools.loader.
+    rag_service.n_results = args.rag_results
+    return True
+
+
+def run_chat(
+    args: argparse.Namespace,
+    *,
+    llm: LLMClient,
+    registry,
+    rag_service: RAGService,
+    output_dir: Path,
+    run_store_service,
+    mode: str,
+) -> None:
+    if not ensure_rag_index(
+        args,
+        rag_service,
+        output_dir,
+        run_store_service,
+        require_documents=(mode == "rag"),
+    ):
+        return
+
+    chat_agent = ChatAgent(
+        llm=llm,
+        rag_service=rag_service,
+        tool_registry=registry,
+    )
+    chat_agent.chat_loop(mode=mode)
+
+
+
+
+def register_chat_workflow_tools(*, registry, workflow, rag_service, run_store_service) -> None:
+    """Register high-level workflow adapters that may be exposed to chat agents.
+
+    Internal AutoSurvey tools remain registered for the workflow itself, but chat
+    only sees the autosurvey adapter through ChatAgent's allowlist.
+    """
+    if registry.has("autosurvey"):
+        return
+
+    schema_path = Path(__file__).resolve().parent / "tools" / "autosurvey_tool" / "tool_schema.json"
+    registry.register(
+        AutoSurveyTool(
+            schema=load_schema(schema_path),
+            workflow=workflow,
+            rag_service=rag_service,
+            run_store_service=run_store_service,
+            max_docs_cap=5,
+        )
+    )
 
 
 def main() -> None:
@@ -106,7 +157,7 @@ def main() -> None:
         trace_latency=not args.no_trace_latency,
     )
 
-    registry, run_store_service = build_registry(
+    registry, run_store_service, rag_service = build_registry(
         llm=llm,
         run_root=output_dir,
         batch_size=args.batch_size,
@@ -120,8 +171,12 @@ def main() -> None:
         collect_batch_size=args.batch_size,
         scout_docs=args.scout_docs,
     )
-
-    rag_service = build_rag_service(llm, output_dir)
+    register_chat_workflow_tools(
+        registry=registry,
+        workflow=workflow,
+        rag_service=rag_service,
+        run_store_service=run_store_service,
+    )
 
     print(f"[info] output directory = {output_dir}")
 
@@ -153,18 +208,45 @@ def main() -> None:
         return
 
     if args.phase == "rag":
-        run_rag_chat(args, rag_service, output_dir, run_store_service)
+        run_chat(
+            args,
+            llm=llm,
+            registry=registry,
+            rag_service=rag_service,
+            output_dir=output_dir,
+            run_store_service=run_store_service,
+            mode="rag",
+        )
         return
 
-    # Auto-detect mode: no instruction + existing markdown data → RAG only
+    if args.phase == "chat":
+        run_chat(
+            args,
+            llm=llm,
+            registry=registry,
+            rag_service=rag_service,
+            output_dir=output_dir,
+            run_store_service=run_store_service,
+            mode="auto",
+        )
+        return
+
+    # Auto-detect mode: no instruction + existing markdown data -> schema-driven chat.
     has_any_markdown = any(output_dir.rglob("*.md"))
     if not args.instruction and args.phase == "all":
         if has_any_markdown:
-            print("[info] No instruction provided, but documents exist. Entering RAG mode.")
-            run_rag_chat(args, rag_service, output_dir, run_store_service)
+            print("[info] No instruction provided, but documents exist. Entering schema-driven chat mode.")
+            run_chat(
+                args,
+                llm=llm,
+                registry=registry,
+                rag_service=rag_service,
+                output_dir=output_dir,
+                run_store_service=run_store_service,
+                mode="auto",
+            )
             return
-        else:
-            raise SystemExit("instruction is required (or use --phase rag with existing data)")
+        raise SystemExit("instruction is required (or use --phase rag/--phase chat with existing data)")
 
     # Full survey pipeline
     result = workflow.run_all(
@@ -175,12 +257,20 @@ def main() -> None:
     print(f"[done] final report saved: {run_store_service.final_path}")
     print(result["final_result"])
 
-    # Enter RAG chat after survey (unless --no-rag)
+    # Enter schema-driven chat after survey unless explicitly skipped.
     if not args.no_rag:
         print("\n" + "=" * 60)
-        print("Survey complete! Entering RAG chat mode...")
+        print("Survey complete! Entering schema-driven chat mode...")
         print("=" * 60)
-        run_rag_chat(args, rag_service, output_dir, run_store_service)
+        run_chat(
+            args,
+            llm=llm,
+            registry=registry,
+            rag_service=rag_service,
+            output_dir=output_dir,
+            run_store_service=run_store_service,
+            mode="auto",
+        )
 
 
 if __name__ == "__main__":

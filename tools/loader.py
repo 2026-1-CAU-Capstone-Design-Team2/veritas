@@ -6,16 +6,6 @@ from typing import Any
 
 from .registry import ToolRegistry
 
-from .web_search_tool import WebSearchTool
-from .fetch_webpage_tool import FetchWebpageTool
-from .current_time_tool import CurrentTimeTool
-from .term_grounding_tool import TermGroundingTool
-from .query_plan_tool import QueryPlanTool
-from .document_summarize_tool import DocumentSummarizeTool
-from .final_report_tool import FinalReportTool
-
-from services.run_store_tool_funcs import RunStoreService
-
 
 TOOLS_DIR = Path(__file__).resolve().parent
 
@@ -29,6 +19,19 @@ def load_schema(schema_path: str | Path) -> dict[str, Any]:
 
 
 def build_registry(llm, run_root: str | Path, *, batch_size: int = 5, max_context: int = 16384):
+    from services.run_store_tool_funcs import RunStoreService
+    from storage.vector_store import VectorStore
+    from services.rag_service import RAGService
+
+    from .current_time_tool import CurrentTimeTool
+    from .document_summarize_tool import DocumentSummarizeTool
+    from .fetch_webpage_tool import FetchWebpageTool
+    from .final_report_tool import FinalReportTool
+    from .query_plan_tool import QueryPlanTool
+    from .rag_tool import RAGSearchTool
+    from .term_grounding_tool import TermGroundingTool
+    from .web_search_tool import WebSearchTool
+
     registry = ToolRegistry()
     run_store_service = RunStoreService(run_root)
 
@@ -85,4 +88,19 @@ def build_registry(llm, run_root: str | Path, *, batch_size: int = 5, max_contex
         )
     )
 
-    return registry, run_store_service
+    rag_service = RAGService(
+        llm=llm,
+        vector_store=VectorStore(
+            persist_dir=Path(run_root) / "chromadb",
+            collection_name="research_docs",
+        ),
+    )
+
+    registry.register(
+        RAGSearchTool(
+            schema=load_schema(TOOLS_DIR / "rag_tool" / "tool_schema.json"),
+            rag_service=rag_service,
+        )
+    )
+
+    return registry, run_store_service, rag_service

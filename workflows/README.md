@@ -1,5 +1,7 @@
 # workflows/
 
+> RAG workflow update: `AutoSurveyWorkflow` still orchestrates the deterministic research pipeline. RAG chat is now backed by the registered `rag` tool after indexing, so workflow phases should continue to call explicit tools for plan/collect/summarize/final while chat sessions may expose `rag` to the LLM through tool-calling.
+
 **역할**: 여러 도구를 조합한 파이프라인 정의 및 오케스트레이션
 
 ---

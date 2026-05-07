@@ -2,7 +2,7 @@
   "type": "function",
   "function": {
     "name": "term_grounding",
-    "description": "Ground user terms literally and generate seed search queries before planning.",
+    "description": "Extract a small set of important literal terms, entities, and technical keywords from the user's request. This tool does not generate search queries.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -10,10 +10,10 @@
           "type": "string",
           "description": "Original user request text."
         },
-        "max_seed_queries": {
+        "max_terms": {
           "type": "integer",
-          "description": "Maximum number of generated seed queries.",
-          "default": 6
+          "description": "Maximum number of important terms to extract.",
+          "default": 8
         }
       },
       "required": ["user_request"]

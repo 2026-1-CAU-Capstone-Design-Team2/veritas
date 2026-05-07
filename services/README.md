@@ -1,5 +1,7 @@
 # services/
 
+> RAG service update: `services/rag_service.py` owns indexing, retrieval, query rewriting, and document-grounded answer generation. `tools/rag_tool/` is a thin `rag_search` adapter for LLM tool-calling only.
+
 **역할**: 도구(Tool)들이 공유하는 비즈니스 로직, 상태 관리, 유틸리티 함수 제공
 
 ---
@@ -16,7 +18,7 @@
 services/
 ├── __init__.py
 ├── hints.py                        # HTML 힌트 패턴 re-export
-├── rag_service.py                  # RAG(Retrieval-Augmented Generation) 서비스
+├── rag_service.py                  # RAGService 호환 alias (구현은 tools/rag_tool/)
 │
 ├── fetch_webpage_tool_funcs/       # fetch_webpage 도구 전용 함수들
 │   ├── __init__.py
@@ -113,12 +115,14 @@ output_dir/
 
 ---
 
-### 2. `rag_service.py` - RAG 서비스
+### 2. `rag_service.py` - RAG 호환 경로
+
+현재 RAG의 실제 구현은 `tools/rag_tool/RAGTool`로 이동했습니다. 이 파일은 기존 코드의 `from services.rag_service import RAGService` import를 깨지 않기 위한 얇은 호환 계층입니다. 신규 RAG 기능, LLM-facing schema, multi-turn chat tool-use 정책은 `tools/rag_tool/`에서 관리합니다.
 
 수집된 문서를 기반으로 대화형 Q&A를 제공하는 서비스입니다.
 
 ```python
-class RAGService:
+class RAGService(RAGTool):
     def __init__(
         self,
         llm,                        # LLMClient 인스턴스
@@ -209,14 +213,14 @@ store.write_fetched_record(
 is_dup, score, dup_of = store.find_duplicate(new_text)
 ```
 
-### RAGService 사용
+### RAGTool 사용
 
 ```python
-from services.rag_service import RAGService
 from storage.vector_store import VectorStore
+from tools.rag_tool import RAGTool
 
 vector_store = VectorStore(persist_dir=output_dir / "chromadb")
-rag = RAGService(llm=llm, vector_store=vector_store)
+rag = RAGTool(llm=llm, vector_store=vector_store)
 
 # 문서 인덱싱
 rag.index_autosurvey_output(summary_dir=output_dir / "summary")
@@ -291,7 +295,7 @@ tools/
 
 services/
 ├── run_store_tool_funcs/ ──▶ core/models.DocRecord
-├── rag_service.py ──────────▶ storage/VectorStore
+├── rag_service.py ──────────▶ tools/rag_tool.RAGTool (compat alias)
 └── fetch_webpage_tool_funcs/ ──▶ bs4 (BeautifulSoup)
 ```
 

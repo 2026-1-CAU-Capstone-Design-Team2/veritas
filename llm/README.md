@@ -1,5 +1,7 @@
 # llm/
 
+> Tool-calling update: multi-turn RAG chat uses a two-step path: `LLMClient.collect_tool_outputs(...)` lets the model decide whether to call `rag`, then the final answer is generated through normal `LLMClient.ask(..., stream=True)` without tools. The model decides from the schema; no regex-based user-prompt gating is part of the LLM layer.
+
 **역할**: LLM(Large Language Model) 백엔드와의 통신을 담당하는 클라이언트 모듈
 
 ---

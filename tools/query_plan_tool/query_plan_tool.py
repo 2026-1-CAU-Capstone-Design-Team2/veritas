@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 from core.prompts import INITIAL_PLANNER_PROMPT, REPLANNER_PROMPT
@@ -11,7 +12,9 @@ from tools.tool import BaseTool, ToolResult
 
 class QueryPlanTool(BaseTool):
     PLAN_REASONING_ENABLED = True
-    LLM_EXPOSED_TOOL_NAMES = ("current_time",)
+    LLM_EXPOSED_TOOL_NAMES = ()
+    PLAN_TIMEOUT_SEC = 90
+    REPLAN_TIMEOUT_SEC = 90
 
     def __init__(self, schema: dict[str, Any], llm, run_store_service, tool_registry=None) -> None:
         super().__init__(schema=schema)
@@ -91,18 +94,24 @@ class QueryPlanTool(BaseTool):
                     "prior_plan": prior_plan or {},
                     "gap_directions": prepared_gap_directions,
                     "used_queries": used_queries,
+                    "current_time_context": self._current_time_context(),
                 }
 
                 plan = self._llm.ask_json(
                     planner_prompt,
                     json.dumps(planner_input, ensure_ascii=False, indent=2),
-                    reasoning=self.PLAN_REASONING_ENABLED,
-                    max_retries=2,
+                    reasoning=(self.PLAN_REASONING_ENABLED and mode != "replan"),
+                    max_retries=(0 if mode == "replan" else 2),
                     stream=False,
                     stream_label=f"plan:{mode}",
                     tools=llm_tools,
                     tool_runner=llm_tool_runner,
-                    max_tool_rounds=2,
+                    max_tool_rounds=0,
+                    timeout_sec=(
+                        self.REPLAN_TIMEOUT_SEC
+                        if mode == "replan"
+                        else self.PLAN_TIMEOUT_SEC
+                    ),
                 )
 
                 plan = self._normalize_plan(
@@ -117,6 +126,7 @@ class QueryPlanTool(BaseTool):
                     plan = self._refresh_replan_fields(
                         plan,
                         user_request=user_request,
+                        grounding=grounding,
                         prior_plan=prior_plan,
                         gap_directions=prepared_gap_directions,
                         used_queries=used_queries,
@@ -135,6 +145,23 @@ class QueryPlanTool(BaseTool):
                 data=plan,
             )
         except Exception as e:
+            if mode == "replan":
+                fallback_plan = self._fallback_replan(
+                    user_request=user_request,
+                    prior_plan=prior_plan,
+                    grounding=grounding,
+                    gap_directions=prepared_gap_directions,
+                    used_queries=used_queries,
+                    reason=str(e),
+                )
+                if save:
+                    self._run_store_service.save_plan(fallback_plan)
+                print("[replan][fallback] replan failed or timed out; continuing with fallback plan")
+                return ToolResult(
+                    success=True,
+                    content="Replan failed or timed out; continued with fallback plan.",
+                    data=fallback_plan,
+                )
             return ToolResult(success=False, error=f"Failed to build query plan: {e}")
 
     def _normalize_plan(
@@ -178,6 +205,7 @@ class QueryPlanTool(BaseTool):
         plan: dict[str, Any],
         *,
         user_request: str,
+        grounding: dict[str, Any] | None,
         prior_plan: dict[str, Any] | None,
         gap_directions: list[str],
         used_queries: list[str],
@@ -233,14 +261,131 @@ class QueryPlanTool(BaseTool):
                 max_items=10,
             )
             if not fallback_queries:
+                fallback_queries = self._recover_unused_grounding_queries(
+                    grounding=grounding,
+                    used_queries=used_queries,
+                    max_items=10,
+                )
+            if not fallback_queries:
                 fallback_queries = self._recover_unused_prior_queries(
                     prior_plan=previous_plan,
                     used_queries=used_queries,
                     max_items=10,
                 )
+            if not fallback_queries:
+                fallback_queries = self._build_expansion_queries(
+                    user_request=user_request,
+                    plan=plan,
+                    prior_plan=previous_plan,
+                    grounding=grounding,
+                    gap_directions=relevant_gaps,
+                    used_queries=used_queries,
+                    max_items=10,
+                )
+            if fallback_queries:
+                print(
+                    "[replan][fallback] recovered "
+                    f"{len(fallback_queries)} search queries after empty replan"
+                )
             plan["search_queries"] = fallback_queries
 
         return plan
+
+    def _fallback_replan(
+        self,
+        *,
+        user_request: str,
+        prior_plan: dict[str, Any] | None,
+        grounding: dict[str, Any] | None,
+        gap_directions: list[str],
+        used_queries: list[str],
+        reason: str,
+    ) -> dict[str, Any]:
+        """Build a safe fallback plan when replan generation fails.
+
+        This preserves workflow progress without letting a bad replan response stop
+        the whole AutoSurvey run. It does not participate in chat tool routing.
+        """
+        base_plan = dict(prior_plan or {})
+        if not base_plan:
+            base_plan = {
+                "topic": user_request,
+                "goal": "",
+                "search_queries": [],
+                "must_cover": [],
+                "keywords": [],
+            }
+
+        queries = self._build_gap_queries(gap_directions, used_queries=used_queries, max_items=10)
+        if not queries:
+            queries = self._recover_unused_grounding_queries(
+                grounding=grounding,
+                used_queries=used_queries,
+                max_items=10,
+            )
+        if not queries:
+            queries = self._recover_unused_prior_queries(
+                prior_plan=base_plan,
+                used_queries=used_queries,
+                max_items=10,
+            )
+        if not queries:
+            queries = self._build_expansion_queries(
+                user_request=user_request,
+                plan=base_plan,
+                prior_plan=base_plan,
+                grounding=grounding,
+                gap_directions=gap_directions,
+                used_queries=used_queries,
+                max_items=10,
+            )
+
+        base_plan["search_queries"] = queries
+        base_plan["plan_mode"] = "replan_fallback"
+        base_plan["replan_fallback"] = True
+        base_plan["replan_fallback_reason"] = str(reason)[:500]
+        return self._normalize_plan(
+            base_plan,
+            user_request=user_request,
+            mode="replan",
+            used_queries=used_queries,
+            allow_empty_search_queries=True,
+        )
+
+    def _recover_unused_grounding_queries(
+        self,
+        *,
+        grounding: dict[str, Any] | None,
+        used_queries: list[str],
+        max_items: int,
+    ) -> list[str]:
+        """Recover neutral fallback queries from grounded terms only.
+
+        term_grounding no longer emits seed_queries. If planning/replanning fails,
+        the safest fallback is to search the literal grounded terms without adding
+        academic, definition, recency, or other intent-changing suffixes.
+        """
+        if not isinstance(grounding, dict):
+            return []
+
+        terms = []
+        terms.extend(self._normalize_list(grounding.get("grounded_terms"), max_items=50))
+        terms.extend(self._normalize_list(grounding.get("candidate_entities"), max_items=50))
+        if not terms:
+            return []
+
+        used = {self._normalize_query(query) for query in used_queries}
+        recovered: list[str] = []
+        for term in terms:
+            query = str(term).strip()
+            key = self._normalize_query(query)
+            if not key or key in used:
+                continue
+            recovered.append(query)
+            if len(recovered) >= max_items:
+                break
+
+        return recovered
 
     def _prepare_replan_gap_directions(
         self,
@@ -379,6 +524,58 @@ class QueryPlanTool(BaseTool):
 
         return queries
 
+    def _build_expansion_queries(
+        self,
+        *,
+        user_request: str,
+        plan: dict[str, Any],
+        prior_plan: dict[str, Any],
+        grounding: dict[str, Any] | None,
+        gap_directions: list[str],
+        used_queries: list[str],
+        max_items: int,
+    ) -> list[str]:
+        used = {self._normalize_query(query) for query in used_queries}
+        candidates: list[str] = []
+
+        for source in (plan, prior_plan):
+            candidates.extend(self._normalize_list(source.get("must_cover"), max_items=20))
+            candidates.extend(self._normalize_list(source.get("keywords"), max_items=20))
+
+        if isinstance(grounding, dict):
+            candidates.extend(self._normalize_list(grounding.get("grounded_terms"), max_items=20))
+            candidates.extend(self._normalize_list(grounding.get("candidate_entities"), max_items=20))
+
+        candidates.extend(self._clean_gap_directions(gap_directions, max_items=20))
+
+        queries: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            text = str(candidate).strip()
+            if not text or text.lower() == "none":
+                continue
+
+            expansions = [
+                f"{user_request} {text}",
+                f"{text} evidence",
+                f"{text} analysis",
+            ]
+            for query in expansions:
+                key = self._normalize_query(query)
+                if not key or key in used or key in seen:
+                    continue
+                seen.add(key)
+                queries.append(query)
+                if len(queries) >= max_items:
+                    return queries
+
+        fallback = str(user_request).strip()
+        fallback_key = self._normalize_query(fallback)
+        if fallback and fallback_key not in used and fallback_key not in seen:
+            queries.append(fallback)
+
+        return queries[:max_items]
+
     def _filter_relevant_items(
         self,
         items: list[str],
@@ -497,8 +694,29 @@ class QueryPlanTool(BaseTool):
         return " ".join(str(query).lower().split())
 
     def _build_llm_tooling(self, _user_request: str):
+        if not self.LLM_EXPOSED_TOOL_NAMES:
+            return None, None
         return build_llm_tooling(
             self._tool_registry,
             stage_label="planning",
             allowed_tool_names=self.LLM_EXPOSED_TOOL_NAMES,
         )
+
+    def _current_time_context(self) -> dict[str, Any]:
+        if self._tool_registry is not None and self._tool_registry.has("current_time"):
+            try:
+                result = self._tool_registry.get("current_time").run()
+                if result.success and isinstance(result.data, dict):
+                    return result.data
+            except Exception:
+                pass
+
+        now = datetime.now().astimezone()
+        return {
+            "current_datetime_iso": now.isoformat(timespec="seconds"),
+            "current_date": now.date().isoformat(),
+            "current_year": now.year,
+            "current_month": now.month,
+            "current_day": now.day,
+            "timezone": str(now.tzinfo or ""),
+        }

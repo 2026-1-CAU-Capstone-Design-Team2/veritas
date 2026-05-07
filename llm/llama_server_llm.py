@@ -35,6 +35,16 @@ class LLMClient:
         "min_p": 0.0,
         "repeat_penalty": 1.05,
     }
+    TOOL_DECISION_SAMPLING_PARAMS = {
+        "temperature": 0.0,
+        "top_p": 0.2,
+        "presence_penalty": 0.0,
+    }
+    TOOL_DECISION_EXTRA_SAMPLING_PARAMS = {
+        "top_k": 5,
+        "min_p": 0.0,
+        "repeat_penalty": 1.0,
+    }
 
     def __init__(
         self,
@@ -94,6 +104,7 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
         tool_runner: Callable[[str, dict[str, Any]], Any] | None = None,
         max_tool_rounds: int = 4,
+        timeout_sec: float | None = None,
     ) -> str:
         """Generate a chat completion response."""
         think_tag = "/think" if reasoning else "/no_think"
@@ -103,11 +114,18 @@ class LLMClient:
         sampled_extra = {**self.EXTRA_SAMPLING_PARAMS, **(extra_sampling_params or {})}
         system_text = system_prompt.strip()
         if force_json:
-            system_text = (
-                f"{system_text}\n"
-                "Return a strict JSON object only. "
-                "Do not include markdown fences, commentary, or extra wrapper text."
-            )
+            if reasoning:
+                system_text = (
+                    f"{system_text}\n"
+                    "Think privately if needed, then put a strict JSON object in the final answer. "
+                    "Do not include markdown fences, commentary, or extra wrapper text after thinking."
+                )
+            else:
+                system_text = (
+                    f"{system_text}\n"
+                    "Return a strict JSON object only. "
+                    "Do not include markdown fences, commentary, or extra wrapper text."
+                )
 
         extra_body = {
             **sampled_extra,
@@ -127,16 +145,20 @@ class LLMClient:
             stream = False
 
         if stream:
-            chunks = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
+            stream_kwargs = {
+                "model": self.model,
+                "messages": [
                     {"role": "system", "content": system_text},
                     {"role": "user", "content": f"{think_tag}\n{user_prompt}"},
                 ],
-                stream=True,
+                "stream": True,
                 **sampled_params,
-                extra_body=extra_body,
-            )
+                "extra_body": extra_body,
+            }
+            if timeout_sec is not None:
+                stream_kwargs["timeout"] = timeout_sec
+
+            chunks = self.client.chat.completions.create(**stream_kwargs)
             text = self._consume_stream(
                 chunks, stream_label=stream_label, filter_think=not reasoning
             )
@@ -150,6 +172,7 @@ class LLMClient:
                 tools=tools,
                 tool_runner=tool_runner,
                 max_tool_rounds=max_tool_rounds,
+                timeout_sec=timeout_sec,
             )
 
         if self.trace_latency:
@@ -176,6 +199,7 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
         tool_runner: Callable[[str, dict[str, Any]], Any] | None = None,
         max_tool_rounds: int = 4,
+        timeout_sec: float | None = None,
     ) -> dict[str, Any]:
         """Generate a chat completion and parse as JSON."""
         last_error: Exception | None = None
@@ -198,15 +222,20 @@ class LLMClient:
                     force_json=True,
                     response_format=(
                         {"type": "json_object"}
-                        if (prefer_response_format and not stream and not tools)
+                        if (prefer_response_format and not reasoning and not stream and not tools)
                         else None
                     ),
                     tools=tools,
                     tool_runner=tool_runner,
                     max_tool_rounds=max_tool_rounds,
+                    timeout_sec=timeout_sec,
                 )
             except Exception as e:
                 last_error = e
+                print(
+                    f"[llm][json]{tag} request-failed "
+                    f"attempt={attempt_no}/{max_retries + 1} error={e}"
+                )
                 if prefer_response_format and not stream:
                     prefer_response_format = False
                     print(
@@ -234,6 +263,88 @@ class LLMClient:
             raise last_error
         raise json.JSONDecodeError("Failed to parse JSON", "", 0)
 
+    def collect_tool_outputs(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        reasoning: bool = False,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_runner: Callable[[str, dict[str, Any]], Any] | None = None,
+        max_tool_calls: int = 1,
+        stream_label: str = "",
+        timeout_sec: float | None = None,
+    ) -> dict[str, Any]:
+        """Ask the model whether to call tools and return executed tool outputs.
+
+        This intentionally does not ask the model for the final answer after tool
+        execution. Callers can use the returned tool outputs as context for a
+        normal streaming answer.
+        """
+        think_tag = "/think" if reasoning else "/no_think"
+        start = time.perf_counter()
+
+        tool_schemas = list(tools or [])
+        if not tool_schemas:
+            return {"content": "", "tool_outputs": []}
+        if tool_runner is None:
+            raise RuntimeError("`tool_runner` is required when tools are provided.")
+
+        sampled_params = dict(self.TOOL_DECISION_SAMPLING_PARAMS)
+        sampled_extra = dict(self.TOOL_DECISION_EXTRA_SAMPLING_PARAMS)
+        extra_body = {
+            **sampled_extra,
+            "enable_thinking": reasoning,
+            "enable_reasoning": reasoning,
+            "chat_template_kwargs": {
+                "enable_thinking": reasoning,
+                "enable_reasoning": reasoning,
+            },
+        }
+
+        messages = [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": f"{think_tag}\n{user_prompt}"},
+        ]
+        request_kwargs = self._build_request_kwargs(
+            messages=messages,
+            sampled_params=sampled_params,
+            extra_body=extra_body,
+            response_format=None,
+            tools=tool_schemas,
+            timeout_sec=timeout_sec,
+        )
+
+        response = self.client.chat.completions.create(**request_kwargs)
+        message = response.choices[0].message
+        text = self._coerce_message_content(getattr(message, "content", ""))
+        tool_calls = list(getattr(message, "tool_calls", []) or [])
+
+        tool_outputs: list[dict[str, Any]] = []
+        call_budget = max(1, int(max_tool_calls))
+        for tool_call in tool_calls[:call_budget]:
+            tool_message = self._execute_tool_call(tool_call, tool_runner)
+            tool_outputs.append(
+                {
+                    "name": str(tool_message.get("name") or ""),
+                    "content": str(tool_message.get("content") or ""),
+                }
+            )
+
+        if self.trace_latency:
+            elapsed = time.perf_counter() - start
+            tag = f" [{stream_label}]" if stream_label else ""
+            mode = "think" if reasoning else "no_think"
+            print(
+                f"[llm][tools-decision]{tag} mode={mode} "
+                f"calls={len(tool_outputs)} elapsed={elapsed:.2f}s"
+            )
+
+        if not reasoning:
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+
+        return {"content": text.strip(), "tool_outputs": tool_outputs}
+
     def _ask_with_optional_tools(
         self,
         *,
@@ -245,6 +356,7 @@ class LLMClient:
         tools: list[dict[str, Any]] | None,
         tool_runner: Callable[[str, dict[str, Any]], Any] | None,
         max_tool_rounds: int,
+        timeout_sec: float | None = None,
     ) -> str:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_text},
@@ -255,6 +367,7 @@ class LLMClient:
         tools_enabled = bool(tool_schemas)
         tool_round_budget = max(1, int(max_tool_rounds))
         tool_rounds_used = 0
+        last_tool_outputs: list[str] = []
 
         while True:
             request_kwargs = self._build_request_kwargs(
@@ -263,10 +376,19 @@ class LLMClient:
                 extra_body=extra_body,
                 response_format=response_format,
                 tools=(tool_schemas if tools_enabled else None),
+                timeout_sec=timeout_sec,
             )
 
             try:
+                label = "with-tools" if tools_enabled else "plain"
+                print(
+                    "[llm][request] "
+                    f"mode={label} timeout={timeout_sec} "
+                    f"tools={len(tool_schemas) if tools_enabled else 0} "
+                    f"messages={len(messages)}"
+                )
                 response = self.client.chat.completions.create(**request_kwargs)
+                print("[llm][response] received")
             except Exception as e:
                 if tools_enabled:
                     print(f"[llm][tools] disabled after API error: {e}")
@@ -279,6 +401,10 @@ class LLMClient:
             tool_calls = list(getattr(message, "tool_calls", []) or [])
 
             if not tools_enabled or not tool_calls:
+                if not text.strip() and tool_rounds_used and last_tool_outputs:
+                    fallback_text = self._fallback_text_from_tool_outputs(last_tool_outputs)
+                    if fallback_text:
+                        return fallback_text
                 return text
 
             if tool_runner is None:
@@ -295,7 +421,9 @@ class LLMClient:
             )
 
             for tool_call in tool_calls:
-                messages.append(self._execute_tool_call(tool_call, tool_runner))
+                tool_message = self._execute_tool_call(tool_call, tool_runner)
+                messages.append(tool_message)
+                last_tool_outputs.append(str(tool_message.get("content") or ""))
 
             tool_rounds_used += 1
             if tool_rounds_used >= tool_round_budget:
@@ -310,6 +438,29 @@ class LLMClient:
                 )
                 tools_enabled = False
 
+    def _fallback_text_from_tool_outputs(self, tool_outputs: list[str]) -> str:
+        for raw_output in reversed(tool_outputs):
+            text = str(raw_output or "").strip()
+            if not text:
+                continue
+
+            try:
+                payload = json.loads(text)
+            except Exception:
+                return text
+
+            if isinstance(payload, dict):
+                for key in ("answer", "content", "result"):
+                    value = payload.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                return json.dumps(payload, ensure_ascii=False)
+
+            if isinstance(payload, str) and payload.strip():
+                return payload.strip()
+
+        return ""
+
     def _build_request_kwargs(
         self,
         *,
@@ -318,6 +469,7 @@ class LLMClient:
         extra_body: dict[str, Any],
         response_format: dict[str, Any] | None,
         tools: list[dict[str, Any]] | None,
+        timeout_sec: float | None = None,
     ) -> dict[str, Any]:
         request_kwargs: dict[str, Any] = {
             "model": self.model,
@@ -330,6 +482,8 @@ class LLMClient:
         if tools:
             request_kwargs["tools"] = tools
             request_kwargs["tool_choice"] = "auto"
+        if timeout_sec is not None:
+            request_kwargs["timeout"] = timeout_sec
         return request_kwargs
 
     def _coerce_message_content(self, content: Any) -> str:
@@ -501,6 +655,7 @@ class LLMClient:
         reasoning_chunks: list[str] = []
         in_think_block = False
         think_buffer = ""
+        printed_any = False
 
         prefix = f"[{stream_label}] " if stream_label else ""
         print(f"[stream] {prefix}start")
@@ -529,34 +684,70 @@ class LLMClient:
                         else:
                             start_idx = think_buffer.find("<think>")
                             if start_idx != -1:
-                                print(think_buffer[:start_idx], end="", flush=True)
+                                visible = think_buffer[:start_idx]
+                                if visible:
+                                    print(visible, end="", flush=True)
+                                    printed_any = True
                                 think_buffer = think_buffer[start_idx + 7 :]
                                 in_think_block = True
                             else:
                                 # Keep potential partial tag in buffer
                                 safe_end = max(0, len(think_buffer) - 7)
-                                print(think_buffer[:safe_end], end="", flush=True)
+                                visible = think_buffer[:safe_end]
+                                if visible:
+                                    print(visible, end="", flush=True)
+                                    printed_any = True
                                 think_buffer = think_buffer[safe_end:]
                                 break
                 else:
                     print(content, end="", flush=True)
+                    printed_any = True
 
-            if self.stream_reasoning:
-                reasoning_text = getattr(delta, "reasoning_content", None)
-                if reasoning_text:
-                    reasoning_chunks.append(reasoning_text)
+            reasoning_text = getattr(delta, "reasoning_content", None)
+            if reasoning_text:
+                reasoning_chunks.append(reasoning_text)
+                if self.stream_reasoning:
                     print(reasoning_text, end="", flush=True)
+                    printed_any = True
 
         # Flush remaining buffer
         if filter_think and think_buffer and not in_think_block:
             print(think_buffer, end="", flush=True)
+            printed_any = True
+
+        combined = "".join(collected_text)
+        if not printed_any:
+            fallback_text = self._visible_stream_fallback(
+                combined=combined,
+                reasoning_chunks=reasoning_chunks,
+            )
+            if fallback_text:
+                print(fallback_text, end="", flush=True)
+                combined = fallback_text
 
         print("\n[stream] end")
 
-        combined = "".join(collected_text)
         if self.stream_reasoning and reasoning_chunks and "<think>" not in combined:
             combined = f"<think>{''.join(reasoning_chunks)}</think>\n{combined}"
         return combined
+
+    def _visible_stream_fallback(
+        self,
+        *,
+        combined: str,
+        reasoning_chunks: list[str],
+    ) -> str:
+        text = str(combined or "").strip()
+        if not text and reasoning_chunks:
+            text = "".join(reasoning_chunks).strip()
+        if not text:
+            return ""
+
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL).strip()
+        text = re.sub(r"^```(?:markdown|text)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text).strip()
+        return text
 
     def _extract_json(self, text: str) -> dict[str, Any]:
         """Extract JSON object from text that may contain thinking tags or markdown."""
