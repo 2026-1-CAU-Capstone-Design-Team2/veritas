@@ -801,6 +801,12 @@ class MainWindow(QMainWindow):
 			border-color: #94A3B8;
 		}
 
+		QPushButton#FilterChip:checked {
+			background-color: #EEF2FF;
+			color: #3730A3;
+			border: 1px solid #818CF8;
+		}
+
 		QTextEdit#DocEditor {
 			background-color: #FFFFFF;
 			border: 1px solid #CBD5E1;
