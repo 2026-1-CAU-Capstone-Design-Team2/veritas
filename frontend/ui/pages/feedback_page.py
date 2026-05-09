@@ -115,6 +115,7 @@ class FeedbackPage(QWidget):
 				continue
 			path = Path(file_path)
 			self._uploaded_files.append(path)
+			existing.add(file_path)
 			item = QListWidgetItem(path.name)
 			item.setData(Qt.UserRole, str(path))
 			self.file_list.addItem(item)

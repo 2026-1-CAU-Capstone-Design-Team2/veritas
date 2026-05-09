@@ -201,6 +201,13 @@ class SettingsPage(QWidget):
 		self.defaultWorkspaceChanged.emit(workspace_name)
 		self._update_workspace_summary("기본 워크스페이스가 저장되었습니다.")
 
+	def set_default_workspace_by_name(self, workspace_name: str) -> None:
+		index = self.workspace_selector.findText(workspace_name)
+		if index < 0:
+			return
+		self.workspace_selector.setCurrentIndex(index)
+		self._save_workspace_settings()
+
 	def _update_model_status(self, prefix: str) -> None:
 		self.model_status.setText(
 			f"{prefix} · {self.model_selector.currentText()} · 창의성 {self.temperature_input.value():.1f} · "

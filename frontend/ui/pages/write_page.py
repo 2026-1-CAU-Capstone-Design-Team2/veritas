@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QKeyEvent
+import re
+
+from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtGui import QAction, QKeyEvent
 from PySide6.QtWidgets import (
-	QButtonGroup,
 	QFrame,
 	QHBoxLayout,
 	QLabel,
+	QMenu,
 	QPlainTextEdit,
+	QPushButton,
 	QScrollArea,
 	QSizePolicy,
+	QToolButton,
 	QVBoxLayout,
 	QWidget,
 )
@@ -21,7 +25,7 @@ class ComposerEdit(QPlainTextEdit):
 	sendRequested = Signal()
 
 	def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
-		if event.key() in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ControlModifier:
+		if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not event.modifiers() & Qt.ShiftModifier:
 			self.sendRequested.emit()
 			return
 
@@ -29,11 +33,11 @@ class ComposerEdit(QPlainTextEdit):
 
 
 class WriteChatBubble(QFrame):
-	def __init__(self, text: str, is_user: bool, max_width: int, parent: QWidget | None = None) -> None:
+	def __init__(self, text: str, is_user: bool, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("UserBubble" if is_user else "AIBubble")
-		self.setMaximumWidth(max_width)
-		self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Minimum)
+		self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+		self.setMinimumWidth(120)
 
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(14, 11, 14, 11)
@@ -43,11 +47,12 @@ class WriteChatBubble(QFrame):
 		meta.setObjectName("BubbleMeta")
 		meta.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
 
-		text_label = QLabel(text)
+		text_label = QLabel(self._add_breakpoints(text))
 		text_label.setObjectName("BubbleText")
 		text_label.setWordWrap(True)
 		text_label.setTextFormat(Qt.PlainText)
 		text_label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+		text_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
 		if is_user:
 			layout.addWidget(meta, 0, Qt.AlignRight)
@@ -56,15 +61,27 @@ class WriteChatBubble(QFrame):
 			layout.addWidget(meta, 0, Qt.AlignLeft)
 			layout.addWidget(text_label)
 
+	def set_bubble_width(self, max_width: int) -> None:
+		self.setMaximumWidth(max_width)
+		for label in self.findChildren(QLabel, "BubbleText"):
+			label.setMaximumWidth(max(80, max_width - 28))
+			label.updateGeometry()
+
+	def _add_breakpoints(self, text: str) -> str:
+		def break_long_token(match: re.Match[str]) -> str:
+			token = match.group(0)
+			return "\u200b".join(token[index : index + 24] for index in range(0, len(token), 24))
+
+		return re.sub(r"\S{32,}", break_long_token, text)
+
 
 class WritePage(QWidget):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 
-		self._max_line_chars = 34
-		self._assistant_max_line_chars = 160
 		self._mode = "research"
 		self._welcome_message = "메시지를 입력하면 워크스페이스 기반 AI 답변을 제공합니다."
+		self._bubbles: list[tuple[WriteChatBubble, bool]] = []
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
@@ -104,26 +121,32 @@ class WritePage(QWidget):
 		button_row.setContentsMargins(0, 0, 0, 0)
 		button_row.setSpacing(8)
 
-		self.mode_group = QButtonGroup(self)
-		self.mode_group.setExclusive(True)
+		self.mode_menu_btn = QToolButton()
+		self.mode_menu_btn.setObjectName("ModeMenuButton")
+		self.mode_menu_btn.setText("+")
+		self.mode_menu_btn.setPopupMode(QToolButton.InstantPopup)
+		self.mode_menu_btn.setCursor(Qt.PointingHandCursor)
+		self.mode_menu_btn.setToolTip("모드 선택")
 
-		self.research_mode_btn = AppButton("자료조사", variant="filter")
-		self.research_mode_btn.setCheckable(True)
-		self.research_mode_btn.setChecked(True)
-		self.research_mode_btn.clicked.connect(lambda: self._set_mode("research"))
+		mode_menu = QMenu(self.mode_menu_btn)
+		research_action = QAction("자료조사", self)
+		research_action.triggered.connect(lambda: self._set_mode("research"))
+		rag_action = QAction("RAG", self)
+		rag_action.triggered.connect(lambda: self._set_mode("rag"))
+		mode_menu.addAction(research_action)
+		mode_menu.addAction(rag_action)
+		self.mode_menu_btn.setMenu(mode_menu)
 
-		self.rag_mode_btn = AppButton("RAG", variant="filter")
-		self.rag_mode_btn.setCheckable(True)
-		self.rag_mode_btn.clicked.connect(lambda: self._set_mode("rag"))
-
-		self.mode_group.addButton(self.research_mode_btn)
-		self.mode_group.addButton(self.rag_mode_btn)
+		self.mode_chip = QPushButton("자료조사")
+		self.mode_chip.setObjectName("ActiveModeChip")
+		self.mode_chip.setCursor(Qt.PointingHandCursor)
+		self.mode_chip.clicked.connect(self.mode_menu_btn.showMenu)
 
 		send_btn = AppButton("전송", variant="send")
 		send_btn.clicked.connect(self._send_message)
 
-		button_row.addWidget(self.research_mode_btn)
-		button_row.addWidget(self.rag_mode_btn)
+		button_row.addWidget(self.mode_menu_btn)
+		button_row.addWidget(self.mode_chip)
 		button_row.addStretch(1)
 		button_row.addWidget(send_btn)
 
@@ -137,8 +160,9 @@ class WritePage(QWidget):
 		self._append_message(self._welcome_message, is_user=False)
 
 	def _append_message(self, text: str, is_user: bool) -> None:
-		max_width = 1520 if is_user else 1800
-		bubble = WriteChatBubble(self._wrap_message_text(text, is_user), is_user, max_width)
+		bubble = WriteChatBubble(text, is_user)
+		bubble.set_bubble_width(self._bubble_width(is_user))
+		self._bubbles.append((bubble, is_user))
 		row = QHBoxLayout()
 		row.setContentsMargins(0, 0, 0, 0)
 		row.setSpacing(0)
@@ -152,26 +176,12 @@ class WritePage(QWidget):
 
 		insert_at = max(0, self.chat_layout.count() - 1)
 		self.chat_layout.insertLayout(insert_at, row)
-		self._scroll_to_bottom()
+		QTimer.singleShot(0, self._scroll_to_bottom)
 
-	def _wrap_message_text(self, text: str, is_user: bool) -> str:
-		lines = text.splitlines()
-		if not lines:
-			return text
-
-		max_line_chars = self._max_line_chars if is_user else self._assistant_max_line_chars
-		wrapped: list[str] = []
-		for line in lines:
-			if not line:
-				wrapped.append("")
-				continue
-
-			start = 0
-			while start < len(line):
-				wrapped.append(line[start : start + max_line_chars])
-				start += max_line_chars
-
-		return "\n".join(wrapped)
+	def _bubble_width(self, is_user: bool) -> int:
+		viewport_width = max(360, self.chat_scroll.viewport().width())
+		ratio = 0.72 if is_user else 0.86
+		return max(240, int(viewport_width * ratio))
 
 	def _scroll_to_bottom(self) -> None:
 		bar = self.chat_scroll.verticalScrollBar()
@@ -180,9 +190,17 @@ class WritePage(QWidget):
 	def _set_mode(self, mode: str) -> None:
 		self._mode = mode
 		if mode == "rag":
+			self.mode_chip.setText("RAG")
 			self.input.setPlaceholderText("RAG 모드로 질문하세요")
 		else:
+			self.mode_chip.setText("자료조사")
 			self.input.setPlaceholderText("자료조사 모드로 질문하세요")
+
+	def resizeEvent(self, event) -> None:  # type: ignore[override]
+		super().resizeEvent(event)
+		for bubble, is_user in self._bubbles:
+			bubble.set_bubble_width(self._bubble_width(is_user))
+		QTimer.singleShot(0, self._scroll_to_bottom)
 
 	def _assistant_reply(self, text: str) -> str:
 		lowered = text.lower()
@@ -211,3 +229,4 @@ class WritePage(QWidget):
 		self.input.clear()
 		self._append_message(text, is_user=True)
 		self._append_message(self._assistant_reply(text), is_user=False)
+		QTimer.singleShot(0, self._scroll_to_bottom)

@@ -12,24 +12,15 @@ from PySide6.QtWidgets import (
 
 from ...components.buttons import AppButton
 from ...components.cards import CardWidget
+from ...api_common import STATE
 
 
 class DraftPage(QWidget):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self._workspace_options = [
-			(
-				"기후 정책 검증 워크스페이스",
-				"웹 조사 12건 · 검증 완료 8건 · 초안 적합도 높음",
-			),
-			(
-				"AI 안전성 브리프 워크스페이스",
-				"웹 조사 9건 · 검증 완료 7건 · 경영진 보고용",
-			),
-			(
-				"규제 대응 메모 워크스페이스",
-				"웹 조사 15건 · 검증 완료 11건 · 안내문/공지문 적합",
-			),
+			(item["name"], item["detail"])
+			for item in STATE["workspaces"]
 		]
 		self._selected_workspace_index = 0
 
@@ -115,6 +106,14 @@ class DraftPage(QWidget):
 		name, detail = self._workspace_options[index]
 		self.workspace_label.setText(f"선택된 워크스페이스: {name} · {detail}")
 		self._generate_draft()
+
+	def set_workspace_by_name(self, workspace_name: str) -> None:
+		for index, (name, _detail) in enumerate(self._workspace_options):
+			if name == workspace_name:
+				self.workspace_selector.setCurrentIndex(index)
+				if self._selected_workspace_index == index:
+					self._on_workspace_changed(index)
+				return
 
 	def _copy_output(self) -> None:
 		self.output.selectAll()

@@ -152,14 +152,16 @@ class MainWindow(QMainWindow):
 		self._add_page("dashboard", DashboardPage())
 		self._add_page("research", ResearchPage())
 		self._add_page("verify", VerifyPage())
-		self._add_page("draft", DraftPage())
+		self.draft_page = DraftPage()
+		self._add_page("draft", self.draft_page)
 		self._add_page("document_assist", DocumentAssistPage())
 		self._add_page("write", WritePage())
 		self._add_page("document", DocumentPage())
 		self._add_page("feedback", FeedbackPage())
-		settings_page = SettingsPage()
-		settings_page.defaultWorkspaceChanged.connect(self.sidebar.set_current_workspace)
-		self._add_page("settings", settings_page)
+		self.settings_page = SettingsPage()
+		self.settings_page.defaultWorkspaceChanged.connect(self.sidebar.set_current_workspace)
+		self.sidebar.workspaceChanged.connect(self._on_workspace_changed)
+		self._add_page("settings", self.settings_page)
 
 		center_layout.addWidget(top_hero)
 		center_layout.addWidget(self.stepper)
@@ -187,6 +189,10 @@ class MainWindow(QMainWindow):
 			self.document_assist_window.hide()
 			return
 		self.show_document_assist_window()
+
+	def _on_workspace_changed(self, workspace_name: str) -> None:
+		self.settings_page.set_default_workspace_by_name(workspace_name)
+		self.draft_page.set_workspace_by_name(workspace_name)
 
 	def _toggle_sidebar(self) -> None:
 		start = self.sidebar.width()
@@ -607,12 +613,53 @@ class MainWindow(QMainWindow):
 			background-color: #4338CA;
 		}
 
+		QToolButton#ModeMenuButton {
+			background-color: #FFFFFF;
+			color: #111827;
+			border: 1px solid #CBD5E1;
+			border-radius: 10px;
+			padding: 8px 12px;
+			font-size: 18px;
+			font-weight: 800;
+		}
+
+		QToolButton#ModeMenuButton:hover {
+			background-color: #F1F5F9;
+			border-color: #94A3B8;
+		}
+
+		QPushButton#ActiveModeChip {
+			background-color: #EEF2FF;
+			color: #3730A3;
+			border: 1px solid #C7D2FE;
+			border-radius: 10px;
+			padding: 8px 12px;
+			font-weight: 800;
+		}
+
+		QMenu {
+			background-color: #FFFFFF;
+			border: 1px solid #CBD5E1;
+			border-radius: 8px;
+			padding: 6px;
+		}
+
+		QMenu::item {
+			color: #111827;
+			padding: 8px 28px 8px 12px;
+			border-radius: 6px;
+		}
+
+		QMenu::item:selected {
+			background-color: #EEF2FF;
+			color: #3730A3;
+		}
+
 		QFrame#UserBubble {
 			background-color: #EEF2FF;
 			border: 1px solid #C7D2FE;
 			border-radius: 11px;
 			border-top-right-radius: 3px;
-			max-width: 460px;
 		}
 
 		QFrame#AIBubble {
@@ -620,7 +667,6 @@ class MainWindow(QMainWindow):
 			border: 1px solid #E2E8F0;
 			border-radius: 11px;
 			border-top-left-radius: 3px;
-			max-width: 460px;
 		}
 
 		QLabel#BubbleText {
