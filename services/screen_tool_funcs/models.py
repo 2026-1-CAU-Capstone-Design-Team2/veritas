@@ -58,6 +58,7 @@ class UiAutomationResult:
     hover_text: str = ""
     hover_rect: BoundingBox | None = None
     mouse_position: list[int] | None = None
+    browser_url: str = ""
     source_quality: str = "rejected"
     reject_reason: str | None = None
     error: str | None = None
@@ -112,6 +113,7 @@ class ScreenContextEvent:
     ui_automation: UiAutomationResult
     filtered: FilteredScreenContext
     intervention: InterventionDecision
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def new(
@@ -124,6 +126,7 @@ class ScreenContextEvent:
         ui_automation: UiAutomationResult,
         filtered: FilteredScreenContext,
         intervention: InterventionDecision,
+        diagnostics: dict[str, Any] | None = None,
     ) -> "ScreenContextEvent":
         return cls(
             event_id=event_id,
@@ -134,6 +137,7 @@ class ScreenContextEvent:
             ui_automation=ui_automation,
             filtered=filtered,
             intervention=intervention,
+            diagnostics=diagnostics or {},
         )
 
     def to_dict(self) -> dict[str, Any]:

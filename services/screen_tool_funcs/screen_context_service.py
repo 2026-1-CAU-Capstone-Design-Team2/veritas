@@ -31,8 +31,10 @@ class ScreenContextService:
         crop_top: int = 0,
         crop_right: int = 0,
         crop_bottom: int = 0,
+        console_log: bool = False,
     ) -> None:
         self.interval_sec = interval_sec
+        self.console_log = console_log
         self.window_reader = WindowContextReader()
         self.screen_capture = ScreenCapture(
             crop_left=crop_left,
@@ -46,7 +48,10 @@ class ScreenContextService:
         self.content_filter = ContentFilter()
         self.intervention_detector = InterventionDetector()
         self.store = ScreenContextStore(root)
-        self.intervention_dispatcher = InterventionDispatcher(self.store)
+        self.intervention_dispatcher = InterventionDispatcher(
+            self.store,
+            console_log=console_log,
+        )
 
         self._previous_active_text = ""
         self._last_poll_error: str | None = None
@@ -88,6 +93,14 @@ class ScreenContextService:
             filtered=filtered,
             history_events=history_events,
         )
+        diagnostics = self.diagnose_capture(
+            window=window,
+            app_text=app_text,
+            ui_automation=ui_automation,
+            ocr=ocr,
+            filtered=filtered,
+            intervention=intervention,
+        )
 
         self._previous_active_text = filtered.active_editor_text
         event = ScreenContextEvent.new(
@@ -98,10 +111,88 @@ class ScreenContextService:
             ui_automation=ui_automation,
             filtered=filtered,
             intervention=intervention,
+            diagnostics=diagnostics,
         )
         self.store.save_event(event)
         self.intervention_dispatcher.dispatch(event)
+        self._log_capture_event(event)
         return event
+
+    def diagnose_event(self, event: ScreenContextEvent) -> dict:
+        return self.diagnose_capture(
+            window=event.window,
+            app_text=event.app_text,
+            ui_automation=event.ui_automation,
+            ocr=event.ocr,
+            filtered=event.filtered,
+            intervention=event.intervention,
+        )
+
+    def diagnose_capture(
+        self,
+        *,
+        window,
+        app_text: AppTextResult,
+        ui_automation: UiAutomationResult,
+        ocr: OcrResult,
+        filtered,
+        intervention,
+    ) -> dict:
+        text = (filtered.active_editor_text or "").strip()
+        current_paragraph = (filtered.current_paragraph_text or "").strip()
+        text_source = self._diagnose_text_source(
+            app_text=app_text,
+            ui_automation=ui_automation,
+            ocr=ocr,
+            filtered=filtered,
+        )
+        has_foreground_window = bool(window.hwnd and not window.error)
+        has_text = bool(text)
+        has_current_paragraph = bool(current_paragraph)
+        usable_for_llm = bool(has_foreground_window and has_text and filtered.confidence > 0)
+
+        return {
+            "has_foreground_window": has_foreground_window,
+            "has_text": has_text,
+            "has_current_paragraph": has_current_paragraph,
+            "text_source": text_source,
+            "confidence": filtered.confidence,
+            "active_text_chars": len(text),
+            "current_paragraph_chars": len(current_paragraph),
+            "browser_url": ui_automation.browser_url,
+            "usable_for_llm": usable_for_llm,
+            "intervention_queued": bool(intervention.should_consider_llm),
+            "intervention_blockers": (
+                (intervention.metadata or {}).get("blockers")
+                if not intervention.should_consider_llm
+                else []
+            ),
+            "errors": {
+                "window": window.error,
+                "app_text": app_text.error,
+                "ui_automation": ui_automation.error,
+                "ocr": ocr.error,
+            },
+        }
+
+    def _diagnose_text_source(
+        self,
+        *,
+        app_text: AppTextResult,
+        ui_automation: UiAutomationResult,
+        ocr: OcrResult,
+        filtered,
+    ) -> str:
+        active_text = (filtered.active_editor_text or "").strip()
+        if not active_text:
+            return "none"
+        if (app_text.text or "").strip() == active_text:
+            return app_text.text_source or "app_text"
+        if (ui_automation.text or "").strip() == active_text:
+            return ui_automation.text_source or "ui_automation"
+        if (ocr.text or "").strip() == active_text:
+            return "ocr"
+        return "filtered"
 
     def start_polling(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -130,9 +221,84 @@ class ScreenContextService:
                 self._last_poll_error = None
             except Exception as exc:
                 self._last_poll_error = f"{type(exc).__name__}: {exc}"
+                if self.console_log:
+                    print(f"[screen_context][poll][error] {self._last_poll_error}")
             elapsed = time.monotonic() - started_at
             remaining = max(self.interval_sec - elapsed, 0.0)
             self._stop_event.wait(remaining)
+
+    def _log_capture_event(self, event: ScreenContextEvent) -> None:
+        diagnostics = event.diagnostics or {}
+        blockers = diagnostics.get("intervention_blockers") or []
+        errors = diagnostics.get("errors") or {}
+        if not isinstance(errors, dict):
+            errors = {}
+
+        window = event.window
+        title = " ".join((window.window_title or "").split())
+        if len(title) > 120:
+            title = title[:117] + "..."
+
+        log_payload = {
+            "type": "screen_capture",
+            "event_id": event.event_id,
+            "captured_at": event.captured_at,
+            "window": {
+                "process_name": window.process_name,
+                "window_title": window.window_title,
+                "pid": window.pid,
+                "hwnd": window.hwnd,
+            },
+            "browser_url": event.ui_automation.browser_url,
+            "diagnostics": diagnostics,
+            "filtered": {
+                "active_app_type": event.filtered.active_app_type,
+                "active_text_chars": len((event.filtered.active_editor_text or "").strip()),
+                "current_paragraph_chars": len((event.filtered.current_paragraph_text or "").strip()),
+                "changed_text_chars": len((event.filtered.changed_text or "").strip()),
+                "current_paragraph_source": event.filtered.current_paragraph_source,
+            },
+            "intervention": {
+                "should_consider_llm": event.intervention.should_consider_llm,
+                "score": event.intervention.score,
+                "priority": event.intervention.priority,
+                "reason_codes": event.intervention.reason_codes,
+                "metadata": event.intervention.metadata,
+            },
+        }
+        self.store.append_capture_log(log_payload)
+
+        if not self.console_log:
+            return
+
+        base = (
+            f"[screen_context][capture] event={event.event_id} "
+            f"process={window.process_name or '-'} "
+            f"title={title!r} "
+            f"source={diagnostics.get('text_source', 'unknown')} "
+            f"chars={diagnostics.get('active_text_chars', 0)} "
+            f"confidence={diagnostics.get('confidence', 0.0)} "
+            f"queued={diagnostics.get('intervention_queued', False)}"
+        )
+        if blockers:
+            base += f" blockers={blockers}"
+        print(base)
+
+        if not diagnostics.get("has_foreground_window"):
+            print(
+                "[screen_context][capture][warn] "
+                f"event={event.event_id} window_error={errors.get('window') or 'unknown'}"
+            )
+        elif not diagnostics.get("has_text"):
+            extractor_errors = {
+                key: value
+                for key, value in errors.items()
+                if key in {"app_text", "ui_automation", "ocr"} and value
+            }
+            print(
+                "[screen_context][capture][warn] "
+                f"event={event.event_id} no_readable_text errors={extractor_errors}"
+            )
 
     def _new_event_id(self) -> str:
         return datetime.now().strftime("%Y%m%d_%H%M%S_%f")

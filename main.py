@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="Seconds between foreground-window context captures in chat mode.",
     )
+    parser.add_argument(
+        "--screen-debug-log",
+        action="store_true",
+        help="Print screen-context capture diagnostics to the console. JSONL capture logs are always saved.",
+    )
     return parser.parse_args()
 
 
@@ -178,6 +183,7 @@ def main() -> None:
         max_context=args.max_context,
         enable_screen_context=not args.no_screen_context,
         screen_interval_sec=args.screen_interval,
+        screen_debug_log=args.screen_debug_log,
     )
 
     workflow = AutoSurveyWorkflow(

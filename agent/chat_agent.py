@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime
 from typing import Any, Callable
 
 from core.prompts import (
@@ -39,6 +40,7 @@ class ChatAgent:
     FINAL_ANSWER_TIMEOUT_SEC = 180
     SCREEN_INTERVENTION_POLL_SEC = 2.0
     SCREEN_INTERVENTION_TIMEOUT_SEC = 180
+    SCREEN_INTERVENTION_TTL_SEC = 30.0
 
     def __init__(
         self,
@@ -61,6 +63,7 @@ class ChatAgent:
         self._screen_stop_event = threading.Event()
         self._screen_monitor_thread: threading.Thread | None = None
         self._screen_answer_callback: Callable[[str, dict[str, Any]], None] | None = None
+        self._last_handled_screen_event_id = ""
 
     def ask_rag(self, question: str, *, stream: bool = False) -> str:
         """Strict document-grounded Q&A mode for explicit --phase rag sessions."""
@@ -75,6 +78,10 @@ class ChatAgent:
             explicit_command = self._parse_explicit_command(question)
             if explicit_command:
                 command, command_text = explicit_command
+                if command == "screen" and command_text.lower() in {"debug", "raw"}:
+                    answer = self._run_screen_debug_command()
+                    self._append_history(question, answer)
+                    return answer
                 tool_outputs = self._run_explicit_tool_command(
                     command=command,
                     command_text=command_text,
@@ -181,6 +188,24 @@ class ChatAgent:
             )
 
         return []
+
+    def _run_screen_debug_command(self) -> str:
+        if self.tool_registry is None:
+            return self._pretty_payload({"error": "Tool registry is not available."})
+
+        try:
+            result = self.tool_registry.call("screen_context", action="capture_once")
+        except Exception as e:
+            return self._pretty_payload({"error": str(e)})
+
+        payload = {
+            "action": "capture_once",
+            "success": result.success,
+            "error": result.error,
+            "content_chars": len(result.content or ""),
+            "data": result.data if result.data is not None else {},
+        }
+        return self._pretty_payload(payload)
 
     def _call_registry_tool(self, tool_name: str, **arguments) -> list[dict[str, str]]:
         try:
@@ -379,7 +404,7 @@ class ChatAgent:
     def _screen_intervention_loop(self, *, stream: bool) -> None:
         while not self._screen_stop_event.wait(self.SCREEN_INTERVENTION_POLL_SEC):
             interventions = self._consume_screen_interventions(limit=1)
-            for intervention in interventions:
+            for intervention in self._fresh_screen_interventions(interventions):
                 answer = self.answer_screen_intervention(intervention, stream=stream)
                 if self._screen_answer_callback is not None:
                     self._screen_answer_callback(answer, intervention)
@@ -406,6 +431,33 @@ class ChatAgent:
         data = result.data if isinstance(result.data, dict) else {}
         interventions = data.get("interventions", [])
         return [item for item in interventions if isinstance(item, dict)]
+
+    def _fresh_screen_interventions(
+        self,
+        interventions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        fresh: list[dict[str, Any]] = []
+        for intervention in interventions:
+            event_id = str(intervention.get("event_id") or "").strip()
+            if event_id and event_id == self._last_handled_screen_event_id:
+                continue
+            if self._is_stale_screen_intervention(intervention):
+                continue
+            if event_id:
+                self._last_handled_screen_event_id = event_id
+            fresh.append(intervention)
+        return fresh
+
+    def _is_stale_screen_intervention(self, intervention: dict[str, Any]) -> bool:
+        captured_at = str(intervention.get("captured_at") or "").strip()
+        if not captured_at:
+            return False
+        try:
+            captured = datetime.fromisoformat(captured_at)
+        except ValueError:
+            return False
+        age_sec = (datetime.now() - captured).total_seconds()
+        return age_sec > self.SCREEN_INTERVENTION_TTL_SEC
 
     def _screen_intervention_query(self, intervention: dict[str, Any]) -> str:
         writing = intervention.get("writing_context") if isinstance(intervention, dict) else {}
@@ -461,7 +513,7 @@ class ChatAgent:
         print(f"\n[Chat] {mode_label}. {doc_count} RAG chunks indexed. Type 'exit' to quit.")
         if mode == "auto":
             print(f"[Chat] Exposed tools: {allowed}\n")
-            print("[Chat] Explicit commands: /autosurvey <request>, /rag <question>, /screen [action]\n")
+            print("[Chat] Explicit commands: /autosurvey <request>, /rag <question>, /screen [action], /screen debug\n")
         else:
             print()
 

@@ -35,6 +35,7 @@ class UiAutomationReader:
 
             selection = self._read_selection_paragraph(auto, text_pattern)
             hover = self._read_hover_paragraph(auto, window)
+            browser_url = self._read_browser_url(auto, window)
             current_text = selection["paragraph_text"] or hover["paragraph_text"]
             current_source = selection["source"] or hover["source"]
             current_rect = selection["paragraph_rect"] or hover["paragraph_rect"]
@@ -54,6 +55,7 @@ class UiAutomationReader:
                 hover_text=hover["paragraph_text"],
                 hover_rect=hover["paragraph_rect"],
                 mouse_position=hover["mouse_position"],
+                browser_url=browser_url,
             )
             if not text.strip() and not current_text.strip():
                 result.reject_reason = "empty_text"
@@ -68,6 +70,85 @@ class UiAutomationReader:
             return result
         except Exception as exc:
             return UiAutomationResult(reject_reason="exception", error=str(exc))
+
+    def _read_browser_url(self, auto: Any, window: WindowContext) -> str:
+        if (window.process_name or "").lower() not in {"chrome.exe", "msedge.exe", "firefox.exe"}:
+            return ""
+
+        root = None
+        try:
+            root = auto.ControlFromHandle(window.hwnd) if window.hwnd else None
+        except Exception:
+            root = None
+        if root is None:
+            try:
+                root = auto.GetFocusedControl()
+                while root is not None and getattr(root, "GetParentControl", None):
+                    parent = root.GetParentControl()
+                    if parent is None:
+                        break
+                    root = parent
+            except Exception:
+                return ""
+
+        candidates = self._browser_url_candidates(auto, root)
+        for candidate in candidates:
+            text = self._read_value_text(candidate) or str(getattr(candidate, "Name", "") or "")
+            url = self._normalize_browser_url(text)
+            if url:
+                return url
+        return ""
+
+    def _browser_url_candidates(self, auto: Any, root: Any) -> list[Any]:
+        candidates: list[Any] = []
+        try:
+            edit_controls = root.GetChildren() or []
+        except Exception:
+            edit_controls = []
+
+        stack = list(edit_controls)
+        visited = 0
+        while stack and visited < 300:
+            visited += 1
+            control = stack.pop(0)
+            try:
+                control_type = str(control.ControlTypeName or "").lower()
+                name = str(control.Name or "").lower()
+                automation_id = str(control.AutomationId or "").lower()
+                class_name = str(control.ClassName or "").lower()
+            except Exception:
+                continue
+
+            if (
+                "edit" in control_type
+                and (
+                    "address" in name
+                    or "주소" in name
+                    or "url" in name
+                    or "omnibox" in name
+                    or "address" in automation_id
+                    or "omnibox" in class_name
+                )
+            ):
+                candidates.append(control)
+
+            try:
+                stack.extend(control.GetChildren() or [])
+            except Exception:
+                continue
+
+        return candidates
+
+    def _normalize_browser_url(self, text: str) -> str:
+        value = " ".join(str(text or "").split()).strip()
+        if not value:
+            return ""
+        lower = value.lower()
+        if lower.startswith(("http://", "https://")):
+            return value
+        if lower.startswith(("docs.google.com/", "drive.google.com/", "hancomdocs.com/", "docs.hancom.com/")):
+            return f"https://{value}"
+        return ""
 
     def _get_pattern(self, control: Any, name: str) -> Any | None:
         try:

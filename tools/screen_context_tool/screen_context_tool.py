@@ -27,10 +27,36 @@ class ScreenContextTool(BaseTool):
 
             if action == "capture_once":
                 event = self._screen_context_service.capture_once()
+                payload = event.to_dict()
+                diagnostics = payload.get("diagnostics") or {}
+                if not diagnostics.get("has_foreground_window"):
+                    error = self._diagnostic_error(
+                        "Screen capture failed",
+                        diagnostics,
+                        fallback="No usable foreground window.",
+                    )
+                    print(f"[screen_context][tool][warn] action=capture_once {error}")
+                    return ToolResult(
+                        success=False,
+                        error=error,
+                        data=payload,
+                    )
+                if not diagnostics.get("has_text"):
+                    error = self._diagnostic_error(
+                        "Screen capture succeeded, but no readable text was extracted",
+                        diagnostics,
+                        fallback="No readable text.",
+                    )
+                    print(f"[screen_context][tool][warn] action=capture_once {error}")
+                    return ToolResult(
+                        success=False,
+                        error=error,
+                        data=payload,
+                    )
                 return ToolResult(
                     success=True,
                     content=event.filtered.active_editor_text,
-                    data=event.to_dict(),
+                    data=payload,
                 )
 
             if action == "latest":
@@ -58,14 +84,47 @@ class ScreenContextTool(BaseTool):
                 return ToolResult(success=True, data={"polling": False})
 
             if action == "status":
+                latest = self._screen_context_service.store.load_latest() or {}
+                pending = self._screen_context_service.store.load_pending_interventions()
+                latest_intervention = pending[0] if pending else {}
                 return ToolResult(
                     success=True,
                     data={
                         "polling": self._screen_context_service.is_polling(),
                         "last_poll_error": self._screen_context_service.last_poll_error(),
+                        "latest_event_id": latest.get("event_id"),
+                        "latest_captured_at": latest.get("captured_at"),
+                        "latest_diagnostics": latest.get("diagnostics") or {},
+                        "pending_intervention_count": len(pending),
+                        "latest_intervention_event_id": latest_intervention.get("event_id"),
+                        "latest_intervention_captured_at": latest_intervention.get("captured_at"),
+                        "capture_log_path": str(self._screen_context_service.store.capture_log_path),
                     },
                 )
 
             return ToolResult(success=False, error=f"Unknown action: {action}")
         except Exception as exc:
             return ToolResult(success=False, error=str(exc))
+
+    def _diagnostic_error(
+        self,
+        message: str,
+        diagnostics: dict[str, Any],
+        *,
+        fallback: str,
+    ) -> str:
+        errors = diagnostics.get("errors") if isinstance(diagnostics, dict) else {}
+        if not isinstance(errors, dict):
+            errors = {}
+        details = [
+            f"text_source={diagnostics.get('text_source', 'unknown')}",
+            f"confidence={diagnostics.get('confidence', 0.0)}",
+            f"active_text_chars={diagnostics.get('active_text_chars', 0)}",
+        ]
+        for key in ("window", "app_text", "ui_automation", "ocr"):
+            value = errors.get(key)
+            if value:
+                details.append(f"{key}_error={value}")
+        if len(details) <= 3:
+            details.append(f"reason={fallback}")
+        return f"{message}. " + "; ".join(details)

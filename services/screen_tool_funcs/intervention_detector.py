@@ -151,7 +151,7 @@ class InterventionDetector:
 
         previous = self._latest_event_with_paragraph(previous_same_document_events)
         if previous is None:
-            return False
+            return bool((filtered.current_paragraph_text or "").strip())
 
         previous_filtered = previous.get("filtered") or {}
         previous_paragraph = str(previous_filtered.get("current_paragraph_text") or "")
@@ -161,7 +161,9 @@ class InterventionDetector:
 
         similarity = difflib.SequenceMatcher(None, previous_paragraph, current_paragraph).ratio()
         previous_full_text = str(previous_filtered.get("active_editor_text") or "")
-        return similarity >= 0.5 and previous_full_text != (filtered.active_editor_text or "")
+        if previous_full_text != (filtered.active_editor_text or ""):
+            return similarity >= 0.5
+        return similarity >= 0.98 and bool(current_paragraph.strip())
 
     def _passes_cooldown(self, current_snapshot: dict[str, Any], history_events: list[dict[str, Any]]) -> bool:
         current_doc = current_snapshot["document_key"]

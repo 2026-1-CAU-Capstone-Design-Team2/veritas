@@ -1,26 +1,21 @@
 {
-  "event_id": "20260507_183421_222027",
-  "captured_at": "2026-05-07T18:34:21",
+  "event_id": "20260508_165817_460363",
+  "captured_at": "2026-05-08T16:58:17",
   "window": {
-    "hwnd": 853962,
-    "pid": 18280,
-    "process_name": "WindowsTerminal.exe",
-    "process_path": "C:\\Program Files\\WindowsApps\\Microsoft.WindowsTerminal_1.23.20211.0_x64__8wekyb3d8bbwe\\WindowsTerminal.exe",
-    "window_title": "C:\\Windows\\System32\\cmd.exe - python  main.py \"Vision-Language-Action Model 에 대한 최신 연구 논문 및 동향에 대해 자세히 파악하여 조사해줘\" --output-dir ./runs/research-vla --phase all --embed-port 8081",
-    "rect": {
-      "x": 46,
-      "y": 58,
-      "width": 1129,
-      "height": 635
-    },
-    "error": null
+    "hwnd": null,
+    "pid": null,
+    "process_name": "",
+    "process_path": "",
+    "window_title": "",
+    "rect": null,
+    "error": "No foreground window."
   },
   "ocr": {
     "text": "",
     "language": "ko-KR",
     "lines": [],
     "image_size": null,
-    "error": "Windows OCR bridge package is not installed. Install a Python WinRT bridge such as `winsdk` to use Windows.Media.Ocr."
+    "error": "No captured image."
   },
   "app_text": {
     "text": "",
@@ -62,10 +57,11 @@
   },
   "intervention": {
     "should_consider_llm": false,
-    "score": 0.25,
+    "score": 0.0,
     "priority": "low",
     "reason_codes": [
       "not_editing_app",
+      "insufficient_dwell",
       "unstable_current_paragraph",
       "not_continuing_paragraph_edit",
       "cooldown_or_duplicate"
@@ -73,16 +69,41 @@
     "metadata": {
       "history_window": 10,
       "history_count": 10,
-      "same_document_count": 9,
-      "dwell_ratio": 0.9,
-      "document_key": "windowsterminal.exe|c:\\windows\\system32\\cmd.exe - python main.py \"vision-language-action model 에 대한 최신 연구 논문 및 동향에 대해 자세히 파악하여 조사해줘\" --output-dir ./runs/research-vla --phase all --embed-port 8081",
+      "same_document_count": 4,
+      "dwell_ratio": 0.4,
+      "document_key": "|",
       "paragraph_fingerprint": "",
       "blockers": [
         "not_editing_app",
+        "insufficient_dwell",
         "unstable_current_paragraph",
         "not_continuing_paragraph_edit",
         "cooldown_or_duplicate"
       ]
+    }
+  },
+  "diagnostics": {
+    "has_foreground_window": false,
+    "has_text": false,
+    "has_current_paragraph": false,
+    "text_source": "none",
+    "confidence": 0.0,
+    "active_text_chars": 0,
+    "current_paragraph_chars": 0,
+    "usable_for_llm": false,
+    "intervention_queued": false,
+    "intervention_blockers": [
+      "not_editing_app",
+      "insufficient_dwell",
+      "unstable_current_paragraph",
+      "not_continuing_paragraph_edit",
+      "cooldown_or_duplicate"
+    ],
+    "errors": {
+      "window": "No foreground window.",
+      "app_text": "skipped: no app-specific text reader.",
+      "ui_automation": "skipped: foreground app is not a text extraction target.",
+      "ocr": "No captured image."
     }
   }
 }

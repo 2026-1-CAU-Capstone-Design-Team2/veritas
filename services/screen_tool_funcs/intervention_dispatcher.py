@@ -9,8 +9,9 @@ from .store import ScreenContextStore
 class InterventionDispatcher:
     """Persist approved intervention candidates for downstream consumers."""
 
-    def __init__(self, store: ScreenContextStore) -> None:
+    def __init__(self, store: ScreenContextStore, *, console_log: bool = False) -> None:
         self.store = store
+        self.console_log = console_log
 
     def dispatch(self, event: ScreenContextEvent) -> dict | None:
         if not event.intervention.should_consider_llm:
@@ -18,6 +19,13 @@ class InterventionDispatcher:
 
         payload = self._build_payload(event)
         self.store.enqueue_intervention(payload)
+        if self.console_log:
+            print(
+                "[screen_context][intervention] "
+                f"queued event={event.event_id} "
+                f"priority={event.intervention.priority} "
+                f"score={event.intervention.score}"
+            )
         return payload
 
     def _build_payload(self, event: ScreenContextEvent) -> dict:
