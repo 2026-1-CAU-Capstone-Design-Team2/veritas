@@ -151,7 +151,7 @@ class Sidebar(QFrame):
 			pixmap = QPixmap(str(logo_path)).scaled(26, 26, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 			logo.setPixmap(pixmap)
 
-		subtitle = QLabel("AI ?뚰겕?뚮줈???ㅽ뒠?붿삤")
+		subtitle = QLabel("AI 워크플로우 스튜디오")
 		subtitle.setObjectName("BrandSubLabel")
 		self._subtitle = subtitle
 
@@ -215,13 +215,13 @@ class Sidebar(QFrame):
 		footer_layout.setContentsMargins(10, 10, 10, 10)
 		footer_layout.setSpacing(6)
 
-		footer_title = QLabel("?꾩옱 ?뚰겕?ㅽ럹?댁뒪")
+		footer_title = QLabel("현재 워크스페이스")
 		footer_title.setObjectName("SidebarFooterTitle")
 		self._workspace_desc = QLabel()
 		self._workspace_desc.setObjectName("SidebarFooterDesc")
 		self._workspace_desc.setWordWrap(True)
 
-		self._switch_workspace_btn = QPushButton("?뚰겕?ㅽ럹?댁뒪 ?꾪솚")
+		self._switch_workspace_btn = QPushButton("워크스페이스 전환")
 		self._switch_workspace_btn.setObjectName("SidebarWorkspaceButton")
 		self._switch_workspace_btn.setCursor(Qt.PointingHandCursor)
 		self._switch_workspace_btn.clicked.connect(self._open_workspace_dialog)
@@ -264,7 +264,7 @@ class Sidebar(QFrame):
 
 	def _open_workspace_dialog(self) -> None:
 		dialog = QDialog(self)
-		dialog.setWindowTitle("?뚰겕?ㅽ럹?댁뒪 ?꾪솚")
+		dialog.setWindowTitle("워크스페이스 전환")
 		dialog.setModal(True)
 		dialog.resize(420, 180)
 
@@ -272,10 +272,10 @@ class Sidebar(QFrame):
 		layout.setContentsMargins(16, 14, 16, 14)
 		layout.setSpacing(10)
 
-		title = QLabel("寃利??꾨즺 ?뚰겕?ㅽ럹?댁뒪瑜??좏깮?섏꽭??")
+		title = QLabel("사용할 워크스페이스를 선택하세요")
 		title.setObjectName("CardPrimary")
 
-		hint = QLabel("?좏깮???뚰겕?ㅽ럹?댁뒪???ъ씠?쒕컮? 珥덉븞/梨꾪똿 ?붾㈃??怨듯넻?쇰줈 諛섏쁺?⑸땲??")
+		hint = QLabel("선택한 워크스페이스는 사이드바, 초안, 채팅 화면에 공통으로 반영됩니다.")
 		hint.setObjectName("CardSecondary")
 		hint.setWordWrap(True)
 
@@ -284,7 +284,7 @@ class Sidebar(QFrame):
 		selector.setCurrentIndex(self._current_workspace_index)
 
 		buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
-		switch_btn = buttons.addButton("?꾪솚", QDialogButtonBox.AcceptRole)
+		switch_btn = buttons.addButton("전환", QDialogButtonBox.AcceptRole)
 		switch_btn.setObjectName("PrimaryButton")
 		switch_btn.setFixedHeight(32)
 
