@@ -107,19 +107,9 @@ class WritePage(QWidget):
 
 		composer_card = QFrame()
 		composer_card.setObjectName("ComposerCard")
-		composer_layout = QVBoxLayout(composer_card)
+		composer_layout = QHBoxLayout(composer_card)
 		composer_layout.setContentsMargins(8, 8, 8, 8)
-		composer_layout.setSpacing(6)
-
-		self.input = ComposerEdit()
-		self.input.setObjectName("ChatInput")
-		self.input.setPlaceholderText("메시지를 입력하세요")
-		self.input.setFixedHeight(84)
-		self.input.sendRequested.connect(self._send_message)
-
-		button_row = QHBoxLayout()
-		button_row.setContentsMargins(0, 0, 0, 0)
-		button_row.setSpacing(8)
+		composer_layout.setSpacing(8)
 
 		self.mode_menu_btn = QToolButton()
 		self.mode_menu_btn.setObjectName("ModeMenuButton")
@@ -137,21 +127,18 @@ class WritePage(QWidget):
 		mode_menu.addAction(rag_action)
 		self.mode_menu_btn.setMenu(mode_menu)
 
-		self.mode_chip = QPushButton("자료조사")
-		self.mode_chip.setObjectName("ActiveModeChip")
-		self.mode_chip.setCursor(Qt.PointingHandCursor)
-		self.mode_chip.clicked.connect(self.mode_menu_btn.showMenu)
+		self.input = ComposerEdit()
+		self.input.setObjectName("ChatInput")
+		self.input.setPlaceholderText("메시지를 입력하세요 (Enter: 전송, Shift+Enter: 줄바꿈)")
+		self.input.setFixedHeight(64)
+		self.input.sendRequested.connect(self._send_message)
 
 		send_btn = AppButton("전송", variant="send")
 		send_btn.clicked.connect(self._send_message)
 
-		button_row.addWidget(self.mode_menu_btn)
-		button_row.addWidget(self.mode_chip)
-		button_row.addStretch(1)
-		button_row.addWidget(send_btn)
-
-		composer_layout.addWidget(self.input)
-		composer_layout.addLayout(button_row)
+		composer_layout.addWidget(self.mode_menu_btn)
+		composer_layout.addWidget(self.input, 1)
+		composer_layout.addWidget(send_btn)
 
 		chat_panel_layout.addWidget(self.chat_scroll, 1)
 		chat_panel_layout.addWidget(composer_card)
@@ -190,10 +177,12 @@ class WritePage(QWidget):
 	def _set_mode(self, mode: str) -> None:
 		self._mode = mode
 		if mode == "rag":
-			self.mode_chip.setText("RAG")
+			self.mode_menu_btn.setText("RAG")
+			self.mode_menu_btn.setToolTip("RAG 모드")
 			self.input.setPlaceholderText("RAG 모드로 질문하세요")
 		else:
-			self.mode_chip.setText("자료조사")
+			self.mode_menu_btn.setText("자료")
+			self.mode_menu_btn.setToolTip("자료조사 모드")
 			self.input.setPlaceholderText("자료조사 모드로 질문하세요")
 
 	def resizeEvent(self, event) -> None:  # type: ignore[override]

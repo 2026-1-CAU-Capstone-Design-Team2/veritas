@@ -493,9 +493,11 @@ class MainWindow(QMainWindow):
 		}
 
 		QFrame#ComposerCard {
-			background-color: #F8FAFC;
-			border: 1px solid #E2E8F0;
+			background-color: #FFFFFF;
+			border: 1px solid rgba(15,23,42,0.06);
 			border-radius: 14px;
+			padding: 8px;
+			box-shadow: 0px 6px 18px rgba(2,6,23,0.06);
 		}
 
 		QFrame#ChatHeroIconBox {
@@ -581,51 +583,58 @@ class MainWindow(QMainWindow):
 		}
 
 		QPlainTextEdit#ChatInput {
-			background-color: #F8FAFC;
-			border: 1px solid #CBD5E1;
-			border-radius: 12px;
-			padding: 12px 12px;
-			color: #1F2937;
-			selection-background-color: #C7D2FE;
+			background-color: #F3F4F6;
+			border: 1px solid rgba(15,23,42,0.06);
+			border-radius: 14px;
+			padding: 10px 14px;
+			color: #0F172A;
+			selection-background-color: #E9D5FF;
 			selection-color: #0F172A;
+			font-size: 13px;
 		}
 
 		QPlainTextEdit#ChatInput:focus {
-			border: 1px solid #4F46E5;
+			border: 1px solid #7C3AED;
 			background-color: #FFFFFF;
 		}
 
 		QLineEdit#ChatInput:focus {
-			border: 1px solid #4F46E5;
+			border: 1px solid #7C3AED;
 			background-color: #FFFFFF;
 		}
 
 		QPushButton#SendButton {
-			background-color: #4F46E5;
+			background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #7C3AED, stop:1 #5B21B6);
 			color: #FFFFFF;
-			border: 1px solid #4338CA;
-			border-radius: 10px;
-			padding: 10px 14px;
+			border: none;
+			border-radius: 18px;
+			min-width: 44px;
+			min-height: 44px;
+			padding: 8px 12px;
 			font-weight: 700;
+			font-size: 13px;
 		}
 
 		QPushButton#SendButton:hover {
-			background-color: #4338CA;
+			transform: translateY(-1px);
+			background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #6D28D9, stop:1 #4C1D95);
 		}
 
 		QToolButton#ModeMenuButton {
 			background-color: #FFFFFF;
 			color: #111827;
-			border: 1px solid #CBD5E1;
+			border: 1px solid rgba(15,23,42,0.06);
 			border-radius: 10px;
-			padding: 8px 12px;
-			font-size: 18px;
-			font-weight: 800;
+			padding: 8px 10px;
+			font-size: 12px;
+			font-weight: 700;
+			min-width: 44px;
+			min-height: 44px;
 		}
 
 		QToolButton#ModeMenuButton:hover {
-			background-color: #F1F5F9;
-			border-color: #94A3B8;
+			background-color: #F8FAFF;
+			border-color: rgba(124,58,237,0.12);
 		}
 
 		QPushButton#ActiveModeChip {

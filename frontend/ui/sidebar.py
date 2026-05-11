@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -88,7 +88,8 @@ class NavButton(QPushButton):
 	def _apply_style(self) -> None:
 		p = self._hover
 		bg_alpha = int(0 + 18 * p)
-		left_pad = int(12 + 4 * p) if not self._compact else 10
+		left_pad = int(12 + 4 * p) if not self._compact else 0
+		right_pad = 12 if not self._compact else 0
 		align = "left" if not self._compact else "center"
 		self.setStyleSheet(
 			f"""
@@ -96,7 +97,7 @@ class NavButton(QPushButton):
 				text-align: {align};
 				border: 1px solid rgba(255, 255, 255, 0);
 				border-radius: 11px;
-				padding: 10px 12px 10px {left_pad}px;
+				padding: 10px {right_pad}px 10px {left_pad}px;
 				color: #D6DBE5;
 				background-color: rgba(255, 255, 255, {bg_alpha});
 				font-size: 13px;
@@ -150,7 +151,7 @@ class Sidebar(QFrame):
 			pixmap = QPixmap(str(logo_path)).scaled(26, 26, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 			logo.setPixmap(pixmap)
 
-		subtitle = QLabel("AI 워크플로우 스튜디오")
+		subtitle = QLabel("AI ?뚰겕?뚮줈???ㅽ뒠?붿삤")
 		subtitle.setObjectName("BrandSubLabel")
 		self._subtitle = subtitle
 
@@ -182,16 +183,17 @@ class Sidebar(QFrame):
 		nav_container.setSpacing(8)
 
 		icon_dir = Path(__file__).resolve().parent / "public" / "images" / "icons"
+
 		nav_items = [
-			("대시보드", "dashboard", "dashboard.svg", "dashboard_active.svg"),
-			("조사", "research", "collect.svg", "collect_active.svg"),
-			("검증", "verify", "verify.svg", "verify_active.svg"),
-			("초안", "draft", "collect.svg", "collect_active.svg"),
-			("문서 보조", "document_assist", "write.svg", "write_active.svg"),
-			("채팅", "write", "write.svg", "write_active.svg"),
-			("문서", "document", "verify.svg", "verify_active.svg"),
-			("피드백", "feedback", "feedback.svg", "feedback_active.svg"),
-			("설정", "settings", "settings.svg", "settings_active.svg"),
+			("\ub300\uc2dc\ubcf4\ub4dc", "dashboard", "dashboard.svg", "dashboard_active.svg"),
+			("\uc870\uc0ac", "research", "collect.svg", "collect_active.svg"),
+			("\uac80\uc99d", "verify", "verify.svg", "verify_active.svg"),
+			("\ucd08\uc548", "draft", "draft.svg", "draft_active.svg"),
+			("\ubb38\uc11c \ubcf4\uc870", "document_assist", "document_assist.svg", "document_assist_active.svg"),
+			("\ucc44\ud305", "write", "write.svg", "write_active.svg"),
+			("\ubb38\uc11c", "document", "document.svg", "document_active.svg"),
+			("\ud53c\ub4dc\ubc31", "feedback", "feedback.svg", "feedback_active.svg"),
+			("\uc124\uc815", "settings", "settings.svg", "settings_active.svg"),
 		]
 
 		for text, route, icon_name, active_icon_name in nav_items:
@@ -213,13 +215,13 @@ class Sidebar(QFrame):
 		footer_layout.setContentsMargins(10, 10, 10, 10)
 		footer_layout.setSpacing(6)
 
-		footer_title = QLabel("현재 워크스페이스")
+		footer_title = QLabel("?꾩옱 ?뚰겕?ㅽ럹?댁뒪")
 		footer_title.setObjectName("SidebarFooterTitle")
 		self._workspace_desc = QLabel()
 		self._workspace_desc.setObjectName("SidebarFooterDesc")
 		self._workspace_desc.setWordWrap(True)
 
-		self._switch_workspace_btn = QPushButton("워크스페이스 전환")
+		self._switch_workspace_btn = QPushButton("?뚰겕?ㅽ럹?댁뒪 ?꾪솚")
 		self._switch_workspace_btn.setObjectName("SidebarWorkspaceButton")
 		self._switch_workspace_btn.setCursor(Qt.PointingHandCursor)
 		self._switch_workspace_btn.clicked.connect(self._open_workspace_dialog)
@@ -262,7 +264,7 @@ class Sidebar(QFrame):
 
 	def _open_workspace_dialog(self) -> None:
 		dialog = QDialog(self)
-		dialog.setWindowTitle("워크스페이스 전환")
+		dialog.setWindowTitle("?뚰겕?ㅽ럹?댁뒪 ?꾪솚")
 		dialog.setModal(True)
 		dialog.resize(420, 180)
 
@@ -270,10 +272,10 @@ class Sidebar(QFrame):
 		layout.setContentsMargins(16, 14, 16, 14)
 		layout.setSpacing(10)
 
-		title = QLabel("검증 완료 워크스페이스를 선택하세요.")
+		title = QLabel("寃利??꾨즺 ?뚰겕?ㅽ럹?댁뒪瑜??좏깮?섏꽭??")
 		title.setObjectName("CardPrimary")
 
-		hint = QLabel("선택한 워크스페이스는 사이드바와 초안/채팅 화면에 공통으로 반영됩니다.")
+		hint = QLabel("?좏깮???뚰겕?ㅽ럹?댁뒪???ъ씠?쒕컮? 珥덉븞/梨꾪똿 ?붾㈃??怨듯넻?쇰줈 諛섏쁺?⑸땲??")
 		hint.setObjectName("CardSecondary")
 		hint.setWordWrap(True)
 
@@ -282,7 +284,7 @@ class Sidebar(QFrame):
 		selector.setCurrentIndex(self._current_workspace_index)
 
 		buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
-		switch_btn = buttons.addButton("전환", QDialogButtonBox.AcceptRole)
+		switch_btn = buttons.addButton("?꾪솚", QDialogButtonBox.AcceptRole)
 		switch_btn.setObjectName("PrimaryButton")
 		switch_btn.setFixedHeight(32)
 
