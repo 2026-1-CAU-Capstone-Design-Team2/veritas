@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--embed-host", default=None)
-    parser.add_argument("--embed-port", type=int, default=None)
+    parser.add_argument("--embed-port", type=int, default=8081)
     parser.add_argument("--batch-size", type=int, default=5)
     parser.add_argument("--scout-docs", type=int, default=3)
     parser.add_argument("--max-docs", type=int, default=15)

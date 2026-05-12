@@ -3,6 +3,23 @@
 Veritas is a local research assistant that combines an AutoSurvey workflow, local
 RAG over generated markdown outputs, and schema-driven chat tool use.
 
+## 2026-05 UI/API Integration Notes
+
+- API/CLI entrypoints now use separate OpenAI-compatible servers by default:
+  chat completions on `127.0.0.1:8080`, embeddings on `127.0.0.1:8081`.
+- The frontend Research page runs `/api/v1/research/jobs` on a Qt worker thread
+  so the UI stays responsive during long AutoSurvey runs.
+- Completed research jobs return document titles/links from `summary/index.json`,
+  document counts, indexed chunk count, elapsed seconds, `finalPath`, and the
+  final markdown report.
+- The frontend Document page loads the latest AutoSurvey `final.md` through the
+  documents API and renders it as markdown.
+- Each AutoSurvey API run is stored as its own folder under `runs/`. The API
+  performs a lightweight term-grounding pass first, then creates the workspace
+  folder from the first `grounded_terms` string before ChromaDB opens any files.
+- Runs subdirectories are treated as UI workspaces. The sidebar workspace
+  dropdown refreshes from `/api/v1/workspaces`, which scans `runs/`.
+
 The project is built around one principle:
 
 ```text

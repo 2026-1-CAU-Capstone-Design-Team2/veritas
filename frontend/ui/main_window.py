@@ -18,7 +18,9 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
+from ..api_common import ApiError, current_workspace_id
 from ..components.cards import CardWidget
+from ..controllers import AgentController
 from ..components.stepper import WorkflowStepper
 from .pages.dashboard_page import DashboardPage
 from .pages.document_page import DocumentPage
@@ -152,14 +154,16 @@ class MainWindow(QMainWindow):
 		self._add_page("dashboard", DashboardPage())
 		self._add_page("research", ResearchPage())
 		self._add_page("verify", VerifyPage())
-		self._add_page("draft", DraftPage())
+		self.draft_page = DraftPage()
+		self._add_page("draft", self.draft_page)
 		self._add_page("document_assist", DocumentAssistPage())
 		self._add_page("write", WritePage())
 		self._add_page("document", DocumentPage())
 		self._add_page("feedback", FeedbackPage())
-		settings_page = SettingsPage()
-		settings_page.defaultWorkspaceChanged.connect(self.sidebar.set_current_workspace)
-		self._add_page("settings", settings_page)
+		self.settings_page = SettingsPage()
+		self.settings_page.defaultWorkspaceChanged.connect(self.sidebar.set_current_workspace)
+		self.sidebar.workspaceChanged.connect(self._on_workspace_changed)
+		self._add_page("settings", self.settings_page)
 
 		center_layout.addWidget(top_hero)
 		center_layout.addWidget(self.stepper)
@@ -169,6 +173,8 @@ class MainWindow(QMainWindow):
 		shell.addWidget(center_panel, 1)
 
 		self.document_assist_window = DocumentAssistWindow(self)
+		self._agent_controller = AgentController()
+		self.document_assist_window.messageSubmitted.connect(self._send_assist_window_message)
 		self.document_assist_window.hide()
 
 		self._assist_toggle_shortcut = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
@@ -187,6 +193,22 @@ class MainWindow(QMainWindow):
 			self.document_assist_window.hide()
 			return
 		self.show_document_assist_window()
+
+	def _send_assist_window_message(self, message: str) -> None:
+		mode = self.document_assist_window.input_bar.mode()
+		try:
+			reply = self._agent_controller.send_document_assist_message(
+				current_workspace_id(),
+				message,
+				mode,
+			)
+		except ApiError as e:
+			reply = f"API 요청 실패: {e}"
+		self.document_assist_window.add_chat_message("VERITAS", reply)
+
+	def _on_workspace_changed(self, workspace_name: str) -> None:
+		self.settings_page.set_default_workspace_by_name(workspace_name)
+		self.draft_page.set_workspace_by_name(workspace_name)
 
 	def _toggle_sidebar(self) -> None:
 		start = self.sidebar.width()
@@ -268,7 +290,7 @@ class MainWindow(QMainWindow):
 			"write": ("AI 채팅", "워크스페이스 기반 AI와 채팅이 가능합니다."),
 			"document": ("문서", "스크랩 합본과 요약본을 검토합니다."),
 			"feedback": ("문서 피드백", "약한 주장과 저신뢰 문장을 우선 교정합니다."),
-			"settings": ("설정", "워크스페이스와 모델 정책을 구성합니다."),
+			"settings": ("설정", "모델명과 로컬 접근 폴더를 구성합니다."),
 		}
 		title, desc = section_map.get(route, ("대시보드", ""))
 		self.section_title.setText(title)
@@ -276,6 +298,11 @@ class MainWindow(QMainWindow):
 
 		self.sidebar.set_active(route)
 		self.pages.setCurrentIndexAnimated(index)
+		current_widget = self.pages.currentWidget()
+		page = current_widget.widget() if isinstance(current_widget, QScrollArea) else current_widget
+		refresh = getattr(page, "refresh", None)
+		if callable(refresh):
+			refresh()
 
 		is_workflow_route = route in self.STEP_ORDER
 		self.stepper.setVisible(is_workflow_route)
@@ -486,10 +513,159 @@ class MainWindow(QMainWindow):
 			border-radius: 16px;
 		}
 
+		QFrame#AssistPagePanel {
+			background-color: #F8FAFC;
+			border: 1px solid #E5E7EB;
+			border-radius: 16px;
+		}
+
+		QFrame#AssistSectionCard {
+			background-color: #FFFFFF;
+			border: 1px solid #E5E7EB;
+			border-radius: 13px;
+		}
+
+		QLabel#AssistSubText {
+			color: #6B7280;
+			font-size: 12px;
+			font-weight: 600;
+		}
+
+		QLabel#AssistSectionTitle {
+			color: #111827;
+			font-size: 13px;
+			font-weight: 850;
+		}
+
+		QScrollArea#AssistScrollArea {
+			background-color: transparent;
+			border: none;
+		}
+
+		QFrame#SuggestionCard {
+			background-color: #FFFFFF;
+			border: 1px solid #E5E7EB;
+			border-radius: 12px;
+		}
+
+		QLabel#SuggestionText {
+			color: #1F2937;
+			font-size: 13px;
+			font-weight: 650;
+			line-height: 1.5;
+		}
+
+		QLabel#AssistEmptyState {
+			background-color: #F8FAFC;
+			border: 1px dashed #CBD5E1;
+			border-radius: 12px;
+			color: #6B7280;
+			padding: 18px 14px;
+			font-weight: 650;
+		}
+
+		QPushButton#AssistCopyButton {
+			background-color: #FFFFFF;
+			color: #4B5563;
+			border: 1px solid #D1D5DB;
+			border-radius: 8px;
+			padding: 5px 8px;
+			font-size: 11px;
+			font-weight: 800;
+		}
+
+		QPushButton#AssistCopyButton:hover {
+			background-color: #F3F4F6;
+			color: #111827;
+		}
+
+		QFrame#AssistUserBubble {
+			background-color: #DBEAFE;
+			border: 1px solid #BFDBFE;
+			border-radius: 13px;
+			border-top-right-radius: 4px;
+		}
+
+		QFrame#AssistAiBubble {
+			background-color: #FFFFFF;
+			border: 1px solid #E5E7EB;
+			border-radius: 13px;
+			border-top-left-radius: 4px;
+		}
+
+		QLabel#AssistBubbleMeta {
+			color: #6B7280;
+			font-size: 10px;
+			font-weight: 800;
+		}
+
+		QLabel#AssistBubbleText {
+			color: #1F2937;
+			font-size: 12px;
+			font-weight: 600;
+		}
+
+		QFrame#AssistInputBar {
+			background-color: #FFFFFF;
+			border: 1px solid #E5E7EB;
+			border-radius: 14px;
+		}
+
+		QTextEdit#AssistChatInput {
+			background-color: #F8FAFC;
+			border: 1px solid #E5E7EB;
+			border-radius: 11px;
+			padding: 8px 10px;
+			color: #111827;
+			selection-background-color: #BFDBFE;
+			selection-color: #111827;
+		}
+
+		QTextEdit#AssistChatInput:focus {
+			background-color: #FFFFFF;
+			border: 1px solid #3B82F6;
+		}
+
+		QPushButton#AssistSendButton {
+			background-color: #3B82F6;
+			border: 1px solid #2563EB;
+			border-radius: 11px;
+			color: #FFFFFF;
+			font-weight: 850;
+		}
+
+		QPushButton#AssistSendButton:hover {
+			background-color: #2563EB;
+		}
+
+		QToolButton#AssistModeButton {
+			background-color: #F8FAFC;
+			color: #111827;
+			border: 1px solid #D1D5DB;
+			border-radius: 11px;
+			padding: 0px 8px;
+			font-size: 12px;
+			font-weight: 850;
+		}
+
+		QToolButton#AssistModeButton:hover {
+			background-color: #EEF2FF;
+			border-color: #818CF8;
+			color: #3730A3;
+		}
+
+		QToolButton#AssistModeButton::menu-indicator {
+			image: none;
+			width: 0px;
+			height: 0px;
+		}
+
 		QFrame#ComposerCard {
 			background-color: #F8FAFC;
 			border: 1px solid #E2E8F0;
-			border-radius: 14px;
+			border-radius: 18px;
+			padding: 8px;
+			box-shadow: 0px 6px 18px rgba(2,6,23,0.06);
 		}
 
 		QFrame#ChatHeroIconBox {
@@ -575,36 +751,144 @@ class MainWindow(QMainWindow):
 		}
 
 		QPlainTextEdit#ChatInput {
-			background-color: #F8FAFC;
-			border: 1px solid #CBD5E1;
-			border-radius: 12px;
-			padding: 12px 12px;
-			color: #1F2937;
-			selection-background-color: #C7D2FE;
+			background-color: #FFFFFF;
+			border: 1px solid #E2E8F0;
+			border-radius: 16px;
+			padding: 9px 13px;
+			color: #0F172A;
+			selection-background-color: #E9D5FF;
 			selection-color: #0F172A;
+			font-size: 13px;
 		}
 
 		QPlainTextEdit#ChatInput:focus {
-			border: 1px solid #4F46E5;
+			border: 1px solid #7C3AED;
 			background-color: #FFFFFF;
 		}
 
 		QLineEdit#ChatInput:focus {
-			border: 1px solid #4F46E5;
+			border: 1px solid #7C3AED;
 			background-color: #FFFFFF;
 		}
 
 		QPushButton#SendButton {
-			background-color: #4F46E5;
+			background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #7C3AED, stop:1 #5B21B6);
 			color: #FFFFFF;
-			border: 1px solid #4338CA;
-			border-radius: 10px;
-			padding: 10px 14px;
+			border: none;
+			border-radius: 18px;
+			min-width: 44px;
+			min-height: 44px;
+			padding: 8px 12px;
 			font-weight: 700;
+			font-size: 13px;
 		}
 
 		QPushButton#SendButton:hover {
-			background-color: #4338CA;
+			transform: translateY(-1px);
+			background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #6D28D9, stop:1 #4C1D95);
+		}
+
+		QToolButton#ModeMenuButton {
+			background-color: #111827;
+			color: #FFFFFF;
+			border: 1px solid #111827;
+			border-radius: 19px;
+			padding: 0px;
+			font-size: 12px;
+			font-weight: 700;
+			text-align: center;
+			min-width: 82px;
+			min-height: 38px;
+			max-width: 82px;
+			max-height: 38px;
+		}
+
+		QToolButton#ModeMenuButton:hover {
+			background-color: #4F46E5;
+			border-color: #4338CA;
+		}
+
+		QToolButton#ModeMenuButton::menu-indicator {
+			image: none;
+			width: 0px;
+			height: 0px;
+		}
+
+		QTextEdit#ResearchInput {
+			background-color: #FFFFFF;
+			border: 1px solid #CBD5E1;
+			border-radius: 12px;
+			padding: 11px 12px;
+			color: #0F172A;
+			selection-background-color: #C7D2FE;
+			selection-color: #0F172A;
+		}
+
+		QTextEdit#ResearchInput:focus {
+			border: 1px solid #4F46E5;
+		}
+
+		QFrame#ReferenceUrlRow {
+			background-color: #F8FAFC;
+			border: 1px solid #E2E8F0;
+			border-radius: 12px;
+		}
+
+		QLineEdit#ReferenceUrlInput {
+			background-color: transparent;
+			border: none;
+			color: #0F172A;
+			padding: 7px 4px;
+			font-size: 13px;
+		}
+
+		QToolButton#RoundAddButton {
+			background-color: #111827;
+			color: #FFFFFF;
+			border: 1px solid #111827;
+			border-radius: 15px;
+			font-size: 17px;
+			font-weight: 800;
+			padding: 0px;
+		}
+
+		QToolButton#RoundAddButton:hover {
+			background-color: #4F46E5;
+			border-color: #4338CA;
+		}
+
+		QToolButton#UrlRemoveButton {
+			background-color: #FFFFFF;
+			color: #64748B;
+			border: 1px solid #CBD5E1;
+			border-radius: 13px;
+			font-size: 14px;
+			font-weight: 800;
+			padding: 0px;
+		}
+
+		QToolButton#UrlRemoveButton:hover {
+			background-color: #FEF2F2;
+			color: #B91C1C;
+			border-color: #FECACA;
+		}
+
+		QMenu {
+			background-color: #FFFFFF;
+			border: 1px solid #CBD5E1;
+			border-radius: 8px;
+			padding: 6px;
+		}
+
+		QMenu::item {
+			color: #111827;
+			padding: 8px 28px 8px 12px;
+			border-radius: 6px;
+		}
+
+		QMenu::item:selected {
+			background-color: #EEF2FF;
+			color: #3730A3;
 		}
 
 		QFrame#UserBubble {
@@ -612,7 +896,6 @@ class MainWindow(QMainWindow):
 			border: 1px solid #C7D2FE;
 			border-radius: 11px;
 			border-top-right-radius: 3px;
-			max-width: 460px;
 		}
 
 		QFrame#AIBubble {
@@ -620,7 +903,6 @@ class MainWindow(QMainWindow):
 			border: 1px solid #E2E8F0;
 			border-radius: 11px;
 			border-top-left-radius: 3px;
-			max-width: 460px;
 		}
 
 		QLabel#BubbleText {
@@ -801,6 +1083,12 @@ class MainWindow(QMainWindow):
 			border-color: #94A3B8;
 		}
 
+		QPushButton#FilterChip:checked {
+			background-color: #EEF2FF;
+			color: #3730A3;
+			border: 1px solid #818CF8;
+		}
+
 		QTextEdit#DocEditor {
 			background-color: #FFFFFF;
 			border: 1px solid #CBD5E1;
@@ -814,6 +1102,7 @@ class MainWindow(QMainWindow):
 		}
 
 		QComboBox#SettingsInput,
+		QLineEdit#SettingsInput,
 		QSpinBox#SettingsInput,
 		QDoubleSpinBox#SettingsInput {
 			background-color: #F8FAFC;
@@ -825,6 +1114,7 @@ class MainWindow(QMainWindow):
 		}
 
 		QComboBox#SettingsInput:focus,
+		QLineEdit#SettingsInput:focus,
 		QSpinBox#SettingsInput:focus,
 		QDoubleSpinBox#SettingsInput:focus {
 			border: 1px solid #4F46E5;
@@ -835,6 +1125,47 @@ class MainWindow(QMainWindow):
 			color: #334155;
 			font-weight: 700;
 			spacing: 8px;
+		}
+
+		QPushButton#SettingsModelToggle {
+			background-color: #FFFFFF;
+			color: #334155;
+			border: 1px solid #CBD5E1;
+			border-radius: 10px;
+			padding: 9px 14px;
+			font-weight: 800;
+		}
+
+		QPushButton#SettingsModelToggle:hover {
+			background-color: #F8FAFC;
+			border-color: #94A3B8;
+		}
+
+		QPushButton#SettingsModelToggle:checked {
+			background-color: #EEF2FF;
+			color: #3730A3;
+			border: 1px solid #818CF8;
+		}
+
+		QListWidget#SettingsFolderList {
+			background-color: #F8FAFC;
+			border: 1px solid #CBD5E1;
+			border-radius: 10px;
+			padding: 6px;
+			color: #0F172A;
+			selection-background-color: #DBEAFE;
+			selection-color: #0F172A;
+		}
+
+		QListWidget#SettingsFolderList::item {
+			border-radius: 7px;
+			padding: 7px 8px;
+			margin: 2px;
+		}
+
+		QListWidget#SettingsFolderList::item:selected {
+			background-color: #DBEAFE;
+			color: #0F172A;
 		}
 
 		QLabel#SettingsStatus {

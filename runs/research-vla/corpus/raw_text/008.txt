@@ -1,3 +1,0 @@
-Unified Vision-Language-Action Model
-Yuqi Wang , Xinghang Li , Wenxuan Wang , Junbo Zhang , Yingyan Li , Yuntao Chen , Xinlong Wang , Zhaoxiang Zhang
-OpenReview is a long-term project to advance science through improved peer review with legal nonprofit status. We gratefully acknowledge the support of the OpenReview Sponsors . © 2026 OpenReview

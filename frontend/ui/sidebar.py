@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
-from ..api_common import STATE
+from ..api_common import STATE, load_bootstrap_state, switch_workspace
 
 
 class NavButton(QPushButton):
@@ -88,7 +88,8 @@ class NavButton(QPushButton):
 	def _apply_style(self) -> None:
 		p = self._hover
 		bg_alpha = int(0 + 18 * p)
-		left_pad = int(12 + 4 * p) if not self._compact else 10
+		left_pad = int(12 + 4 * p) if not self._compact else 0
+		right_pad = 12 if not self._compact else 0
 		align = "left" if not self._compact else "center"
 		self.setStyleSheet(
 			f"""
@@ -96,7 +97,7 @@ class NavButton(QPushButton):
 				text-align: {align};
 				border: 1px solid rgba(255, 255, 255, 0);
 				border-radius: 11px;
-				padding: 10px 12px 10px {left_pad}px;
+				padding: 10px {right_pad}px 10px {left_pad}px;
 				color: #D6DBE5;
 				background-color: rgba(255, 255, 255, {bg_alpha});
 				font-size: 13px;
@@ -122,7 +123,9 @@ class Sidebar(QFrame):
 		self.setObjectName("Sidebar")
 		self._buttons: dict[str, NavButton] = {}
 		self._compact = False
+		self._ensure_workspace_state()
 		self._workspace_names = [item["name"] for item in STATE["workspaces"]]
+		self._workspace_ids = [item["workspaceId"] for item in STATE["workspaces"]]
 		current_workspace_id = STATE["current_workspace_id"]
 		self._current_workspace_index = next(
 			(
@@ -182,16 +185,17 @@ class Sidebar(QFrame):
 		nav_container.setSpacing(8)
 
 		icon_dir = Path(__file__).resolve().parent / "public" / "images" / "icons"
+
 		nav_items = [
-			("대시보드", "dashboard", "dashboard.svg", "dashboard_active.svg"),
-			("조사", "research", "collect.svg", "collect_active.svg"),
-			("검증", "verify", "verify.svg", "verify_active.svg"),
-			("초안", "draft", "collect.svg", "collect_active.svg"),
-			("문서 보조", "document_assist", "write.svg", "write_active.svg"),
-			("채팅", "write", "write.svg", "write_active.svg"),
-			("문서", "document", "verify.svg", "verify_active.svg"),
-			("피드백", "feedback", "feedback.svg", "feedback_active.svg"),
-			("설정", "settings", "settings.svg", "settings_active.svg"),
+			("\ub300\uc2dc\ubcf4\ub4dc", "dashboard", "dashboard.svg", "dashboard_active.svg"),
+			("\uc870\uc0ac", "research", "collect.svg", "collect_active.svg"),
+			("\uac80\uc99d", "verify", "verify.svg", "verify_active.svg"),
+			("\ucd08\uc548", "draft", "draft.svg", "draft_active.svg"),
+			("\ubb38\uc11c \ubcf4\uc870", "document_assist", "document_assist.svg", "document_assist_active.svg"),
+			("\ucc44\ud305", "write", "write.svg", "write_active.svg"),
+			("\ubb38\uc11c", "document", "document.svg", "document_active.svg"),
+			("\ud53c\ub4dc\ubc31", "feedback", "feedback.svg", "feedback_active.svg"),
+			("\uc124\uc815", "settings", "settings.svg", "settings_active.svg"),
 		]
 
 		for text, route, icon_name, active_icon_name in nav_items:
@@ -237,6 +241,7 @@ class Sidebar(QFrame):
 			button.setChecked(key == route)
 
 	def set_current_workspace(self, workspace_name: str) -> None:
+		self._reload_workspaces()
 		if workspace_name not in self._workspace_names:
 			return
 		self._current_workspace_index = self._workspace_names.index(workspace_name)
@@ -258,9 +263,48 @@ class Sidebar(QFrame):
 		self._toggle_btn.setIconSize(QSize(14, 14))
 
 	def _refresh_workspace_footer(self) -> None:
+		if not self._workspace_names:
+			self._workspace_names = ["default"]
+			self._workspace_ids = ["default"]
+			self._current_workspace_index = 0
+		self._current_workspace_index = min(self._current_workspace_index, len(self._workspace_names) - 1)
 		self._workspace_desc.setText(self._workspace_names[self._current_workspace_index])
 
+	def _ensure_workspace_state(self) -> None:
+		workspaces = STATE.get("workspaces")
+		if isinstance(workspaces, list) and workspaces:
+			return
+		STATE["workspaces"] = [
+			{
+				"workspaceId": "default",
+				"name": "default",
+				"detail": "기본 워크스페이스",
+				"status": "active",
+			}
+		]
+		STATE["current_workspace_id"] = "default"
+
+	def _reload_workspaces(self) -> None:
+		try:
+			load_bootstrap_state()
+		except Exception:
+			pass
+		self._ensure_workspace_state()
+		self._workspace_names = [item["name"] for item in STATE["workspaces"]]
+		self._workspace_ids = [item["workspaceId"] for item in STATE["workspaces"]]
+		current_workspace_id = STATE["current_workspace_id"]
+		self._current_workspace_index = next(
+			(
+				index
+				for index, workspace_id in enumerate(self._workspace_ids)
+				if workspace_id == current_workspace_id
+			),
+			0,
+		)
+		self._refresh_workspace_footer()
+
 	def _open_workspace_dialog(self) -> None:
+		self._reload_workspaces()
 		dialog = QDialog(self)
 		dialog.setWindowTitle("워크스페이스 전환")
 		dialog.setModal(True)
@@ -270,10 +314,10 @@ class Sidebar(QFrame):
 		layout.setContentsMargins(16, 14, 16, 14)
 		layout.setSpacing(10)
 
-		title = QLabel("검증 완료 워크스페이스를 선택하세요.")
+		title = QLabel("사용할 워크스페이스를 선택하세요")
 		title.setObjectName("CardPrimary")
 
-		hint = QLabel("선택한 워크스페이스는 사이드바와 초안/채팅 화면에 공통으로 반영됩니다.")
+		hint = QLabel("선택한 워크스페이스는 사이드바, 초안, 채팅 화면에 공통으로 반영됩니다.")
 		hint.setObjectName("CardSecondary")
 		hint.setWordWrap(True)
 
@@ -284,7 +328,9 @@ class Sidebar(QFrame):
 		buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
 		switch_btn = buttons.addButton("전환", QDialogButtonBox.AcceptRole)
 		switch_btn.setObjectName("PrimaryButton")
-		switch_btn.setFixedHeight(32)
+		switch_btn.setMinimumSize(72, 36)
+		switch_btn.setContentsMargins(0, 0, 0, 0)
+		buttons.button(QDialogButtonBox.Cancel).setMinimumSize(72, 36)
 
 		buttons.rejected.connect(dialog.reject)
 		buttons.accepted.connect(dialog.accept)
@@ -293,10 +339,12 @@ class Sidebar(QFrame):
 		layout.addWidget(hint)
 		layout.addWidget(selector)
 		layout.addStretch(1)
+		layout.addSpacing(4)
 		layout.addWidget(buttons)
 
 		if dialog.exec() == QDialog.Accepted:
 			self._current_workspace_index = selector.currentIndex()
-			current = self._workspace_names[self._current_workspace_index]
+			workspace_id = self._workspace_ids[self._current_workspace_index]
+			current = switch_workspace(workspace_id)
 			self._refresh_workspace_footer()
 			self.workspaceChanged.emit(current)

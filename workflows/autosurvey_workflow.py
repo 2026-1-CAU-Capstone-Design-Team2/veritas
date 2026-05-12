@@ -291,11 +291,17 @@ class AutoSurveyWorkflow:
         *,
         force_plan: bool = False,
         overwrite_summaries: bool = False,
+        grounding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.run_store_service.save_request(user_request)
         self.run_store_service.reset_query_state()
 
-        grounding = self.run_term_grounding(user_request=user_request, force=True)
+        if grounding is None:
+            grounding = self.run_term_grounding(user_request=user_request, force=True)
+        else:
+            grounding = dict(grounding)
+            grounding["request_text"] = user_request
+            self.run_store_service.save_grounding(grounding)
         reference_sites = self._extract_reference_sites(user_request)
         if reference_sites:
             grounding["reference_sites"] = reference_sites

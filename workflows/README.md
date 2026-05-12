@@ -1,5 +1,13 @@
 # workflows/
 
+## 최신 API 연동 결과
+
+- API의 research job은 `AutoSurveyWorkflow.run_all()` 완료 후 `summary/index.json`과 `final.md`를 읽어 UI 표시용 메타데이터를 구성합니다.
+- `summary/index.json`의 records는 조사 결과 화면에서 문서 제목/링크/전체 문서 수로 표시됩니다.
+- `final.md`는 문서 화면의 요약본 영역에서 markdown으로 렌더링됩니다.
+- workflow 자체는 기존처럼 plan, collect, summarize, final 단계를 담당하고, RAG embedding index 생성은 workflow 완료 후 API runtime에서 수행합니다.
+- API runtime은 workflow 시작 전에 같은 term-grounding logic으로 얻은 첫 `grounded_terms` 문자열을 조사별 workspace 폴더명으로 사용합니다. workflow는 최종 workspace 폴더 안에서 다시 grounding, plan, collect, summarize, final 단계를 수행합니다.
+
 > RAG workflow update: `AutoSurveyWorkflow` still orchestrates the deterministic research pipeline. RAG chat is now backed by the registered `rag` tool after indexing, so workflow phases should continue to call explicit tools for plan/collect/summarize/final while chat sessions may expose `rag` to the LLM through tool-calling.
 
 **역할**: 여러 도구를 조합한 파이프라인 정의 및 오케스트레이션

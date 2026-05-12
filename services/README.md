@@ -1,5 +1,13 @@
 # services/
 
+## 최신 RAG/문서 표시 동작
+
+- AutoSurvey 완료 후 API runtime은 `RAGService.index_autosurvey_output(summary_dir, index_path)`를 호출해 `summary/doc_*.md`를 chunking하고 embedding server에 batch embedding을 요청합니다.
+- API/CLI 기본 embedding endpoint는 `127.0.0.1:8081/v1/embeddings`입니다.
+- `RunStoreService.index_path`는 `summary/index.json`이며, UI 조사 결과의 문서 제목/링크/문서 수는 이 파일의 records를 기준으로 표시됩니다.
+- `RunStoreService.final_path`는 `final.md`이며, UI 문서 화면의 요약본은 이 markdown 내용을 API가 저장한 workspace document state에서 읽어 표시합니다.
+- API research runtime은 workflow 시작 전에 lightweight term-grounding으로 workspace 이름을 정하고, 곧바로 `runs/<workspace>` 폴더에 `RunStoreService`와 ChromaDB를 생성합니다. Windows에서 열린 `chroma.sqlite3` 때문에 폴더 이동이 실패하지 않도록 pending 폴더 이동을 사용하지 않습니다.
+
 > RAG service update: `services/rag_service.py` owns indexing, retrieval, query rewriting, and document-grounded answer generation. `tools/rag_tool/` is a thin `rag_search` adapter for LLM tool-calling only.
 
 **역할**: 도구(Tool)들이 공유하는 비즈니스 로직, 상태 관리, 유틸리티 함수 제공
