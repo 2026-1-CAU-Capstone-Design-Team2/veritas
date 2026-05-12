@@ -286,7 +286,9 @@ class Sidebar(QFrame):
 		buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
 		switch_btn = buttons.addButton("전환", QDialogButtonBox.AcceptRole)
 		switch_btn.setObjectName("PrimaryButton")
-		switch_btn.setFixedHeight(32)
+		switch_btn.setMinimumSize(72, 36)
+		switch_btn.setContentsMargins(0, 0, 0, 0)
+		buttons.button(QDialogButtonBox.Cancel).setMinimumSize(72, 36)
 
 		buttons.rejected.connect(dialog.reject)
 		buttons.accepted.connect(dialog.accept)
@@ -295,6 +297,7 @@ class Sidebar(QFrame):
 		layout.addWidget(hint)
 		layout.addWidget(selector)
 		layout.addStretch(1)
+		layout.addSpacing(4)
 		layout.addWidget(buttons)
 
 		if dialog.exec() == QDialog.Accepted:
