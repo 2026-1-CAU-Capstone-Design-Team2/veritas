@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QLabel, QTextEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QVBoxLayout, QWidget
 
-from ...components.cards import CardWidget
+from ..windows.document_assist_window import SuggestionList
 
 
 class DocumentAssistPage(QWidget):
@@ -10,58 +10,43 @@ class DocumentAssistPage(QWidget):
 		super().__init__(parent)
 		self.setObjectName("DocumentAssistPage")
 		self._build_ui()
-		self._apply_stylesheet()
+		self._load_demo_data()
 
 	def _build_ui(self) -> None:
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
-		root.setSpacing(12)
+		root.setSpacing(0)
 
-		header_card = CardWidget("문서 보조")
-		subtitle = QLabel("실시간 보조 내용을 확인하는 전용 화면입니다.")
-		subtitle.setObjectName("PageSubtitle")
-		subtitle.setWordWrap(True)
-		header_card.layout.addWidget(subtitle)
-		root.addWidget(header_card)
+		panel = QFrame()
+		panel.setObjectName("AssistPagePanel")
+		panel_layout = QVBoxLayout(panel)
+		panel_layout.setContentsMargins(12, 12, 12, 12)
+		panel_layout.setSpacing(10)
 
-		assist_card = CardWidget("실시간 문서 보조")
-		assist_hint = QLabel("문서 분석 텍스트, 추천 문장, 경고, 수정 제안을 아래 영역에 표시합니다.")
-		assist_hint.setObjectName("CardSecondary")
-		assist_hint.setWordWrap(True)
-		assist_card.layout.addWidget(assist_hint)
+		self.suggestion_list = SuggestionList()
 
-		self.assist_text_edit = QTextEdit()
-		self.assist_text_edit.setObjectName("AssistTextEdit")
-		self.assist_text_edit.setReadOnly(True)
-		self.assist_text_edit.setPlaceholderText("분석 결과, 추천 문장, 경고, 수정 제안이 여기에 표시됩니다.")
-		self.assist_text_edit.setMinimumHeight(300)
-		assist_card.layout.addWidget(self.assist_text_edit)
-		root.addWidget(assist_card)
+		panel_layout.addWidget(self.suggestion_list, 1)
 
-	def _apply_stylesheet(self) -> None:
-		self.setStyleSheet(
-			"""
-			QWidget#DocumentAssistPage {
-				background-color: transparent;
-				color: #0F172A;
-				font-family: 'Segoe UI Variable', 'Segoe UI', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
-				font-size: 12px;
-			}
-			QTextEdit#AssistTextEdit {
-				background-color: #FFFFFF;
-				border: 1px solid #D7E2F0;
-				border-radius: 8px;
-				padding: 6px;
-				selection-background-color: #BFDBFE;
-				selection-color: #0F172A;
-			}
-			"""
+		root.addWidget(panel, 1)
+
+	def _load_demo_data(self) -> None:
+		self.suggestion_list.set_suggestions(
+			[
+				{
+					"category": "수정",
+					"text": "본 보고서는 2026년 AI 규제 변화가 기업 운영에 미치는 영향을 분석하고, 우선 대응이 필요한 리스크를 정리합니다.",
+					"tone": "working",
+				},
+				{
+					"category": "근거 보강",
+					"text": "효율성 개선 효과는 내부 처리 시간 비교 데이터 또는 외부 벤치마크 수치를 함께 제시하면 더 설득력 있습니다.",
+					"tone": "warning",
+				},
+			]
 		)
 
 	def update_assist_text(self, text: str) -> None:
-		self.assist_text_edit.setPlainText(text)
+		self.suggestion_list.set_suggestions([{"category": "수정", "text": text, "tone": "working"}])
 
 	def append_assist_text(self, text: str) -> None:
-		if self.assist_text_edit.toPlainText():
-			self.assist_text_edit.append("")
-		self.assist_text_edit.append(text)
+		self.suggestion_list.add_suggestion("수정", text, "idle")
