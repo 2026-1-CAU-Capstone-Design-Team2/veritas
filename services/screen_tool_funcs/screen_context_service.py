@@ -333,7 +333,6 @@ class ScreenContextService:
             "stable_paragraph",
             "typing_pause",
             "cooldown",
-            "supported_app",
         ):
             check = checks.get(name) or {}
             if not isinstance(check, dict):
@@ -372,8 +371,6 @@ class ScreenContextService:
             return f"reason={reason} app_type={check.get('active_app_type') or '-'}"
         if name == "cooldown":
             return f"reason={reason} window={check.get('cooldown_events')}"
-        if name == "supported_app":
-            return f"reason={reason} process={check.get('process_name') or '-'}"
         return f"reason={reason}"
 
     def _preview_text(self, text: str, *, limit: int = 220) -> str:

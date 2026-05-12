@@ -2,7 +2,7 @@
   "type": "function",
   "function": {
     "name": "web_search",
-    "description": "Search the web with DuckDuckGo HTML search and return organic results. No API key or self-hosted search instance is required.",
+    "description": "Search the web with DuckDuckGo and return organic results. Empty result sets are returned as successful results=[] responses. No API key or self-hosted search instance is required.",
     "parameters": {
       "type": "object",
       "properties": {

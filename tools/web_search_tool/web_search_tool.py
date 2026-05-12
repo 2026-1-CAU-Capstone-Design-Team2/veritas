@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from typing import Any
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -105,8 +105,77 @@ class DuckDuckGoSearchProvider:
         return f"{parsed.scheme}://{parsed.netloc.lower()}{parsed.path}".rstrip("/")
 
 
+class DDGSPackageSearchProvider:
+    """Fallback provider backed by the installed `ddgs` package."""
+
+    def __init__(self, *, timeout_sec: int = 15) -> None:
+        self.timeout_sec = max(1, int(timeout_sec))
+
+    def search(self, *, query: str, num_results: int) -> list[SearchResult]:
+        try:
+            from ddgs import DDGS
+        except ImportError as e:
+            raise RuntimeError("ddgs package is not installed") from e
+
+        try:
+            ddgs_client = DDGS(timeout=self.timeout_sec)
+        except TypeError:
+            ddgs_client = DDGS()
+
+        if hasattr(ddgs_client, "__enter__"):
+            with ddgs_client as ddgs:
+                raw_results = self._text_results(ddgs, query=query, num_results=num_results)
+        else:
+            try:
+                raw_results = self._text_results(
+                    ddgs_client,
+                    query=query,
+                    num_results=num_results,
+                )
+            finally:
+                close = getattr(ddgs_client, "close", None)
+                if callable(close):
+                    close()
+
+        results: list[SearchResult] = []
+        seen: set[str] = set()
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+
+            link = str(item.get("href") or item.get("url") or item.get("link") or "").strip()
+            title = str(item.get("title") or "").strip()
+            snippet = str(item.get("body") or item.get("snippet") or item.get("description") or "").strip()
+            if not title or not link or not link.startswith(("http://", "https://")):
+                continue
+
+            key = self._canonical_key(link)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(SearchResult(title=title, link=link, snippet=snippet))
+            if len(results) >= num_results:
+                break
+
+        return results
+
+    def _text_results(self, ddgs: Any, *, query: str, num_results: int) -> list[dict[str, Any]]:
+        return list(
+            ddgs.text(
+                query,
+                region="wt-wt",
+                safesearch="moderate",
+                max_results=num_results,
+            )
+        )
+
+    def _canonical_key(self, url: str) -> str:
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc.lower()}{parsed.path}".rstrip("/")
+
+
 class WebSearchTool(BaseTool):
-    """Search the web using DuckDuckGo HTML search only."""
+    """Search the web using DuckDuckGo HTML search with a ddgs fallback."""
 
     def __init__(self, schema: dict[str, Any]) -> None:
         super().__init__(schema=schema)
@@ -121,21 +190,48 @@ class WebSearchTool(BaseTool):
             return ToolResult(success=False, error="`query` must be a non-empty string.")
 
         limit = max(1, min(int(num_results or 5), 20))
-        provider = DuckDuckGoSearchProvider()
+        provider_errors: list[str] = []
+        completed_provider_count = 0
 
         try:
-            results = provider.search(query=search_query, num_results=limit)
+            results = DuckDuckGoSearchProvider().search(query=search_query, num_results=limit)
+            completed_provider_count += 1
         except Exception as e:
+            provider_errors.append(f"html: {e}")
+            results = []
+
+        if not results:
+            try:
+                results = DDGSPackageSearchProvider().search(
+                    query=search_query,
+                    num_results=limit,
+                )
+                completed_provider_count += 1
+            except Exception as e:
+                provider_errors.append(f"ddgs: {e}")
+
+        if provider_errors and not results and completed_provider_count == 0:
             return ToolResult(
                 success=False,
-                error=f"DuckDuckGo search failed for query={search_query!r}: {e}",
+                error=(
+                    f"DuckDuckGo search failed for query={search_query!r}: "
+                    + "; ".join(provider_errors)
+                ),
             )
 
         if not results:
             return ToolResult(
-                success=False,
-                error=f"DuckDuckGo returned no parseable results for query={search_query!r}.",
-                data={"query": search_query, "provider": "duckduckgo", "results": []},
+                success=True,
+                content="",
+                data={
+                    "query": search_query,
+                    "provider": "duckduckgo",
+                    "results": [],
+                    "warnings": [
+                        "DuckDuckGo returned no parseable results; treating as an empty result set.",
+                        *provider_errors,
+                    ],
+                },
             )
 
         content = "\n".join(

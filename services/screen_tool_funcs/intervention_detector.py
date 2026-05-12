@@ -18,12 +18,12 @@ class InterventionDetector:
         *,
         history_window: int = 10,
         min_history_count: int = 5,
-        dwell_threshold: float = 0.8,
+        dwell_threshold: float = 0.5,
         cooldown_events: int = 5,
         min_paragraph_chars: int = 20,
         min_ocr_paragraph_chars: int = 40,
         min_changed_chars: int = 10,
-        min_idle_captures: int = 4,
+        min_idle_captures: int = 2,
         idle_similarity_threshold: float = 0.985,
     ) -> None:
         self.history_window = history_window
@@ -70,7 +70,6 @@ class InterventionDetector:
         stable_paragraph = self._has_stable_paragraph(filtered)
         typing_pause_ready = bool(typing_pause.get("ready"))
         cooldown_passed = self._passes_cooldown(current_snapshot, history_events)
-        supported_app = not self._is_sensitive_or_unsupported(window)
         metadata["checks"] = {
             "editing_app": {
                 "passed": editing_app,
@@ -112,11 +111,6 @@ class InterventionDetector:
                 "reason": "cooldown_dedupe_passed" if cooldown_passed else "cooldown_or_duplicate",
                 "cooldown_events": self.cooldown_events,
             },
-            "supported_app": {
-                "passed": supported_app,
-                "reason": "supported_app" if supported_app else "sensitive_or_unsupported_app",
-                "process_name": window.process_name,
-            },
         }
 
         if not editing_app:
@@ -148,11 +142,6 @@ class InterventionDetector:
         else:
             score += 0.1
             reasons.append("cooldown_dedupe_passed")
-
-        if not supported_app:
-            blockers = ["sensitive_or_unsupported_app"]
-            score = 0.0
-            reasons = []
 
         should_consider = not blockers
         priority = "high" if should_consider and score >= 0.85 else "medium" if should_consider else "low"
@@ -308,9 +297,6 @@ class InterventionDetector:
             if paragraph:
                 return event
         return None
-
-    def _is_sensitive_or_unsupported(self, window: WindowContext) -> bool:
-        return (window.process_name or "").lower() in {"lockapp.exe"}
 
     def _make_document_key(self, window: WindowContext) -> str:
         process_name = (window.process_name or "").lower()
