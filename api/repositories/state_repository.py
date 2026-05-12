@@ -114,6 +114,21 @@ def get_settings() -> dict[str, Any]:
     return STATE["settings"]
 
 
+def set_model_settings(model_name: str) -> dict[str, Any]:
+    STATE["settings"]["model"] = {"modelName": model_name}
+    return STATE["settings"]["model"]
+
+
+def set_local_access_settings(folder_paths: list[str]) -> dict[str, Any]:
+    cleaned_paths: list[str] = []
+    for folder_path in folder_paths:
+        cleaned = folder_path.strip()
+        if cleaned and cleaned not in cleaned_paths:
+            cleaned_paths.append(cleaned)
+    STATE["settings"]["localAccess"] = {"folderPaths": cleaned_paths}
+    return STATE["settings"]["localAccess"]
+
+
 def get_current_workspace_id() -> str:
     return STATE["current_workspace_id"]
 

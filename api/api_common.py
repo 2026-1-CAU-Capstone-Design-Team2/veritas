@@ -127,15 +127,10 @@ STATE: dict[str, Any] = {
     },
     "settings": {
         "model": {
-            "modelId": "veritas-balanced",
-            "modelName": "VERITAS Balanced",
-            "temperature": 0.2,
-            "maxOutputTokens": 1600,
+            "modelName": "0.8B",
         },
-        "defaultWorkspace": {
-            "workspaceId": "ws_001",
-            "workspaceName": "기후 정책 검증 워크스페이스",
-            "openOnLaunch": True,
+        "localAccess": {
+            "folderPaths": [],
         },
     },
 }

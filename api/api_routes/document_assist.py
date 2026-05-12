@@ -17,7 +17,7 @@ async def document_assist_analyze(payload: DocumentAssistAnalyzeRequest) -> dict
 
 @router.post("/api/v1/document-assist/chat/messages")
 async def document_assist_chat(payload: DocumentAssistChatRequest) -> dict[str, Any]:
-    return document_assist_service.send_chat_message(payload.workspaceId, payload.message)
+    return document_assist_service.send_chat_message(payload.workspaceId, payload.message, payload.mode)
 
 
 @router.get("/api/v1/document-assist/sessions/{sessionId}")

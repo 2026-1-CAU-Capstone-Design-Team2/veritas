@@ -31,6 +31,7 @@ def list_verify_results(
                 "title": item["title"],
                 "matchRate": item["matchRate"],
                 "level": item["level"],
+                "issues": item.get("issues", []),
             }
             for item in page_items
         ],
@@ -43,4 +44,11 @@ def get_verify_detail(doc_id: str) -> dict[str, Any]:
     item = repo.find_verify_result(doc_id)
     if item is None:
         raise HTTPException(status_code=404, detail=f"document '{doc_id}' not found")
-    return {"docId": item["docId"], "title": item["title"], "issues": item["issues"]}
+    return {
+        "docId": item["docId"],
+        "workspaceId": item["workspaceId"],
+        "title": item["title"],
+        "matchRate": item["matchRate"],
+        "level": item["level"],
+        "issues": item["issues"],
+    }

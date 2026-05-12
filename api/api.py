@@ -16,6 +16,7 @@ from .api_routes import (
     feedback_router,
     frontend_router,
     research_router,
+    settings_router,
     system_router,
     verify_router,
     workspaces_router,
@@ -69,6 +70,7 @@ app.include_router(system_router)
 app.include_router(dashboard_router)
 app.include_router(workspaces_router)
 app.include_router(research_router)
+app.include_router(settings_router)
 app.include_router(verify_router)
 app.include_router(draft_chat_router)
 app.include_router(documents_router)

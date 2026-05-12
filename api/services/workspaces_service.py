@@ -13,7 +13,13 @@ def list_workspaces(status: str | None) -> dict[str, list[dict[str, Any]]]:
         items = [item for item in items if item["status"] == status]
     return {
         "items": [
-            {"workspaceId": item["workspaceId"], "name": item["name"], "detail": item["detail"]}
+            {
+                "workspaceId": item["workspaceId"],
+                "name": item["name"],
+                "detail": item["detail"],
+                "status": item.get("status"),
+                "lastWorkedAt": item.get("lastWorkedAt"),
+            }
             for item in items
         ]
     }

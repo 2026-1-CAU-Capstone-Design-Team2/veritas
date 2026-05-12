@@ -21,6 +21,7 @@ class DraftRegenerateRequest(BaseModel):
 class ChatMessageRequest(BaseModel):
     workspaceId: str
     message: str
+    mode: Literal["research", "rag"] = "research"
 
 
 class FeedbackAnalyzeRequest(BaseModel):
@@ -42,6 +43,15 @@ class DocumentAssistAnalyzeRequest(BaseModel):
 class DocumentAssistChatRequest(BaseModel):
     workspaceId: str
     message: str
+    mode: Literal["research", "rag"] = "research"
+
+
+class SettingsModelRequest(BaseModel):
+    modelName: Literal["0.8B", "9B"]
+
+
+class SettingsLocalAccessRequest(BaseModel):
+    folderPaths: list[str] = Field(default_factory=list)
 
 
 class TypingContextRequest(BaseModel):

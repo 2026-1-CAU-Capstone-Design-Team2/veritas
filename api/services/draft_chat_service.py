@@ -37,7 +37,7 @@ def regenerate_draft(draft_id: str, prompt: str) -> dict[str, Any]:
     return {"draftId": draft_id, "content": draft["content"]}
 
 
-def send_chat_message(workspace_id: str, message: str) -> dict[str, str]:
+def send_chat_message(workspace_id: str, message: str, mode: str = "research") -> dict[str, str]:
     workspace = repo.find_workspace(workspace_id)
     if workspace is None:
         raise HTTPException(status_code=404, detail=f"workspace '{workspace_id}' not found")
@@ -46,9 +46,12 @@ def send_chat_message(workspace_id: str, message: str) -> dict[str, str]:
     session_id = f"session_{workspace_id}"
     history = repo.get_or_create_chat_history(session_id)
     history.append({"role": "user", "text": message})
-    assistant_text = f"{workspace['name']} 기준으로 개요, 리스크, 실행 권고 순서로 정리하겠습니다."
+    if mode == "rag":
+        assistant_text = f"{workspace['name']}의 저장 문서와 검증 결과를 기준으로 근거를 찾아 답변하겠습니다."
+    else:
+        assistant_text = f"{workspace['name']} 기준으로 새 조사 방향, 확인할 출처, 정리 방식을 제안하겠습니다."
     history.append({"role": "assistant", "text": assistant_text})
-    return {"messageId": message_id, "assistant": assistant_text}
+    return {"messageId": message_id, "assistant": assistant_text, "mode": mode}
 
 
 def get_chat_history(session_id: str) -> dict[str, Any]:

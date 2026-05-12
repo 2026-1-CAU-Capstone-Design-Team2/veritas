@@ -41,29 +41,40 @@ def analyze_document(workspace_id: str, text: str, cursor: int | None) -> dict[s
         "analysis": "문서 분석 텍스트, 추천 문장, 경고, 수정 제안을 mock 결과로 생성했습니다.",
         "warnings": warnings or ["치명적 경고는 감지되지 않았습니다."],
         "recommendations": recommendations,
+        "suggestions": [
+            {"category": "경고", "text": warning, "tone": "warning"}
+            for warning in (warnings or ["치명적 경고는 감지되지 않았습니다."])
+        ]
+        + [
+            {"category": "추천", "text": recommendation, "tone": "idle"}
+            for recommendation in recommendations
+        ],
         "updatedAt": utc_now_iso(),
     }
     repo.save_document_assist_session(session_id, payload)
     return payload
 
 
-def send_chat_message(workspace_id: str, message: str) -> dict[str, Any]:
+def send_chat_message(workspace_id: str, message: str, mode: str = "research") -> dict[str, Any]:
     workspace = repo.find_workspace(workspace_id)
     if workspace is None:
         raise HTTPException(status_code=404, detail=f"workspace '{workspace_id}' not found")
 
     lowered = message.lower()
-    if "보고" in lowered or "브리프" in lowered:
-        reply = "경영진 보고용으로 개요, 핵심 리스크, 실행 권고 순서의 초안을 정리하겠습니다."
+    if mode == "rag":
+        reply = "RAG 모드: 현재 워크스페이스의 저장 문서와 검증 결과를 기준으로 답변하겠습니다."
+    elif "보고" in lowered or "브리프" in lowered:
+        reply = "자료조사 모드: 보고용 개요, 핵심 리스크, 실행 권고 순서로 초안을 정리하겠습니다."
     elif "메일" in lowered or "안내" in lowered or "공지" in lowered:
-        reply = "수신자 중심의 짧고 명확한 문장으로 바로 보낼 수 있는 초안을 작성하겠습니다."
+        reply = "자료조사 모드: 수신자 중심의 짧고 명확한 문장으로 바로 보낼 수 있는 초안을 작성하겠습니다."
     else:
-        reply = "선택한 검증 완료 워크스페이스의 맥락을 반영해 자연스럽게 이어서 작성하겠습니다."
+        reply = "자료조사 모드: 새로 확인할 쟁점과 출처 후보를 먼저 정리한 뒤 답변하겠습니다."
 
     return {
         "messageId": new_id("msg"),
         "workspaceId": workspace_id,
         "workspaceName": workspace["name"],
+        "mode": mode,
         "reply": reply,
     }
 

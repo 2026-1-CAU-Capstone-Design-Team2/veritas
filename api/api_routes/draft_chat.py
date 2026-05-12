@@ -22,7 +22,7 @@ async def draft_regenerate(draftId: str, payload: DraftRegenerateRequest) -> dic
 
 @router.post("/api/v1/chat/messages")
 async def chat_send(payload: ChatMessageRequest) -> dict[str, str]:
-    return draft_chat_service.send_chat_message(payload.workspaceId, payload.message)
+    return draft_chat_service.send_chat_message(payload.workspaceId, payload.message, payload.mode)
 
 
 @router.get("/api/v1/chat/sessions/{sessionId}/messages")
