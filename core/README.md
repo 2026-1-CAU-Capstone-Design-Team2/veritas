@@ -1,5 +1,7 @@
 # core/
 
+> RAG prompt update: RAG-specific prompts now belong to this directory in `core/prompts.py`: `RAG_SYSTEM_PROMPT`, `QUERY_REWRITE_SYSTEM_PROMPT`, `QUERY_REWRITE_PROMPT`, `RAG_USER_PROMPT_TEMPLATE`, `RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE`, `TOOL_CHAT_SYSTEM_PROMPT`, and `TOOL_CHAT_USER_PROMPT_TEMPLATE`. `core/` still remains dependency-free and only owns shared data models and prompt templates.
+
 **역할**: 프로젝트 전역에서 사용되는 공유 데이터 모델 및 프롬프트 템플릿 정의
 
 ---

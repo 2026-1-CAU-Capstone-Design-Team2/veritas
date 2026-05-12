@@ -2,13 +2,13 @@
   "type": "function",
   "function": {
     "name": "web_search",
-    "description": "Search the web and return relevant search results.",
+    "description": "Search the web with DuckDuckGo and return organic results. Empty result sets are returned as successful results=[] responses. No API key or self-hosted search instance is required.",
     "parameters": {
       "type": "object",
       "properties": {
         "query": {
           "type": "string",
-          "description": "The search query."
+          "description": "The search query. Pass the planner's query exactly; the tool does not rewrite or expand it."
         },
         "num_results": {
           "type": "integer",

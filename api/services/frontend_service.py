@@ -3,10 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 from ..repositories import state_repository as repo
+from . import workspaces_service
 
 
 def get_bootstrap() -> dict[str, Any]:
     ui_state = repo.get_ui_state()
+    workspaces = workspaces_service.list_workspaces(None)["items"]
     return {
         "defaultRoute": ui_state.get("route", "dashboard"),
         "menus": [
@@ -20,7 +22,7 @@ def get_bootstrap() -> dict[str, Any]:
             "feedback",
             "settings",
         ],
-        "workspaces": repo.list_workspaces(),
+        "workspaces": workspaces,
         "currentWorkspaceId": repo.get_current_workspace_id(),
         "settings": repo.get_settings(),
     }
@@ -61,7 +63,7 @@ def hide_prediction_popup(prediction_id: str, reason: str) -> dict[str, Any]:
 
 def apply_prediction_popup(prediction_id: str) -> dict[str, Any]:
     repo.set_ui_prediction_popup({"visible": False, "predictionId": prediction_id, "applied": True})
-    return {"predictionId": prediction_id, "applied": True, "newCursor": 266}
+    return {"predictionId": prediction_id, "applied": True}
 
 
 def get_ui_snapshot(route: str | None) -> dict[str, Any]:

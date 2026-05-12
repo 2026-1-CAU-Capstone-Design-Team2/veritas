@@ -1,5 +1,15 @@
 # llm/
 
+## 최신 서버 포트 규칙
+
+- 채팅/생성 LLM 서버는 기본 `127.0.0.1:8080`입니다.
+- embedding 서버는 기본 `127.0.0.1:8081`입니다.
+- API runtime은 `VERITAS_EMBED_PORT`가 없으면 8081을 사용합니다.
+- CLI `main.py`도 `--embed-port` 기본값을 8081로 사용합니다.
+- `LLMClient` 자체는 `embed_host`/`embed_port`를 명시하지 않으면 chat endpoint를 embedding endpoint로 재사용할 수 있지만, VERITAS API/CLI 진입점은 분리 서버 구성을 기본으로 넘깁니다.
+
+> Tool-calling update: multi-turn RAG chat uses a two-step path: `LLMClient.collect_tool_outputs(...)` lets the model decide whether to call `rag`, then the final answer is generated through normal `LLMClient.ask(..., stream=True)` without tools. The model decides from the schema; no regex-based user-prompt gating is part of the LLM layer.
+
 **역할**: LLM(Large Language Model) 백엔드와의 통신을 담당하는 클라이언트 모듈
 
 ---

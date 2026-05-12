@@ -1,0 +1,22 @@
+{
+  "type": "function",
+  "function": {
+    "name": "rag_search",
+    "description": "Search the indexed local research corpus only when the user explicitly asks to use saved/indexed/local documents, previous AutoSurvey outputs, collected sources, summaries, final reports, source notes, or document-grounded evidence. Do not use this for ordinary conceptual questions, code/design advice, general explanations, greetings, identity questions, current date/time, or fresh web research.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "A standalone search query for the indexed local corpus. Preserve the user's exact topic and scope. Do not add arXiv, definition, paper, conference, or year modifiers unless they were part of the user's local-corpus request."
+        },
+        "use_history": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether to use recent chat history to rewrite the query before retrieval. Set true only when the current question explicitly depends on previous turns."
+        }
+      },
+      "required": ["query"]
+    }
+  }
+}

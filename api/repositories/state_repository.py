@@ -25,6 +25,17 @@ def find_workspace(workspace_id: str) -> dict[str, Any] | None:
     return next((item for item in STATE["workspaces"] if item["workspaceId"] == workspace_id), None)
 
 
+def upsert_workspace(workspace: dict[str, Any]) -> None:
+    workspace_id = str(workspace.get("workspaceId") or "").strip()
+    if not workspace_id:
+        return
+    for index, item in enumerate(STATE["workspaces"]):
+        if item.get("workspaceId") == workspace_id:
+            STATE["workspaces"][index] = {**item, **workspace}
+            return
+    STATE["workspaces"].append(workspace)
+
+
 def set_current_workspace(workspace_id: str) -> None:
     workspace = find_workspace(workspace_id)
     STATE["current_workspace_id"] = workspace_id
@@ -61,6 +72,10 @@ def get_document(workspace_id: str) -> dict[str, Any] | None:
     return STATE["documents"].get(workspace_id)
 
 
+def save_document(workspace_id: str, document: dict[str, Any]) -> None:
+    STATE["documents"][workspace_id] = document
+
+
 def save_feedback_file(file_id: str, name: str, content_type: str, text: str = "") -> None:
     STATE["feedback_files"][file_id] = {
         "fileId": file_id,
@@ -78,12 +93,24 @@ def save_feedback_session(analysis_id: str, file_ids: list[str], status: str) ->
     STATE["feedback_sessions"][analysis_id] = {"fileIds": file_ids, "status": status}
 
 
+def save_feedback_result(file_id: str, payload: dict[str, Any]) -> None:
+    STATE["feedback_results"][file_id] = payload
+
+
+def get_feedback_result(file_id: str) -> dict[str, Any] | None:
+    return STATE["feedback_results"].get(file_id)
+
+
 def clear_feedback_session(session_id: str) -> None:
     STATE["feedback_sessions"].pop(session_id, None)
 
 
 def save_prediction_state(key: str, payload: dict[str, Any]) -> None:
     STATE["prediction_state"][key] = payload
+
+
+def get_prediction_state(key: str) -> dict[str, Any] | None:
+    return STATE["prediction_state"].get(key)
 
 
 def save_research_job(job_id: str, job: dict[str, Any]) -> None:

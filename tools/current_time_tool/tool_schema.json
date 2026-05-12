@@ -2,13 +2,13 @@
   "type": "function",
   "function": {
     "name": "current_time",
-    "description": "Return the current local date/time context for time-sensitive planning and query generation.",
+    "description": "Get the current local date and time. Use this for questions about today's date, current time, day of week, or relative dates. Do not use document search or autosurvey for simple date/time questions.",
     "parameters": {
       "type": "object",
       "properties": {
         "timezone": {
           "type": "string",
-          "description": "Optional IANA timezone name (for example, Asia/Seoul). If omitted, local system timezone is used."
+          "description": "Optional IANA timezone name, for example Asia/Seoul. If omitted, the local system timezone is used."
         }
       }
     }

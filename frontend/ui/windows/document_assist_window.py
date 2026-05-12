@@ -791,14 +791,6 @@ class DocumentAssistWindow(QWidget):
 	def on_message_submitted(self, message: str) -> None:
 		self.add_chat_message("나", message)
 		self.messageSubmitted.emit(message)
-		if self.input_bar.mode() == "rag":
-			reply = "RAG 모드: 현재 워크스페이스에 저장된 문서와 검증 결과를 기준으로 근거를 찾아 답변하겠습니다."
-		else:
-			reply = "자료조사 모드: 새로 확인할 쟁점과 출처 후보를 먼저 정리한 뒤 답변하겠습니다."
-		self.add_chat_message(
-			"VERITAS",
-			reply,
-		)
 
 	def on_send_clicked(self) -> None:
 		self.input_bar._emit_send()

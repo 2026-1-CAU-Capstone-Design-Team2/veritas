@@ -3,43 +3,28 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from storage.vector_store import VectorStore
+from core.prompts import (
+    QUERY_REWRITE_PROMPT,
+    QUERY_REWRITE_SYSTEM_PROMPT,
+    RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE,
+    RAG_SYSTEM_PROMPT,
+    RAG_USER_PROMPT_TEMPLATE,
+)
 
-
-RAG_SYSTEM_PROMPT = """You are a helpful research assistant. Answer questions based on the provided research documents.
-
-Rules:
-- Use ONLY information from the provided documents
-- Cite document IDs when referencing specific information following this format: [Document parent_doc_id]
-- If the documents don't contain relevant information, say so clearly
-- Be concise but comprehensive
-"""
-
-QUERY_REWRITE_PROMPT = """Given the conversation history and a follow-up question, rewrite the follow-up question to be a standalone question that captures the full context.
-
-CONVERSATION HISTORY:
-{history}
-
-FOLLOW-UP QUESTION: {question}
-
-Rewrite the follow-up question as a standalone search query. Output ONLY the rewritten query, nothing else."""
-
-RAG_USER_PROMPT_TEMPLATE = """Based on the following research documents, answer the user's question.
-
-DOCUMENTS:
-{context}
-
-RECENT CONVERSATION:
-{history}
-
-USER QUESTION: {question}
-
-Provide a clear, well-structured answer based on the documents above."""
+if TYPE_CHECKING:
+    from storage.vector_store import VectorStore
 
 
 class RAGService:
+    """Service-owned RAG implementation.
+
+    This class owns indexing, retrieval, query rewriting, document formatting,
+    and document-grounded answer generation. LLM-facing tool schemas should wrap
+    this service instead of owning RAG state themselves.
+    """
+
     def __init__(
         self,
         llm,
@@ -50,7 +35,7 @@ class RAGService:
         max_embed_chars: int = 900,
         chunk_overlap_chars: int = 120,
         max_history_turns: int = 3,
-    ):
+    ) -> None:
         self.llm = llm
         self.vector_store = vector_store
         self.n_results = n_results
@@ -59,6 +44,12 @@ class RAGService:
         self.chunk_overlap_chars = chunk_overlap_chars
         self.max_history_turns = max_history_turns
         self.chat_history: list[tuple[str, str]] = []
+
+    def clear_index(self) -> None:
+        self.vector_store.clear()
+
+    def get_document_count(self) -> int:
+        return self.vector_store.get_document_count()
 
     def _format_recent_history(self) -> str:
         if not self.chat_history:
@@ -134,9 +125,6 @@ class RAGService:
             contents.append(chunk)
             metadatas.append(chunk_metadata)
 
-    def clear_index(self) -> None:
-        self.vector_store.clear()
-
     def index_autosurvey_output(self, summary_dir: Path, index_path: Path | None = None, clear_first: bool = True) -> int:
         if clear_first:
             self.clear_index()
@@ -209,7 +197,9 @@ class RAGService:
 
         md_files = sorted(
             p for p in base_dir.rglob("*.md")
-            if p.is_file() and "chromadb" not in p.parts and not any(part.startswith(".") for part in p.parts)
+            if p.is_file()
+            and "chromadb" not in p.parts
+            and not any(part.startswith(".") for part in p.parts)
         )
 
         if not md_files:
@@ -252,7 +242,6 @@ class RAGService:
 
         print(f"[rag] Generating embeddings for {len(doc_ids)} chunks...")
         embeddings = self.llm.embed_batch(contents)
-
         self.vector_store.add_documents(
             doc_ids=doc_ids,
             contents=contents,
@@ -269,11 +258,12 @@ class RAGService:
 
         history = self._format_recent_history()
         rewrite_prompt = QUERY_REWRITE_PROMPT.format(history=history, question=question)
-
         rewritten = self.llm.ask(
-            "You are a helpful assistant that rewrites questions.",
+            QUERY_REWRITE_SYSTEM_PROMPT,
             rewrite_prompt,
             reasoning=False,
+            sampling_params={"temperature": 0.0, "top_p": 0.2, "presence_penalty": 0.0},
+            extra_sampling_params={"top_k": 5, "min_p": 0.0, "repeat_penalty": 1.0},
         ).strip()
 
         print(f"[rag] Rewritten query: {rewritten}")
@@ -288,40 +278,115 @@ class RAGService:
             n_results=self.n_results,
         )
 
-    def answer(self, question: str, stream: bool = False) -> str:
-        retrieved = self.retrieve(question)
-        history = self._format_recent_history()
+    def _strip_weak_evidence_sections(self, content: str) -> str:
+        """Remove metadata-like sections that are useful for retrieval but weak as answer evidence."""
+        text = str(content or "").replace("\r\n", "\n")
+        lines = text.splitlines()
+        kept: list[str] = []
+        skip_section = False
 
-        if not retrieved:
-            return self.llm.ask(
-                RAG_SYSTEM_PROMPT,
-                (
-                    "No relevant documents found.\n\n"
-                    f"RECENT CONVERSATION:\n{history}\n\n"
-                    f"USER QUESTION: {question}\n\n"
-                    "Please indicate that you don't have enough information."
-                ),
-                reasoning=False,
-            )
+        weak_headings = {
+            "keywords",
+            "reliability notes",
+            "source notes",
+        }
 
-        context_parts: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            lower = stripped.lower()
+
+            if lower.startswith("## "):
+                heading = lower[3:].strip().strip(":")
+                skip_section = heading in weak_headings
+                if skip_section:
+                    continue
+            elif lower.startswith("# "):
+                skip_section = False
+
+            if skip_section:
+                continue
+
+            if lower.startswith("- search query:"):
+                continue
+
+            kept.append(line)
+
+        sanitized = "\n".join(kept)
+        sanitized = re.sub(r"\n{3,}", "\n\n", sanitized).strip()
+        return sanitized
+
+    def _has_substantive_context(self, content: str) -> bool:
+        text = str(content or "").strip()
+        if not text:
+            return False
+        # Headers and separators alone are not substantive evidence.
+        evidence_lines = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("[") and stripped.endswith("]"):
+                continue
+            if re.fullmatch(r"[-_=*]{3,}", stripped):
+                continue
+            if stripped.startswith("#"):
+                continue
+            evidence_lines.append(stripped)
+        return len(" ".join(evidence_lines)) >= 80
+
+    def format_retrieved_documents(self, documents: list[Any]) -> str:
+        parts: list[str] = []
         total_chars = 0
 
-        for doc in retrieved:
-            label = doc["metadata"].get("parent_doc_id", doc["doc_id"])
-            file_path = doc["metadata"].get("file_path", "")
+        for item in documents:
+            if not isinstance(item, dict):
+                continue
+
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            label = metadata.get("parent_doc_id", item.get("doc_id", "unknown"))
+            file_path = metadata.get("file_path", "")
             header = f"[Document {label}]"
             if file_path:
                 header += f" ({file_path})"
 
-            doc_text = f"{header}\n{doc['content']}"
+            raw_content = str(item.get("content") or "").strip()
+            content = self._strip_weak_evidence_sections(raw_content)
+            if not self._has_substantive_context(content):
+                continue
+
+            doc_text = f"{header}\n{content}"
             if total_chars + len(doc_text) > self.max_context_chars:
                 break
 
-            context_parts.append(doc_text)
+            parts.append(doc_text)
             total_chars += len(doc_text)
 
-        context = "\n\n---\n\n".join(context_parts)
+        return "\n\n---\n\n".join(parts)
+
+    def answer(self, question: str, stream: bool = False, use_history: bool = True) -> str:
+        retrieved = self.retrieve(question, use_history=use_history)
+        history = self._format_recent_history()
+
+        if not retrieved:
+            answer = self.llm.ask(
+                RAG_SYSTEM_PROMPT,
+                RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE.format(history=history, question=question),
+                reasoning=False,
+                stream=stream,
+                stream_label="rag",
+            )
+            return answer
+
+        context = self.format_retrieved_documents(retrieved)
+        if not context.strip():
+            answer = self.llm.ask(
+                RAG_SYSTEM_PROMPT,
+                RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE.format(history=history, question=question),
+                reasoning=False,
+                stream=stream,
+                stream_label="rag",
+            )
+            return answer
 
         user_prompt = RAG_USER_PROMPT_TEMPLATE.format(
             context=context,
@@ -337,24 +402,5 @@ class RAGService:
             stream_label="rag",
         )
 
-    def chat_loop(self) -> None:
-        doc_count = self.vector_store.get_document_count()
-        print(f"\n[RAG Chat] {doc_count} chunks indexed. Type 'exit' to quit.\n")
 
-        while True:
-            try:
-                question = input("Question: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\n[RAG Chat] Goodbye!")
-                break
-
-            if not question:
-                continue
-            if question.lower() in ("exit", "quit", "q"):
-                print("[RAG Chat] Goodbye!")
-                break
-
-            print("\n[RAG Chat] Searching and generating answer...\n")
-            answer = self.answer(question, stream=True)
-            self.chat_history.append((question, answer))
-            print()
+__all__ = ["RAGService"]

@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
-from ..api_common import STATE
+from ..api_common import STATE, load_bootstrap_state, switch_workspace
 
 
 class NavButton(QPushButton):
@@ -123,7 +123,9 @@ class Sidebar(QFrame):
 		self.setObjectName("Sidebar")
 		self._buttons: dict[str, NavButton] = {}
 		self._compact = False
+		self._ensure_workspace_state()
 		self._workspace_names = [item["name"] for item in STATE["workspaces"]]
+		self._workspace_ids = [item["workspaceId"] for item in STATE["workspaces"]]
 		current_workspace_id = STATE["current_workspace_id"]
 		self._current_workspace_index = next(
 			(
@@ -239,6 +241,7 @@ class Sidebar(QFrame):
 			button.setChecked(key == route)
 
 	def set_current_workspace(self, workspace_name: str) -> None:
+		self._reload_workspaces()
 		if workspace_name not in self._workspace_names:
 			return
 		self._current_workspace_index = self._workspace_names.index(workspace_name)
@@ -260,9 +263,48 @@ class Sidebar(QFrame):
 		self._toggle_btn.setIconSize(QSize(14, 14))
 
 	def _refresh_workspace_footer(self) -> None:
+		if not self._workspace_names:
+			self._workspace_names = ["default"]
+			self._workspace_ids = ["default"]
+			self._current_workspace_index = 0
+		self._current_workspace_index = min(self._current_workspace_index, len(self._workspace_names) - 1)
 		self._workspace_desc.setText(self._workspace_names[self._current_workspace_index])
 
+	def _ensure_workspace_state(self) -> None:
+		workspaces = STATE.get("workspaces")
+		if isinstance(workspaces, list) and workspaces:
+			return
+		STATE["workspaces"] = [
+			{
+				"workspaceId": "default",
+				"name": "default",
+				"detail": "기본 워크스페이스",
+				"status": "active",
+			}
+		]
+		STATE["current_workspace_id"] = "default"
+
+	def _reload_workspaces(self) -> None:
+		try:
+			load_bootstrap_state()
+		except Exception:
+			pass
+		self._ensure_workspace_state()
+		self._workspace_names = [item["name"] for item in STATE["workspaces"]]
+		self._workspace_ids = [item["workspaceId"] for item in STATE["workspaces"]]
+		current_workspace_id = STATE["current_workspace_id"]
+		self._current_workspace_index = next(
+			(
+				index
+				for index, workspace_id in enumerate(self._workspace_ids)
+				if workspace_id == current_workspace_id
+			),
+			0,
+		)
+		self._refresh_workspace_footer()
+
 	def _open_workspace_dialog(self) -> None:
+		self._reload_workspaces()
 		dialog = QDialog(self)
 		dialog.setWindowTitle("워크스페이스 전환")
 		dialog.setModal(True)
@@ -302,6 +344,7 @@ class Sidebar(QFrame):
 
 		if dialog.exec() == QDialog.Accepted:
 			self._current_workspace_index = selector.currentIndex()
-			current = self._workspace_names[self._current_workspace_index]
+			workspace_id = self._workspace_ids[self._current_workspace_index]
+			current = switch_workspace(workspace_id)
 			self._refresh_workspace_footer()
 			self.workspaceChanged.emit(current)

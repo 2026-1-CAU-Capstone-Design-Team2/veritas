@@ -1,5 +1,7 @@
 # storage/
 
+> RAG storage update: `VectorStore` is now consumed by `tools/rag_tool/RAGTool` rather than a service-owned RAG implementation. `storage/` still only owns persistence and vector retrieval; prompt construction, chat behavior, and tool exposure belong outside this layer.
+
 **역할**: 데이터 영속성 계층 - 벡터 저장소 및 기타 데이터 저장 기능 제공
 
 ---
@@ -151,14 +153,14 @@ def delete_documents(self, doc_ids: list[str]) -> None:
 
 ---
 
-## 🔌 RAGService와의 연동
+## 🔌 RAGTool과의 연동
 
-`VectorStore`는 `services/rag_service.py`의 `RAGService`와 함께 사용됩니다:
+`VectorStore`는 `tools/rag_tool`의 `RAGTool`과 함께 사용됩니다. `services.rag_service.RAGService`는 기존 import 호환을 위한 alias입니다:
 
 ```python
 from llm.llama_server_llm import LLMClient
 from storage.vector_store import VectorStore
-from services.rag_service import RAGService
+from tools.rag_tool import RAGTool
 
 # 초기화
 llm = LLMClient(host="127.0.0.1", port=8080)
@@ -167,14 +169,14 @@ vector_store = VectorStore(
     collection_name="research_docs",
 )
 
-# RAGService 생성
-rag = RAGService(
+# RAGTool 생성
+rag = RAGTool(
     llm=llm,
     vector_store=vector_store,
     n_results=5,
 )
 
-# 문서 인덱싱 (RAGService가 청킹 + 임베딩 처리)
+# 문서 인덱싱 (RAGTool이 청킹 + 임베딩 처리)
 rag.index_autosurvey_output(summary_dir=Path("./output/summary"))
 
 # 검색 및 응답
@@ -223,7 +225,7 @@ storage/
 └── vector_store.py ──▶ chromadb
 
 사용처:
-├── services/rag_service.py ──▶ storage/VectorStore
+├── tools/rag_tool.RAGTool ──▶ storage/VectorStore
 └── main.py ──▶ storage/VectorStore (초기화)
 ```
 

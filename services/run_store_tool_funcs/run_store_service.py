@@ -3,6 +3,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from core.models import DocRecord
 from services.run_store_tool_funcs.path_manager import RunPathManager
@@ -55,7 +56,7 @@ class RunStoreService:
     def save_text(self, path: str | Path, content: str) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path.write_text(self.sanitize_text(content), encoding="utf-8", errors="replace")
 
     def save_json(self, path: str | Path, payload: dict) -> None:
         path = Path(path)
@@ -68,7 +69,7 @@ class RunStoreService:
     def load_request(self) -> str:
         if not self.paths.request_path.exists():
             raise FileNotFoundError(f"Missing request file: {self.paths.request_path}")
-        return self.paths.request_path.read_text(encoding="utf-8").strip()
+        return self.read_text_file(str(self.paths.request_path)).strip()
 
     def save_grounding(self, payload: dict[str, Any]) -> None:
         self.save_json(self.paths.grounding_path, payload)
@@ -76,7 +77,7 @@ class RunStoreService:
     def load_grounding(self) -> dict[str, Any]:
         if not self.paths.grounding_path.exists():
             raise FileNotFoundError(f"Missing grounding file: {self.paths.grounding_path}")
-        return json.loads(self.paths.grounding_path.read_text(encoding="utf-8"))
+        return json.loads(self.read_text_file(str(self.paths.grounding_path)))
 
     def grounding_exists(self) -> bool:
         return self.paths.grounding_path.exists()
@@ -87,7 +88,7 @@ class RunStoreService:
     def load_plan(self) -> dict:
         if not self.paths.plan_path.exists():
             raise FileNotFoundError(f"Missing plan file: {self.paths.plan_path}")
-        return json.loads(self.paths.plan_path.read_text(encoding="utf-8"))
+        return json.loads(self.read_text_file(str(self.paths.plan_path)))
 
     def plan_exists(self) -> bool:
         return self.paths.plan_path.exists()
@@ -106,7 +107,7 @@ class RunStoreService:
             return {"used_queries": [], "cycles_executed": 0}
 
         try:
-            payload = json.loads(self.paths.query_state_path.read_text(encoding="utf-8"))
+            payload = json.loads(self.read_text_file(str(self.paths.query_state_path)))
         except Exception:
             return {"used_queries": [], "cycles_executed": 0}
 
@@ -124,7 +125,7 @@ class RunStoreService:
         if not self.paths.plan_history_path.exists():
             return []
         try:
-            payload = json.loads(self.paths.plan_history_path.read_text(encoding="utf-8"))
+            payload = json.loads(self.read_text_file(str(self.paths.plan_history_path)))
             if isinstance(payload, dict):
                 entries = payload.get("entries", [])
             else:
@@ -166,7 +167,7 @@ class RunStoreService:
             return []
 
         try:
-            payload = json.loads(self.paths.index_path.read_text(encoding="utf-8"))
+            payload = json.loads(self.read_text_file(str(self.paths.index_path)))
             records = self.serializer.deserialize_records(payload.get("records", []))
         except Exception:
             return []
@@ -197,7 +198,7 @@ class RunStoreService:
             path = Path(record.text_path)
             if path.exists() and path.stat().st_size > 0:
                 try:
-                    texts.append(path.read_text(encoding="utf-8"))
+                    texts.append(self.read_text_file(str(path)))
                 except Exception:
                     pass
         return texts
@@ -228,8 +229,25 @@ class RunStoreService:
             if Path(r.summary_path).exists() and Path(r.summary_path).stat().st_size > 0
         ]
 
+    def sanitize_text(self, content: Any) -> str:
+        text = str(content or "")
+        text = text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        text = text.replace("\x00", "")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        return text
+
     def read_text_file(self, path_str: str) -> str:
-        return Path(path_str).read_text(encoding="utf-8")
+        path = Path(path_str)
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except UnicodeError:
+            raw = path.read_bytes()
+            for encoding in ("utf-8-sig", "cp949", "euc-kr", "latin-1"):
+                try:
+                    return raw.decode(encoding, errors="replace")
+                except Exception:
+                    continue
+            return raw.decode("utf-8", errors="replace")
 
     def get_batch_summary_path(self, batch_index: int):
         return self.paths.batch_path(batch_index)
@@ -265,6 +283,70 @@ class RunStoreService:
         text = re.sub(r"\s+", " ", text)
         return text.strip()
 
+    def normalize_title(self, title: str) -> str:
+        text = str(title or "").lower()
+        text = re.sub(r"\[[^\]]+\]", " ", text)
+        text = re.sub(r"\([^)]*\)", " ", text)
+        text = re.sub(r"\s+[-–—|:]\s+.*$", "", text)
+        text = re.sub(r"[^a-z0-9가-힣]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def canonicalize_url(self, url: str) -> str:
+        text = str(url or "").strip()
+        if not text:
+            return ""
+
+        try:
+            parsed = urlparse(text)
+        except Exception:
+            return text
+
+        scheme = (parsed.scheme or "https").lower()
+        host = parsed.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+
+        path = re.sub(r"/{2,}", "/", parsed.path or "/")
+        path = path.rstrip("/") or "/"
+
+        arxiv_id = self.extract_arxiv_id(text)
+        if arxiv_id:
+            return f"https://arxiv.org/html/{arxiv_id}"
+
+        ignored_query_keys = {
+            "utm_source",
+            "utm_medium",
+            "utm_campaign",
+            "utm_term",
+            "utm_content",
+            "fbclid",
+            "gclid",
+        }
+        query_pairs = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=False)
+            if key.lower() not in ignored_query_keys
+        ]
+        query = urlencode(sorted(query_pairs))
+
+        return urlunparse((scheme, host, path, "", query, ""))
+
+    def extract_arxiv_id(self, text: str) -> str:
+        value = str(text or "")
+        match = re.search(
+            r"arxiv\.org/(?:abs|html|pdf)/([0-9]{4}\.[0-9]{4,5})(?:v\d+)?",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return match.group(1)
+
+        match = re.search(r"\barxiv\s*:\s*([0-9]{4}\.[0-9]{4,5})(?:v\d+)?\b", value, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+        return ""
+
     def jaccard_similarity(self, a: str, b: str) -> float:
         sa = set(self.normalize_text(a).split())
         sb = set(self.normalize_text(b).split())
@@ -272,27 +354,82 @@ class RunStoreService:
             return 0.0
         return len(sa & sb) / len(sa | sb)
 
-    def find_duplicate(self, fetched_text: str, threshold: float = 0.82) -> tuple[bool, float, str | None]:
-        records = self.load_records()
-        text_cache = self.load_text_cache()
+    def find_duplicate(
+        self,
+        fetched_text: str,
+        threshold: float = 0.82,
+        *,
+        url: str = "",
+        final_url: str = "",
+        title: str = "",
+    ) -> tuple[bool, float, str | None]:
+        kept_records = [r for r in self.load_records() if r.duplicate_of is None]
+
+        fetched_urls = {
+            self.canonicalize_url(url),
+            self.canonicalize_url(final_url),
+        }
+        fetched_urls.discard("")
+
+        fetched_arxiv_id = (
+            self.extract_arxiv_id(url)
+            or self.extract_arxiv_id(final_url)
+            or self.extract_arxiv_id(fetched_text[:4000])
+        )
+        fetched_title = self.normalize_title(title)
 
         best = 0.0
-        matched_index: int | None = None
+        matched_doc_id: str | None = None
 
-        for idx, old_text in enumerate(text_cache):
+        for record in kept_records:
+            record_urls = {
+                self.canonicalize_url(record.url),
+                self.canonicalize_url(record.final_url),
+            }
+            record_urls.discard("")
+
+            if fetched_urls and record_urls and fetched_urls & record_urls:
+                return True, 1.0, record.doc_id
+
+            record_arxiv_id = (
+                self.extract_arxiv_id(record.url)
+                or self.extract_arxiv_id(record.final_url)
+            )
+            if fetched_arxiv_id and record_arxiv_id and fetched_arxiv_id == record_arxiv_id:
+                return True, 1.0, record.doc_id
+
+            record_title = self.normalize_title(record.title)
+            if fetched_title and record_title:
+                title_score = self.jaccard_similarity(fetched_title, record_title)
+                if title_score > best:
+                    best = title_score
+                if title_score >= 0.92 and min(len(fetched_title), len(record_title)) >= 24:
+                    matched_doc_id = record.doc_id
+                    break
+
+            old_text = ""
+            if record.text_path:
+                path = Path(record.text_path)
+                if path.exists() and path.stat().st_size > 0:
+                    try:
+                        old_text = self.read_text_file(str(path))
+                    except Exception:
+                        old_text = ""
+
+            if not old_text:
+                continue
+
             score = self.jaccard_similarity(fetched_text[:6000], old_text[:6000])
             if score > best:
                 best = score
             if score >= threshold:
-                matched_index = idx
+                matched_doc_id = record.doc_id
                 break
 
-        if matched_index is None:
+        if matched_doc_id is None:
             return False, best, None
 
-        kept_records = [r for r in records if r.duplicate_of is None]
-        duplicate_of = kept_records[matched_index].doc_id if matched_index < len(kept_records) else None
-        return True, best, duplicate_of
+        return True, best, matched_doc_id
 
     def write_fetch_error_note(self, doc_id: str, url: str, error: str) -> None:
         self.save_text(
@@ -352,6 +489,7 @@ class RunStoreService:
         search_query: str,
         html: str,
         text: str,
+        content_type: str = "",
     ) -> None:
         records = self.load_records()
         html_path = self.paths.raw_html_dir / f"{doc_id}.html"

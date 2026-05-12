@@ -18,7 +18,9 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
+from ..api_common import ApiError, current_workspace_id
 from ..components.cards import CardWidget
+from ..controllers import AgentController
 from ..components.stepper import WorkflowStepper
 from .pages.dashboard_page import DashboardPage
 from .pages.document_page import DocumentPage
@@ -171,6 +173,8 @@ class MainWindow(QMainWindow):
 		shell.addWidget(center_panel, 1)
 
 		self.document_assist_window = DocumentAssistWindow(self)
+		self._agent_controller = AgentController()
+		self.document_assist_window.messageSubmitted.connect(self._send_assist_window_message)
 		self.document_assist_window.hide()
 
 		self._assist_toggle_shortcut = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
@@ -189,6 +193,18 @@ class MainWindow(QMainWindow):
 			self.document_assist_window.hide()
 			return
 		self.show_document_assist_window()
+
+	def _send_assist_window_message(self, message: str) -> None:
+		mode = self.document_assist_window.input_bar.mode()
+		try:
+			reply = self._agent_controller.send_document_assist_message(
+				current_workspace_id(),
+				message,
+				mode,
+			)
+		except ApiError as e:
+			reply = f"API 요청 실패: {e}"
+		self.document_assist_window.add_chat_message("VERITAS", reply)
 
 	def _on_workspace_changed(self, workspace_name: str) -> None:
 		self.settings_page.set_default_workspace_by_name(workspace_name)
@@ -282,6 +298,11 @@ class MainWindow(QMainWindow):
 
 		self.sidebar.set_active(route)
 		self.pages.setCurrentIndexAnimated(index)
+		current_widget = self.pages.currentWidget()
+		page = current_widget.widget() if isinstance(current_widget, QScrollArea) else current_widget
+		refresh = getattr(page, "refresh", None)
+		if callable(refresh):
+			refresh()
 
 		is_workflow_route = route in self.STEP_ORDER
 		self.stepper.setVisible(is_workflow_route)

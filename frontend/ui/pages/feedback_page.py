@@ -30,12 +30,16 @@ except ImportError:  # pragma: no cover
 
 from ...components.buttons import AppButton
 from ...components.cards import CardWidget
+from ...api_common import ApiError
+from ...controllers import AgentController
 
 
 class FeedbackPage(QWidget):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self._uploaded_files: list[Path] = []
+		self._file_ids: dict[str, str] = {}
+		self._controller = AgentController()
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
@@ -123,10 +127,12 @@ class FeedbackPage(QWidget):
 		if self.file_list.count() > 0 and self.file_list.currentRow() < 0:
 			self.file_list.setCurrentRow(0)
 
+		self._analyze_uploaded_documents([Path(file_path) for file_path in files])
 		self._refresh_stats()
 
 	def _clear_documents(self) -> None:
 		self._uploaded_files.clear()
+		self._file_ids.clear()
 		self.file_list.clear()
 		self.feedback_output.setPlainText("아직 업로드된 문서가 없습니다.")
 		self._refresh_stats()
@@ -136,7 +142,59 @@ class FeedbackPage(QWidget):
 			return
 
 		file_path = self._uploaded_files[row]
-		self.feedback_output.setPlainText(self._build_feedback(file_path))
+		file_id = self._file_ids.get(str(file_path))
+		if not file_id:
+			self.feedback_output.setPlainText(self._build_feedback(file_path))
+			return
+
+		try:
+			result = self._controller.get_feedback_result(file_id)
+			self.feedback_output.setPlainText(self._format_agent_feedback(result))
+		except ApiError as e:
+			self.feedback_output.setPlainText(f"API 요청 실패: {e}")
+
+	def _analyze_uploaded_documents(self, paths: list[Path]) -> None:
+		new_paths = [path for path in paths if str(path) not in self._file_ids]
+		if not new_paths:
+			return
+
+		self.feedback_output.setPlainText("backend agent가 문서를 분석하는 중입니다...")
+		try:
+			uploaded = self._controller.upload_feedback_files(new_paths)
+			file_ids: list[str] = []
+			for path, item in zip(new_paths, uploaded):
+				file_id = str(item.get("fileId") or "")
+				if file_id:
+					self._file_ids[str(path)] = file_id
+					file_ids.append(file_id)
+			if file_ids:
+				self._controller.analyze_feedback(file_ids)
+			if self.file_list.currentRow() >= 0:
+				self._on_file_selected(self.file_list.currentRow())
+		except ApiError as e:
+			self.feedback_output.setPlainText(f"API 요청 실패: {e}")
+
+	def _format_agent_feedback(self, result: dict[str, object]) -> str:
+		name = str(result.get("name") or "")
+		char_count = result.get("charCount", 0)
+		line_count = result.get("lineCount", 0)
+		weak_points = result.get("weakPoints", [])
+		suggestions = result.get("suggestions", [])
+
+		lines = [
+			f"파일명: {name}",
+			f"문서 길이: {char_count}자 / {line_count}줄",
+			"",
+			"[주요 피드백]",
+		]
+		if isinstance(weak_points, list):
+			for index, point in enumerate(weak_points, start=1):
+				lines.append(f"{index}. {point}")
+		lines.extend(["", "[개선 제안]"])
+		if isinstance(suggestions, list):
+			for index, suggestion in enumerate(suggestions, start=1):
+				lines.append(f"{index}. {suggestion}")
+		return "\n".join(lines).strip()
 
 	def _refresh_stats(self) -> None:
 		total = len(self._uploaded_files)

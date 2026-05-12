@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any
 
 from ..api_common import new_id
 from ..repositories import state_repository as repo
+from .agent_runtime import get_runtime
 
 
 def push_typing_context(
@@ -30,18 +30,29 @@ def push_typing_context(
 
 
 async def prediction_event_stream(session_id: str, workspace_id: str) -> Any:
-    payloads = [
-        {"predictionId": new_id("pr"), "text": "다음 문단 제안: 핵심 근거를 먼저 제시하세요.", "confidence": 0.84},
-        {"predictionId": new_id("pr"), "text": "보완 제안: 수치를 한 문장 더 추가하면 설득력이 높아집니다.", "confidence": 0.79},
-    ]
-    for payload in payloads:
-        event = {
-            "sessionId": session_id,
-            "workspaceId": workspace_id,
-            **payload,
-        }
-        yield f"event: prediction\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
-        await asyncio.sleep(0)
+    context = repo.get_prediction_state(session_id) or {}
+    prefix = str(context.get("prefix") or "").strip()
+    suffix = str(context.get("suffix") or "").strip()
+    if not prefix and not suffix:
+        return
+
+    prompt = (
+        "다음 작성 문맥에 자연스럽게 이어질 짧은 문장 또는 문단 하나만 제안해 주세요. "
+        "설명 없이 삽입할 텍스트만 답하세요.\n\n"
+        f"prefix:\n{prefix}\n\nsuffix:\n{suffix}"
+    )
+    text = get_runtime().answer_chat(prompt, mode="research").strip()
+    if not text:
+        return
+
+    event = {
+        "sessionId": session_id,
+        "workspaceId": workspace_id,
+        "predictionId": new_id("pr"),
+        "text": text,
+        "confidence": 0.0,
+    }
+    yield f"event: prediction\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
 def ack_prediction(prediction_id: str, action: str) -> dict[str, str]:

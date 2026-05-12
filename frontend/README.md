@@ -1,5 +1,15 @@
 # VERITAS Frontend Standalone UI Preview
 
+## 최신 통합 동작
+
+- `python -m frontend.main` 실행 시 프론트엔드는 API bootstrap을 먼저 로드하고, API가 없으면 로컬 FastAPI 서버를 백그라운드로 시작합니다.
+- 조사 화면의 `조사 실행` 버튼은 `/api/v1/research/jobs`를 백그라운드 `QThread`에서 호출합니다. AutoSurvey가 오래 걸려도 Qt UI는 응답 없음 상태로 멈추지 않습니다.
+- 조사 결과 영역에는 상태, jobId, finalPath, indexedChunks, 전체 문서 수, 총 소요 시간, `summary/index.json` 기반 문서 제목/링크 목록, final report 요약이 표시됩니다.
+- 문서 화면의 요약본 영역은 `/api/v1/documents/{workspaceId}/summary`를 호출해 최신 AutoSurvey `final.md`를 markdown으로 렌더링합니다.
+- 문서 화면의 수집 문서 영역은 `/api/v1/documents/{workspaceId}/merged`를 호출해 수집된 문서 제목과 링크를 표시합니다.
+- 사이드바의 현재 워크스페이스 전환 dropdown은 API bootstrap/workspace 목록을 다시 읽어 `runs/` 하위 각 조사 폴더를 workspace로 표시합니다.
+- 새 조사를 시작할 때 API가 먼저 term-grounding을 수행해 첫 `grounded_terms` 문자열로 run folder 이름을 정하고, 이후 해당 폴더가 workspace로 선택 가능합니다.
+
 ## 1. 목적
 
 이 README는 `veritas-core/frontend` UI만 단독으로 실행하기 위한 문서입니다.

@@ -6,16 +6,6 @@ from typing import Any
 
 from .registry import ToolRegistry
 
-from .web_search_tool import WebSearchTool
-from .fetch_webpage_tool import FetchWebpageTool
-from .current_time_tool import CurrentTimeTool
-from .term_grounding_tool import TermGroundingTool
-from .query_plan_tool import QueryPlanTool
-from .document_summarize_tool import DocumentSummarizeTool
-from .final_report_tool import FinalReportTool
-
-from services.run_store_tool_funcs import RunStoreService
-
 
 TOOLS_DIR = Path(__file__).resolve().parent
 
@@ -28,7 +18,31 @@ def load_schema(schema_path: str | Path) -> dict[str, Any]:
         return json.load(f)
 
 
-def build_registry(llm, run_root: str | Path, *, batch_size: int = 5, max_context: int = 16384):
+def build_registry(
+    llm,
+    run_root: str | Path,
+    *,
+    batch_size: int = 5,
+    max_context: int = 16384,
+    enable_screen_context: bool = True,
+    screen_interval_sec: float = 5.0,
+    screen_debug_log: bool = False,
+):
+    from services.run_store_tool_funcs import RunStoreService
+    from storage.vector_store import VectorStore
+    from services.rag_service import RAGService
+    from services.screen_tool_funcs import ScreenContextService
+
+    from .current_time_tool import CurrentTimeTool
+    from .document_summarize_tool import DocumentSummarizeTool
+    from .fetch_webpage_tool import FetchWebpageTool
+    from .final_report_tool import FinalReportTool
+    from .query_plan_tool import QueryPlanTool
+    from .rag_tool import RAGSearchTool
+    from .screen_context_tool import ScreenContextTool
+    from .term_grounding_tool import TermGroundingTool
+    from .web_search_tool import WebSearchTool
+
     registry = ToolRegistry()
     run_store_service = RunStoreService(run_root)
 
@@ -85,4 +99,35 @@ def build_registry(llm, run_root: str | Path, *, batch_size: int = 5, max_contex
         )
     )
 
-    return registry, run_store_service
+    rag_service = RAGService(
+        llm=llm,
+        vector_store=VectorStore(
+            persist_dir=Path(run_root) / "chromadb",
+            collection_name="research_docs",
+        ),
+    )
+
+    registry.register(
+        RAGSearchTool(
+            schema=load_schema(TOOLS_DIR / "rag_tool" / "tool_schema.json"),
+            rag_service=rag_service,
+        )
+    )
+
+    if enable_screen_context:
+        try:
+            screen_context_service = ScreenContextService(
+                run_root,
+                interval_sec=screen_interval_sec,
+                console_log=screen_debug_log,
+            )
+            registry.register(
+                ScreenContextTool(
+                    schema=load_schema(TOOLS_DIR / "screen_context_tool" / "tool_schema.json"),
+                    screen_context_service=screen_context_service,
+                )
+            )
+        except Exception as e:
+            print(f"[screen_context][warn] screen context tool disabled: {e}")
+
+    return registry, run_store_service, rag_service

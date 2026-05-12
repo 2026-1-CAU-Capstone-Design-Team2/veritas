@@ -1,5 +1,15 @@
 # services/
 
+## 최신 RAG/문서 표시 동작
+
+- AutoSurvey 완료 후 API runtime은 `RAGService.index_autosurvey_output(summary_dir, index_path)`를 호출해 `summary/doc_*.md`를 chunking하고 embedding server에 batch embedding을 요청합니다.
+- API/CLI 기본 embedding endpoint는 `127.0.0.1:8081/v1/embeddings`입니다.
+- `RunStoreService.index_path`는 `summary/index.json`이며, UI 조사 결과의 문서 제목/링크/문서 수는 이 파일의 records를 기준으로 표시됩니다.
+- `RunStoreService.final_path`는 `final.md`이며, UI 문서 화면의 요약본은 이 markdown 내용을 API가 저장한 workspace document state에서 읽어 표시합니다.
+- API research runtime은 workflow 시작 전에 lightweight term-grounding으로 workspace 이름을 정하고, 곧바로 `runs/<workspace>` 폴더에 `RunStoreService`와 ChromaDB를 생성합니다. Windows에서 열린 `chroma.sqlite3` 때문에 폴더 이동이 실패하지 않도록 pending 폴더 이동을 사용하지 않습니다.
+
+> RAG service update: `services/rag_service.py` owns indexing, retrieval, query rewriting, and document-grounded answer generation. `tools/rag_tool/` is a thin `rag_search` adapter for LLM tool-calling only.
+
 **역할**: 도구(Tool)들이 공유하는 비즈니스 로직, 상태 관리, 유틸리티 함수 제공
 
 ---
@@ -16,7 +26,7 @@
 services/
 ├── __init__.py
 ├── hints.py                        # HTML 힌트 패턴 re-export
-├── rag_service.py                  # RAG(Retrieval-Augmented Generation) 서비스
+├── rag_service.py                  # RAGService 호환 alias (구현은 tools/rag_tool/)
 │
 ├── fetch_webpage_tool_funcs/       # fetch_webpage 도구 전용 함수들
 │   ├── __init__.py
@@ -113,12 +123,14 @@ output_dir/
 
 ---
 
-### 2. `rag_service.py` - RAG 서비스
+### 2. `rag_service.py` - RAG 호환 경로
+
+현재 RAG의 실제 구현은 `tools/rag_tool/RAGTool`로 이동했습니다. 이 파일은 기존 코드의 `from services.rag_service import RAGService` import를 깨지 않기 위한 얇은 호환 계층입니다. 신규 RAG 기능, LLM-facing schema, multi-turn chat tool-use 정책은 `tools/rag_tool/`에서 관리합니다.
 
 수집된 문서를 기반으로 대화형 Q&A를 제공하는 서비스입니다.
 
 ```python
-class RAGService:
+class RAGService(RAGTool):
     def __init__(
         self,
         llm,                        # LLMClient 인스턴스
@@ -209,14 +221,14 @@ store.write_fetched_record(
 is_dup, score, dup_of = store.find_duplicate(new_text)
 ```
 
-### RAGService 사용
+### RAGTool 사용
 
 ```python
-from services.rag_service import RAGService
 from storage.vector_store import VectorStore
+from tools.rag_tool import RAGTool
 
 vector_store = VectorStore(persist_dir=output_dir / "chromadb")
-rag = RAGService(llm=llm, vector_store=vector_store)
+rag = RAGTool(llm=llm, vector_store=vector_store)
 
 # 문서 인덱싱
 rag.index_autosurvey_output(summary_dir=output_dir / "summary")
@@ -291,7 +303,7 @@ tools/
 
 services/
 ├── run_store_tool_funcs/ ──▶ core/models.DocRecord
-├── rag_service.py ──────────▶ storage/VectorStore
+├── rag_service.py ──────────▶ tools/rag_tool.RAGTool (compat alias)
 └── fetch_webpage_tool_funcs/ ──▶ bs4 (BeautifulSoup)
 ```
 
