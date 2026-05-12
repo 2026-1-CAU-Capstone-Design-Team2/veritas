@@ -1,3 +1,163 @@
+# 문서 작업 중 Agent 개입 조건
+
+이 디렉토리의 screen context 파이프라인은 autosurvey 이후 `chat` 모드에서 screen context monitoring 이 켜져 있을 때, 사용자가 문서/편집기 계열 앱에서 작성 중인 텍스트를 주기적으로 캡처하고 조건을 만족하는 경우에만 agent 개입 후보를 큐에 넣습니다.
+
+## 1. 실행 전제
+
+- `main.py`에서 `--phase chat` 또는 autosurvey 완료 후 자동 chat 진입 시 `mode="auto"`로 실행되어야 합니다.
+- `--no-screen-context`가 없어야 합니다.
+- `ChatAgent.chat_loop(..., enable_screen_context=True)`가 `screen_context` tool의 `start_polling`을 호출해야 합니다.
+- 캡처 주기는 기본 `--screen-interval 5.0`초입니다.
+
+관련 코드:
+- `main.py`
+- `agent/chat_agent.py`
+- `tools/screen_context_tool/screen_context_tool.py`
+- `services/screen_tool_funcs/screen_context_service.py`
+
+## 2. 캡처 및 텍스트 추출 순서
+
+`ScreenContextService.capture_once()`는 현재 foreground window를 읽고 다음 순서로 텍스트를 수집합니다.
+
+1. 앱 전용 reader
+   - 현재는 PowerPoint (`powerpnt.exe`) active slide 텍스트를 우선 읽습니다.
+2. UI Automation
+   - 지원 대상 앱이면 focused control의 `TextPattern`, `ValuePattern`, selection paragraph, hover paragraph를 읽습니다.
+   - 주요 대상: Notepad, Word, Excel, PowerPoint, Notepad++, Notion, HWP, VS Code, Visual Studio, PyCharm, `.txt/.md/.doc/.hwp/.ppt/.pptx` 제목을 가진 창 등.
+3. OCR fallback
+   - 앱/API/UI Automation 텍스트가 충분하지 않을 때 foreground window 이미지를 OCR로 읽습니다.
+
+텍스트가 선택되면 `ContentFilter`가 다음 값을 만듭니다.
+
+- `active_editor_text`: 현재 편집기 전체 텍스트
+- `current_paragraph_text`: UIA paragraph가 있으면 해당 문단, 없으면 사용 가능한 전체 텍스트 fallback
+- `changed_text`: 직전 `active_editor_text`가 현재 텍스트의 prefix인 경우 새로 붙은 suffix
+- `confidence`: app text 0.95, UIA 0.90, OCR 0.55
+
+관련 코드:
+- `screen_context_service.py`
+- `ui_automation.py`
+- `powerpoint_com.py`
+- `ocr_engine.py`
+- `content_filter.py`
+
+## 3. 개입 후보가 되는 앱 조건
+
+`InterventionDetector`는 아래 app type만 편집 앱으로 봅니다.
+
+- `document`
+- `presentation`
+- `spreadsheet`
+- `code_editor`
+
+`ContentFilter`는 프로세스명, window title, browser URL을 보고 app type을 추정합니다. 예를 들어 Notepad/Word/HWP/Google Docs/Hancom Docs 계열은 `document`, PowerPoint/Google Slides 계열은 `presentation`, Excel/Google Sheets 계열은 `spreadsheet`, VS Code/PyCharm 등은 `code_editor`로 분류됩니다.
+
+관련 코드:
+- `content_filter.py`
+- `intervention_detector.py`
+
+## 4. LLM 개입 후보 승인 조건
+
+`InterventionDetector.decide()`는 아래 조건을 모두 통과해야 `should_consider_llm=True`로 판단합니다.
+
+1. 편집 앱이어야 함
+   - `active_app_type`이 `document`, `presentation`, `spreadsheet`, `code_editor` 중 하나여야 합니다.
+
+2. 충분히 같은 문서에 머물러야 함
+   - 기본 조건: 최근 history가 최소 5개이고, 같은 document key 비율이 0.8 이상이어야 합니다.
+
+3. 현재 문단이 충분히 안정적이어야 함
+   - UIA/app text 기반: paragraph source가 있고, 문단 길이가 20자 이상이며, confidence가 0.8 이상이어야 합니다.
+   - OCR 기반: 문단 길이가 40자 이상이고, confidence가 0.55 이상이어야 합니다.
+
+4. 사용자가 작성 후 멈춘 상태여야 함
+   - 같은 문서에서 이전 캡처 대비 텍스트가 의미 있게 변한 기록이 있어야 합니다.
+   - 이후 현재 텍스트와 같거나 거의 같은 내용이 기본 4회 연속 캡처되어야 합니다.
+   - OCR/UIA의 공백, 줄바꿈, 극소량의 인식 흔들림은 같은 idle text로 봅니다.
+   - 즉, 문장이 각 capture마다 계속 늘어나는 중이면 개입하지 않고, 작성이 멈춘 뒤 안정적으로 같은 텍스트가 관측될 때만 통과합니다.
+   - 의미 있는 변화는 기본 10자 이상 증가하거나, 짧은 수정이라도 이전 텍스트와 충분히 달라진 경우로 판단합니다.
+
+5. cooldown / duplicate 조건을 통과해야 함
+   - 최근 5개 capture event 안에서 `should_consider_llm=True`였던 intervention 후보를 봅니다.
+   - 그중 같은 document key와 같은 paragraph fingerprint가 이미 있으면 다시 개입하지 않습니다.
+   - 즉, 같은 문단에 대해 방금 제안을 했으면 중복 제안을 막고, 문단 내용이 바뀌어 fingerprint가 달라지면 다시 통과할 수 있습니다.
+
+6. 민감하거나 지원하지 않는 앱이 아니어야 함
+   - 현재 `lockapp.exe`는 차단됩니다.
+
+관련 코드:
+- `intervention_detector.py`
+
+## 5. 개입 payload 범위
+
+승인된 이벤트는 `InterventionDispatcher`가 downstream payload로 변환해 intervention queue에 저장합니다.
+
+`writing_context`에는 전체 텍스트도 보존하지만, agent에게 실제로 우선 전달되는 핵심 범위는 다음입니다.
+
+- `recent_sentences`: 현재 문단 또는 active text의 마지막 1-2문장
+- `focused_sentence`: 변경분과 가장 가까운 문장, 없으면 마지막 문장
+- `changed_text`: 최근 변경 텍스트
+- `full_text_chars`: 전체 텍스트 길이
+
+`ChatAgent.answer_screen_intervention()`은 LLM 프롬프트를 만들 때 `full_text` 전체를 그대로 넣지 않고, `recent_sentences -> focused_sentence -> changed_text -> current_paragraph 일부` 순서로 최근 작성 범위를 선택합니다. 따라서 긴 문서를 계속 보고 같은 초반 문장에 대해 반복 제안하는 것을 줄이고, 마지막 1-2문장 중심으로 이어쓰기/수정/근거 보강 제안을 하도록 동작합니다.
+
+관련 코드:
+- `intervention_dispatcher.py`
+- `agent/chat_agent.py`
+- `core/prompts.py`
+
+## 6. 개입 큐 처리
+
+승인된 payload는 `ScreenContextStore`에 저장됩니다.
+
+- latest event: `screen_context/latest.json`
+- capture log: `screen_context/capture_logs/*.jsonl`
+- pending intervention: `screen_context/latest_intervention.json`
+- intervention log: `screen_context/interventions.jsonl`
+
+`ChatAgent`의 background thread는 기본 2초마다 `consume_interventions`를 호출합니다. 새 intervention이 stale 하지 않고 중복 event id가 아니면 LLM 답변을 생성해 chat에 출력합니다.
+
+추가 필터:
+
+- 같은 event id는 한 번만 처리합니다.
+- intervention captured time이 120초보다 오래되면 stale로 보고 무시합니다.
+- RAG 문서가 있으면 최근 문장 기반 query로 knowledge base를 검색해 근거 제안에 활용합니다.
+
+관련 코드:
+- `store.py`
+- `screen_context_tool.py`
+- `agent/chat_agent.py`
+
+## 7. Screen Debug CLI 로그
+
+디버깅이 필요하면 `main.py` 실행 시 `--screen-debug`를 추가합니다. 기존 `--screen-debug-log`도 같은 옵션으로 계속 동작합니다.
+
+예:
+
+```bash
+python main.py --output-dir ./output --phase chat --screen-debug
+```
+
+debug 모드에서는 screen monitoring 중 각 capture마다 CLI에 다음 로그가 출력됩니다.
+
+- `[screen_context][capture]`: event id, foreground process/title, text source, confidence, intervention queued 여부
+- `[screen_context][text]`: 추출된 active/current/changed text 길이와 현재 문단 preview
+- `[screen_context][ocr]`: OCR fallback이 실제로 실행되어 텍스트를 읽은 경우 OCR preview
+- `[screen_context][decision]`: 개입 판단 step별 `PASS` / `BLOCK`
+- `[screen_context][queue]`: intervention queue에서 소비한 event id, stale/duplicate drop 사유
+- `[screen_context][assist]`: screen assist LLM 답변 생성 시작과 생성된 답변 길이
+
+판단 step은 다음 순서로 출력됩니다.
+
+- `editing_app`: 현재 foreground app이 문서/편집 앱인지
+- `dwell`: 같은 문서에 충분히 머물렀는지
+- `stable_paragraph`: 현재 문단이 길이/confidence 기준을 만족하는지
+- `typing_pause`: 작성 후 멈춘 상태인지, 즉 같은 텍스트가 `min_idle_captures`회 연속 관측되었는지
+- `cooldown`: 같은 문단에 대한 중복 개입 cooldown을 통과했는지
+- `supported_app`: 민감/미지원 앱이 아닌지
+
+`ChatAgent`는 stale intervention을 기본 120초 이후 drop합니다. debug 모드에서 `[screen_context][queue] drop ... reason=stale_intervention`이 보이면, gating은 되었지만 답변 생성 thread가 이전 LLM 호출 등으로 늦어져 TTL을 넘긴 경우입니다.
+
 # screen_tool_funcs/
 
 **역할**: 사용자의 현재 화면, 포그라운드 창, 편집 중인 텍스트를 수집하고 LLM 개입 후보를 판단하는 screen context 서비스 모듈

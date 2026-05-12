@@ -64,9 +64,29 @@ class ScreenContextStore:
         return records
 
     def enqueue_intervention(self, payload: dict[str, Any]) -> None:
+        """Append one approved intervention to the durable FIFO queue.
+
+        Earlier versions used latest_intervention.json as the effective queue and
+        rewrote intervention_queue.json with only the newest payload. That made
+        screen assists fragile: a newly approved event could overwrite an older
+        pending event, and consume_interventions could clear the whole queue even
+        when only one item was requested. The chat-side consumer now gets a real
+        FIFO queue while latest_intervention.json remains a diagnostic snapshot.
+        """
         with self._lock:
+            queue = self._load_pending_interventions_unlocked()
+            event_id = str(payload.get("event_id") or "").strip()
+            if event_id:
+                queue = [
+                    item
+                    for item in queue
+                    if str(item.get("event_id") or "").strip() != event_id
+                ]
+            queue.append(payload)
+            queue = queue[-50:]
+
             self._write_json_atomic(self.latest_intervention_path, payload, indent=2)
-            self._write_pending_interventions_unlocked([payload])
+            self._write_pending_interventions_unlocked(queue)
 
             with self.intervention_log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -79,39 +99,40 @@ class ScreenContextStore:
         return queue[: max(limit, 0)]
 
     def _load_pending_interventions_unlocked(self) -> list[dict[str, Any]]:
-        if self.latest_intervention_path.exists():
-            try:
-                payload = json.loads(self.latest_intervention_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                payload = None
-            if isinstance(payload, dict):
-                return [payload]
         if not self.intervention_queue_path.exists():
             return []
         try:
             queue = json.loads(self.intervention_queue_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except (OSError, json.JSONDecodeError):
             return []
         if not isinstance(queue, list):
             return []
-        return queue
+        return [item for item in queue if isinstance(item, dict)]
 
     def consume_pending_interventions(self, limit: int = 1) -> list[dict[str, Any]]:
         with self._lock:
             queue = self._load_pending_interventions_unlocked()
             count = max(limit, 0)
             consumed = queue[:count]
+            remaining = queue[count:]
             if consumed:
-                self.clear_latest_intervention()
+                self._write_pending_interventions_unlocked(remaining)
+                if remaining:
+                    self._write_json_atomic(self.latest_intervention_path, remaining[-1], indent=2)
+                else:
+                    self._unlink_latest_intervention_unlocked()
             return consumed
 
     def clear_latest_intervention(self) -> None:
         with self._lock:
-            try:
-                self.latest_intervention_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            self._unlink_latest_intervention_unlocked()
             self._write_pending_interventions_unlocked([])
+
+    def _unlink_latest_intervention_unlocked(self) -> None:
+        try:
+            self.latest_intervention_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _write_pending_interventions(self, queue: list[dict[str, Any]]) -> None:
         with self._lock:

@@ -53,7 +53,9 @@ def parse_args() -> argparse.Namespace:
         help="Seconds between foreground-window context captures in chat mode.",
     )
     parser.add_argument(
+        "--screen-debug",
         "--screen-debug-log",
+        dest="screen_debug_log",
         action="store_true",
         help="Print screen-context capture diagnostics to the console. JSONL capture logs are always saved.",
     )
@@ -132,6 +134,7 @@ def run_chat(
         llm=llm,
         rag_service=rag_service,
         tool_registry=registry,
+        screen_debug=args.screen_debug_log,
     )
     chat_agent.chat_loop(
         mode=mode,

@@ -1,21 +1,26 @@
 {
-  "event_id": "20260508_165817_460363",
-  "captured_at": "2026-05-08T16:58:17",
+  "event_id": "20260512_165846_781769",
+  "captured_at": "2026-05-12T16:58:46",
   "window": {
-    "hwnd": null,
-    "pid": null,
-    "process_name": "",
-    "process_path": "",
-    "window_title": "",
-    "rect": null,
-    "error": "No foreground window."
+    "hwnd": 394734,
+    "pid": 12696,
+    "process_name": "Notepad.exe",
+    "process_path": "C:\\Program Files\\WindowsApps\\Microsoft.WindowsNotepad_11.2512.29.0_x64__8wekyb3d8bbwe\\Notepad\\Notepad.exe",
+    "window_title": "*VLA (Vision-Language-Action) 모델은 관측 - 메모장",
+    "rect": {
+      "x": 955,
+      "y": 0,
+      "width": 970,
+      "height": 1037
+    },
+    "error": null
   },
   "ocr": {
     "text": "",
     "language": "ko-KR",
     "lines": [],
     "image_size": null,
-    "error": "No captured image."
+    "error": "skipped: UI Automation text extraction succeeded."
   },
   "app_text": {
     "text": "",
@@ -26,84 +31,156 @@
   },
   "ui_automation": {
     "top_window_title": "",
-    "focused_name": "",
-    "control_type": "",
+    "focused_name": "텍스트 편집기",
+    "control_type": "DocumentControl",
     "automation_id": "",
-    "class_name": "",
-    "bounding_rect": null,
-    "text": "",
-    "text_source": "",
+    "class_name": "RichEditD2DPT",
+    "bounding_rect": {
+      "x": 961,
+      "y": 75,
+      "width": 958,
+      "height": 924
+    },
+    "text": "VLA (Vision-Language-Action) 모델은 관측 이미지와 text instruction 을 받아 적절한 action 을 생성하는 생성형 모델로, 주로 VLM (Vision-Language Model) 을 backbone 으로 한다.\r\r예를 들어, Unified Diffusion VLA 는 액션의 생성 및 이미지를 공유된 denoising 과정 상에서 통합되도록 하며, X-VLA 는 확장 가능한 soft-prompt Transformer 를 활용해서 다중 단계의 계획 및 긴 길이의 액션 생성을 안정적으로 할 수 있도록 한다.\r\r추가적으로 XL-VLA 는 dextorous hands 가 서로 동일한 latent action 공간을 공유하도록 하여 multi-hand 조작 task 에서 강건한 zero-shot 일반화를 가능하도록 하였다.\r\rAutoregressive 한 생성 방식을 활용한 VLA 의 경우, Llama-2 또는 GPT 와 같은 자기회귀적 decoder 를 활용해 토큰 단위로 동작을 예측한다.",
+    "text_source": "text_pattern",
     "selection_text": "",
-    "current_paragraph_text": "",
-    "current_paragraph_source": "",
-    "current_paragraph_rect": null,
-    "hover_text": "",
-    "hover_rect": null,
-    "mouse_position": null,
-    "source_quality": "rejected",
+    "current_paragraph_text": "Autoregressive 한 생성 방식을 활용한 VLA 의 경우, Llama-2 또는 GPT 와 같은 자기회귀적 decoder 를 활용해 토큰 단위로 동작을 예측한다.",
+    "current_paragraph_source": "selection_paragraph",
+    "current_paragraph_rect": {
+      "x": 977,
+      "y": 271,
+      "width": 939,
+      "height": 20
+    },
+    "hover_text": "Autoregressive 한 생성 방식을 활용한 VLA 의 경우, Llama-2 또는 GPT 와 같은 자기회귀적 decoder 를 활용해 토큰 단위로 동작을 예측한다.",
+    "hover_rect": {
+      "x": 977,
+      "y": 271,
+      "width": 939,
+      "height": 20
+    },
+    "mouse_position": [
+      1139,
+      335
+    ],
+    "browser_url": "",
+    "source_quality": "usable",
     "reject_reason": null,
-    "error": "skipped: foreground app is not a text extraction target."
+    "error": null
   },
   "filtered": {
-    "active_app_type": "unknown",
-    "active_editor_text": "",
-    "current_paragraph_text": "",
-    "current_paragraph_source": "",
-    "current_paragraph_rect": null,
-    "visible_context": "",
+    "active_app_type": "document",
+    "active_editor_text": "VLA (Vision-Language-Action) 모델은 관측 이미지와 text instruction 을 받아 적절한 action 을 생성하는 생성형 모델로, 주로 VLM (Vision-Language Model) 을 backbone 으로 한다.\r\r예를 들어, Unified Diffusion VLA 는 액션의 생성 및 이미지를 공유된 denoising 과정 상에서 통합되도록 하며, X-VLA 는 확장 가능한 soft-prompt Transformer 를 활용해서 다중 단계의 계획 및 긴 길이의 액션 생성을 안정적으로 할 수 있도록 한다.\r\r추가적으로 XL-VLA 는 dextorous hands 가 서로 동일한 latent action 공간을 공유하도록 하여 multi-hand 조작 task 에서 강건한 zero-shot 일반화를 가능하도록 하였다.\r\rAutoregressive 한 생성 방식을 활용한 VLA 의 경우, Llama-2 또는 GPT 와 같은 자기회귀적 decoder 를 활용해 토큰 단위로 동작을 예측한다.",
+    "current_paragraph_text": "Autoregressive 한 생성 방식을 활용한 VLA 의 경우, Llama-2 또는 GPT 와 같은 자기회귀적 decoder 를 활용해 토큰 단위로 동작을 예측한다.",
+    "current_paragraph_source": "uia_selection_paragraph",
+    "current_paragraph_rect": {
+      "x": 977,
+      "y": 271,
+      "width": 939,
+      "height": 20
+    },
+    "visible_context": "VLA (Vision-Language-Action) 모델은 관측 이미지와 text instruction 을 받아 적절한 action 을 생성하는 생성형 모델로, 주로 VLM (Vision-Language Model) 을 backbone 으로 한다.\r\r예를 들어, Unified Diffusion VLA 는 액션의 생성 및 이미지를 공유된 denoising 과정 상에서 통합되도록 하며, X-VLA 는 확장 가능한 soft-prompt Transformer 를 활용해서 다중 단계의 계획 및 긴 길이의 액션 생성을 안정적으로 할 수 있도록 한다.\r\r추가적으로 XL-VLA 는 dextorous hands 가 서로 동일한 latent action 공간을 공유하도록 하여 multi-hand 조작 task 에서 강건한 zero-shot 일반화를 가능하도록 하였다.\r\rAutoregressive 한 생성 방식을 활용한 VLA 의 경우, Llama-2 또는 GPT 와 같은 자기회귀적 decoder 를 활용해 토큰 단위로 동작을 예측한다.",
     "changed_text": "",
-    "confidence": 0.0,
+    "confidence": 0.9,
     "noise_removed": []
   },
   "intervention": {
     "should_consider_llm": false,
-    "score": 0.0,
+    "score": 0.9,
     "priority": "low",
     "reason_codes": [
-      "not_editing_app",
-      "insufficient_dwell",
-      "unstable_current_paragraph",
-      "not_continuing_paragraph_edit",
       "cooldown_or_duplicate"
     ],
     "metadata": {
       "history_window": 10,
       "history_count": 10,
-      "same_document_count": 4,
-      "dwell_ratio": 0.4,
-      "document_key": "|",
-      "paragraph_fingerprint": "",
+      "same_document_count": 10,
+      "dwell_ratio": 1.0,
+      "document_key": "notepad.exe|*vla (vision-language-action) 모델은 관측 - 메모장",
+      "paragraph_fingerprint": "d4c5bfa9488c9725ab1bb63bf1cdd2f59b4ffc46",
+      "typing_pause": {
+        "ready": true,
+        "reason": "ready",
+        "stable_capture_count": 7,
+        "min_idle_captures": 4,
+        "idle_similarity_threshold": 0.985,
+        "last_similarity": 0.0,
+        "last_length_delta": 31,
+        "changed_before_pause": true,
+        "current_text_chars": 517,
+        "prior_text_chars": 486
+      },
+      "checks": {
+        "editing_app": {
+          "passed": true,
+          "reason": "editing_app_active",
+          "active_app_type": "document"
+        },
+        "dwell": {
+          "passed": true,
+          "reason": "editing_app_dwell_satisfied",
+          "history_count": 10,
+          "min_history_count": 5,
+          "dwell_ratio": 1.0,
+          "dwell_threshold": 0.8
+        },
+        "stable_paragraph": {
+          "passed": true,
+          "reason": "current_paragraph_stable",
+          "current_paragraph_source": "uia_selection_paragraph",
+          "current_paragraph_chars": 94,
+          "min_paragraph_chars": 20,
+          "min_ocr_paragraph_chars": 40,
+          "confidence": 0.9
+        },
+        "typing_pause": {
+          "passed": true,
+          "reason": "ready",
+          "ready": true,
+          "stable_capture_count": 7,
+          "min_idle_captures": 4,
+          "idle_similarity_threshold": 0.985,
+          "last_similarity": 0.0,
+          "last_length_delta": 31,
+          "changed_before_pause": true,
+          "current_text_chars": 517,
+          "prior_text_chars": 486
+        },
+        "cooldown": {
+          "passed": false,
+          "reason": "cooldown_or_duplicate",
+          "cooldown_events": 5
+        },
+        "supported_app": {
+          "passed": true,
+          "reason": "supported_app",
+          "process_name": "Notepad.exe"
+        }
+      },
       "blockers": [
-        "not_editing_app",
-        "insufficient_dwell",
-        "unstable_current_paragraph",
-        "not_continuing_paragraph_edit",
         "cooldown_or_duplicate"
       ]
     }
   },
   "diagnostics": {
-    "has_foreground_window": false,
-    "has_text": false,
-    "has_current_paragraph": false,
-    "text_source": "none",
-    "confidence": 0.0,
-    "active_text_chars": 0,
-    "current_paragraph_chars": 0,
-    "usable_for_llm": false,
+    "has_foreground_window": true,
+    "has_text": true,
+    "has_current_paragraph": true,
+    "text_source": "text_pattern",
+    "confidence": 0.9,
+    "active_text_chars": 520,
+    "current_paragraph_chars": 94,
+    "browser_url": "",
+    "usable_for_llm": true,
     "intervention_queued": false,
     "intervention_blockers": [
-      "not_editing_app",
-      "insufficient_dwell",
-      "unstable_current_paragraph",
-      "not_continuing_paragraph_edit",
       "cooldown_or_duplicate"
     ],
     "errors": {
-      "window": "No foreground window.",
+      "window": null,
       "app_text": "skipped: no app-specific text reader.",
-      "ui_automation": "skipped: foreground app is not a text extraction target.",
-      "ocr": "No captured image."
+      "ui_automation": null,
+      "ocr": "skipped: UI Automation text extraction succeeded."
     }
   }
 }

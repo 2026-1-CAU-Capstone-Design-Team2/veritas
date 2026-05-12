@@ -40,7 +40,7 @@ class ChatAgent:
     FINAL_ANSWER_TIMEOUT_SEC = 180
     SCREEN_INTERVENTION_POLL_SEC = 2.0
     SCREEN_INTERVENTION_TIMEOUT_SEC = 180
-    SCREEN_INTERVENTION_TTL_SEC = 30.0
+    SCREEN_INTERVENTION_TTL_SEC = 300.0
 
     def __init__(
         self,
@@ -51,6 +51,7 @@ class ChatAgent:
         optional_tool_names: tuple[str, ...] | None = None,
         max_history_turns: int = 3,
         max_tool_calls: int = 1,
+        screen_debug: bool = False,
     ) -> None:
         self.llm = llm
         self.rag_service = rag_service
@@ -58,6 +59,7 @@ class ChatAgent:
         self.optional_tool_names = optional_tool_names or self.DEFAULT_OPTIONAL_TOOL_NAMES
         self.max_history_turns = max_history_turns
         self.max_tool_calls = max(1, int(max_tool_calls))
+        self.screen_debug = screen_debug
         self.chat_history: list[tuple[str, str]] = []
         self._conversation_lock = threading.RLock()
         self._screen_stop_event = threading.Event()
@@ -380,7 +382,9 @@ class ChatAgent:
                 app_context=self._pretty_payload(
                     intervention.get("app_context") or intervention.get("app") or {}
                 ),
-                writing_context=self._pretty_payload(intervention.get("writing_context") or {}),
+                writing_context=self._pretty_payload(
+                    self._screen_prompt_writing_context(intervention)
+                ),
                 routing_hint=self._pretty_payload(intervention.get("tool_routing_hint") or {}),
                 knowledge_context=knowledge_context,
             )
@@ -397,21 +401,40 @@ class ChatAgent:
                 answer = f"[screen_context][error] failed to generate answer: {e}"
                 print(answer)
 
+            if not str(answer or "").strip():
+                answer = "[screen_context][warn] LLM returned an empty screen assist answer."
             history_question = self._screen_history_question(intervention)
             self._append_history(history_question, answer)
             return answer.strip()
 
     def _screen_intervention_loop(self, *, stream: bool) -> None:
         while not self._screen_stop_event.wait(self.SCREEN_INTERVENTION_POLL_SEC):
-            interventions = self._consume_screen_interventions(limit=1)
-            for intervention in self._fresh_screen_interventions(interventions):
-                answer = self.answer_screen_intervention(intervention, stream=stream)
-                if self._screen_answer_callback is not None:
-                    self._screen_answer_callback(answer, intervention)
-                else:
-                    print("\n[Screen Assist]")
-                    print(answer)
-                    print()
+            try:
+                interventions = self._consume_screen_interventions(limit=1)
+                for intervention in self._fresh_screen_interventions(interventions):
+                    event_id = str(intervention.get("event_id") or "-")
+                    if self.screen_debug:
+                        query = self._screen_intervention_query(intervention)
+                        print(
+                            "[screen_context][assist] "
+                            f"event={event_id} generating query={query[:160]!r}"
+                        )
+                    answer = self.answer_screen_intervention(intervention, stream=stream)
+                    if self.screen_debug:
+                        print(
+                            "[screen_context][assist] "
+                            f"event={event_id} answer_chars={len(answer)}"
+                        )
+                    if self._screen_answer_callback is not None:
+                        self._screen_answer_callback(answer, intervention)
+                    else:
+                        print("\n[Screen Assist]")
+                        print(answer)
+                        print()
+            except Exception as e:
+                # Keep screen monitoring alive even if LLM generation, printing, or
+                # an external callback fails for one proactive intervention.
+                print(f"[screen_context][assist][error] {type(e).__name__}: {e}")
 
     def _consume_screen_interventions(self, *, limit: int) -> list[dict[str, Any]]:
         if not self.has_screen_context():
@@ -430,7 +453,11 @@ class ChatAgent:
             return []
         data = result.data if isinstance(result.data, dict) else {}
         interventions = data.get("interventions", [])
-        return [item for item in interventions if isinstance(item, dict)]
+        valid = [item for item in interventions if isinstance(item, dict)]
+        if self.screen_debug and valid:
+            ids = [str(item.get("event_id") or "-") for item in valid]
+            print(f"[screen_context][queue] consumed={len(valid)} event_ids={ids}")
+        return valid
 
     def _fresh_screen_interventions(
         self,
@@ -440,8 +467,16 @@ class ChatAgent:
         for intervention in interventions:
             event_id = str(intervention.get("event_id") or "").strip()
             if event_id and event_id == self._last_handled_screen_event_id:
+                self._log_screen_drop(
+                    intervention,
+                    reason="duplicate_event_id",
+                )
                 continue
             if self._is_stale_screen_intervention(intervention):
+                self._log_screen_drop(
+                    intervention,
+                    reason="stale_intervention",
+                )
                 continue
             if event_id:
                 self._last_handled_screen_event_id = event_id
@@ -459,21 +494,75 @@ class ChatAgent:
         age_sec = (datetime.now() - captured).total_seconds()
         return age_sec > self.SCREEN_INTERVENTION_TTL_SEC
 
+    def _log_screen_drop(self, intervention: dict[str, Any], *, reason: str) -> None:
+        if not self.screen_debug:
+            return
+        event_id = str(intervention.get("event_id") or "-")
+        captured_at = str(intervention.get("captured_at") or "")
+        age_text = "-"
+        if captured_at:
+            try:
+                age_text = f"{(datetime.now() - datetime.fromisoformat(captured_at)).total_seconds():.1f}s"
+            except ValueError:
+                age_text = "invalid"
+        print(
+            "[screen_context][queue] "
+            f"drop event={event_id} reason={reason} age={age_text} "
+            f"ttl={self.SCREEN_INTERVENTION_TTL_SEC:.0f}s"
+        )
+
     def _screen_intervention_query(self, intervention: dict[str, Any]) -> str:
         writing = intervention.get("writing_context") if isinstance(intervention, dict) else {}
         if not isinstance(writing, dict):
             writing = {}
         candidates = [
+            writing.get("recent_sentences"),
             writing.get("focused_sentence"),
-            writing.get("current_paragraph"),
             writing.get("changed_text"),
-            writing.get("full_text"),
+            writing.get("current_paragraph"),
         ]
         for candidate in candidates:
             text = " ".join(str(candidate or "").split()).strip()
             if text:
                 return text[:1000]
         return "screen writing context"
+
+    def _screen_prompt_writing_context(self, intervention: dict[str, Any]) -> dict[str, Any]:
+        writing = intervention.get("writing_context") if isinstance(intervention, dict) else {}
+        if not isinstance(writing, dict):
+            return {}
+
+        recent_sentences = " ".join(
+            str(writing.get("recent_sentences") or "").split()
+        ).strip()
+        focused_sentence = " ".join(
+            str(writing.get("focused_sentence") or "").split()
+        ).strip()
+        changed_text = " ".join(str(writing.get("changed_text") or "").split()).strip()
+        current_paragraph = " ".join(
+            str(writing.get("current_paragraph") or "").split()
+        ).strip()
+
+        scoped_text = (
+            recent_sentences
+            or focused_sentence
+            or changed_text
+            or current_paragraph[:1000]
+        )
+        full_text_chars = writing.get(
+            "full_text_chars",
+            len(str(writing.get("full_text") or "")),
+        )
+        return {
+            "recent_sentences": scoped_text,
+            "focused_sentence": focused_sentence,
+            "changed_text": changed_text[:500],
+            "paragraph_source": writing.get("paragraph_source") or "",
+            "paragraph_rect": writing.get("paragraph_rect"),
+            "full_text_chars": full_text_chars,
+            "confidence": writing.get("confidence", 0.0),
+            "scope_note": "Only the latest 1-2 sentences are provided for this intervention.",
+        }
 
     def _screen_history_question(self, intervention: dict[str, Any]) -> str:
         app = intervention.get("app_context") or intervention.get("app") or {}

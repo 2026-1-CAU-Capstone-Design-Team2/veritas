@@ -283,6 +283,9 @@ class ScreenContextService:
         if blockers:
             base += f" blockers={blockers}"
         print(base)
+        if diagnostics.get("has_text"):
+            self._log_debug_text(event, diagnostics)
+        self._log_debug_decision(event)
 
         if not diagnostics.get("has_foreground_window"):
             print(
@@ -299,6 +302,85 @@ class ScreenContextService:
                 "[screen_context][capture][warn] "
                 f"event={event.event_id} no_readable_text errors={extractor_errors}"
             )
+
+    def _log_debug_text(self, event: ScreenContextEvent, diagnostics: dict) -> None:
+        filtered = event.filtered
+        print(
+            "[screen_context][text] "
+            f"source={diagnostics.get('text_source', 'unknown')} "
+            f"active_chars={len((filtered.active_editor_text or '').strip())} "
+            f"paragraph_chars={len((filtered.current_paragraph_text or '').strip())} "
+            f"changed_chars={len((filtered.changed_text or '').strip())} "
+            f"preview={self._preview_text(filtered.current_paragraph_text or filtered.active_editor_text)!r}"
+        )
+        if (event.ocr.text or "").strip():
+            print(
+                "[screen_context][ocr] "
+                f"chars={len((event.ocr.text or '').strip())} "
+                f"lines={len(event.ocr.lines or [])} "
+                f"preview={self._preview_text(event.ocr.text)!r}"
+            )
+
+    def _log_debug_decision(self, event: ScreenContextEvent) -> None:
+        metadata = event.intervention.metadata or {}
+        checks = metadata.get("checks") or {}
+        if not isinstance(checks, dict):
+            return
+
+        for name in (
+            "editing_app",
+            "dwell",
+            "stable_paragraph",
+            "typing_pause",
+            "cooldown",
+            "supported_app",
+        ):
+            check = checks.get(name) or {}
+            if not isinstance(check, dict):
+                continue
+            status = "PASS" if check.get("passed") else "BLOCK"
+            detail = self._format_debug_check_detail(name, check)
+            print(f"[screen_context][decision] {name}={status} {detail}".rstrip())
+
+    def _format_debug_check_detail(self, name: str, check: dict) -> str:
+        reason = str(check.get("reason") or "")
+        if name == "dwell":
+            return (
+                f"reason={reason} "
+                f"history={check.get('history_count')}/{check.get('min_history_count')} "
+                f"dwell={check.get('dwell_ratio')}/{check.get('dwell_threshold')}"
+            )
+        if name == "stable_paragraph":
+            return (
+                f"reason={reason} "
+                f"source={check.get('current_paragraph_source') or '-'} "
+                f"chars={check.get('current_paragraph_chars')} "
+                f"min={check.get('min_paragraph_chars')} "
+                f"ocr_min={check.get('min_ocr_paragraph_chars')} "
+                f"confidence={check.get('confidence')}"
+            )
+        if name == "typing_pause":
+            return (
+                f"reason={reason} "
+                f"stable={check.get('stable_capture_count')}/{check.get('min_idle_captures')} "
+                f"similarity={check.get('last_similarity')} "
+                f"len_delta={check.get('last_length_delta')} "
+                f"changed_before_pause={check.get('changed_before_pause')} "
+                f"chars={check.get('current_text_chars')} prior_chars={check.get('prior_text_chars')}"
+            )
+        if name == "editing_app":
+            return f"reason={reason} app_type={check.get('active_app_type') or '-'}"
+        if name == "cooldown":
+            return f"reason={reason} window={check.get('cooldown_events')}"
+        if name == "supported_app":
+            return f"reason={reason} process={check.get('process_name') or '-'}"
+        return f"reason={reason}"
+
+    def _preview_text(self, text: str, *, limit: int = 220) -> str:
+        value = " ".join(str(text or "").split()).strip()
+        if len(value) <= limit:
+            return value
+        return value[: limit - 3] + "..."
 
     def _new_event_id(self) -> str:
         return datetime.now().strftime("%Y%m%d_%H%M%S_%f")

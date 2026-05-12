@@ -20,11 +20,13 @@ class InterventionDispatcher:
         payload = self._build_payload(event)
         self.store.enqueue_intervention(payload)
         if self.console_log:
+            pending_count = len(self.store.load_pending_interventions())
             print(
                 "[screen_context][intervention] "
                 f"queued event={event.event_id} "
                 f"priority={event.intervention.priority} "
-                f"score={event.intervention.score}"
+                f"score={event.intervention.score} "
+                f"pending={pending_count}"
             )
         return payload
 
@@ -33,10 +35,16 @@ class InterventionDispatcher:
         window = event.window
         metadata = event.intervention.metadata or {}
         activity_context = self._activity_context(metadata)
+        recent_sentences = self._recent_sentences(
+            filtered.current_paragraph_text or filtered.active_editor_text,
+            limit=2,
+        )
         focused_sentence = self._focused_sentence(
             paragraph=filtered.current_paragraph_text,
             changed_text=filtered.changed_text,
         )
+        if not focused_sentence:
+            focused_sentence = self._recent_sentences(recent_sentences, limit=1)
         intervention_flag = self._intervention_flag(event)
         tool_routing_hint = self._tool_routing_hint(event, focused_sentence=focused_sentence)
 
@@ -60,7 +68,9 @@ class InterventionDispatcher:
             },
             "writing_context": {
                 "full_text": filtered.active_editor_text,
+                "full_text_chars": len(filtered.active_editor_text or ""),
                 "current_paragraph": filtered.current_paragraph_text,
+                "recent_sentences": recent_sentences,
                 "focused_sentence": focused_sentence,
                 "paragraph_source": filtered.current_paragraph_source,
                 "paragraph_rect": (
@@ -95,6 +105,7 @@ class InterventionDispatcher:
             "dwell_ratio": metadata.get("dwell_ratio", 0.0),
             "document_key": metadata.get("document_key", ""),
             "paragraph_fingerprint": metadata.get("paragraph_fingerprint", ""),
+            "typing_pause": metadata.get("typing_pause") or {},
         }
 
     def _intervention_flag(self, event: ScreenContextEvent) -> dict:
@@ -109,8 +120,8 @@ class InterventionDispatcher:
             "flags": {
                 "editing_app": "editing_app_active" in reasons,
                 "dwell_satisfied": "editing_app_dwell_satisfied" in reasons,
+                "typing_pause_satisfied": "typing_pause_satisfied" in reasons,
                 "paragraph_stable": "current_paragraph_stable" in reasons,
-                "continuing_edit": "paragraph_edit_continuing" in reasons,
                 "cooldown_dedupe_passed": "cooldown_dedupe_passed" in reasons,
             },
         }
@@ -145,7 +156,7 @@ class InterventionDispatcher:
         if not paragraph:
             return ""
 
-        sentences = [part.strip() for part in re.split(r"(?<=[.!?。！？])\s+|\n+", paragraph) if part.strip()]
+        sentences = self._split_sentences(paragraph)
         if not sentences:
             return paragraph
 
@@ -159,6 +170,25 @@ class InterventionDispatcher:
                     return sentence
 
         return sentences[-1]
+
+    def _recent_sentences(self, text: str, *, limit: int = 2) -> str:
+        text = (text or "").strip()
+        if not text:
+            return ""
+        sentences = self._split_sentences(text)
+        if not sentences:
+            return text[-800:].strip()
+        return " ".join(sentences[-max(limit, 1) :])[-800:].strip()
+
+    def _split_sentences(self, text: str) -> list[str]:
+        normalized = re.sub(r"\n+", "\n", (text or "").strip())
+        if not normalized:
+            return []
+
+        parts = [part.strip() for part in re.split(r"(?<=[.!?。！？])\s+|\n+", normalized) if part.strip()]
+        if parts:
+            return parts
+        return [normalized]
 
     def _looks_research_needy(self, text: str) -> bool:
         normalized = (text or "").lower()

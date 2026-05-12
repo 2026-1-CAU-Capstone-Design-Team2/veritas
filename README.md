@@ -343,6 +343,9 @@ non-RAG tools.
 | `--markdown-root` | markdown directory to index for RAG | `--output-dir` |
 | `--no-rag` | skip chat after `--phase all` completes | false |
 | `--reindex` | rebuild the vector index | false |
+| `--no-screen-context` | disable screen-context polling and proactive chat interventions | false |
+| `--screen-interval` | seconds between foreground-window context captures in chat mode | `5.0` |
+| `--screen-debug` / `--screen-debug-log` | print screen capture text previews, intervention decision checks, queue drops, and assist generation logs to CLI | false |
 
 ## Extension Rules
 
@@ -369,4 +372,3 @@ Avoid adding:
 Use prompts and schema descriptions for LLM intent decisions. Use code for
 resource caps, allowed tool boundaries, persistence, and deterministic workflow
 steps.
-
