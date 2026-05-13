@@ -318,7 +318,25 @@ class AutoSurveyWorkflow:
         )
         if not result.success:
             raise RuntimeError(result.error)
-        return result.data
+        data = result.data or {}
+        for summarized_id in data.get("summarized_doc_ids", []) or []:
+            doc_id_str = str(summarized_id)
+            try:
+                summary_path = self.run_store_service.paths.summary_path_for(
+                    int(doc_id_str)
+                )
+                summary_path_str = str(summary_path.resolve())
+            except Exception:
+                summary_path_str = ""
+            self._emit_progress(
+                "doc_summarized",
+                f"요약 완료: doc_{doc_id_str}",
+                detail={
+                    "doc_id": doc_id_str,
+                    "summary_path": summary_path_str,
+                },
+            )
+        return data
 
     def run_final(self, *, user_request: str | None = None) -> dict[str, Any]:
         self._emit_progress("final_report", "최종 보고서 작성 중...")
@@ -637,6 +655,18 @@ class AutoSurveyWorkflow:
             html=fetched.html,
             text=fetched.text,
             content_type=getattr(fetched, "content_type", ""),
+        )
+        stored_title = fetched.title or title_hint or "Untitled"
+        self._emit_progress(
+            "doc_fetched",
+            f"문서 수집 완료: {stored_title}",
+            detail={
+                "doc_id": doc_id,
+                "title": stored_title,
+                "url": stored_url,
+                "final_url": stored_final_url,
+                "domain": fetched.domain,
+            },
         )
         return {"status": "fetched", "doc_id": doc_id}
 

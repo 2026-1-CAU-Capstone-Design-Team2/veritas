@@ -64,6 +64,17 @@ RAG over generated markdown outputs, and schema-driven chat tool use.
   URL hyperlink (uses `QDesktopServices.openUrl`, auto-prepends `https://`
   when the URL has no scheme), and a `doc_NNN.md ↗` button that opens the
   corresponding `summary/doc_<docId>.md` in the OS default viewer.
+- Collected-document bars stream in live as `AutoSurveyWorkflow` runs.
+  `_fetch_one` emits a `doc_fetched` progress event after a non-duplicate
+  record is committed, carrying `{doc_id, title, url, final_url, domain}`;
+  `run_summarize` emits one `doc_summarized` event per successfully summarized
+  doc with the absolute `summary_path`. The Research page (controller) owns a
+  `_doc_bars: dict[doc_id → DocumentBar]` model: `doc_fetched` creates the bar
+  in pending state (greyed-out "요약 대기 중" button) and `doc_summarized`
+  flips it to ready via the single mutation method `DocumentBar.set_summary_ready`.
+  The final job response is then reconciled in `_reconcile_documents` so any
+  bars that polling missed are appended and any pending bars get their summary
+  path filled in.
 - The Document page now renders `final.md` through Python's `markdown` library
   (`tables` / `fenced_code` / `sane_lists` / `nl2br` extensions) and calls
   `QTextEdit.setHtml`, because Qt's built-in `setMarkdown` has known GFM-table

@@ -160,14 +160,21 @@ class LinkLabel(QLabel):
 class DocumentBar(QFrame):
 	"""One collected-document row with a title, hyperlink URL, and an
 	"open doc_*.md" button on the right.
+
+	The widget is a dumb view: it is built in a "pending" state with the
+	open-summary button greyed out, and mutated exactly once via
+	:meth:`set_summary_ready` when the controller learns the corresponding
+	`summary/doc_NNN.md` has been written. Live state changes during a run
+	flow through this single method.
 	"""
 
 	def __init__(
 		self,
 		index: int,
+		doc_id: str,
 		title: str,
 		url: str,
-		summary_path: Path | None,
+		summary_path: Path | None = None,
 		parent: QWidget | None = None,
 	) -> None:
 		super().__init__(parent)
@@ -177,7 +184,8 @@ class DocumentBar(QFrame):
 			"border-radius: 10px; }"
 			"QFrame#ResearchDocumentBar:hover { border-color: #C7D2FE; }"
 		)
-		self._summary_path = summary_path
+		self.doc_id = str(doc_id or "")
+		self._summary_path: Path | None = None
 
 		layout = QHBoxLayout(self)
 		layout.setContentsMargins(12, 10, 12, 10)
@@ -200,9 +208,9 @@ class DocumentBar(QFrame):
 
 		layout.addLayout(text_column, 1)
 
-		open_button = QPushButton(self._button_label())
-		open_button.setCursor(Qt.PointingHandCursor)
-		open_button.setStyleSheet(
+		self._open_button = QPushButton(self)
+		self._open_button.setCursor(Qt.PointingHandCursor)
+		self._open_button.setStyleSheet(
 			"QPushButton { background-color: #EEF2FF; color: #3730A3; "
 			"border: 1px solid #C7D2FE; border-radius: 8px; padding: 6px 10px; "
 			"font-size: 11px; font-weight: 800; }"
@@ -210,18 +218,29 @@ class DocumentBar(QFrame):
 			"QPushButton:disabled { background-color: #F3F4F6; color: #9CA3AF; "
 			"border-color: #E5E7EB; }"
 		)
-		open_button.clicked.connect(self._on_open_clicked)
-		if summary_path is None or not summary_path.exists():
-			open_button.setEnabled(False)
-			open_button.setToolTip("요약 파일이 아직 생성되지 않았습니다.")
-		else:
-			open_button.setToolTip(str(summary_path))
-		layout.addWidget(open_button, 0, Qt.AlignTop)
+		self._open_button.clicked.connect(self._on_open_clicked)
+		layout.addWidget(self._open_button, 0, Qt.AlignTop)
 
-	def _button_label(self) -> str:
-		if self._summary_path is None:
-			return "요약 없음"
-		return f"{self._summary_path.name} ↗"
+		# Render initial state. If a path was passed (e.g. when reconstructing
+		# from a completed job), we honor it immediately; otherwise the button
+		# starts in pending/disabled state.
+		if summary_path is not None and summary_path.exists():
+			self.set_summary_ready(summary_path)
+		else:
+			self._apply_pending_state()
+
+	def set_summary_ready(self, summary_path: Path) -> None:
+		"""Mark this document's summary as available and enable the open button."""
+		self._summary_path = summary_path
+		self._open_button.setEnabled(True)
+		self._open_button.setText(f"{summary_path.name} ↗")
+		self._open_button.setToolTip(str(summary_path))
+
+	def _apply_pending_state(self) -> None:
+		self._summary_path = None
+		self._open_button.setEnabled(False)
+		self._open_button.setText("요약 대기 중")
+		self._open_button.setToolTip("요약이 완료되면 열 수 있습니다.")
 
 	def _on_open_clicked(self) -> None:
 		if self._summary_path is None or not self._summary_path.exists():
@@ -252,11 +271,16 @@ class ResearchWorker(QObject):
 
 
 class ResearchProgressPoller(QThread):
-	"""Polls /api/v1/research/progress on a background thread and emits the
-	latest single-line status message so the UI can render it in gray.
+	"""Polls /api/v1/research/progress on a background thread.
+
+	Emits the full list of new events each tick so the controller can drive
+	per-document UI lifecycle (doc_fetched/doc_summarized) in addition to the
+	single-line gray status display. Cursor advances strictly forward, so a
+	long-running job that survives an API hiccup will still see every event
+	exactly once.
 	"""
 
-	progress = Signal(str)
+	events = Signal(list)
 
 	def __init__(self, parent: QObject | None = None) -> None:
 		super().__init__(parent)
@@ -273,15 +297,13 @@ class ResearchProgressPoller(QThread):
 	def run(self) -> None:  # type: ignore[override]
 		while not self._stop:
 			try:
-				response = AgentController().get_research_progress(since=self._cursor, limit=50)
+				response = AgentController().get_research_progress(since=self._cursor, limit=100)
 				items = response.get("items", []) if isinstance(response, dict) else []
 				if isinstance(items, list) and items:
 					self._cursor = int(response.get("nextCursor") or self._cursor)
-					latest = items[-1]
-					if isinstance(latest, dict):
-						message = str(latest.get("message") or "")
-						if message:
-							self.progress.emit(message)
+					valid = [item for item in items if isinstance(item, dict)]
+					if valid:
+						self.events.emit(valid)
 			except Exception:
 				pass
 			elapsed = 0
@@ -300,6 +322,10 @@ class ResearchPage(QWidget):
 		self._research_thread: QThread | None = None
 		self._research_worker: ResearchWorker | None = None
 		self._progress_poller: ResearchProgressPoller | None = None
+		# Controller-side document model keyed by doc_id. Bars are created on
+		# `doc_fetched` events and activated on `doc_summarized`. The final
+		# response reconciles anything that polling may have missed.
+		self._doc_bars: dict[str, DocumentBar] = {}
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
@@ -474,7 +500,7 @@ class ResearchPage(QWidget):
 	def _start_progress_poller(self) -> None:
 		self._stop_progress_poller()
 		poller = ResearchProgressPoller(self)
-		poller.progress.connect(self._on_progress_message)
+		poller.events.connect(self._on_progress_events)
 		self._progress_poller = poller
 		poller.start()
 
@@ -486,14 +512,69 @@ class ResearchPage(QWidget):
 			poller.wait(1500)
 			poller.deleteLater()
 
-	def _on_progress_message(self, message: str) -> None:
-		# Replace the existing single line so the latest agent action is
-		# displayed inline (ChatGPT/Claude style) instead of stacking lines.
+	def _on_progress_events(self, items: list) -> None:
+		"""Route each backend progress event to the right view update.
+
+		Stage handlers are intentionally small and side-effect-only:
+		- `doc_fetched`     → add a pending DocumentBar
+		- `doc_summarized`  → activate the matching bar
+		- any other stage   → refresh the gray single-line progress label
+		The latest message wins on the progress label, mirroring the previous
+		behavior.
+		"""
+		latest_message = ""
+		for event in items:
+			if not isinstance(event, dict):
+				continue
+			stage = str(event.get("stage") or "").strip()
+			detail = event.get("detail") if isinstance(event.get("detail"), dict) else {}
+			message = str(event.get("message") or "")
+			if stage == "doc_fetched":
+				self._add_pending_document_bar(detail)
+			elif stage == "doc_summarized":
+				self._activate_document_bar(detail)
+			if message:
+				latest_message = message
+		if latest_message:
+			self._set_progress_line(latest_message)
+
+	def _set_progress_line(self, message: str) -> None:
 		text = " ".join(message.split())
 		if len(text) > 200:
 			text = text[:197] + "..."
 		self.progress_line.setText(text)
 		self.progress_line.setVisible(True)
+
+	def _add_pending_document_bar(self, detail: dict) -> None:
+		doc_id = str(detail.get("doc_id") or "").strip()
+		if not doc_id or doc_id in self._doc_bars:
+			return
+		title = str(detail.get("title") or "Untitled")
+		url = str(detail.get("final_url") or detail.get("url") or "")
+		index = len(self._doc_bars) + 1
+		bar = DocumentBar(index=index, doc_id=doc_id, title=title, url=url)
+		self._doc_bars[doc_id] = bar
+		self.documents_container.addWidget(bar)
+		# First arrival flips the section from "empty" to "list-of-bars".
+		self.documents_header.setVisible(True)
+		self.result_empty.setVisible(False)
+		self.info_doc_count.set_value(f"{len(self._doc_bars)}건")
+		self.info_row_widget.setVisible(True)
+
+	def _activate_document_bar(self, detail: dict) -> None:
+		doc_id = str(detail.get("doc_id") or "").strip()
+		if not doc_id:
+			return
+		bar = self._doc_bars.get(doc_id)
+		if bar is None:
+			# Late summarize event without a prior fetch event (rare —
+			# polling lag or restart). Reconciliation at completion will
+			# pick this doc up from the final response.
+			return
+		summary_path_str = str(detail.get("summary_path") or "").strip()
+		if not summary_path_str:
+			return
+		bar.set_summary_ready(Path(summary_path_str))
 
 	def _start_research_worker(self, instruction: str, reference_urls: list[str]) -> None:
 		thread = QThread(self)
@@ -561,6 +642,15 @@ class ResearchPage(QWidget):
 		self.run_button.setEnabled(True)
 
 	def _render_result(self, response: dict[str, Any]) -> None:
+		"""Apply final/persisted job state to the result card.
+
+		Header info (status pill, info tiles) is always refreshed from the
+		response. Document bars are *reconciled* in place: bars that were
+		already created from live events are kept and merely have their
+		summary path filled in if needed; bars for documents that the live
+		stream missed are appended. This preserves the realtime UX while
+		guaranteeing the final view matches the persisted truth.
+		"""
 		status = str(response.get("status") or "").lower().strip()
 		error_message = str(response.get("error") or "").strip()
 		if status == "completed":
@@ -584,30 +674,17 @@ class ResearchPage(QWidget):
 			or "-"
 		)
 		final_path_raw = str(response.get("finalPath") or "").strip()
-		doc_count = response.get("documentCount", len(documents))
+		self._final_path = Path(final_path_raw) if final_path_raw else None
 
 		self.info_job_name.set_value(job_name)
 		self.info_save_path.set_value(final_path_raw or "-")
-		self.info_doc_count.set_value(f"{doc_count}건")
 		self.info_row_widget.setVisible(True)
 
-		self._final_path = Path(final_path_raw) if final_path_raw else None
+		self._reconcile_documents(documents)
 
-		self._clear_documents()
-		if documents:
+		if self._doc_bars:
 			self.documents_header.setVisible(True)
 			self.result_empty.setVisible(False)
-			summary_dir = self._summary_dir_from_final_path(self._final_path)
-			for index, item in enumerate(documents, start=1):
-				title = str(item.get("title") or "Untitled")
-				url = str(item.get("url") or "")
-				doc_id = str(item.get("docId") or "").strip()
-				summary_path: Path | None = None
-				if doc_id and summary_dir is not None:
-					candidate = summary_dir / f"doc_{doc_id}.md"
-					summary_path = candidate
-				bar = DocumentBar(index, title, url, summary_path)
-				self.documents_container.addWidget(bar)
 		else:
 			self.documents_header.setVisible(False)
 			if status == "completed":
@@ -615,6 +692,30 @@ class ResearchPage(QWidget):
 				self.result_empty.setVisible(True)
 			else:
 				self.result_empty.setVisible(False)
+
+	def _reconcile_documents(self, documents: list[dict[str, Any]]) -> None:
+		"""Merge the authoritative document list from the API response with
+		any bars created from live events. Existing bars are preserved;
+		missing ones are appended at the end; ready summaries are filled in.
+		"""
+		summary_dir = self._summary_dir_from_final_path(self._final_path)
+		for item in documents:
+			doc_id = str(item.get("docId") or "").strip()
+			if not doc_id:
+				continue
+			bar = self._doc_bars.get(doc_id)
+			if bar is None:
+				title = str(item.get("title") or "Untitled")
+				url = str(item.get("url") or "")
+				index = len(self._doc_bars) + 1
+				bar = DocumentBar(index=index, doc_id=doc_id, title=title, url=url)
+				self._doc_bars[doc_id] = bar
+				self.documents_container.addWidget(bar)
+			if summary_dir is not None:
+				summary_path = summary_dir / f"doc_{doc_id}.md"
+				if summary_path.exists():
+					bar.set_summary_ready(summary_path)
+		self.info_doc_count.set_value(f"{len(self._doc_bars)}건")
 
 	def _summary_dir_from_final_path(self, final_path: Path | None) -> Path | None:
 		if final_path is None:
@@ -631,6 +732,7 @@ class ResearchPage(QWidget):
 			if widget is not None:
 				widget.setParent(None)
 				widget.deleteLater()
+		self._doc_bars.clear()
 
 	def _show_message(self, text: str) -> None:
 		self._clear_documents()
