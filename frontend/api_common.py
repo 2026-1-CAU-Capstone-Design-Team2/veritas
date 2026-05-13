@@ -5,7 +5,7 @@ import os
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
 
@@ -59,6 +59,10 @@ class ApiClient:
         )
         return self._send_json(request)
 
+    def delete(self, path: str, query: dict[str, Any] | None = None) -> dict[str, Any]:
+        request = urllib.request.Request(self._url(path, query), method="DELETE")
+        return self._send_json(request)
+
     def put(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         data = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
@@ -68,6 +72,62 @@ class ApiClient:
             headers={"Content-Type": "application/json"},
         )
         return self._send_json(request)
+
+    def stream_post_sse(
+        self,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
+        """POST a JSON body and yield decoded SSE (event, data) tuples.
+
+        Server-Sent Events format: 'event: <name>\\ndata: <json>\\n\\n'.
+        Non-JSON data lines are yielded with the raw string under data['_raw'].
+        """
+        data = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self._url(path),
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            },
+        )
+        try:
+            response = urllib.request.urlopen(request, timeout=600)
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", errors="ignore")
+            raise ApiError(self._error_message(raw) or f"HTTP {e.code}") from e
+        except Exception as e:
+            raise ApiError(str(e)) from e
+
+        with response:
+            event_name = "message"
+            data_buffer: list[str] = []
+            while True:
+                line = response.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if text == "":
+                    if data_buffer:
+                        raw_data = "\n".join(data_buffer)
+                        try:
+                            decoded: dict[str, Any] = json.loads(raw_data)
+                            if not isinstance(decoded, dict):
+                                decoded = {"value": decoded}
+                        except json.JSONDecodeError:
+                            decoded = {"_raw": raw_data}
+                        yield event_name, decoded
+                    event_name = "message"
+                    data_buffer = []
+                    continue
+                if text.startswith(":"):
+                    continue
+                if text.startswith("event:"):
+                    event_name = text[len("event:") :].strip() or "message"
+                elif text.startswith("data:"):
+                    data_buffer.append(text[len("data:") :].lstrip())
 
     def upload_files(self, path: str, files: list[Path]) -> dict[str, Any]:
         boundary = f"----veritas-{uuid4().hex}"
@@ -158,8 +218,7 @@ def load_bootstrap_state() -> dict[str, Any]:
         isinstance(item, dict) and item.get("workspaceId") == current_workspace_id
         for item in workspaces
     ):
-        workspaces.insert(0, default_workspace())
-        current_workspace_id = "default"
+        current_workspace_id = str(workspaces[0].get("workspaceId") or "default")
 
     settings = bootstrap.get("settings")
     if isinstance(settings, dict):

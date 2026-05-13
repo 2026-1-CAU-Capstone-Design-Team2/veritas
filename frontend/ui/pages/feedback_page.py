@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
 from ...components.buttons import AppButton
 from ...components.cards import CardWidget
 from ...api_common import ApiError
-from ...controllers import AgentController
+from ...controllers import AgentController, JobCategory, get_job_manager
 
 
 class FeedbackPage(QWidget):
@@ -103,6 +103,16 @@ class FeedbackPage(QWidget):
 
 		root.addStretch(1)
 
+		# Find the upload button (declared above) so we can toggle it from
+		# busy_changed. We stash a reference on `self` for the slot.
+		self._upload_btn = upload_btn
+		get_job_manager().busy_changed.connect(self._sync_busy_state)
+		self._sync_busy_state()
+
+	def _sync_busy_state(self) -> None:
+		blocked = get_job_manager().is_blocked(JobCategory.FEEDBACK)
+		self._upload_btn.setEnabled(not blocked)
+
 	def _upload_documents(self) -> None:
 		files, _ = QFileDialog.getOpenFileNames(
 			self,
@@ -159,20 +169,41 @@ class FeedbackPage(QWidget):
 			return
 
 		self.feedback_output.setPlainText("backend agent가 문서를 분석하는 중입니다...")
-		try:
-			uploaded = self._controller.upload_feedback_files(new_paths)
-			file_ids: list[str] = []
+
+		controller = self._controller
+
+		def _run() -> dict[str, list[dict[str, str]]]:
+			uploaded = controller.upload_feedback_files(new_paths)
+			ids: list[str] = []
+			id_map: dict[str, str] = {}
 			for path, item in zip(new_paths, uploaded):
 				file_id = str(item.get("fileId") or "")
 				if file_id:
-					self._file_ids[str(path)] = file_id
-					file_ids.append(file_id)
-			if file_ids:
-				self._controller.analyze_feedback(file_ids)
-			if self.file_list.currentRow() >= 0:
-				self._on_file_selected(self.file_list.currentRow())
-		except ApiError as e:
-			self.feedback_output.setPlainText(f"API 요청 실패: {e}")
+					id_map[str(path)] = file_id
+					ids.append(file_id)
+			if ids:
+				controller.analyze_feedback(ids)
+			return {"file_ids": id_map}
+
+		started = get_job_manager().submit(
+			JobCategory.FEEDBACK,
+			_run,
+			on_success=self._on_feedback_analyzed,
+			on_error=self._on_feedback_failed,
+		)
+		if not started:
+			self.feedback_output.setPlainText("다른 작업이 진행 중입니다. 잠시 후 다시 시도하세요.")
+
+	def _on_feedback_analyzed(self, result) -> None:
+		if isinstance(result, dict):
+			id_map = result.get("file_ids", {})
+			if isinstance(id_map, dict):
+				self._file_ids.update({str(k): str(v) for k, v in id_map.items()})
+		if self.file_list.currentRow() >= 0:
+			self._on_file_selected(self.file_list.currentRow())
+
+	def _on_feedback_failed(self, message: str) -> None:
+		self.feedback_output.setPlainText(f"API 요청 실패: {message}")
 
 	def _format_agent_feedback(self, result: dict[str, object]) -> str:
 		name = str(result.get("name") or "")

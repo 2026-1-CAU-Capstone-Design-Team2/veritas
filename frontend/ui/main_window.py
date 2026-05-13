@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, Qt
+from PySide6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, Qt, QThread, Signal
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
 	QApplication,
@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 
 from ..api_common import ApiError, current_workspace_id
 from ..components.cards import CardWidget
-from ..controllers import AgentController
+from ..controllers import AgentController, JobCategory, get_chat_bus, get_job_manager
 from ..components.stepper import WorkflowStepper
 from .pages.dashboard_page import DashboardPage
 from .pages.document_page import DocumentPage
@@ -34,6 +34,43 @@ from .pages.write_page import WritePage
 
 from .sidebar import Sidebar
 from .windows.document_assist_window import DocumentAssistWindow
+
+
+class ScreenEventPollWorker(QThread):
+	eventsReceived = Signal(list)
+	pollError = Signal(str)
+
+	def __init__(
+		self,
+		agent_controller: "AgentController",
+		parent: QWidget | None = None,
+	) -> None:
+		super().__init__(parent)
+		self._agent = agent_controller
+		self._cursor = 0
+		self._stop = False
+		self._sleep_seconds = 3.0
+
+	def request_stop(self) -> None:
+		self._stop = True
+
+	def reset_cursor(self) -> None:
+		self._cursor = 0
+
+	def run(self) -> None:  # type: ignore[override]
+		while not self._stop:
+			try:
+				response = self._agent.get_screen_monitoring_events(since=self._cursor, limit=20)
+				items = response.get("items", []) if isinstance(response, dict) else []
+				if isinstance(items, list) and items:
+					self._cursor = int(response.get("nextCursor") or self._cursor)
+					self.eventsReceived.emit(items)
+			except Exception as e:
+				self.pollError.emit(str(e))
+			for _ in range(int(self._sleep_seconds * 10)):
+				if self._stop:
+					return
+				self.msleep(100)
 
 
 class AnimatedStackedWidget(QStackedWidget):
@@ -152,13 +189,18 @@ class MainWindow(QMainWindow):
 
 		self.route_to_index: dict[str, int] = {}
 		self._add_page("dashboard", DashboardPage())
-		self._add_page("research", ResearchPage())
+		self.research_page = ResearchPage()
+		self.research_page.workspaceChanged.connect(self.sidebar.set_current_workspace)
+		self.research_page.workspaceChanged.connect(self._on_workspace_changed)
+		self._add_page("research", self.research_page)
 		self._add_page("verify", VerifyPage())
 		self.draft_page = DraftPage()
 		self._add_page("draft", self.draft_page)
 		self._add_page("document_assist", DocumentAssistPage())
-		self._add_page("write", WritePage())
-		self._add_page("document", DocumentPage())
+		self.write_page = WritePage()
+		self._add_page("write", self.write_page)
+		self.document_page = DocumentPage()
+		self._add_page("document", self.document_page)
 		self._add_page("feedback", FeedbackPage())
 		self.settings_page = SettingsPage()
 		self.settings_page.defaultWorkspaceChanged.connect(self.sidebar.set_current_workspace)
@@ -174,8 +216,23 @@ class MainWindow(QMainWindow):
 
 		self.document_assist_window = DocumentAssistWindow(self)
 		self._agent_controller = AgentController()
+		self._chat_bus = get_chat_bus()
 		self.document_assist_window.messageSubmitted.connect(self._send_assist_window_message)
+		self.document_assist_window.visibilityChanged.connect(self._on_assist_visibility_changed)
 		self.document_assist_window.hide()
+		self._assist_streaming = False
+		self._chat_bus.userMessageQueued.connect(self._on_chat_user_queued)
+		self._chat_bus.assistantStreamStarted.connect(self._on_chat_stream_started)
+		self._chat_bus.assistantChunk.connect(self._on_chat_stream_chunk)
+		self._chat_bus.assistantCompleted.connect(self._on_chat_stream_completed)
+		self._chat_bus.assistantFailed.connect(self._on_chat_stream_failed)
+		# Floating assist window's chat input follows the global busy state
+		# (locked while AutoSurvey runs or another chat is mid-stream).
+		get_job_manager().busy_changed.connect(self._sync_assist_busy_state)
+		self._sync_assist_busy_state()
+
+		self._screen_monitor_worker: ScreenEventPollWorker | None = None
+		self._screen_monitor_active = False
 
 		self._assist_toggle_shortcut = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
 		self._assist_toggle_shortcut.activated.connect(self.toggle_document_assist_window)
@@ -194,21 +251,128 @@ class MainWindow(QMainWindow):
 			return
 		self.show_document_assist_window()
 
+	def _start_screen_monitoring(self) -> None:
+		if self._screen_monitor_active:
+			return
+		try:
+			self._agent_controller.start_screen_monitoring(current_workspace_id())
+		except ApiError as e:
+			self.document_assist_window.title_bar.status.setText("연결 실패")
+			self.document_assist_window.add_chat_message(
+				"VERITAS",
+				f"화면 모니터링 시작 실패: {e}",
+			)
+			return
+		self._screen_monitor_active = True
+		self.document_assist_window.title_bar.status.setText("● 모니터링 중")
+		worker = ScreenEventPollWorker(self._agent_controller, self)
+		worker.eventsReceived.connect(self._on_proactive_events_received)
+		worker.pollError.connect(self._on_proactive_poll_error)
+		self._screen_monitor_worker = worker
+		worker.start()
+
+	def _stop_screen_monitoring(self) -> None:
+		if not self._screen_monitor_active:
+			return
+		self._screen_monitor_active = False
+		worker = self._screen_monitor_worker
+		self._screen_monitor_worker = None
+		if worker is not None:
+			worker.request_stop()
+			worker.wait(2000)
+		try:
+			self._agent_controller.stop_screen_monitoring()
+		except ApiError:
+			pass
+
+	def _on_proactive_events_received(self, items: list) -> None:
+		for item in items:
+			if not isinstance(item, dict):
+				continue
+			answer = str(item.get("answer") or "").strip()
+			if not answer:
+				continue
+			trigger = str(item.get("triggerText") or "").strip()
+			category = "실시간 보조"
+			text = f"{trigger}\n→ {answer}" if trigger else answer
+			self.document_assist_window.suggestion_list.add_suggestion(
+				category,
+				text,
+				tone="working",
+			)
+
+	def _on_proactive_poll_error(self, message: str) -> None:
+		print(f"[screen_monitoring][poll][warn] {message}")
+
+	def _sync_assist_busy_state(self) -> None:
+		blocked = get_job_manager().is_blocked(JobCategory.CHAT)
+		self.document_assist_window.input_bar.setEnabled(not blocked)
+		if blocked:
+			self.document_assist_window.input_bar.input.setPlaceholderText(
+				"다른 작업이 진행 중입니다. 잠시만 기다려 주세요..."
+			)
+		else:
+			# Restore the mode-specific placeholder.
+			current_mode = self.document_assist_window.input_bar.mode()
+			self.document_assist_window.input_bar.set_mode(current_mode, emit=False)
+
+	def _on_assist_visibility_changed(self, visible: bool) -> None:
+		if visible:
+			if not self._assist_streaming:
+				self._hydrate_assist_history_from_backend()
+			self._start_screen_monitoring()
+		else:
+			self._stop_screen_monitoring()
+
 	def _send_assist_window_message(self, message: str) -> None:
 		mode = self.document_assist_window.input_bar.mode()
-		try:
-			reply = self._agent_controller.send_document_assist_message(
-				current_workspace_id(),
-				message,
-				mode,
+		workspace_id = current_workspace_id()
+		if not self._chat_bus.send(workspace_id, message, mode):
+			self.document_assist_window.add_chat_message(
+				"VERITAS", "이미 답변을 생성하고 있어요. 잠시만 기다려 주세요."
 			)
-		except ApiError as e:
-			reply = f"API 요청 실패: {e}"
-		self.document_assist_window.add_chat_message("VERITAS", reply)
+
+	def _hydrate_assist_history_from_backend(self) -> None:
+		try:
+			history = self._agent_controller.get_chat_history(current_workspace_id())
+		except ApiError:
+			history = []
+		self.document_assist_window.hydrate_history(history)
+
+	def _on_chat_user_queued(self, _workspace_id: str, text: str) -> None:
+		# Both views render the user bubble in response to the bus event.
+		self.document_assist_window.add_chat_message("나", text)
+
+	def _on_chat_stream_started(self) -> None:
+		self._assist_streaming = True
+		self.document_assist_window.chat_panel.start_streaming_assistant("VERITAS")
+		self.document_assist_window.title_bar.status.setText("● 답변 생성 중")
+
+	def _on_chat_stream_chunk(self, chunk: str) -> None:
+		if not self._assist_streaming:
+			return
+		self.document_assist_window.chat_panel.append_streaming_chunk(chunk)
+
+	def _on_chat_stream_completed(self, text: str) -> None:
+		if not self._assist_streaming:
+			return
+		self._assist_streaming = False
+		self.document_assist_window.chat_panel.finalize_streaming_assistant(text)
+		self.document_assist_window.title_bar.status.setText("● 대기")
+
+	def _on_chat_stream_failed(self, error: str) -> None:
+		if not self._assist_streaming:
+			return
+		self._assist_streaming = False
+		self.document_assist_window.chat_panel.cancel_streaming_assistant(error)
+		self.document_assist_window.title_bar.status.setText("● 오류")
 
 	def _on_workspace_changed(self, workspace_name: str) -> None:
 		self.settings_page.set_default_workspace_by_name(workspace_name)
 		self.draft_page.set_workspace_by_name(workspace_name)
+		self.research_page.set_workspace_by_name(workspace_name)
+		self.write_page.set_workspace_by_name(workspace_name)
+		self.document_page.refresh()
 
 	def _toggle_sidebar(self) -> None:
 		start = self.sidebar.width()

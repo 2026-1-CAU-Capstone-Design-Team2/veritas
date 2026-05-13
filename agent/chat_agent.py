@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from core.prompts import (
     SCREEN_INTERVENTION_SYSTEM_PROMPT,
@@ -104,6 +104,129 @@ class ChatAgent:
             )
             self._append_history(question, answer)
             return answer
+
+    def ask_explicit_tool(self, command: str, question: str, *, stream: bool = False) -> str:
+        """Run the same forced tool path used by CLI slash commands.
+
+        This is intended for UI controls that choose a tool mode without making
+        the user type `/autosurvey` or `/rag` into the prompt field.
+        """
+        normalized_command = str(command or "").strip().lower()
+        if normalized_command not in {"autosurvey", "rag"}:
+            raise ValueError(f"Unsupported explicit chat tool: {command}")
+
+        command_text = str(question or "").strip()
+        with self._conversation_lock:
+            tool_outputs = self._run_explicit_tool_command(
+                command=normalized_command,
+                command_text=command_text,
+            )
+            answer = self._answer_from_current_turn(
+                question=command_text,
+                tool_outputs=tool_outputs,
+                stream=stream,
+            )
+            self._append_history(command_text, answer)
+            return answer
+
+    def ask_auto_iter(self, question: str) -> Iterator[str]:
+        """Generator variant of ask_auto. Tool decision runs non-streaming,
+        the final answer is streamed as chunks, and history is updated when
+        the stream completes.
+        """
+        with self._conversation_lock:
+            explicit_command = self._parse_explicit_command(question)
+            if explicit_command:
+                command, command_text = explicit_command
+                if command == "screen" and command_text.lower() in {"debug", "raw"}:
+                    answer = self._run_screen_debug_command()
+                    self._append_history(question, answer)
+                    if answer:
+                        yield answer
+                    return
+                tool_outputs = self._run_explicit_tool_command(
+                    command=command,
+                    command_text=command_text,
+                )
+                question_text = command_text or question
+                yield from self._stream_final_answer(
+                    question=question_text,
+                    tool_outputs=tool_outputs,
+                    history_question=question,
+                )
+                return
+
+            tool_outputs = self._collect_tool_outputs(question)
+            yield from self._stream_final_answer(
+                question=question,
+                tool_outputs=tool_outputs,
+                history_question=question,
+            )
+
+    def ask_explicit_tool_iter(self, command: str, question: str) -> Iterator[str]:
+        normalized_command = str(command or "").strip().lower()
+        if normalized_command not in {"autosurvey", "rag"}:
+            raise ValueError(f"Unsupported explicit chat tool: {command}")
+
+        command_text = str(question or "").strip()
+        with self._conversation_lock:
+            tool_outputs = self._run_explicit_tool_command(
+                command=normalized_command,
+                command_text=command_text,
+            )
+            yield from self._stream_final_answer(
+                question=command_text,
+                tool_outputs=tool_outputs,
+                history_question=command_text,
+            )
+
+    def ask_rag_iter(self, question: str) -> Iterator[str]:
+        with self._conversation_lock:
+            collected: list[str] = []
+            try:
+                for chunk in self.rag_service.iter_answer(question, use_history=True):
+                    collected.append(chunk)
+                    yield chunk
+            except AttributeError:
+                # rag_service does not support iter_answer yet; fall back to one-shot.
+                answer = self.rag_service.answer(question, stream=False, use_history=True)
+                collected.append(answer)
+                yield answer
+            self._append_history(question, "".join(collected))
+
+    def _stream_final_answer(
+        self,
+        *,
+        question: str,
+        tool_outputs: list[dict[str, str]],
+        history_question: str,
+    ) -> Iterator[str]:
+        prompt = TOOL_CHAT_FINAL_PROMPT_TEMPLATE.format(
+            history=self._format_recent_history(),
+            question=question,
+            tool_results=self._format_tool_results(tool_outputs),
+        )
+        collected: list[str] = []
+        try:
+            for chunk in self.llm.iter_ask(
+                self._chat_system_prompt(),
+                prompt,
+                reasoning=False,
+                stream_label="chat:final" if tool_outputs else "chat",
+                timeout_sec=self.FINAL_ANSWER_TIMEOUT_SEC,
+            ):
+                if not chunk:
+                    continue
+                collected.append(chunk)
+                yield chunk
+        except Exception as e:
+            error_text = f"[chat][error] failed to generate answer: {e}"
+            print(error_text)
+            collected.append(error_text)
+            yield error_text
+
+        final_text = "".join(collected).strip()
+        self._append_history(history_question, final_text)
 
     def _append_history(self, question: str, answer: str) -> None:
         self.chat_history.append((question, answer))

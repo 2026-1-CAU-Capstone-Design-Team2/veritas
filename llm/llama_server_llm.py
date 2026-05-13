@@ -7,7 +7,7 @@ and /v1/embeddings endpoints.
 import json
 import re
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import httpx
 from openai import OpenAI
@@ -187,6 +187,104 @@ class LLMClient:
             text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
         return text.strip()
+
+    def iter_ask(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        reasoning: bool = False,
+        *,
+        stream_label: str = "",
+        sampling_params: dict[str, Any] | None = None,
+        extra_sampling_params: dict[str, Any] | None = None,
+        timeout_sec: float | None = None,
+    ) -> Iterator[str]:
+        """Stream a chat completion as visible chunks.
+
+        Yields one chunk per delta with <think> blocks filtered out when
+        reasoning is disabled. The caller is responsible for accumulating the
+        full text and writing it to history.
+        """
+        think_tag = "/think" if reasoning else "/no_think"
+        sampled_params = {**self.SAMPLING_PARAMS, **(sampling_params or {})}
+        sampled_extra = {**self.EXTRA_SAMPLING_PARAMS, **(extra_sampling_params or {})}
+        extra_body = {
+            **sampled_extra,
+            "enable_thinking": reasoning,
+            "enable_reasoning": reasoning,
+            "chat_template_kwargs": {
+                "enable_thinking": reasoning,
+                "enable_reasoning": reasoning,
+            },
+        }
+        stream_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": f"{think_tag}\n{user_prompt}"},
+            ],
+            "stream": True,
+            **sampled_params,
+            "extra_body": extra_body,
+        }
+        if timeout_sec is not None:
+            stream_kwargs["timeout"] = self._request_timeout(timeout_sec)
+
+        start = time.perf_counter()
+        prefix = f"[{stream_label}] " if stream_label else ""
+        print(f"[stream-iter] {prefix}start")
+
+        chunks = self.client.chat.completions.create(**stream_kwargs)
+        filter_think = not reasoning
+        buffer = ""
+        in_think = False
+        total = 0
+
+        for chunk in chunks:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            content = getattr(delta, "content", None) or ""
+            if not content:
+                continue
+            if not filter_think:
+                total += len(content)
+                yield content
+                continue
+            buffer += content
+            while True:
+                if in_think:
+                    end_idx = buffer.find("</think>")
+                    if end_idx != -1:
+                        buffer = buffer[end_idx + 8 :]
+                        in_think = False
+                        continue
+                    break
+                start_idx = buffer.find("<think>")
+                if start_idx != -1:
+                    visible = buffer[:start_idx]
+                    if visible:
+                        total += len(visible)
+                        yield visible
+                    buffer = buffer[start_idx + 7 :]
+                    in_think = True
+                    continue
+                # Keep potential partial open tag in buffer
+                safe_end = max(0, len(buffer) - 7)
+                visible = buffer[:safe_end]
+                if visible:
+                    total += len(visible)
+                    yield visible
+                buffer = buffer[safe_end:]
+                break
+
+        if filter_think and buffer and not in_think:
+            total += len(buffer)
+            yield buffer
+
+        if self.trace_latency:
+            elapsed = time.perf_counter() - start
+            print(f"[stream-iter] {prefix}end chars={total} elapsed={elapsed:.2f}s")
 
     def ask_json(
         self,

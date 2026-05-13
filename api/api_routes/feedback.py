@@ -22,7 +22,8 @@ async def feedback_upload(
 
 
 @router.post("/api/v1/feedback/analyze")
-async def feedback_analyze(payload: FeedbackAnalyzeRequest) -> dict[str, str]:
+def feedback_analyze(payload: FeedbackAnalyzeRequest) -> dict[str, str]:
+    # Sync feedback analysis — keep off the event loop.
     return feedback_service.analyze_feedback(payload.fileIds)
 
 

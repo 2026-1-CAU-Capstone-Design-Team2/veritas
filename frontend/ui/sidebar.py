@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..api_common import STATE, load_bootstrap_state, switch_workspace
+from ..controllers import JobCategory, get_job_manager
 
 
 class NavButton(QPushButton):
@@ -236,6 +237,20 @@ class Sidebar(QFrame):
 
 		self._refresh_workspace_footer()
 
+		# Workspace switching rebuilds the backend registry; it must not be
+		# triggered while research/feedback/etc. are in flight.
+		get_job_manager().busy_changed.connect(self._sync_busy_state)
+		self._sync_busy_state()
+
+	def _sync_busy_state(self) -> None:
+		blocked = get_job_manager().is_blocked(JobCategory.WORKSPACE_SWITCH)
+		self._switch_workspace_btn.setEnabled(not blocked)
+		self._switch_workspace_btn.setToolTip(
+			"다른 작업이 진행 중일 때는 워크스페이스를 전환할 수 없습니다."
+			if blocked
+			else ""
+		)
+
 	def set_active(self, route: str) -> None:
 		for key, button in self._buttons.items():
 			button.setChecked(key == route)
@@ -345,6 +360,23 @@ class Sidebar(QFrame):
 		if dialog.exec() == QDialog.Accepted:
 			self._current_workspace_index = selector.currentIndex()
 			workspace_id = self._workspace_ids[self._current_workspace_index]
-			current = switch_workspace(workspace_id)
-			self._refresh_workspace_footer()
-			self.workspaceChanged.emit(current)
+			# Run the switch on a worker thread; the backend rebuilds the
+			# tool registry / ChromaDB handles which can take a moment.
+			started = get_job_manager().submit(
+				JobCategory.WORKSPACE_SWITCH,
+				switch_workspace,
+				workspace_id,
+				on_success=self._on_workspace_switched,
+				on_error=self._on_workspace_switch_failed,
+			)
+			if not started:
+				# Should not happen — button is gated by busy_changed —
+				# but be defensive.
+				return
+
+	def _on_workspace_switched(self, current: str) -> None:
+		self._refresh_workspace_footer()
+		self.workspaceChanged.emit(str(current or ""))
+
+	def _on_workspace_switch_failed(self, message: str) -> None:
+		print(f"[workspace][switch][warn] {message}")

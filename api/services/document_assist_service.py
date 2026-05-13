@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import HTTPException
 
 from ..api_common import new_id, utc_now_iso
 from ..repositories import state_repository as repo
+from . import draft_chat_service
 from .agent_runtime import get_runtime
 
 
@@ -44,18 +45,26 @@ def analyze_document(workspace_id: str, text: str, cursor: int | None) -> dict[s
 
 
 def send_chat_message(workspace_id: str, message: str, mode: str = "research") -> dict[str, Any]:
-    message_text = message.strip()
-    if not message_text:
-        raise HTTPException(status_code=422, detail="message must not be empty")
-
-    reply = get_runtime().answer_chat(message_text, mode)
+    """Route document-assist chat through the same persisted history as the
+    main chat panel so both views stay in sync.
+    """
+    result = draft_chat_service.send_chat_message(workspace_id, message, mode)
     return {
-        "messageId": new_id("msg"),
+        "messageId": result.get("messageId"),
         "workspaceId": workspace_id,
         "workspaceName": _workspace_name(workspace_id),
-        "mode": mode,
-        "reply": reply,
+        "mode": result.get("mode") or mode,
+        "reply": result.get("assistant") or "",
     }
+
+
+def send_chat_message_stream(
+    workspace_id: str,
+    message: str,
+    mode: str = "research",
+) -> Iterator[bytes]:
+    """SSE alias that reuses the chat streaming pipeline."""
+    return draft_chat_service.send_chat_message_stream(workspace_id, message, mode)
 
 
 def get_snapshot(session_id: str) -> dict[str, Any]:
