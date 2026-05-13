@@ -27,3 +27,11 @@ async def research_job_list(limit: int = Query(default=10, ge=1, le=100)) -> dic
 @router.get("/api/v1/research/jobs/{jobId}")
 async def research_job_detail(jobId: str) -> dict[str, Any]:
     return research_service.get_research_job(jobId)
+
+
+@router.get("/api/v1/research/progress")
+async def research_progress(
+    since: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict[str, Any]:
+    return research_service.get_progress(since=since, limit=limit)

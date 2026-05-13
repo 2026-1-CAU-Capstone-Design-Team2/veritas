@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import HTTPException
 
@@ -67,6 +67,67 @@ def send_chat_message(workspace_id: str, message: str, mode: str = "research") -
     history.append({"role": "assistant", "text": assistant_text})
     _save_workspace_chat_history(workspace_id, history)
     return {"messageId": message_id, "assistant": assistant_text, "mode": mode}
+
+
+def send_chat_message_stream(
+    workspace_id: str,
+    message: str,
+    mode: str = "research",
+) -> Iterator[bytes]:
+    """Stream the assistant response as SSE events.
+
+    Events:
+        event: start  data: {"messageId": "...", "workspaceId": "..."}
+        event: delta  data: {"text": "<chunk>"}
+        event: done   data: {"messageId": "...", "assistant": "<full>", "mode": "..."}
+        event: error  data: {"error": "..."}
+    """
+    message_text = message.strip()
+    if not message_text:
+        yield _sse("error", {"error": "message must not be empty"})
+        return
+
+    message_id = new_id("msg")
+    session_id = f"session_{workspace_id}"
+    history = _get_workspace_chat_history(workspace_id, session_id)
+    history.append({"role": "user", "text": message})
+
+    runtime = get_runtime()
+    runtime.set_workspace(workspace_id)
+
+    yield _sse(
+        "start",
+        {"messageId": message_id, "workspaceId": workspace_id, "mode": mode},
+    )
+
+    collected: list[str] = []
+    try:
+        for chunk in runtime.answer_chat_selection_iter(message_text, mode):
+            if not chunk:
+                continue
+            collected.append(chunk)
+            yield _sse("delta", {"text": chunk})
+    except Exception as e:
+        error_text = f"[chat][error] {e}"
+        collected.append(error_text)
+        yield _sse("error", {"error": str(e)})
+
+    assistant_text = "".join(collected)
+    history.append({"role": "assistant", "text": assistant_text})
+    _save_workspace_chat_history(workspace_id, history)
+    yield _sse(
+        "done",
+        {
+            "messageId": message_id,
+            "assistant": assistant_text,
+            "mode": mode,
+        },
+    )
+
+
+def _sse(event: str, payload: dict[str, Any]) -> bytes:
+    body = json.dumps(payload, ensure_ascii=False)
+    return f"event: {event}\ndata: {body}\n\n".encode("utf-8")
 
 
 def get_chat_history(session_id: str) -> dict[str, Any]:

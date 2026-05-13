@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from core.models import DocRecord
+
+
+ProgressCallback = Callable[..., None]
 
 
 class AutoSurveyWorkflow:
@@ -17,12 +20,33 @@ class AutoSurveyWorkflow:
         max_docs: int = 15,
         collect_batch_size: int = 5,
         scout_docs: int = 3,
+        progress_callback: ProgressCallback | None = None,
     ):
         self.registry = registry
         self.run_store_service = run_store_service
         self.max_docs = max(1, int(max_docs))
         self.collect_batch_size = max(1, int(collect_batch_size))
         self.scout_docs = max(1, min(int(scout_docs), self.max_docs))
+        self._progress_callback = progress_callback
+
+    def _emit_progress(
+        self,
+        stage: str,
+        message: str,
+        *,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        if self._progress_callback is None:
+            return
+        try:
+            self._progress_callback(stage, message, detail=detail or {})
+        except TypeError:
+            try:
+                self._progress_callback(stage, message)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def run_term_grounding(
         self,
@@ -43,6 +67,7 @@ class AutoSurveyWorkflow:
             except Exception:
                 pass
 
+        self._emit_progress("term_grounding", "주제어 추출 중...")
         result = self.registry.get("term_grounding").run(
             user_request=request_text,
             max_terms=max_terms,
@@ -81,6 +106,8 @@ class AutoSurveyWorkflow:
         query_state = self.run_store_service.load_query_state()
         used_queries = query_state.get("used_queries", [])
 
+        plan_label = "검색 계획 수립 중..." if mode == "initial" else "검색 계획 재구성 중..."
+        self._emit_progress("query_plan", plan_label, detail={"mode": mode})
         result = self.registry.get("query_plan").run(
             user_request=user_request,
             force=force_plan,
@@ -185,6 +212,11 @@ class AutoSurveyWorkflow:
             used_query_keys.add(normalized_query)
             used_queries.append(query)
 
+            self._emit_progress(
+                "web_search",
+                f"검색 중: {query}",
+                detail={"query": query, "phase": phase_label},
+            )
             search_result = self.registry.get("web_search").run(
                 query=query,
                 num_results=max(5, min(10, target_new_docs * 3)),
@@ -270,6 +302,15 @@ class AutoSurveyWorkflow:
                 "batch_result": {"batch_files": [], "count": 0},
             }
 
+        doc_count = len(doc_ids) if doc_ids is not None else 0
+        message = (
+            f"문서 요약 중: {doc_count}건" if doc_count > 0 else "문서 요약 중..."
+        )
+        self._emit_progress(
+            "document_summarize",
+            message,
+            detail={"doc_count": doc_count, "doc_ids": doc_ids or []},
+        )
         result = self.registry.get("document_summarize").run(
             overwrite=overwrite,
             doc_ids=doc_ids,
@@ -280,6 +321,7 @@ class AutoSurveyWorkflow:
         return result.data
 
     def run_final(self, *, user_request: str | None = None) -> dict[str, Any]:
+        self._emit_progress("final_report", "최종 보고서 작성 중...")
         result = self.registry.get("final_report").run(user_request=user_request)
         if not result.success:
             raise RuntimeError(result.error)
@@ -535,6 +577,12 @@ class AutoSurveyWorkflow:
         records = self.run_store_service.load_records()
         doc_id = self.run_store_service.next_doc_id(len(records))
 
+        domain = urlparse(url).netloc or url
+        self._emit_progress(
+            "fetch_webpage",
+            f"문서 수집 중: {domain}",
+            detail={"url": url, "title": title_hint},
+        )
         fetch_result = self.registry.get("fetch_webpage").run(
             url=url,
             timeout_sec=15,

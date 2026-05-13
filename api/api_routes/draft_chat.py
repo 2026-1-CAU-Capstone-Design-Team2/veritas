@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Query
+from fastapi.responses import StreamingResponse
 
 from ..api_models import ChatMessageRequest, DraftGenerateRequest, DraftRegenerateRequest
 from ..services import draft_chat_service
@@ -23,6 +24,17 @@ async def draft_regenerate(draftId: str, payload: DraftRegenerateRequest) -> dic
 @router.post("/api/v1/chat/messages")
 async def chat_send(payload: ChatMessageRequest) -> dict[str, str]:
     return draft_chat_service.send_chat_message(payload.workspaceId, payload.message, payload.mode)
+
+
+@router.post("/api/v1/chat/messages/stream")
+async def chat_send_stream(payload: ChatMessageRequest) -> StreamingResponse:
+    return StreamingResponse(
+        draft_chat_service.send_chat_message_stream(
+            payload.workspaceId, payload.message, payload.mode
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/api/v1/chat/sessions/{sessionId}/messages")

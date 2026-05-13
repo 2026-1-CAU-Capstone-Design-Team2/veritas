@@ -95,3 +95,7 @@ class PredictionHideRequest(BaseModel):
 class PredictionApplyRequest(BaseModel):
     predictionId: str
     insertMode: str
+
+
+class ScreenMonitoringStartRequest(BaseModel):
+    workspaceId: str | None = None

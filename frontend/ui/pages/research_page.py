@@ -43,6 +43,45 @@ class ResearchWorker(QObject):
 			self.failed.emit(str(e))
 
 
+class ResearchProgressPoller(QThread):
+	"""Polls /api/v1/research/progress on a background thread and emits the
+	latest single-line status message so the UI can render it in gray.
+	"""
+
+	progress = Signal(str)
+
+	def __init__(self, parent: QObject | None = None) -> None:
+		super().__init__(parent)
+		self._cursor = 0
+		self._stop = False
+		self._sleep_ms = 800
+
+	def request_stop(self) -> None:
+		self._stop = True
+
+	def reset(self) -> None:
+		self._cursor = 0
+
+	def run(self) -> None:  # type: ignore[override]
+		while not self._stop:
+			try:
+				response = AgentController().get_research_progress(since=self._cursor, limit=50)
+				items = response.get("items", []) if isinstance(response, dict) else []
+				if isinstance(items, list) and items:
+					self._cursor = int(response.get("nextCursor") or self._cursor)
+					latest = items[-1]
+					if isinstance(latest, dict):
+						message = str(latest.get("message") or "")
+						if message:
+							self.progress.emit(message)
+			except Exception:
+				pass
+			elapsed = 0
+			while not self._stop and elapsed < self._sleep_ms:
+				self.msleep(100)
+				elapsed += 100
+
+
 class ResearchPage(QWidget):
 	workspaceChanged = Signal(str)
 
@@ -52,6 +91,7 @@ class ResearchPage(QWidget):
 		self._workspace_id = current_workspace_id()
 		self._research_thread: QThread | None = None
 		self._research_worker: ResearchWorker | None = None
+		self._progress_poller: ResearchProgressPoller | None = None
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
@@ -115,6 +155,13 @@ class ResearchPage(QWidget):
 		root.addWidget(content_card)
 
 		result_card = CardWidget("조사 결과")
+		self.progress_line = QLabel("")
+		self.progress_line.setObjectName("ResearchProgressLine")
+		self.progress_line.setWordWrap(False)
+		self.progress_line.setTextFormat(Qt.PlainText)
+		self.progress_line.setStyleSheet("color: #9CA3AF; font-size: 12px; font-weight: 500;")
+		self.progress_line.setVisible(False)
+		result_card.layout.addWidget(self.progress_line)
 		self.result_output = QPlainTextEdit()
 		self.result_output.setReadOnly(True)
 		self.result_output.setMinimumHeight(260)
@@ -167,7 +214,34 @@ class ResearchPage(QWidget):
 		self._workspace_id = current_workspace_id()
 		self.run_button.setEnabled(False)
 		self.result_output.setPlainText("AutoSurvey workflow를 실행하는 중입니다. 문서 수집과 요약에 시간이 걸릴 수 있습니다...")
+		self.progress_line.setText("조사 준비 중...")
+		self.progress_line.setVisible(True)
+		self._start_progress_poller()
 		self._start_research_worker(instruction, self.get_reference_urls())
+
+	def _start_progress_poller(self) -> None:
+		self._stop_progress_poller()
+		poller = ResearchProgressPoller(self)
+		poller.progress.connect(self._on_progress_message)
+		self._progress_poller = poller
+		poller.start()
+
+	def _stop_progress_poller(self) -> None:
+		poller = self._progress_poller
+		self._progress_poller = None
+		if poller is not None:
+			poller.request_stop()
+			poller.wait(1500)
+			poller.deleteLater()
+
+	def _on_progress_message(self, message: str) -> None:
+		# Replace the existing single line so the latest agent action is
+		# displayed inline (ChatGPT/Claude style) instead of stacking lines.
+		text = " ".join(message.split())
+		if len(text) > 200:
+			text = text[:197] + "..."
+		self.progress_line.setText(text)
+		self.progress_line.setVisible(True)
 
 	def _start_research_worker(self, instruction: str, reference_urls: list[str]) -> None:
 		thread = QThread(self)
@@ -189,6 +263,8 @@ class ResearchPage(QWidget):
 		thread.start()
 
 	def _on_research_finished(self, response: dict[str, Any]) -> None:
+		self._stop_progress_poller()
+		self.progress_line.setVisible(False)
 		try:
 			load_bootstrap_state()
 		except Exception:
@@ -264,6 +340,8 @@ class ResearchPage(QWidget):
 		self.result_output.setPlainText("\n".join(lines).strip())
 
 	def _on_research_failed(self, message: str) -> None:
+		self._stop_progress_poller()
+		self.progress_line.setVisible(False)
 		self.result_output.setPlainText(f"API 요청 실패: {message}")
 		self.run_button.setEnabled(True)
 

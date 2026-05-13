@@ -41,6 +41,7 @@ def create_research_job(
         result = get_runtime().run_autosurvey(
             instruction=instruction_text,
             reference_urls=job["referenceUrls"],
+            job_id=job_id,
         )
     except Exception as e:
         job["status"] = "failed"
@@ -115,6 +116,10 @@ def list_research_jobs(limit: int) -> dict[str, list[dict[str, Any]]]:
     _sync_run_research_jobs()
     jobs = sorted(repo.list_research_jobs(), key=lambda item: item["submittedAt"], reverse=True)
     return {"items": jobs[:limit]}
+
+
+def get_progress(*, since: int, limit: int) -> dict[str, Any]:
+    return get_runtime().get_research_progress(since=since, limit=limit)
 
 
 def _sync_run_research_jobs() -> None:
