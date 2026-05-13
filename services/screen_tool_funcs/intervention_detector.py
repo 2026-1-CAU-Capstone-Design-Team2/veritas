@@ -1,15 +1,34 @@
 from __future__ import annotations
 
-import difflib
 import hashlib
 import re
 from typing import Any
 
 from .models import FilteredScreenContext, InterventionDecision, WindowContext
+from .scenario_scheduler import ScenarioScheduler, ScenarioWeights
+from .scenarios import (
+    IdleAfterWritingScenario,
+    ScenarioContext,
+    ScenarioEvaluation,
+    ScenarioType,
+    WholeDocumentReviewScenario,
+)
 
 
 class InterventionDetector:
-    """History-aware rule gate for LLM intervention candidates."""
+    """Common gates + scenario fan-out + CFS selection.
+
+    Flow:
+        1. Build snapshot + history slice.
+        2. Run common gates (editing_app, dwell, stable_paragraph) sequentially.
+           Any failure short-circuits to a non-intervention decision.
+        3. Fan-out scenario evaluations. Every scenario is evaluated so that
+           all readiness signals are recorded for telemetry, even when CFS
+           ultimately picks only one.
+        4. CFS scheduler selects exactly one scenario from the ready set.
+        5. Build InterventionDecision with intervention_type set to the
+           selected scenario (or "none" if no scenario is ready).
+    """
 
     EDITING_APP_TYPES = {"document", "presentation", "spreadsheet", "code_editor"}
 
@@ -19,22 +38,32 @@ class InterventionDetector:
         history_window: int = 10,
         min_history_count: int = 5,
         dwell_threshold: float = 0.5,
-        cooldown_events: int = 5,
         min_paragraph_chars: int = 20,
         min_ocr_paragraph_chars: int = 40,
-        min_changed_chars: int = 10,
-        min_idle_captures: int = 2,
-        idle_similarity_threshold: float = 0.985,
+        scenarios: list[ScenarioType] | None = None,
+        scheduler: ScenarioScheduler | None = None,
     ) -> None:
         self.history_window = history_window
         self.min_history_count = min_history_count
         self.dwell_threshold = dwell_threshold
-        self.cooldown_events = cooldown_events
         self.min_paragraph_chars = min_paragraph_chars
         self.min_ocr_paragraph_chars = min_ocr_paragraph_chars
-        self.min_changed_chars = min_changed_chars
-        self.min_idle_captures = min_idle_captures
-        self.idle_similarity_threshold = idle_similarity_threshold
+
+        self.scenarios: list[ScenarioType] = scenarios or [
+            IdleAfterWritingScenario(min_paragraph_chars=min_paragraph_chars),
+            WholeDocumentReviewScenario(),
+        ]
+        self.scheduler = scheduler
+
+    @property
+    def scenario_weights(self) -> dict[str, ScenarioWeights]:
+        return {
+            scenario.name: ScenarioWeights(
+                initial_vruntime=scenario.initial_vruntime,
+                vruntime_increment=scenario.vruntime_increment,
+            )
+            for scenario in self.scenarios
+        }
 
     def decide(
         self,
@@ -50,7 +79,7 @@ class InterventionDetector:
             event for event in recent if self._document_key(event) == current_snapshot["document_key"]
         ]
 
-        metadata = {
+        common_metadata = {
             "history_window": self.history_window,
             "history_count": len(recent),
             "same_document_count": len(same_document_events),
@@ -58,19 +87,12 @@ class InterventionDetector:
             "document_key": current_snapshot["document_key"],
             "paragraph_fingerprint": current_snapshot["paragraph_fingerprint"],
         }
-        typing_pause = self._typing_pause_status(same_document_events)
-        metadata["typing_pause"] = typing_pause
-
-        score = 0.0
-        reasons: list[str] = []
-        blockers: list[str] = []
 
         editing_app = self._is_editing_app(filtered)
-        dwell_satisfied = self._has_sufficient_dwell(metadata)
+        dwell_satisfied = self._has_sufficient_dwell(common_metadata)
         stable_paragraph = self._has_stable_paragraph(filtered)
-        typing_pause_ready = bool(typing_pause.get("ready"))
-        cooldown_passed = self._passes_cooldown(current_snapshot, history_events)
-        metadata["checks"] = {
+
+        common_checks: dict[str, dict[str, Any]] = {
             "editing_app": {
                 "passed": editing_app,
                 "reason": "editing_app_active" if editing_app else "not_editing_app",
@@ -79,9 +101,9 @@ class InterventionDetector:
             "dwell": {
                 "passed": dwell_satisfied,
                 "reason": "editing_app_dwell_satisfied" if dwell_satisfied else "insufficient_dwell",
-                "history_count": metadata["history_count"],
+                "history_count": common_metadata["history_count"],
                 "min_history_count": self.min_history_count,
-                "dwell_ratio": metadata["dwell_ratio"],
+                "dwell_ratio": common_metadata["dwell_ratio"],
                 "dwell_threshold": self.dwell_threshold,
             },
             "stable_paragraph": {
@@ -97,62 +119,97 @@ class InterventionDetector:
                 "min_ocr_paragraph_chars": self.min_ocr_paragraph_chars,
                 "confidence": filtered.confidence,
             },
-            "typing_pause": {
-                "passed": typing_pause_ready,
-                "reason": (
-                    "typing_pause_satisfied"
-                    if typing_pause_ready
-                    else "not_paused_after_typing"
-                ),
-                **typing_pause,
-            },
-            "cooldown": {
-                "passed": cooldown_passed,
-                "reason": "cooldown_dedupe_passed" if cooldown_passed else "cooldown_or_duplicate",
-                "cooldown_events": self.cooldown_events,
-            },
         }
 
-        if not editing_app:
-            blockers.append("not_editing_app")
-        else:
-            score += 0.2
-            reasons.append("editing_app_active")
+        common_blockers = [name for name, check in common_checks.items() if not check["passed"]]
+        if common_blockers:
+            return InterventionDecision(
+                should_consider_llm=False,
+                intervention_type="none",
+                score=0.0,
+                priority="low",
+                reason_codes=[common_checks[name]["reason"] for name in common_blockers],
+                metadata={
+                    **common_metadata,
+                    "common_checks": common_checks,
+                    "scenarios": {},
+                    "blockers": common_blockers,
+                    "selected": None,
+                    "scheduler": None,
+                },
+            )
 
-        if not dwell_satisfied:
-            blockers.append("insufficient_dwell")
-        else:
-            score += 0.25
-            reasons.append("editing_app_dwell_satisfied")
+        scenario_ctx = ScenarioContext(
+            window=window,
+            filtered=filtered,
+            history_events=history_events,
+            same_document_events=same_document_events,
+            document_key=current_snapshot["document_key"],
+            paragraph_fingerprint=current_snapshot["paragraph_fingerprint"],
+        )
+        scenario_results: dict[str, ScenarioEvaluation] = {}
+        for scenario in self.scenarios:
+            scenario_results[scenario.name] = scenario.evaluate(scenario_ctx)
 
-        if not stable_paragraph:
-            blockers.append("unstable_current_paragraph")
-        else:
-            score += 0.2
-            reasons.append("current_paragraph_stable")
+        ready_names = [name for name, ev in scenario_results.items() if ev.ready]
+        scheduler_snapshot: dict[str, Any] | None = None
+        selected_name: str | None = None
+        if ready_names and self.scheduler is not None:
+            selected_name = self.scheduler.select(current_snapshot["document_key"], ready_names)
+            scheduler_snapshot = self.scheduler.snapshot(current_snapshot["document_key"])
+        elif ready_names:
+            selected_name = ready_names[0]
 
-        if not typing_pause_ready:
-            blockers.append("not_paused_after_typing")
-        else:
-            score += 0.25
-            reasons.append("typing_pause_satisfied")
+        scenarios_meta = {
+            name: {
+                "ready": ev.ready,
+                "score": round(ev.score, 3),
+                "priority": ev.priority,
+                "reasons": list(ev.reasons),
+                "blockers": list(ev.blockers),
+                "gate_results": ev.gate_results,
+                "metadata": ev.metadata,
+            }
+            for name, ev in scenario_results.items()
+        }
 
-        if not cooldown_passed:
-            blockers.append("cooldown_or_duplicate")
-        else:
-            score += 0.1
-            reasons.append("cooldown_dedupe_passed")
+        if selected_name is None:
+            blockers = [f"scenario:{name}:not_ready" for name in scenario_results if not scenario_results[name].ready]
+            return InterventionDecision(
+                should_consider_llm=False,
+                intervention_type="none",
+                score=0.0,
+                priority="low",
+                reason_codes=blockers,
+                metadata={
+                    **common_metadata,
+                    "common_checks": common_checks,
+                    "scenarios": scenarios_meta,
+                    "blockers": blockers,
+                    "selected": None,
+                    "scheduler": scheduler_snapshot,
+                },
+            )
 
-        should_consider = not blockers
-        priority = "high" if should_consider and score >= 0.85 else "medium" if should_consider else "low"
-        metadata["blockers"] = blockers
+        if self.scheduler is not None:
+            self.scheduler.charge(current_snapshot["document_key"], selected_name)
+            scheduler_snapshot = self.scheduler.snapshot(current_snapshot["document_key"])
 
+        selected = scenario_results[selected_name]
         return InterventionDecision(
-            should_consider_llm=should_consider,
-            score=round(score, 2),
-            priority=priority,
-            reason_codes=reasons if should_consider else blockers,
-            metadata=metadata,
+            should_consider_llm=True,
+            intervention_type=selected_name,
+            score=round(selected.score, 3),
+            priority=selected.priority,
+            reason_codes=list(selected.reasons),
+            metadata={
+                **common_metadata,
+                "common_checks": common_checks,
+                "scenarios": scenarios_meta,
+                "blockers": [],
+                "selected": selected_name,
+                "scheduler": scheduler_snapshot,
+            },
         )
 
     def _snapshot(self, *, window: WindowContext, filtered: FilteredScreenContext) -> dict[str, Any]:
@@ -190,114 +247,6 @@ class InterventionDetector:
             return len(paragraph) >= self.min_ocr_paragraph_chars and filtered.confidence >= 0.55
         return bool(source and len(paragraph) >= self.min_paragraph_chars and filtered.confidence >= 0.8)
 
-    def _typing_pause_status(self, same_document_events: list[dict[str, Any]]) -> dict[str, Any]:
-        current_text = self._normalized_active_text(same_document_events[-1] if same_document_events else {})
-        if len(current_text) < self.min_paragraph_chars:
-            return {
-                "ready": False,
-                "reason": "current_text_too_short",
-                "stable_capture_count": 0,
-                "min_idle_captures": self.min_idle_captures,
-                "current_text_chars": len(current_text),
-                "prior_text_chars": 0,
-            }
-
-        stable_capture_count = 0
-        last_similarity = 1.0
-        last_length_delta = 0
-        for event in reversed(same_document_events):
-            event_text = self._normalized_active_text(event)
-            stable, similarity, length_delta = self._is_same_idle_text(event_text, current_text)
-            last_similarity = similarity
-            last_length_delta = length_delta
-            if not stable:
-                break
-            stable_capture_count += 1
-
-        prior_index = len(same_document_events) - stable_capture_count - 1
-        has_prior_text_event = prior_index >= 0
-        prior_text = (
-            self._normalized_active_text(same_document_events[prior_index])
-            if has_prior_text_event
-            else ""
-        )
-        changed_before_pause = (
-            has_prior_text_event and self._meaningful_text_change(prior_text, current_text)
-        )
-        ready = stable_capture_count >= self.min_idle_captures and changed_before_pause
-        reason = "ready" if ready else "waiting_for_idle_captures"
-        if stable_capture_count >= self.min_idle_captures and not changed_before_pause:
-            reason = "no_recent_text_change_before_pause"
-
-        return {
-            "ready": ready,
-            "reason": reason,
-            "stable_capture_count": stable_capture_count,
-            "min_idle_captures": self.min_idle_captures,
-            "idle_similarity_threshold": self.idle_similarity_threshold,
-            "last_similarity": round(last_similarity, 4),
-            "last_length_delta": last_length_delta,
-            "changed_before_pause": changed_before_pause,
-            "current_text_chars": len(current_text),
-            "prior_text_chars": len(prior_text),
-        }
-
-    def _normalized_active_text(self, event: dict[str, Any]) -> str:
-        filtered = event.get("filtered") or {}
-        text = str(filtered.get("active_editor_text") or "")
-        return " ".join(text.split()).strip()
-
-    def _meaningful_text_change(self, previous: str, current: str) -> bool:
-        if not current:
-            return False
-        if not previous:
-            return len(current) >= self.min_paragraph_chars
-        if current == previous:
-            return False
-        if current.startswith(previous):
-            return len(current) - len(previous) >= self.min_changed_chars
-        if abs(len(current) - len(previous)) >= self.min_changed_chars:
-            return True
-        return difflib.SequenceMatcher(None, previous, current).ratio() < 0.98
-
-    def _is_same_idle_text(self, previous: str, current: str) -> tuple[bool, float, int]:
-        if previous == current:
-            return True, 1.0, 0
-        if not previous or not current:
-            return False, 0.0, abs(len(current) - len(previous))
-
-        length_delta = abs(len(current) - len(previous))
-        max_noise_chars = max(3, int(len(current) * 0.015))
-        if length_delta > max_noise_chars:
-            return False, 0.0, length_delta
-
-        similarity = difflib.SequenceMatcher(None, previous, current).ratio()
-        return similarity >= self.idle_similarity_threshold, similarity, length_delta
-
-    def _passes_cooldown(self, current_snapshot: dict[str, Any], history_events: list[dict[str, Any]]) -> bool:
-        current_doc = current_snapshot["document_key"]
-        current_paragraph = current_snapshot["paragraph_fingerprint"]
-        if not current_paragraph:
-            return False
-
-        for event in reversed(history_events[-self.cooldown_events:]):
-            intervention = event.get("intervention") or {}
-            if not intervention.get("should_consider_llm"):
-                continue
-            if self._document_key(event) != current_doc:
-                continue
-            paragraph = self._event_paragraph_fingerprint(event)
-            if paragraph == current_paragraph:
-                return False
-        return True
-
-    def _latest_event_with_paragraph(self, events: list[dict[str, Any]]) -> dict[str, Any] | None:
-        for event in reversed(events):
-            paragraph = ((event.get("filtered") or {}).get("current_paragraph_text") or "").strip()
-            if paragraph:
-                return event
-        return None
-
     def _make_document_key(self, window: WindowContext) -> str:
         process_name = (window.process_name or "").lower()
         title = self._normalize_key(window.window_title or "")
@@ -310,12 +259,6 @@ class InterventionDetector:
         process_name = str(window.get("process_name") or "").lower()
         title = self._normalize_key(str(window.get("window_title") or ""))
         return f"{process_name}|{title}"
-
-    def _event_paragraph_fingerprint(self, event: dict[str, Any]) -> str:
-        if event.get("paragraph_fingerprint"):
-            return str(event["paragraph_fingerprint"])
-        filtered = event.get("filtered") or {}
-        return self._fingerprint(str(filtered.get("current_paragraph_text") or ""))
 
     def _fingerprint(self, text: str) -> str:
         normalized = " ".join(text.split()).strip().lower()

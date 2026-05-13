@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import threading
 import time
 from datetime import datetime
@@ -22,11 +24,13 @@ class ScreenContextStore:
         self.intervention_queue_path = self.screen_dir / "intervention_queue.json"
         self.latest_intervention_path = self.screen_dir / "latest_intervention.json"
         self.capture_log_dir = self.screen_dir / "capture_logs"
+        self.scheduler_dir = self.screen_dir / "scheduler_state"
         self.capture_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.capture_log_path = self.capture_log_dir / f"capture_{self.capture_session_id}.jsonl"
         self._lock = threading.RLock()
         self.screen_dir.mkdir(parents=True, exist_ok=True)
         self.capture_log_dir.mkdir(parents=True, exist_ok=True)
+        self.scheduler_dir.mkdir(parents=True, exist_ok=True)
 
     def save_event(self, event: ScreenContextEvent) -> None:
         payload = event.to_dict()
@@ -140,6 +144,32 @@ class ScreenContextStore:
 
     def _write_pending_interventions_unlocked(self, queue: list[dict[str, Any]]) -> None:
         self._write_json_atomic(self.intervention_queue_path, queue, indent=2)
+
+    def scheduler_state_path(self, document_key: str) -> Path:
+        safe = self._safe_document_filename(document_key)
+        return self.scheduler_dir / f"{safe}.json"
+
+    def load_scheduler_state(self, document_key: str) -> dict[str, Any] | None:
+        path = self.scheduler_state_path(document_key)
+        with self._lock:
+            if not path.exists():
+                return None
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+        return data if isinstance(data, dict) else None
+
+    def save_scheduler_state(self, document_key: str, payload: dict[str, Any]) -> None:
+        path = self.scheduler_state_path(document_key)
+        with self._lock:
+            self._write_json_atomic(path, payload, indent=2)
+
+    def _safe_document_filename(self, document_key: str) -> str:
+        normalized = (document_key or "unknown").strip() or "unknown"
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", normalized)[:48].strip("_") or "doc"
+        return f"{slug}_{digest}"
 
     def _write_json_atomic(self, path: Path, payload: Any, *, indent: int | None = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

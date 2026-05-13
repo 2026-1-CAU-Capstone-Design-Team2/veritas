@@ -47,6 +47,33 @@ Windows 화면 컨텍스트를 수집하고, 사용자가 문서/편집 앱에�
 - `ocr_engine.py`
 - `content_filter.py`
 
+```mermaid
+flowchart TD
+    A["screen_context_service.py::ScreenContextService.capture_once()"] --> B["window_context.py::WindowContextReader.read_foreground()"]
+    B --> C["screen_context_service.py::_read_app_text_first()"]
+    C --> D["powerpoint_com.py::PowerPointComReader.read_active_slide()"]
+    D --> E{"screen_context_service.py::_is_usable_app_text()<br/>App text usable?"}
+    E -- "Yes" --> F["UIA/OCR skip"]
+    E -- "No" --> G["screen_context_service.py::_read_text_first()"]
+    G --> H["ui_automation.py::UiAutomationReader.read_focused()"]
+    H --> I{"screen_context_service.py::_is_usable_text_source()<br/>UIA text usable?"}
+    I -- "Yes" --> J["OCR skip"]
+    I -- "No" --> K["screen_capture.py::ScreenCapture.capture_window()"]
+    K --> L["ocr_engine.py::OcrEngine.recognize()"]
+    F --> M["content_filter.py::ContentFilter.build()"]
+    J --> M
+    L --> M
+    M --> N["store.py::ScreenContextStore.load_recent()"]
+    N --> O["intervention_detector.py::InterventionDetector.decide()"]
+    O --> P["models.py::ScreenContextEvent.new()"]
+    P --> Q["store.py::ScreenContextStore.save_event()"]
+    Q --> R["intervention_dispatcher.py::InterventionDispatcher.dispatch()"]
+    R --> S{"should_consider_llm?"}
+    S -- "No" --> T["return event"]
+    S -- "Yes" --> U["store.py::ScreenContextStore.enqueue_intervention()"]
+    U --> T
+```
+
 ## 편집 앱 기준
 
 `InterventionDetector`는 아래 `active_app_type`만 편집 앱으로 봅니다.
@@ -241,20 +268,20 @@ priority:
 
 ```mermaid
 flowchart TD
-    A["InterventionDetector.decide()"] --> B["현재 snapshot 생성"]
-    B --> C["최근 history + 현재 snapshot"]
-    C --> D["같은 document_key 이벤트 필터링"]
-    D --> E{"editing_app?"}
+    A["intervention_detector.py::InterventionDetector.decide()"] --> B["intervention_detector.py::_snapshot()<br/>현재 snapshot 생성"]
+    B --> C["store.py::ScreenContextStore.load_recent()<br/>최근 history + 현재 snapshot"]
+    C --> D["intervention_detector.py::_document_key()<br/>같은 document_key 이벤트 필터링"]
+    D --> E{"intervention_detector.py::_is_editing_app()<br/>editing_app?"}
     E -- "No" --> Z1["blocker: not_editing_app"]
-    E -- "Yes" --> F{"dwell 통과?"}
+    E -- "Yes" --> F{"intervention_detector.py::_has_sufficient_dwell()<br/>dwell 통과?"}
     F -- "No" --> Z2["blocker: insufficient_dwell"]
-    F -- "Yes" --> G{"stable_paragraph 통과?"}
+    F -- "Yes" --> G{"intervention_detector.py::_has_stable_paragraph()<br/>stable_paragraph 통과?"}
     G -- "No" --> Z3["blocker: unstable_current_paragraph"]
-    G -- "Yes" --> H{"typing_pause 통과?"}
+    G -- "Yes" --> H{"intervention_detector.py::_typing_pause_status()<br/>typing_pause 통과?"}
     H -- "No" --> Z4["blocker: not_paused_after_typing"]
-    H -- "Yes" --> I{"cooldown 통과?"}
+    H -- "Yes" --> I{"intervention_detector.py::_passes_cooldown()<br/>cooldown 통과?"}
     I -- "No" --> Z5["blocker: cooldown_or_duplicate"]
-    I -- "Yes" --> K["should_consider_llm = true"]
+    I -- "Yes" --> K["models.py::InterventionDecision<br/>should_consider_llm = true"]
 ```
 
 ## Debug CLI 로그
@@ -289,7 +316,7 @@ python main.py --output-dir ./output --phase chat --screen-debug
 주요 필드:
 
 - `app_context`: process, title, pid, hwnd, app type, document key
-- `writing_context`: full text, current paragraph, focused sentence, paragraph source/rect, changed text, confidence
+- `writing_context`: full text, current paragraph, focused sentence, focus scope, paragraph source/rect, changed text, confidence
 - `activity_context`: history count, same document count, dwell ratio, paragraph fingerprint, typing pause metadata
 - `intervention_flag`: `should_consider_llm`, priority, score, reason codes, blockers, flags
 - `tool_routing_hint`: 추천 action과 research 필요 신호

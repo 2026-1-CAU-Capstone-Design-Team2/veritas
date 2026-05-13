@@ -11,6 +11,7 @@ from .intervention_dispatcher import InterventionDispatcher
 from .models import AppTextResult, OcrResult, ScreenContextEvent, UiAutomationResult
 from .ocr_engine import OcrEngine
 from .powerpoint_com import PowerPointComReader
+from .scenario_scheduler import ScenarioScheduler
 from .screen_capture import ScreenCapture
 from .store import ScreenContextStore
 from .ui_automation import UiAutomationReader
@@ -46,8 +47,14 @@ class ScreenContextService:
         self.powerpoint_reader = PowerPointComReader()
         self.ui_reader = UiAutomationReader()
         self.content_filter = ContentFilter()
-        self.intervention_detector = InterventionDetector()
         self.store = ScreenContextStore(root)
+        self.intervention_detector = InterventionDetector()
+        self.scenario_scheduler = ScenarioScheduler(
+            self.store,
+            weights=self.intervention_detector.scenario_weights,
+            console_log=console_log,
+        )
+        self.intervention_detector.scheduler = self.scenario_scheduler
         self.intervention_dispatcher = InterventionDispatcher(
             self.store,
             console_log=console_log,
@@ -199,6 +206,7 @@ class ScreenContextService:
             return
 
         self._stop_event.clear()
+        self.scenario_scheduler.start()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
 
@@ -206,6 +214,7 @@ class ScreenContextService:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=self.interval_sec + 1)
+        self.scenario_scheduler.stop()
 
     def is_polling(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
@@ -260,6 +269,7 @@ class ScreenContextService:
             },
             "intervention": {
                 "should_consider_llm": event.intervention.should_consider_llm,
+                "intervention_type": event.intervention.intervention_type,
                 "score": event.intervention.score,
                 "priority": event.intervention.priority,
                 "reason_codes": event.intervention.reason_codes,
@@ -278,7 +288,8 @@ class ScreenContextService:
             f"source={diagnostics.get('text_source', 'unknown')} "
             f"chars={diagnostics.get('active_text_chars', 0)} "
             f"confidence={diagnostics.get('confidence', 0.0)} "
-            f"queued={diagnostics.get('intervention_queued', False)}"
+            f"queued={diagnostics.get('intervention_queued', False)} "
+            f"type={event.intervention.intervention_type}"
         )
         if blockers:
             base += f" blockers={blockers}"
@@ -323,26 +334,49 @@ class ScreenContextService:
 
     def _log_debug_decision(self, event: ScreenContextEvent) -> None:
         metadata = event.intervention.metadata or {}
-        checks = metadata.get("checks") or {}
-        if not isinstance(checks, dict):
-            return
+        common_checks = metadata.get("common_checks") or {}
+        if isinstance(common_checks, dict):
+            for name in ("editing_app", "dwell", "stable_paragraph"):
+                check = common_checks.get(name) or {}
+                if not isinstance(check, dict):
+                    continue
+                status = "PASS" if check.get("passed") else "BLOCK"
+                detail = self._format_common_check_detail(name, check)
+                print(f"[screen_context][decision] common.{name}={status} {detail}".rstrip())
 
-        for name in (
-            "editing_app",
-            "dwell",
-            "stable_paragraph",
-            "typing_pause",
-            "cooldown",
-        ):
-            check = checks.get(name) or {}
-            if not isinstance(check, dict):
-                continue
-            status = "PASS" if check.get("passed") else "BLOCK"
-            detail = self._format_debug_check_detail(name, check)
-            print(f"[screen_context][decision] {name}={status} {detail}".rstrip())
+        scenarios = metadata.get("scenarios") or {}
+        if isinstance(scenarios, dict):
+            for scenario_name, scenario in scenarios.items():
+                if not isinstance(scenario, dict):
+                    continue
+                status = "READY" if scenario.get("ready") else "WAIT"
+                gates = scenario.get("gate_results") or {}
+                gate_summary = []
+                if isinstance(gates, dict):
+                    for gate_name, gate in gates.items():
+                        if not isinstance(gate, dict):
+                            continue
+                        gate_status = "P" if gate.get("passed") else "B"
+                        gate_summary.append(f"{gate_name}={gate_status}")
+                gate_text = " ".join(gate_summary)
+                print(
+                    f"[screen_context][decision] scenario.{scenario_name}={status} "
+                    f"score={scenario.get('score', 0.0)} {gate_text}".rstrip()
+                )
 
-    def _format_debug_check_detail(self, name: str, check: dict) -> str:
+        selected = metadata.get("selected")
+        if selected:
+            scheduler = metadata.get("scheduler") or {}
+            vruntimes = scheduler.get("vruntimes") if isinstance(scheduler, dict) else None
+            print(
+                f"[screen_context][decision] selected={selected} "
+                f"vruntimes={vruntimes}"
+            )
+
+    def _format_common_check_detail(self, name: str, check: dict) -> str:
         reason = str(check.get("reason") or "")
+        if name == "editing_app":
+            return f"reason={reason} app_type={check.get('active_app_type') or '-'}"
         if name == "dwell":
             return (
                 f"reason={reason} "
@@ -358,19 +392,6 @@ class ScreenContextService:
                 f"ocr_min={check.get('min_ocr_paragraph_chars')} "
                 f"confidence={check.get('confidence')}"
             )
-        if name == "typing_pause":
-            return (
-                f"reason={reason} "
-                f"stable={check.get('stable_capture_count')}/{check.get('min_idle_captures')} "
-                f"similarity={check.get('last_similarity')} "
-                f"len_delta={check.get('last_length_delta')} "
-                f"changed_before_pause={check.get('changed_before_pause')} "
-                f"chars={check.get('current_text_chars')} prior_chars={check.get('prior_text_chars')}"
-            )
-        if name == "editing_app":
-            return f"reason={reason} app_type={check.get('active_app_type') or '-'}"
-        if name == "cooldown":
-            return f"reason={reason} window={check.get('cooldown_events')}"
         return f"reason={reason}"
 
     def _preview_text(self, text: str, *, limit: int = 220) -> str:
