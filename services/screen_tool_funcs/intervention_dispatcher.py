@@ -3,16 +3,28 @@ from __future__ import annotations
 import re
 
 from .models import ScreenContextEvent
+from .scenarios import ScenarioType
 from .store import ScreenContextStore
 
 
 class InterventionDispatcher:
-    """Persist approved intervention candidates for downstream consumers."""
+    """Persist approved intervention candidates for downstream consumers.
 
-    WHOLE_DOCUMENT_REVIEW_CHAR_LIMIT = 6000
+    Scenario-specific payload shaping is delegated to ScenarioType.* hooks
+    (`writing_context_overrides`, `tool_routing_hint_overrides`). The
+    dispatcher only builds the common base shape and merges overrides for the
+    selected scenario.
+    """
 
-    def __init__(self, store: ScreenContextStore, *, console_log: bool = False) -> None:
+    def __init__(
+        self,
+        store: ScreenContextStore,
+        *,
+        scenarios: dict[str, ScenarioType] | None = None,
+        console_log: bool = False,
+    ) -> None:
         self.store = store
+        self.scenarios: dict[str, ScenarioType] = dict(scenarios or {})
         self.console_log = console_log
 
     def dispatch(self, event: ScreenContextEvent) -> dict | None:
@@ -121,35 +133,13 @@ class InterventionDispatcher:
             ),
             "changed_text": filtered.changed_text,
             "confidence": filtered.confidence,
+            "focus_scope": "recent_writing",
         }
-        if intervention_type == "whole_document_review":
-            review_text = self._whole_document_review_text(filtered.active_editor_text)
-            base["focus_scope"] = "full_document"
-            base["recent_sentences"] = review_text
-            base["focused_sentence"] = ""
-            base["full_document_excerpt"] = review_text
-        elif intervention_type == "idle_after_writing":
-            base["focus_scope"] = "recent_writing"
-        else:
-            base["focus_scope"] = "recent_writing"
+        scenario = self.scenarios.get(intervention_type)
+        if scenario is not None:
+            overrides = scenario.writing_context_overrides(filtered=filtered, base=base) or {}
+            base.update(overrides)
         return base
-
-    def _whole_document_review_text(self, text: str) -> str:
-        normalized = " ".join(str(text or "").split()).strip()
-        if len(normalized) <= self.WHOLE_DOCUMENT_REVIEW_CHAR_LIMIT:
-            return (
-                "Full document review requested. Review the complete visible "
-                f"document below:\n{normalized}"
-            )
-        head_limit = self.WHOLE_DOCUMENT_REVIEW_CHAR_LIMIT // 2
-        tail_limit = self.WHOLE_DOCUMENT_REVIEW_CHAR_LIMIT - head_limit
-        return (
-            "Full document review requested. The visible document is too long, "
-            "so review this beginning/end excerpt and mention that the middle "
-            f"was omitted. Full document chars={len(normalized)}.\n"
-            f"[BEGINNING]\n{normalized[:head_limit]}\n"
-            f"[END]\n{normalized[-tail_limit:]}"
-        )
 
     def _activity_context(self, metadata: dict) -> dict:
         scenarios = metadata.get("scenarios") or {}
@@ -227,21 +217,9 @@ class InterventionDispatcher:
         changed_text = event.filtered.changed_text or ""
         needs_research = self._looks_research_needy(current_paragraph)
 
-        if intervention_type == "whole_document_review":
-            preferred_action = "review_whole_document"
-            tone = "comprehensive_review"
-        elif intervention_type == "idle_after_writing":
-            preferred_action = "provide_supporting_material" if needs_research else "continue_writing"
-            tone = "gentle_continuation"
-            if len(current_paragraph.strip()) < 20 and not focused_sentence:
-                preferred_action = "no_action"
-        else:
-            preferred_action = "no_action"
-            tone = "neutral"
-
-        return {
+        base: dict = {
             "intervention_type": intervention_type,
-            "tone": tone,
+            "tone": "neutral",
             "allowed_actions": [
                 "continue_writing",
                 "provide_supporting_material",
@@ -250,13 +228,29 @@ class InterventionDispatcher:
                 "review_whole_document",
                 "no_action",
             ],
-            "preferred_action": preferred_action,
+            "preferred_action": "no_action",
             "signals": {
                 "research_needed": needs_research,
                 "has_recent_change": bool(changed_text.strip()),
                 "has_focused_sentence": bool(focused_sentence.strip()),
             },
         }
+        scenario = self.scenarios.get(intervention_type)
+        if scenario is not None:
+            overrides = (
+                scenario.tool_routing_hint_overrides(
+                    event=event,
+                    base=base,
+                    focused_sentence=focused_sentence,
+                )
+                or {}
+            )
+            for key, value in overrides.items():
+                if key == "signals" and isinstance(value, dict):
+                    base["signals"] = {**base["signals"], **value}
+                else:
+                    base[key] = value
+        return base
 
     def _focused_sentence(self, *, paragraph: str, changed_text: str) -> str:
         paragraph = (paragraph or "").strip()

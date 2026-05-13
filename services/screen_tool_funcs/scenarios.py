@@ -98,6 +98,33 @@ class ScenarioType(ABC):
     def evaluate(self, context: ScenarioContext) -> ScenarioEvaluation:
         """Run scenario-specific gates and return a uniform evaluation."""
 
+    def writing_context_overrides(
+        self,
+        *,
+        filtered: FilteredScreenContext,
+        base: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return partial fields the dispatcher should merge into writing_context.
+
+        Default: no overrides. Subclasses can replace `focus_scope`,
+        `recent_sentences`, `focused_sentence`, etc. when this scenario fires.
+        """
+        return {}
+
+    def tool_routing_hint_overrides(
+        self,
+        *,
+        event: Any,
+        base: dict[str, Any],
+        focused_sentence: str,
+    ) -> dict[str, Any]:
+        """Return partial fields the dispatcher should merge into tool_routing_hint.
+
+        Default: no overrides. Subclasses set `tone`, `preferred_action`, or
+        merge into `signals` when this scenario fires.
+        """
+        return {}
+
     def _gate_result(
         self,
         passed: bool,
@@ -186,6 +213,31 @@ class IdleAfterWritingScenario(ScenarioType):
         evaluation.priority = "high" if evaluation.ready and evaluation.score >= 0.7 else "medium"
         evaluation.metadata = {"typing_pause": typing_pause}
         return evaluation
+
+    def writing_context_overrides(
+        self,
+        *,
+        filtered: FilteredScreenContext,
+        base: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {"focus_scope": "recent_writing"}
+
+    def tool_routing_hint_overrides(
+        self,
+        *,
+        event: Any,
+        base: dict[str, Any],
+        focused_sentence: str,
+    ) -> dict[str, Any]:
+        current_paragraph = (event.filtered.current_paragraph_text or "").strip()
+        needs_research = bool((base.get("signals") or {}).get("research_needed"))
+        preferred_action = "provide_supporting_material" if needs_research else "continue_writing"
+        if len(current_paragraph) < self.min_paragraph_chars and not focused_sentence:
+            preferred_action = "no_action"
+        return {
+            "tone": "gentle_continuation",
+            "preferred_action": preferred_action,
+        }
 
     def _typing_pause_status(self, same_document_events: list[dict[str, Any]]) -> dict[str, Any]:
         current_text = self._normalized_active_text(
@@ -303,6 +355,7 @@ class WholeDocumentReviewScenario(ScenarioType):
     priority = "high"
     initial_vruntime = -10.0
     vruntime_increment = 5.0
+    review_char_limit = 6000
 
     def __init__(
         self,
@@ -389,6 +442,50 @@ class WholeDocumentReviewScenario(ScenarioType):
             "document_cooldown": cooldown,
         }
         return evaluation
+
+    def writing_context_overrides(
+        self,
+        *,
+        filtered: FilteredScreenContext,
+        base: dict[str, Any],
+    ) -> dict[str, Any]:
+        review_text = self._build_review_text(filtered.active_editor_text)
+        return {
+            "focus_scope": "full_document",
+            "recent_sentences": review_text,
+            "focused_sentence": "",
+            "full_document_excerpt": review_text,
+        }
+
+    def tool_routing_hint_overrides(
+        self,
+        *,
+        event: Any,
+        base: dict[str, Any],
+        focused_sentence: str,
+    ) -> dict[str, Any]:
+        return {
+            "tone": "comprehensive_review",
+            "preferred_action": "review_whole_document",
+        }
+
+    def _build_review_text(self, text: str) -> str:
+        normalized = " ".join(str(text or "").split()).strip()
+        limit = self.review_char_limit
+        if len(normalized) <= limit:
+            return (
+                "Full document review requested. Review the complete visible "
+                f"document below:\n{normalized}"
+            )
+        head_limit = limit // 2
+        tail_limit = limit - head_limit
+        return (
+            "Full document review requested. The visible document is too long, "
+            "so review this beginning/end excerpt and mention that the middle "
+            f"was omitted. Full document chars={len(normalized)}.\n"
+            f"[BEGINNING]\n{normalized[:head_limit]}\n"
+            f"[END]\n{normalized[-tail_limit:]}"
+        )
 
     def _sustained_writing_status(
         self,

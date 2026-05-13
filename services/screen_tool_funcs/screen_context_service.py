@@ -57,6 +57,7 @@ class ScreenContextService:
         self.intervention_detector.scheduler = self.scenario_scheduler
         self.intervention_dispatcher = InterventionDispatcher(
             self.store,
+            scenarios={s.name: s for s in self.intervention_detector.scenarios},
             console_log=console_log,
         )
 
