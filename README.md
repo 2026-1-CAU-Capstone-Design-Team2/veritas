@@ -20,6 +20,57 @@ RAG over generated markdown outputs, and schema-driven chat tool use.
 - Runs subdirectories are treated as UI workspaces. The sidebar workspace
   dropdown refreshes from `/api/v1/workspaces`, which scans `runs/`.
 
+### 2026-05-13 Proactive assistance + streaming UX
+
+- Proactive screen-monitoring is now reachable from the API/UI. `AgentRuntime`
+  exposes `start_screen_monitoring`, `stop_screen_monitoring`,
+  `screen_monitoring_status`, and `get_screen_events_since`; these are wired to
+  `POST /api/v1/screen-monitoring/start`, `POST /api/v1/screen-monitoring/stop`,
+  `GET /api/v1/screen-monitoring/status`, and
+  `GET /api/v1/screen-monitoring/events?since=<seq>&limit=<n>`.
+- The proactive intervention loop is started automatically when the floating
+  "AI 보조창" (DocumentAssistWindow) is shown and stopped when it is hidden.
+  Generated screen-assist answers land in a runtime-side ring buffer; the
+  frontend `ScreenEventPollWorker` (QThread) polls every ~3s and renders new
+  answers as cards in the assist window's `SuggestionList`.
+- Chat is fully asynchronous. The OpenAI streaming path is exposed via
+  `LLMClient.iter_ask`, threaded through `ChatAgent.ask_auto_iter` /
+  `ask_explicit_tool_iter` / `ask_rag_iter`, and surfaced over Server-Sent
+  Events at `POST /api/v1/chat/messages/stream` and
+  `POST /api/v1/document-assist/chat/messages/stream`. The events are
+  `start` / `delta` / `done` / `error`.
+- `frontend/controllers/chat_bus.py` introduces a `ChatBus` singleton plus a
+  `ChatStreamWorker(QThread)`. Sending a chat message from any panel goes
+  through the bus; the main thread returns immediately (no UI freeze) and the
+  bus broadcasts `userMessageQueued`, `assistantStreamStarted`, `assistantChunk`,
+  `assistantCompleted`, and `assistantFailed`.
+- The main chat page (`WritePage`) and the floating assist window
+  (`DocumentAssistWindow`) both subscribe to the bus and stay in sync — the
+  same user/assistant bubbles appear in both views and chunk-by-chunk streaming
+  updates happen simultaneously. Backend-side, `document_assist_service` was
+  unified to route through `draft_chat_service`, so both panels share the same
+  `chat_history.json` per workspace.
+- AutoSurvey emits live progress events. `AutoSurveyWorkflow` accepts a
+  `progress_callback` and emits at term grounding, query plan (initial/replan),
+  per-query web search, per-URL fetch, batch summarize, and final report. The
+  runtime keeps a `_research_progress` ring buffer exposed at
+  `GET /api/v1/research/progress?since=<seq>&limit=<n>`. The Research page runs
+  `ResearchProgressPoller(QThread)` and displays the latest single line in
+  gray, replaced live as the agent acts (ChatGPT/Claude style).
+- The Research result card was redesigned: a colored status pill (green
+  `● 완료`, red `● 오류` with a click-to-open `QMessageBox`, blue `● 진행 중`),
+  three info tiles (`작업 이름` / `저장 경로` / `수집된 문서 수`), and one
+  `DocumentBar` per collected document. Each bar shows the title, a clickable
+  URL hyperlink (uses `QDesktopServices.openUrl`, auto-prepends `https://`
+  when the URL has no scheme), and a `doc_NNN.md ↗` button that opens the
+  corresponding `summary/doc_<docId>.md` in the OS default viewer.
+- The Document page now renders `final.md` through Python's `markdown` library
+  (`tables` / `fenced_code` / `sane_lists` / `nl2br` extensions) and calls
+  `QTextEdit.setHtml`, because Qt's built-in `setMarkdown` has known GFM-table
+  rendering bugs (alignment row mis-parsed, tables breaking when adjacent to
+  other blocks). `frontend/ui/markdown_view.py` falls back to `setMarkdown` if
+  the optional `markdown` package is missing.
+
 The project is built around one principle:
 
 ```text
@@ -83,13 +134,28 @@ tools/
   query_plan_tool/
   document_summarize_tool/
   final_report_tool/
+  screen_context_tool/
 
 services/
   rag_service.py: indexing, retrieval, document-grounded answers
   run_store_tool_funcs/: output/state persistence
+  screen_tool_funcs/: foreground-window OCR/UIA capture, intervention detector
 
 storage/
   vector_store.py: ChromaDB vector store wrapper
+
+api/
+  api.py, main.py: FastAPI app + uvicorn entrypoint
+  api_routes/: per-feature routers (research, chat, document-assist,
+    documents, workspaces, write, feedback, screen-monitoring, ...)
+  services/: agent_runtime (shared LLM/registry/chat agent), draft_chat,
+    document_assist, research, screen_monitoring, ...
+
+frontend/
+  main.py, ui/: PySide6 desktop UI
+  controllers/agent_controller.py: HTTP client wrapper
+  controllers/chat_bus.py: ChatBus singleton + ChatStreamWorker(QThread)
+  ui/markdown_view.py: markdown -> HTML renderer with table support
 ```
 
 ## Run Modes

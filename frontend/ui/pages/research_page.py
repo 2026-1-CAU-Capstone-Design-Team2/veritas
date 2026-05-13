@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 from pathlib import Path
 from typing import Any
 
@@ -156,12 +157,21 @@ class DocumentBar(QFrame):
 		text_column.addWidget(title_label)
 
 		if url:
-			url_label = QLabel(f'<a href="{url}" style="color:#2563EB; text-decoration:none;">{url}</a>')
+			href = html.escape(url, quote=True)
+			display = html.escape(url, quote=False)
+			url_label = QLabel(
+				f'<a href="{href}" style="color:#2563EB; text-decoration:underline;">{display}</a>'
+			)
 			url_label.setTextFormat(Qt.RichText)
-			url_label.setOpenExternalLinks(True)
-			url_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+			url_label.setOpenExternalLinks(False)
+			url_label.setTextInteractionFlags(
+				Qt.LinksAccessibleByMouse | Qt.LinksAccessibleByKeyboard
+			)
 			url_label.setWordWrap(True)
+			url_label.setCursor(Qt.PointingHandCursor)
 			url_label.setStyleSheet("font-size: 11px;")
+			url_label.setToolTip(url)
+			url_label.linkActivated.connect(self._open_external_link)
 			text_column.addWidget(url_label)
 
 		layout.addLayout(text_column, 1)
@@ -193,6 +203,17 @@ class DocumentBar(QFrame):
 		if self._summary_path is None or not self._summary_path.exists():
 			return
 		QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._summary_path)))
+
+	def _open_external_link(self, href: str) -> None:
+		target = (href or "").strip()
+		if not target:
+			return
+		url = QUrl(target)
+		# Some URLs arrive without a scheme (e.g. "example.com/page"); QDesktopServices
+		# silently fails on those, so prepend https:// when no scheme is present.
+		if not url.scheme():
+			url = QUrl(f"https://{target}")
+		QDesktopServices.openUrl(url)
 
 
 class ResearchWorker(QObject):
