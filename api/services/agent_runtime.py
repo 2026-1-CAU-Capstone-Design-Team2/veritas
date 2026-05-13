@@ -28,6 +28,11 @@ class AgentRuntime:
         self.output_root = Path(os.getenv("VERITAS_OUTPUT_DIR", "runs")).expanduser().resolve()
         self.output_root.mkdir(parents=True, exist_ok=True)
         self._cleanup_pending_dirs()
+        # Remove a stale `runs/api/` from a previous session before we decide
+        # which workspace to attach to. This is what fixes the "api 폴더가
+        # 계속 생기는" issue — we never re-materialize it unless there is
+        # genuinely no real workspace to land on.
+        self._cleanup_empty_api_dir()
 
         self.llm = LLMClient(
             host=os.getenv("VERITAS_LLM_HOST", "127.0.0.1"),
@@ -36,8 +41,6 @@ class AgentRuntime:
             embed_port=int(os.getenv("VERITAS_EMBED_PORT", "8081")),
             trace_latency=os.getenv("VERITAS_TRACE_LATENCY", "1") != "0",
         )
-        self.workspace_id = "default"
-        self.output_dir = self.output_root / "api"
         self._workspace_lock = threading.RLock()
         self._screen_events: deque[dict[str, Any]] = deque(maxlen=SCREEN_EVENT_BUFFER_MAX)
         self._screen_event_seq = 0
@@ -47,6 +50,16 @@ class AgentRuntime:
         self._research_progress_seq = 0
         self._research_progress_lock = threading.Lock()
         self._research_active_job: dict[str, Any] | None = None
+
+        # Boot-time workspace selection: prefer the most recently-used real
+        # workspace so we never create `runs/api/` when one already exists.
+        initial = self._discover_initial_workspace()
+        if initial is not None:
+            self.workspace_id = initial.name
+            self.output_dir = initial
+        else:
+            self.workspace_id = "default"
+            self.output_dir = self.output_root / "api"
         self._configure_workspace_runtime(self.output_dir)
 
     def _configure_workspace_runtime(self, output_dir: Path) -> None:
@@ -81,7 +94,16 @@ class AgentRuntime:
 
     def set_workspace(self, workspace_id: str) -> None:
         workspace_id = str(workspace_id or "").strip()
-        if not workspace_id or workspace_id == self.workspace_id:
+        if not workspace_id:
+            return
+        # The frontend uses "default" as a placeholder for "no workspace
+        # selected yet". If real workspaces exist, resolve it to the most
+        # recently used one so we don't materialize a phantom `runs/api/`.
+        if workspace_id == "default":
+            recent = self._discover_initial_workspace()
+            if recent is not None:
+                workspace_id = recent.name
+        if workspace_id == self.workspace_id:
             return
         with self._workspace_lock:
             if workspace_id == self.workspace_id:
@@ -96,9 +118,18 @@ class AgentRuntime:
                     self.chat_agent.stop_screen_monitoring()
                 except Exception as e:
                     print(f"[screen_monitoring][warn] stop on workspace switch failed: {e}")
+            leaving_default = self.workspace_id == "default"
             self.workspace_id = workspace_id
-            output_dir = self.output_root / workspace_id if workspace_id != "default" else self.output_root / "api"
+            output_dir = (
+                self.output_root / workspace_id
+                if workspace_id != "default"
+                else self.output_root / "api"
+            )
             self._configure_workspace_runtime(output_dir)
+            # If we just moved off the default `api/` workspace and it has
+            # no meaningful content, remove it so it doesn't linger.
+            if leaving_default and workspace_id != "default":
+                self._cleanup_empty_api_dir()
             if was_monitoring:
                 self.start_screen_monitoring()
 
@@ -328,6 +359,61 @@ class AgentRuntime:
                     print(f"[workspace][cleanup][warn] could not remove {resolved}: {e}")
         except Exception as e:
             print(f"[workspace][cleanup][warn] pending cleanup skipped: {e}")
+
+    def _discover_initial_workspace(self) -> Path | None:
+        """Return the most-recently-modified real workspace dir, or None.
+
+        A "real" workspace has at least one piece of research evidence:
+        a final report, a summary index, or any `doc_*.md` summary file.
+        Used to avoid creating `runs/api/` when there is already a workspace
+        to land on at boot, or to resolve frontend requests for the
+        "default" workspace to something concrete.
+        """
+        if not self.output_root.exists():
+            return None
+        candidates: list[Path] = []
+        try:
+            for path in self.output_root.iterdir():
+                if not path.is_dir():
+                    continue
+                name = path.name
+                if name in {"api", "__pycache__"} or name.startswith("_"):
+                    continue
+                summary_dir = path / "summary"
+                has_final = (path / "final.md").exists()
+                has_index = (summary_dir / "index.json").exists()
+                has_summaries = summary_dir.exists() and any(summary_dir.glob("doc_*.md"))
+                if has_final or has_index or has_summaries:
+                    candidates.append(path)
+        except Exception as e:
+            print(f"[workspace][discover][warn] {e}")
+            return None
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates[0]
+
+    def _cleanup_empty_api_dir(self) -> None:
+        """Remove `runs/api/` if it has no meaningful research data.
+
+        Called at boot (to clear a stale `api/` from a prior session) and
+        whenever we transition off the default workspace, so the directory
+        never sticks around as a phantom side-effect of initialization.
+        """
+        api_dir = self.output_root / "api"
+        if not api_dir.exists() or not api_dir.is_dir():
+            return
+        summary_dir = api_dir / "summary"
+        has_final = (api_dir / "final.md").exists()
+        has_index = (summary_dir / "index.json").exists()
+        has_summaries = summary_dir.exists() and any(summary_dir.glob("doc_*.md"))
+        if has_final or has_index or has_summaries:
+            return
+        # Only chromadb/corpus skeletons remain — safe to remove.
+        try:
+            shutil.rmtree(api_dir)
+        except Exception as e:
+            print(f"[workspace][cleanup][warn] could not remove {api_dir}: {e}")
 
     def _ensure_rag_index(self, *, require_documents: bool) -> None:
         if self.rag_service.get_document_count() > 0:

@@ -594,9 +594,17 @@ class ResearchPage(QWidget):
 
 	def _load_existing_result(self) -> None:
 		self._workspace_id = current_workspace_id()
+		# Workspace just changed (or the page is being loaded fresh): drop
+		# any DocumentBar widgets from the previous workspace before we
+		# render the new one. Without this, `_reconcile_documents` would
+		# leave the previous workspace's bars in place (since `doc_id` is
+		# workspace-relative — workspace A's "001" and B's "001" are
+		# different documents) and only append B's tail end after A's bars.
+		self._clear_documents()
 		try:
 			jobs = AgentController().list_research_jobs(100)
 		except Exception:
+			self._show_message("조사 실행 후 agent 결과가 여기에 표시됩니다.")
 			return
 		current_job = next(
 			(

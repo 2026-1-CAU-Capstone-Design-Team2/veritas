@@ -64,6 +64,23 @@ RAG over generated markdown outputs, and schema-driven chat tool use.
   URL hyperlink (uses `QDesktopServices.openUrl`, auto-prepends `https://`
   when the URL has no scheme), and a `doc_NNN.md ↗` button that opens the
   corresponding `summary/doc_<docId>.md` in the OS default viewer.
+- `AgentRuntime` no longer materializes a `runs/api/` directory when a real
+  workspace already exists. At boot it scans `runs/` for the most-recently
+  modified directory that contains real research evidence (a `final.md`, a
+  `summary/index.json`, or any `doc_*.md`) and attaches to that workspace
+  directly. The `runs/api/` slot is only used as a one-time scratch home
+  for the very first session before any research has been produced; it is
+  also removed on boot, and again whenever `set_workspace` transitions off
+  of it, when it has no meaningful content. `set_workspace("default")` is
+  resolved to the same most-recent workspace, so a stale "default" id
+  coming from the frontend doesn't accidentally recreate the directory.
+- The Research result card clears its in-memory `_doc_bars` map at the
+  start of `_load_existing_result` so that switching workspaces does not
+  reconcile workspace B's documents on top of workspace A's leftover bars.
+  Bar identity is by `doc_id`, which is workspace-relative ("001" in
+  workspace A is a different document from "001" in workspace B), so the
+  reconciliation pass — which is correct for live updates within a single
+  run — has to be reset across workspace boundaries.
 - Frontend async dispatch and operation mutex go through a single
   `frontend/controllers/job_manager.py` `JobManager` singleton. Every
   long-running call to the backend (AutoSurvey, chat, draft, feedback
