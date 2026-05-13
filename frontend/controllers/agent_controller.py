@@ -33,6 +33,9 @@ class AgentController:
 			{"since": since, "limit": limit},
 		)
 
+	def delete_workspace(self, workspace_id: str) -> dict[str, Any]:
+		return api_client.delete(f"/api/v1/workspaces/{workspace_id}")
+
 	def get_chat_history(self, workspace_id: str) -> list[dict[str, Any]]:
 		response = api_client.get(f"/api/v1/chat/sessions/session_{workspace_id}/messages")
 		items = response.get("items", [])

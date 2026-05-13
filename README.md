@@ -64,6 +64,26 @@ RAG over generated markdown outputs, and schema-driven chat tool use.
   URL hyperlink (uses `QDesktopServices.openUrl`, auto-prepends `https://`
   when the URL has no scheme), and a `doc_NNN.md ↗` button that opens the
   corresponding `summary/doc_<docId>.md` in the OS default viewer.
+- Workspace lifecycle is now consistent across the on-disk `runs/`
+  directory and the local SQLite DB at `%LOCALAPPDATA%/VERITAS/veritas.db`.
+  `db/workspace_sync.py` exposes two helpers:
+  `reconcile_workspaces_with_disk(runs_root)` runs at both app launches
+  (PySide `frontend/ui/main.py` and `AgentRuntime.__init__`) and prunes DB
+  rows whose backing folder is gone — so workspaces a user manually
+  removed from `runs/` while the app was offline no longer linger in the
+  dashboard's "최근 작업". `delete_workspace(workspace_id, runs_root)`
+  performs the user-initiated delete: it switches the runtime off the
+  target workspace if it was active, removes `runs/<id>/`, and drops
+  rows from `workspaces` / `documents` / `activity_logs` / `app_state`
+  in one transaction. Demo seed rows (whose recorded `path` is outside
+  `runs_root`) are deliberately preserved by both helpers.
+- The dashboard "최근 작업 워크스페이스" panel now renders a red 삭제
+  button on each row. Clicking it opens a confirmation popup
+  ("{workspace_name} 워크스페이스가 삭제됩니다. 계속 하시겠습니까?" with
+  예 / 아니오), and on confirmation calls
+  `DELETE /api/v1/workspaces/{workspaceId}` which delegates to
+  `db.workspace_sync.delete_workspace` and reloads the bootstrap state so
+  the sidebar dropdown also drops the workspace.
 - `AgentRuntime` no longer materializes a `runs/api/` directory when a real
   workspace already exists. At boot it scans `runs/` for the most-recently
   modified directory that contains real research evidence (a `final.md`, a

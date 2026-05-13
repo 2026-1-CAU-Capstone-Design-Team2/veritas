@@ -1,18 +1,29 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+	QFrame,
+	QHBoxLayout,
+	QLabel,
+	QMessageBox,
+	QPushButton,
+	QVBoxLayout,
+	QWidget,
+)
 
 from db.dashboard_service import get_dashboard_summary
 from db.db import init_db
 
+from ...api_common import ApiError, load_bootstrap_state
 from ...components.cards import CardWidget
+from ...controllers import AgentController
 
 
 class DashboardPage(QWidget):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		init_db()
+		self._controller = AgentController()
 
 		self._stat_values: dict[str, QLabel] = {}
 		self._workspace_list = QVBoxLayout()
@@ -92,9 +103,77 @@ class DashboardPage(QWidget):
 			return
 
 		for workspace in workspaces:
+			workspace_id = str(workspace.get("id") or "")
 			name = str(workspace.get("name") or "이름 없는 워크스페이스")
 			last_worked_at = str(workspace.get("last_worked_at") or "-")
-			self._workspace_list.addLayout(self._create_text_row(name, f"마지막 작업: {last_worked_at}"))
+			self._workspace_list.addLayout(
+				self._create_workspace_row(workspace_id, name, last_worked_at)
+			)
+
+	def _create_workspace_row(self, workspace_id: str, name: str, last_worked_at: str) -> QHBoxLayout:
+		row = self._create_text_row(name, f"마지막 작업: {last_worked_at}")
+		delete_button = QPushButton("삭제")
+		delete_button.setObjectName("DashboardWorkspaceDeleteButton")
+		delete_button.setCursor(Qt.PointingHandCursor)
+		delete_button.setFixedHeight(28)
+		delete_button.setStyleSheet(
+			"QPushButton#DashboardWorkspaceDeleteButton {"
+			" background-color: #FFFFFF; color: #B91C1C;"
+			" border: 1px solid #FCA5A5; border-radius: 8px;"
+			" padding: 4px 10px; font-size: 11px; font-weight: 800;"
+			"}"
+			"QPushButton#DashboardWorkspaceDeleteButton:hover {"
+			" background-color: #FEE2E2; border-color: #F87171;"
+			"}"
+			"QPushButton#DashboardWorkspaceDeleteButton:disabled {"
+			" color: #9CA3AF; border-color: #E5E7EB;"
+			"}"
+		)
+		if not workspace_id:
+			delete_button.setEnabled(False)
+			delete_button.setToolTip("워크스페이스 ID가 없어 삭제할 수 없습니다.")
+		else:
+			delete_button.setToolTip(f"{name} 워크스페이스 삭제")
+			delete_button.clicked.connect(
+				lambda _checked=False, wid=workspace_id, wname=name: self._confirm_delete_workspace(wid, wname)
+			)
+		row.addWidget(delete_button, 0, Qt.AlignTop | Qt.AlignRight)
+		return row
+
+	def _confirm_delete_workspace(self, workspace_id: str, workspace_name: str) -> None:
+		"""Confirm with a Yes/No popup, then delete the workspace.
+
+		The actual delete request hits ``DELETE /api/v1/workspaces/{id}``
+		which removes the `runs/<id>/` directory AND the corresponding rows
+		in `appdata/VERITAS/veritas.db` (workspaces, documents,
+		activity_logs, plus app_state.current_workspace_id if it pointed
+		here). Dashboard refresh happens immediately after so the row
+		disappears from the panel.
+		"""
+		box = QMessageBox(self)
+		box.setIcon(QMessageBox.Warning)
+		box.setWindowTitle("워크스페이스 삭제 확인")
+		box.setText(f"{workspace_name} 워크스페이스가 삭제됩니다. 계속 하시겠습니까?")
+		yes_button = box.addButton("예", QMessageBox.YesRole)
+		no_button = box.addButton("아니오", QMessageBox.NoRole)
+		box.setDefaultButton(no_button)
+		box.exec()
+		if box.clickedButton() is not yes_button:
+			return
+
+		try:
+			self._controller.delete_workspace(workspace_id)
+		except ApiError as e:
+			QMessageBox.critical(self, "삭제 실패", f"워크스페이스 삭제에 실패했습니다.\n\n{e}")
+			return
+
+		# Refresh the bootstrap state so the sidebar workspace dropdown
+		# also reflects the removal on the next render.
+		try:
+			load_bootstrap_state()
+		except Exception:
+			pass
+		self.load_dashboard_data()
 
 	def _render_recent_activities(self, activities: list[dict[str, object]]) -> None:
 		self._clear_layout(self._activity_list)

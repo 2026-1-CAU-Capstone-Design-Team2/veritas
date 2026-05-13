@@ -33,6 +33,15 @@ class AgentRuntime:
         # 계속 생기는" issue — we never re-materialize it unless there is
         # genuinely no real workspace to land on.
         self._cleanup_empty_api_dir()
+        # Drop SQLite rows for workspaces whose runs/<id>/ folder was deleted
+        # while the app was offline. The dashboard reads workspaces directly
+        # from the DB, so this is what keeps "최근 작업" honest across reboots.
+        try:
+            from db.workspace_sync import reconcile_workspaces_with_disk
+
+            reconcile_workspaces_with_disk(self.output_root)
+        except Exception as e:
+            print(f"[workspace][reconcile][warn] {e}")
 
         self.llm = LLMClient(
             host=os.getenv("VERITAS_LLM_HOST", "127.0.0.1"),

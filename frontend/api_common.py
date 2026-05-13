@@ -59,6 +59,10 @@ class ApiClient:
         )
         return self._send_json(request)
 
+    def delete(self, path: str, query: dict[str, Any] | None = None) -> dict[str, Any]:
+        request = urllib.request.Request(self._url(path, query), method="DELETE")
+        return self._send_json(request)
+
     def put(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         data = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
