@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QMouseEvent
 from PySide6.QtWidgets import (
 	QFrame,
 	QHBoxLayout,
@@ -118,6 +118,45 @@ class InfoTile(QFrame):
 		self._value.setToolTip(value if value else "")
 
 
+class LinkLabel(QLabel):
+	"""QLabel that opens its URL on left-click anywhere inside the widget.
+
+	Qt's `linkActivated` + `setOpenExternalLinks` mechanism is unreliable on
+	Windows under PySide6 — the cursor changes to a hand on hover but clicks
+	are sometimes never delivered to the link handler. Handling
+	`mousePressEvent` directly removes that ambiguity: the whole label is the
+	hit target, and `QDesktopServices.openUrl` is invoked unconditionally.
+	"""
+
+	def __init__(self, url: str, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self._url = (url or "").strip()
+		display = html.escape(self._url, quote=False)
+		# Rich text is only used for the underline + color; the click handler
+		# does not rely on Qt parsing an <a> tag.
+		self.setText(
+			f'<span style="color:#2563EB; text-decoration:underline;">{display}</span>'
+		)
+		self.setTextFormat(Qt.RichText)
+		self.setTextInteractionFlags(Qt.NoTextInteraction)
+		self.setWordWrap(True)
+		self.setCursor(Qt.PointingHandCursor)
+		self.setToolTip(self._url)
+		self.setStyleSheet("font-size: 11px;")
+
+	def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+		if event.button() == Qt.LeftButton and self._url:
+			url = QUrl(self._url)
+			# Inputs like "example.com/page" lack a scheme and would silently
+			# fail with QDesktopServices.openUrl; default to https in that case.
+			if not url.scheme():
+				url = QUrl(f"https://{self._url}")
+			QDesktopServices.openUrl(url)
+			event.accept()
+			return
+		super().mousePressEvent(event)
+
+
 class DocumentBar(QFrame):
 	"""One collected-document row with a title, hyperlink URL, and an
 	"open doc_*.md" button on the right.
@@ -157,22 +196,7 @@ class DocumentBar(QFrame):
 		text_column.addWidget(title_label)
 
 		if url:
-			href = html.escape(url, quote=True)
-			display = html.escape(url, quote=False)
-			url_label = QLabel(
-				f'<a href="{href}" style="color:#2563EB; text-decoration:underline;">{display}</a>'
-			)
-			url_label.setTextFormat(Qt.RichText)
-			url_label.setOpenExternalLinks(False)
-			url_label.setTextInteractionFlags(
-				Qt.LinksAccessibleByMouse | Qt.LinksAccessibleByKeyboard
-			)
-			url_label.setWordWrap(True)
-			url_label.setCursor(Qt.PointingHandCursor)
-			url_label.setStyleSheet("font-size: 11px;")
-			url_label.setToolTip(url)
-			url_label.linkActivated.connect(self._open_external_link)
-			text_column.addWidget(url_label)
+			text_column.addWidget(LinkLabel(url))
 
 		layout.addLayout(text_column, 1)
 
@@ -203,17 +227,6 @@ class DocumentBar(QFrame):
 		if self._summary_path is None or not self._summary_path.exists():
 			return
 		QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._summary_path)))
-
-	def _open_external_link(self, href: str) -> None:
-		target = (href or "").strip()
-		if not target:
-			return
-		url = QUrl(target)
-		# Some URLs arrive without a scheme (e.g. "example.com/page"); QDesktopServices
-		# silently fails on those, so prepend https:// when no scheme is present.
-		if not url.scheme():
-			url = QUrl(f"https://{target}")
-		QDesktopServices.openUrl(url)
 
 
 class ResearchWorker(QObject):
