@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from ...api_common import current_workspace_id, load_bootstrap_state
 from ...components.buttons import AppButton
 from ...components.cards import CardWidget
-from ...controllers import AgentController
+from ...controllers import AgentController, JobCategory, get_job_manager
 
 
 class StatusPill(QPushButton):
@@ -248,28 +248,6 @@ class DocumentBar(QFrame):
 		QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._summary_path)))
 
 
-class ResearchWorker(QObject):
-	finished = Signal(dict)
-	failed = Signal(str)
-
-	def __init__(self, workspace_id: str, instruction: str, reference_urls: list[str]) -> None:
-		super().__init__()
-		self._workspace_id = workspace_id
-		self._instruction = instruction
-		self._reference_urls = reference_urls
-
-	def run(self) -> None:
-		try:
-			response = AgentController().run_research(
-				self._workspace_id,
-				self._instruction,
-				self._reference_urls,
-			)
-			self.finished.emit(response)
-		except Exception as e:
-			self.failed.emit(str(e))
-
-
 class ResearchProgressPoller(QThread):
 	"""Polls /api/v1/research/progress on a background thread.
 
@@ -319,8 +297,6 @@ class ResearchPage(QWidget):
 		super().__init__(parent)
 		self._url_rows: list[tuple[QFrame, QLineEdit]] = []
 		self._workspace_id = current_workspace_id()
-		self._research_thread: QThread | None = None
-		self._research_worker: ResearchWorker | None = None
 		self._progress_poller: ResearchProgressPoller | None = None
 		# Controller-side document model keyed by doc_id. Bars are created on
 		# `doc_fetched` events and activated on `doc_summarized`. The final
@@ -447,6 +423,12 @@ class ResearchPage(QWidget):
 		self.add_reference_url()
 		self._load_existing_result()
 
+		# Subscribe to global busy state so the run button reflects whether
+		# AutoSurvey can start right now (e.g. another research is in flight
+		# or a chat is mid-stream).
+		get_job_manager().busy_changed.connect(self._sync_busy_state)
+		self._sync_busy_state()
+
 	def add_reference_url(self, url: str = "") -> None:
 		row = QFrame()
 		row.setObjectName("ReferenceUrlRow")
@@ -482,11 +464,24 @@ class ResearchPage(QWidget):
 		if not instruction:
 			self._show_message("조사할 내용을 입력하세요.")
 			return
-		if self._research_thread is not None:
-			return
 
 		self._workspace_id = current_workspace_id()
-		self.run_button.setEnabled(False)
+		reference_urls = self.get_reference_urls()
+		started = get_job_manager().submit(
+			JobCategory.RESEARCH,
+			AgentController().run_research,
+			self._workspace_id,
+			instruction,
+			reference_urls,
+			on_success=self._on_research_finished,
+			on_error=self._on_research_failed,
+		)
+		if not started:
+			# Defensive: the button should already be disabled via busy
+			# state, but if it slipped through (e.g. quick double-click)
+			# we still bail out cleanly.
+			return
+
 		self._clear_documents()
 		self.info_row_widget.setVisible(False)
 		self.documents_header.setVisible(False)
@@ -495,7 +490,11 @@ class ResearchPage(QWidget):
 		self.progress_line.setText("조사 준비 중...")
 		self.progress_line.setVisible(True)
 		self._start_progress_poller()
-		self._start_research_worker(instruction, self.get_reference_urls())
+
+	def _sync_busy_state(self) -> None:
+		"""Reflect the global JobManager state on this page's controls."""
+		manager = get_job_manager()
+		self.run_button.setEnabled(not manager.is_blocked(JobCategory.RESEARCH))
 
 	def _start_progress_poller(self) -> None:
 		self._stop_progress_poller()
@@ -576,26 +575,8 @@ class ResearchPage(QWidget):
 			return
 		bar.set_summary_ready(Path(summary_path_str))
 
-	def _start_research_worker(self, instruction: str, reference_urls: list[str]) -> None:
-		thread = QThread(self)
-		worker = ResearchWorker(self._workspace_id, instruction, reference_urls)
-		worker.moveToThread(thread)
-
-		thread.started.connect(worker.run)
-		worker.finished.connect(self._on_research_finished)
-		worker.failed.connect(self._on_research_failed)
-		worker.finished.connect(thread.quit)
-		worker.failed.connect(thread.quit)
-		worker.finished.connect(worker.deleteLater)
-		worker.failed.connect(worker.deleteLater)
-		thread.finished.connect(thread.deleteLater)
-		thread.finished.connect(self._clear_research_worker)
-
-		self._research_thread = thread
-		self._research_worker = worker
-		thread.start()
-
 	def _on_research_finished(self, response: dict[str, Any]) -> None:
+		# Button re-enable is handled by JobManager.busy_changed → _sync_busy_state.
 		self._stop_progress_poller()
 		self.progress_line.setVisible(False)
 		try:
@@ -606,7 +587,6 @@ class ResearchPage(QWidget):
 		if workspace_name:
 			self.workspaceChanged.emit(workspace_name)
 		self._render_result(response)
-		self.run_button.setEnabled(True)
 
 	def set_workspace_by_name(self, _workspace_name: str) -> None:
 		self._workspace_id = current_workspace_id()
@@ -632,6 +612,7 @@ class ResearchPage(QWidget):
 		self._render_result(current_job)
 
 	def _on_research_failed(self, message: str) -> None:
+		# Button re-enable is handled by JobManager.busy_changed → _sync_busy_state.
 		self._stop_progress_poller()
 		self.progress_line.setVisible(False)
 		self._clear_documents()
@@ -639,7 +620,6 @@ class ResearchPage(QWidget):
 		self.documents_header.setVisible(False)
 		self.result_empty.setVisible(False)
 		self.status_pill.set_state("failed", error_message=message or "알 수 없는 오류가 발생했습니다.")
-		self.run_button.setEnabled(True)
 
 	def _render_result(self, response: dict[str, Any]) -> None:
 		"""Apply final/persisted job state to the result card.
@@ -741,10 +721,6 @@ class ResearchPage(QWidget):
 		self.documents_header.setVisible(False)
 		self.result_empty.setText(text)
 		self.result_empty.setVisible(True)
-
-	def _clear_research_worker(self) -> None:
-		self._research_thread = None
-		self._research_worker = None
 
 	def _remove_reference_url(self, target: QFrame) -> None:
 		if len(self._url_rows) == 1:

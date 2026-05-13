@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 
 from ..api_common import ApiError, current_workspace_id
 from ..components.cards import CardWidget
-from ..controllers import AgentController, get_chat_bus
+from ..controllers import AgentController, JobCategory, get_chat_bus, get_job_manager
 from ..components.stepper import WorkflowStepper
 from .pages.dashboard_page import DashboardPage
 from .pages.document_page import DocumentPage
@@ -226,6 +226,10 @@ class MainWindow(QMainWindow):
 		self._chat_bus.assistantChunk.connect(self._on_chat_stream_chunk)
 		self._chat_bus.assistantCompleted.connect(self._on_chat_stream_completed)
 		self._chat_bus.assistantFailed.connect(self._on_chat_stream_failed)
+		# Floating assist window's chat input follows the global busy state
+		# (locked while AutoSurvey runs or another chat is mid-stream).
+		get_job_manager().busy_changed.connect(self._sync_assist_busy_state)
+		self._sync_assist_busy_state()
 
 		self._screen_monitor_worker: ScreenEventPollWorker | None = None
 		self._screen_monitor_active = False
@@ -299,6 +303,18 @@ class MainWindow(QMainWindow):
 
 	def _on_proactive_poll_error(self, message: str) -> None:
 		print(f"[screen_monitoring][poll][warn] {message}")
+
+	def _sync_assist_busy_state(self) -> None:
+		blocked = get_job_manager().is_blocked(JobCategory.CHAT)
+		self.document_assist_window.input_bar.setEnabled(not blocked)
+		if blocked:
+			self.document_assist_window.input_bar.input.setPlaceholderText(
+				"다른 작업이 진행 중입니다. 잠시만 기다려 주세요..."
+			)
+		else:
+			# Restore the mode-specific placeholder.
+			current_mode = self.document_assist_window.input_bar.mode()
+			self.document_assist_window.input_bar.set_mode(current_mode, emit=False)
 
 	def _on_assist_visibility_changed(self, visible: bool) -> None:
 		if visible:

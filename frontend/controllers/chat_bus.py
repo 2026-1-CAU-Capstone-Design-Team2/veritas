@@ -5,6 +5,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QThread, Signal
 
 from ..api_common import ApiError, api_client
+from .job_manager import JobCategory, get_job_manager
 
 
 class ChatStreamWorker(QThread):
@@ -96,14 +97,22 @@ class ChatBus(QObject):
 		return cls._instance
 
 	def is_busy(self) -> bool:
-		return self._active_worker is not None and self._active_worker.isRunning()
+		return get_job_manager().is_busy(JobCategory.CHAT)
 
 	def send(self, workspace_id: str, message: str, mode: str) -> bool:
-		"""Begin a streaming chat turn. Returns False if a turn is already in flight."""
+		"""Begin a streaming chat turn.
+
+		Returns False if the JobManager rejects the request (e.g. another
+		chat is in flight or an AutoSurvey run is blocking chat). Views are
+		expected to have already disabled their inputs based on
+		``busy_changed``, so this is mostly a defensive guard.
+		"""
 		text = (message or "").strip()
 		if not text:
 			return False
-		if self.is_busy():
+		# JobManager owns the global busy state, including the
+		# research-blocks-chat mutex.
+		if not get_job_manager().register(JobCategory.CHAT):
 			return False
 
 		self.userMessageQueued.emit(workspace_id, text)
@@ -133,6 +142,9 @@ class ChatBus(QObject):
 		self._active_worker = None
 		if worker is not None:
 			worker.deleteLater()
+		# Always release the CHAT slot, even if the stream failed mid-flight,
+		# so subsequent chats can start.
+		get_job_manager().unregister(JobCategory.CHAT)
 
 
 def get_chat_bus() -> ChatBus:

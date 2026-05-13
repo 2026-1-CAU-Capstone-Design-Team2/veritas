@@ -64,6 +64,26 @@ RAG over generated markdown outputs, and schema-driven chat tool use.
   URL hyperlink (uses `QDesktopServices.openUrl`, auto-prepends `https://`
   when the URL has no scheme), and a `doc_NNN.md ↗` button that opens the
   corresponding `summary/doc_<docId>.md` in the OS default viewer.
+- Frontend async dispatch and operation mutex go through a single
+  `frontend/controllers/job_manager.py` `JobManager` singleton. Every
+  long-running call to the backend (AutoSurvey, chat, draft, feedback
+  analyze, workspace switch, ...) is tagged with a
+  `JobCategory` constant and submitted via `JobManager.submit(category, fn,
+  ...)` which runs `fn` on a worker `QThread` and emits `busy_changed` on
+  state transitions. A central block matrix (`_BLOCKS_THIS` in `job_manager.py`)
+  encodes which categories block which: e.g. `RESEARCH` blocks `CHAT`,
+  `DRAFT`, `FEEDBACK`, `DOC_ANALYZE`, and `WORKSPACE_SWITCH`. Views connect
+  to `JobManager.busy_changed` once and disable their inputs via
+  `is_blocked(category)` — so while AutoSurvey is running the chat input
+  bars (in `WritePage` and the floating `DocumentAssistWindow`), the
+  workspace-switch button in the sidebar, the draft "초안 생성" button, and
+  the feedback upload button are all greyed out automatically and cannot
+  be invoked. The existing `ChatStreamWorker` reuses the same mutex via
+  `JobManager.register/unregister(CHAT)`, so chat streams and JobManager-
+  submitted operations participate in the same exclusion model. Adding a
+  new heavy operation is now a single-place change: pick a `JobCategory`,
+  call `submit(...)`, and the UI gating falls out automatically from
+  `_BLOCKS_THIS`.
 - FastAPI handlers that perform synchronous blocking work (`POST /research/jobs`,
   `POST /workspaces/switch`, `POST /chat/messages`, `POST /draft/generate`,
   `POST /draft/{id}/regenerate`, `POST /document-assist/analyze`,

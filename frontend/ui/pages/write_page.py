@@ -3,7 +3,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import QFrame, QVBoxLayout, QWidget
 
 from ...api_common import ApiError, current_workspace_id
-from ...controllers import AgentController, get_chat_bus
+from ...controllers import AgentController, JobCategory, get_chat_bus, get_job_manager
 from ..windows.document_assist_window import ChatInputBar, ChatPanel
 
 
@@ -45,6 +45,21 @@ class WritePage(QWidget):
 		self._bus.assistantChunk.connect(self._on_stream_chunk)
 		self._bus.assistantCompleted.connect(self._on_stream_completed)
 		self._bus.assistantFailed.connect(self._on_stream_failed)
+		# Global busy state drives the input enable/disable: while research is
+		# running or another chat is mid-stream, the chat input is locked.
+		get_job_manager().busy_changed.connect(self._sync_busy_state)
+		self._sync_busy_state()
+
+	def _sync_busy_state(self) -> None:
+		blocked = get_job_manager().is_blocked(JobCategory.CHAT)
+		self.input_bar.setEnabled(not blocked)
+		if blocked:
+			self.input_bar.input.setPlaceholderText(
+				"다른 작업이 진행 중입니다. 잠시만 기다려 주세요..."
+			)
+		else:
+			# Restore mode-appropriate placeholder.
+			self.input_bar.set_mode(self._mode, emit=False)
 
 	def _set_mode(self, mode: str) -> None:
 		self._mode = "rag" if mode == "rag" else "research"
@@ -91,8 +106,8 @@ class WritePage(QWidget):
 		self.chat_panel.add_message("사용자", text, True)
 
 	def _on_stream_started(self) -> None:
+		# Input enable/disable is driven by JobManager.busy_changed, not here.
 		self._streaming = True
-		self.input_bar.setEnabled(False)
 		self.chat_panel.start_streaming_assistant("VERITAS")
 
 	def _on_stream_chunk(self, chunk: str) -> None:
@@ -105,11 +120,9 @@ class WritePage(QWidget):
 			return
 		self._streaming = False
 		self.chat_panel.finalize_streaming_assistant(text)
-		self.input_bar.setEnabled(True)
 
 	def _on_stream_failed(self, error: str) -> None:
 		if not self._streaming:
 			return
 		self._streaming = False
 		self.chat_panel.cancel_streaming_assistant(error)
-		self.input_bar.setEnabled(True)

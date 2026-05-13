@@ -3,10 +3,10 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPlainTextEdit, QVBoxLayout, QWidget
 
-from ...api_common import ApiError, current_workspace_id
+from ...api_common import current_workspace_id
 from ...components.buttons import AppButton
 from ...components.cards import CardWidget
-from ...controllers import AgentController
+from ...controllers import AgentController, JobCategory, get_job_manager
 
 
 class DraftPage(QWidget):
@@ -75,6 +75,13 @@ class DraftPage(QWidget):
 		output_card.layout.addLayout(output_actions)
 		root.addWidget(output_card, 1)
 
+		get_job_manager().busy_changed.connect(self._sync_busy_state)
+		self._sync_busy_state()
+
+	def _sync_busy_state(self) -> None:
+		blocked = get_job_manager().is_blocked(JobCategory.DRAFT)
+		self.generate_button.setEnabled(not blocked)
+
 	def set_workspace_by_name(self, workspace_name: str) -> None:
 		self.workspace_label.setText(f"현재 워크스페이스: {workspace_name or self._workspace_id}")
 
@@ -91,12 +98,25 @@ class DraftPage(QWidget):
 			self.output.setPlainText("초안 생성을 위해 요청을 입력하세요.")
 			return
 
-		self.generate_button.setEnabled(False)
+		# Dispatch to a worker thread; button enable state is managed by
+		# JobManager.busy_changed → _sync_busy_state.
+		started = get_job_manager().submit(
+			JobCategory.DRAFT,
+			self._controller.generate_draft,
+			self._workspace_id,
+			prompt,
+			on_success=self._on_draft_generated,
+			on_error=self._on_draft_failed,
+		)
+		if not started:
+			return
 		self.output.setPlainText("agent가 초안을 생성하는 중입니다...")
-		try:
-			response = self._controller.generate_draft(self._workspace_id, prompt)
+
+	def _on_draft_generated(self, response) -> None:
+		if isinstance(response, dict):
 			self.output.setPlainText(str(response.get("content") or ""))
-		except ApiError as e:
-			self.output.setPlainText(f"API 요청 실패: {e}")
-		finally:
-			self.generate_button.setEnabled(True)
+		else:
+			self.output.setPlainText(str(response or ""))
+
+	def _on_draft_failed(self, message: str) -> None:
+		self.output.setPlainText(f"API 요청 실패: {message}")
