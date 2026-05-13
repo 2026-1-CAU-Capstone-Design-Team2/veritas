@@ -152,13 +152,18 @@ class MainWindow(QMainWindow):
 
 		self.route_to_index: dict[str, int] = {}
 		self._add_page("dashboard", DashboardPage())
-		self._add_page("research", ResearchPage())
+		self.research_page = ResearchPage()
+		self.research_page.workspaceChanged.connect(self.sidebar.set_current_workspace)
+		self.research_page.workspaceChanged.connect(self._on_workspace_changed)
+		self._add_page("research", self.research_page)
 		self._add_page("verify", VerifyPage())
 		self.draft_page = DraftPage()
 		self._add_page("draft", self.draft_page)
 		self._add_page("document_assist", DocumentAssistPage())
-		self._add_page("write", WritePage())
-		self._add_page("document", DocumentPage())
+		self.write_page = WritePage()
+		self._add_page("write", self.write_page)
+		self.document_page = DocumentPage()
+		self._add_page("document", self.document_page)
 		self._add_page("feedback", FeedbackPage())
 		self.settings_page = SettingsPage()
 		self.settings_page.defaultWorkspaceChanged.connect(self.sidebar.set_current_workspace)
@@ -209,6 +214,9 @@ class MainWindow(QMainWindow):
 	def _on_workspace_changed(self, workspace_name: str) -> None:
 		self.settings_page.set_default_workspace_by_name(workspace_name)
 		self.draft_page.set_workspace_by_name(workspace_name)
+		self.research_page.set_workspace_by_name(workspace_name)
+		self.write_page.set_workspace_by_name(workspace_name)
+		self.document_page.refresh()
 
 	def _toggle_sidebar(self) -> None:
 		start = self.sidebar.width()

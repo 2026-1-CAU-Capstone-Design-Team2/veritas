@@ -278,6 +278,9 @@ Explicit slash commands bypass LLM tool selection:
 /rag <question against indexed local documents>
 ```
 
+The frontend chat mode selector uses the same forced paths: `자료조사` maps to
+`/autosurvey`, and `RAG` maps to `/rag`.
+
 Use these commands when you want deterministic tool selection and want to avoid
 the LLM deciding whether a tool should be called.
 

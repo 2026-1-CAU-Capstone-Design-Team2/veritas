@@ -158,8 +158,7 @@ def load_bootstrap_state() -> dict[str, Any]:
         isinstance(item, dict) and item.get("workspaceId") == current_workspace_id
         for item in workspaces
     ):
-        workspaces.insert(0, default_workspace())
-        current_workspace_id = "default"
+        current_workspace_id = str(workspaces[0].get("workspaceId") or "default")
 
     settings = bootstrap.get("settings")
     if isinstance(settings, dict):

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
@@ -56,13 +59,48 @@ def send_chat_message(workspace_id: str, message: str, mode: str = "research") -
 
     message_id = new_id("msg")
     session_id = f"session_{workspace_id}"
-    history = repo.get_or_create_chat_history(session_id)
+    history = _get_workspace_chat_history(workspace_id, session_id)
     history.append({"role": "user", "text": message})
-    assistant_text = get_runtime().answer_chat(message_text, mode)
+    runtime = get_runtime()
+    runtime.set_workspace(workspace_id)
+    assistant_text = runtime.answer_chat_selection(message_text, mode)
     history.append({"role": "assistant", "text": assistant_text})
+    _save_workspace_chat_history(workspace_id, history)
     return {"messageId": message_id, "assistant": assistant_text, "mode": mode}
 
 
 def get_chat_history(session_id: str) -> dict[str, Any]:
-    items = repo.get_chat_history(session_id)
+    workspace_id = session_id.removeprefix("session_")
+    items = _get_workspace_chat_history(workspace_id, session_id)
     return {"items": items, "nextCursor": None}
+
+
+def _get_workspace_chat_history(workspace_id: str, session_id: str) -> list[dict[str, Any]]:
+    history = repo.get_or_create_chat_history(session_id)
+    if history:
+        return history
+
+    path = _chat_history_path(workspace_id)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        items = payload.get("items", payload) if isinstance(payload, dict) else payload
+    except Exception:
+        items = []
+    if isinstance(items, list):
+        history.extend([item for item in items if isinstance(item, dict)])
+    return history
+
+
+def _save_workspace_chat_history(workspace_id: str, history: list[dict[str, Any]]) -> None:
+    path = _chat_history_path(workspace_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"items": history, "updatedAt": utc_now_iso()}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _chat_history_path(workspace_id: str) -> Path:
+    root = Path(os.getenv("VERITAS_OUTPUT_DIR", "runs")).expanduser().resolve()
+    workspace_dir = root / workspace_id if workspace_id != "default" else root / "api"
+    return workspace_dir / "chat_history.json"

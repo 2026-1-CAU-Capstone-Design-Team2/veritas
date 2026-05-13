@@ -16,6 +16,11 @@ class AgentController:
 		)
 		return str(response.get("assistant") or "")
 
+	def get_chat_history(self, workspace_id: str) -> list[dict[str, Any]]:
+		response = api_client.get(f"/api/v1/chat/sessions/session_{workspace_id}/messages")
+		items = response.get("items", [])
+		return items if isinstance(items, list) else []
+
 	def generate_draft(self, workspace_id: str, prompt: str) -> dict[str, Any]:
 		return api_client.post(
 			"/api/v1/draft/generate",
@@ -36,6 +41,11 @@ class AgentController:
 				"referenceUrls": reference_urls,
 			},
 		)
+
+	def list_research_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
+		response = api_client.get("/api/v1/research/jobs", {"limit": limit})
+		items = response.get("items", [])
+		return items if isinstance(items, list) else []
 
 	def upload_feedback_files(self, files: list[Path]) -> list[dict[str, str]]:
 		response = api_client.upload_files("/api/v1/feedback/files", files)

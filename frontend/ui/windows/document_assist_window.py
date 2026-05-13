@@ -378,6 +378,26 @@ class ChatPanel(QFrame):
 		self.layout.insertLayout(insert_at, row)
 		self.schedule_scroll_to_bottom()
 
+	def clear_messages(self) -> None:
+		while self.layout.count():
+			item = self.layout.takeAt(0)
+			self._dispose_layout_item(item)
+		self._bubbles.clear()
+		self.layout.addWidget(self.empty)
+		self.layout.addStretch(1)
+		self.empty.show()
+
+	def _dispose_layout_item(self, item) -> None:
+		widget = item.widget()
+		if widget is not None and widget is not self.empty:
+			widget.setParent(None)
+			widget.deleteLater()
+			return
+		layout = item.layout()
+		if layout is not None:
+			while layout.count():
+				self._dispose_layout_item(layout.takeAt(0))
+
 	def schedule_scroll_to_bottom(self) -> None:
 		for delay in (0, 25, 80):
 			QTimer.singleShot(delay, self._scroll_to_bottom)

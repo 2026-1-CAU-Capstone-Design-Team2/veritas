@@ -14,11 +14,7 @@ class WritePage(QWidget):
 		self._workspace_id = current_workspace_id()
 		self._controller = AgentController()
 		self._build_ui()
-		self.chat_panel.add_message(
-			"VERITAS",
-			"메시지를 입력하면 backend agent 응답이 표시됩니다.",
-			False,
-		)
+		self.refresh()
 
 	def _build_ui(self) -> None:
 		root = QVBoxLayout(self)
@@ -43,11 +39,40 @@ class WritePage(QWidget):
 	def _set_mode(self, mode: str) -> None:
 		self._mode = "rag" if mode == "rag" else "research"
 
+	def set_workspace_by_name(self, _workspace_name: str) -> None:
+		self.refresh()
+
+	def refresh(self) -> None:
+		self._workspace_id = current_workspace_id()
+		self.chat_panel.clear_messages()
+		try:
+			history = self._controller.get_chat_history(self._workspace_id)
+		except ApiError:
+			history = []
+
+		if not history:
+			self.chat_panel.add_message(
+				"VERITAS",
+				"메시지를 입력하면 선택한 워크스페이스의 지식베이스로 답변합니다.",
+				False,
+			)
+			return
+
+		for item in history:
+			if not isinstance(item, dict):
+				continue
+			role = str(item.get("role") or "")
+			text = str(item.get("text") or "")
+			if not text:
+				continue
+			self.chat_panel.add_message("사용자" if role == "user" else "VERITAS", text, role == "user")
+
 	def _send_message(self, message: str) -> None:
 		text = message.rstrip("\n")
 		if not text.strip():
 			return
 
+		self._workspace_id = current_workspace_id()
 		self.chat_panel.add_message("사용자", text, True)
 		try:
 			reply = self._controller.send_chat_message(self._workspace_id, text, self._mode)

@@ -48,7 +48,9 @@ def send_chat_message(workspace_id: str, message: str, mode: str = "research") -
     if not message_text:
         raise HTTPException(status_code=422, detail="message must not be empty")
 
-    reply = get_runtime().answer_chat(message_text, mode)
+    runtime = get_runtime()
+    runtime.set_workspace(workspace_id)
+    reply = runtime.answer_chat_selection(message_text, mode)
     return {
         "messageId": new_id("msg"),
         "workspaceId": workspace_id,

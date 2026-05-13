@@ -23,8 +23,6 @@ class AgentRuntime:
         self.output_root = Path(os.getenv("VERITAS_OUTPUT_DIR", "runs")).expanduser().resolve()
         self.output_root.mkdir(parents=True, exist_ok=True)
         self._cleanup_pending_dirs()
-        self.output_dir = self.output_root / "api"
-        self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.llm = LLMClient(
             host=os.getenv("VERITAS_LLM_HOST", "127.0.0.1"),
@@ -33,6 +31,14 @@ class AgentRuntime:
             embed_port=int(os.getenv("VERITAS_EMBED_PORT", "8081")),
             trace_latency=os.getenv("VERITAS_TRACE_LATENCY", "1") != "0",
         )
+        self.workspace_id = "default"
+        self.output_dir = self.output_root / "api"
+        self._workspace_lock = threading.RLock()
+        self._configure_workspace_runtime(self.output_dir)
+
+    def _configure_workspace_runtime(self, output_dir: Path) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir = output_dir
         self.registry, self.run_store_service, self.rag_service = build_registry(
             llm=self.llm,
             run_root=self.output_dir,
@@ -56,6 +62,20 @@ class AgentRuntime:
             tool_registry=self.registry,
             screen_debug=os.getenv("VERITAS_SCREEN_DEBUG", "0") == "1",
         )
+        self.chat_agent.chat_history = self._load_workspace_chat_history()
+        if self.rag_service is not None:
+            self.rag_service.chat_history = list(self.chat_agent.chat_history)
+
+    def set_workspace(self, workspace_id: str) -> None:
+        workspace_id = str(workspace_id or "").strip()
+        if not workspace_id or workspace_id == self.workspace_id:
+            return
+        with self._workspace_lock:
+            if workspace_id == self.workspace_id:
+                return
+            self.workspace_id = workspace_id
+            output_dir = self.output_root / workspace_id if workspace_id != "default" else self.output_root / "api"
+            self._configure_workspace_runtime(output_dir)
 
     def _register_autosurvey_tool(self) -> None:
         if self.registry.has("autosurvey"):
@@ -76,6 +96,46 @@ class AgentRuntime:
             self._ensure_rag_index(require_documents=False)
             return self.chat_agent.ask_rag(message, stream=False)
         return self.chat_agent.ask_auto(message, stream=False)
+
+    def answer_chat_selection(self, message: str, mode: str) -> str:
+        """Answer a frontend chat turn where the mode selector is authoritative.
+
+        The chat UI's "자료조사" and "RAG" choices are equivalent to entering
+        `/autosurvey ...` and `/rag ...` in the CLI. Other internal API calls
+        still use answer_chat(), where "research" means general tool-capable chat.
+        """
+        normalized_mode = str(mode or "research").strip().lower()
+        if normalized_mode in {"research", "autosurvey"}:
+            return self.chat_agent.ask_explicit_tool("autosurvey", message, stream=False)
+        if normalized_mode == "rag":
+            self._ensure_rag_index(require_documents=False)
+            return self.chat_agent.ask_explicit_tool("rag", message, stream=False)
+        return self.chat_agent.ask_auto(message, stream=False)
+
+    def _load_workspace_chat_history(self) -> list[tuple[str, str]]:
+        path = self.output_dir / "chat_history.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+
+        items = payload.get("items", payload) if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            return []
+
+        turns: list[tuple[str, str]] = []
+        pending_user: str | None = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").lower()
+            text = str(item.get("text") or item.get("content") or "")
+            if role == "user":
+                pending_user = text
+            elif role == "assistant" and pending_user is not None:
+                turns.append((pending_user, text))
+                pending_user = None
+        return turns
 
     def run_autosurvey(
         self,

@@ -44,6 +44,8 @@ class ResearchWorker(QObject):
 
 
 class ResearchPage(QWidget):
+	workspaceChanged = Signal(str)
+
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self._url_rows: list[tuple[QFrame, QLineEdit]] = []
@@ -122,6 +124,7 @@ class ResearchPage(QWidget):
 		root.addWidget(result_card, 1)
 
 		self.add_reference_url()
+		self._load_existing_result()
 
 	def add_reference_url(self, url: str = "") -> None:
 		row = QFrame()
@@ -190,6 +193,9 @@ class ResearchPage(QWidget):
 			load_bootstrap_state()
 		except Exception:
 			pass
+		workspace_name = str(response.get("workspaceName") or response.get("workspaceId") or "")
+		if workspace_name:
+			self.workspaceChanged.emit(workspace_name)
 		documents = response.get("documents", [])
 		if not isinstance(documents, list):
 			documents = []
@@ -214,6 +220,48 @@ class ResearchPage(QWidget):
 		lines.extend(["", "요약", str(response.get("summary") or "")])
 		self.result_output.setPlainText("\n".join(lines).strip())
 		self.run_button.setEnabled(True)
+
+	def set_workspace_by_name(self, _workspace_name: str) -> None:
+		self._workspace_id = current_workspace_id()
+		self._load_existing_result()
+
+	def _load_existing_result(self) -> None:
+		self._workspace_id = current_workspace_id()
+		try:
+			jobs = AgentController().list_research_jobs(100)
+		except Exception:
+			return
+		current_job = next(
+			(
+				job
+				for job in jobs
+				if isinstance(job, dict) and str(job.get("workspaceId") or "") == self._workspace_id
+			),
+			None,
+		)
+		if current_job is None:
+			return
+		documents = current_job.get("documents", [])
+		if not isinstance(documents, list):
+			documents = []
+		lines = [
+			f"status: {current_job.get('status')}",
+			f"jobId: {current_job.get('jobId')}",
+			f"finalPath: {current_job.get('finalPath')}",
+			f"documentCount: {current_job.get('documentCount', len(documents))}",
+			"",
+			"Collected documents",
+		]
+		for index, item in enumerate(documents, start=1):
+			if not isinstance(item, dict):
+				continue
+			title = str(item.get("title") or "Untitled")
+			url = str(item.get("url") or "")
+			lines.append(f"{index}. {title}")
+			if url:
+				lines.append(f"   {url}")
+		lines.extend(["", "Summary", str(current_job.get("summary") or "")])
+		self.result_output.setPlainText("\n".join(lines).strip())
 
 	def _on_research_failed(self, message: str) -> None:
 		self.result_output.setPlainText(f"API 요청 실패: {message}")

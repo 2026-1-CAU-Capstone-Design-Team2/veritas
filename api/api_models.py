@@ -21,7 +21,7 @@ class DraftRegenerateRequest(BaseModel):
 class ChatMessageRequest(BaseModel):
     workspaceId: str
     message: str
-    mode: Literal["research", "rag"] = "research"
+    mode: Literal["research", "autosurvey", "rag"] = "research"
 
 
 class FeedbackAnalyzeRequest(BaseModel):
@@ -43,7 +43,7 @@ class DocumentAssistAnalyzeRequest(BaseModel):
 class DocumentAssistChatRequest(BaseModel):
     workspaceId: str
     message: str
-    mode: Literal["research", "rag"] = "research"
+    mode: Literal["research", "autosurvey", "rag"] = "research"
 
 
 class SettingsModelRequest(BaseModel):

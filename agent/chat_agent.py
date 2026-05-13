@@ -105,6 +105,30 @@ class ChatAgent:
             self._append_history(question, answer)
             return answer
 
+    def ask_explicit_tool(self, command: str, question: str, *, stream: bool = False) -> str:
+        """Run the same forced tool path used by CLI slash commands.
+
+        This is intended for UI controls that choose a tool mode without making
+        the user type `/autosurvey` or `/rag` into the prompt field.
+        """
+        normalized_command = str(command or "").strip().lower()
+        if normalized_command not in {"autosurvey", "rag"}:
+            raise ValueError(f"Unsupported explicit chat tool: {command}")
+
+        command_text = str(question or "").strip()
+        with self._conversation_lock:
+            tool_outputs = self._run_explicit_tool_command(
+                command=normalized_command,
+                command_text=command_text,
+            )
+            answer = self._answer_from_current_turn(
+                question=command_text,
+                tool_outputs=tool_outputs,
+                stream=stream,
+            )
+            self._append_history(command_text, answer)
+            return answer
+
     def _append_history(self, question: str, answer: str) -> None:
         self.chat_history.append((question, answer))
         if self.rag_service is not None:
