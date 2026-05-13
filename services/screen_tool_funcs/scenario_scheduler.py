@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from .scenarios import ScenarioType
 from .store import ScreenContextStore
 
 
@@ -70,7 +71,8 @@ class ScenarioScheduler:
         self,
         store: ScreenContextStore,
         *,
-        weights: dict[str, ScenarioWeights],
+        scenarios: list[ScenarioType] | None = None,
+        weights: dict[str, ScenarioWeights] | None = None,
         decay_per_second: float = 0.05,
         flush_interval_sec: float = 600.0,
         reset_idle_sec: float = 3600.0,
@@ -78,8 +80,21 @@ class ScenarioScheduler:
         max_documents: int = 50,
         console_log: bool = False,
     ) -> None:
+        if scenarios is not None and weights is not None:
+            raise ValueError("Pass either scenarios= or weights=, not both.")
+        if scenarios is None and weights is None:
+            raise ValueError("ScenarioScheduler requires scenarios= (preferred) or weights=.")
         self.store = store
-        self.weights = dict(weights)
+        if scenarios is not None:
+            self.weights = {
+                scenario.name: ScenarioWeights(
+                    initial_vruntime=scenario.initial_vruntime,
+                    vruntime_increment=scenario.vruntime_increment,
+                )
+                for scenario in scenarios
+            }
+        else:
+            self.weights = dict(weights or {})
         self.decay_per_second = max(decay_per_second, 0.0)
         self.flush_interval_sec = max(flush_interval_sec, 1.0)
         self.reset_idle_sec = max(reset_idle_sec, 0.0)
@@ -157,6 +172,41 @@ class ScenarioScheduler:
             current = state.vruntimes.get(name, self.weights[name].initial_vruntime)
             state.vruntimes[name] = current + self.weights[name].vruntime_increment
             state.last_activity_at = now
+
+    def select_and_charge(
+        self,
+        document_key: str,
+        ready_names: list[str],
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        """Pick the winner and charge its vruntime in a single decay step.
+
+        Replaces a `select(...)` followed by `charge(...)`: each of those calls
+        passes through `get_state()`, which applies lazy decay independently.
+        Doing both inside one critical section with a single `now` guarantees
+        decay is applied at most once per capture and that no concurrent
+        `flush_loop`/`get_state` can mutate state between the two operations.
+        """
+        if not ready_names:
+            return None
+        now = now if now is not None else time.time()
+        with self._lock:
+            state = self.get_state(document_key, now=now)
+            scored: list[tuple[float, float, str]] = []
+            for name in ready_names:
+                if name not in self.weights:
+                    continue
+                vruntime = state.vruntimes.get(name, self.weights[name].initial_vruntime)
+                scored.append((vruntime, self.weights[name].initial_vruntime, name))
+            if not scored:
+                return None
+            scored.sort(key=lambda item: (item[0], item[1], item[2]))
+            selected = scored[0][2]
+            current = state.vruntimes.get(selected, self.weights[selected].initial_vruntime)
+            state.vruntimes[selected] = current + self.weights[selected].vruntime_increment
+            state.last_activity_at = now
+            return selected
 
     def snapshot(self, document_key: str, *, now: float | None = None) -> dict[str, Any]:
         state = self.get_state(document_key, now=now)

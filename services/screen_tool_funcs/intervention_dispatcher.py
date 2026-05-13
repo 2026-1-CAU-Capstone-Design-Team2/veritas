@@ -169,22 +169,47 @@ class InterventionDispatcher:
         }
 
     def _intervention_flag(self, event: ScreenContextEvent) -> dict:
+        """Build the intervention_flag payload with scenario-isolated flags.
+
+        flags structure (post B-3):
+            common: { editing_app, dwell_satisfied, paragraph_stable }
+            scenarios: { <name>: { ready, score, gates: { <gate>: bool } } }
+            selected_scenario: <name> | None
+
+        The earlier shape flattened every scenario's reason flag at the top
+        level, so a consumer reading `flags.typing_pause_satisfied` could not
+        tell whether the idle scenario actually failed that gate or whether
+        another scenario was simply chosen. Scoping the flags per scenario
+        removes that ambiguity. Common gate flags also drop the redundant
+        `_satisfied`/`_stable` suffixes so all flags read as plain booleans.
+        """
         metadata = event.intervention.metadata or {}
         common_checks = metadata.get("common_checks") or {}
-        scenarios = metadata.get("scenarios") or {}
+        scenarios_meta = metadata.get("scenarios") or {}
         selected = metadata.get("selected")
-
-        def _passed(name: str) -> bool:
-            check = common_checks.get(name) if isinstance(common_checks, dict) else None
-            return bool(check.get("passed")) if isinstance(check, dict) else False
-
-        selected_scenario = scenarios.get(selected) if isinstance(scenarios, dict) and selected else None
-        selected_reasons = (
-            set(selected_scenario.get("reasons") or [])
-            if isinstance(selected_scenario, dict)
-            else set()
-        )
         blockers = set(metadata.get("blockers") or [])
+
+        common_flags: dict[str, bool] = {}
+        if isinstance(common_checks, dict):
+            for name, check in common_checks.items():
+                common_flags[name] = bool(check.get("passed")) if isinstance(check, dict) else False
+
+        scenario_flags: dict[str, dict] = {}
+        if isinstance(scenarios_meta, dict):
+            for scenario_name, scenario_data in scenarios_meta.items():
+                if not isinstance(scenario_data, dict):
+                    continue
+                gate_results = scenario_data.get("gate_results") or {}
+                gate_flags: dict[str, bool] = {}
+                if isinstance(gate_results, dict):
+                    for gate_name, gate_data in gate_results.items():
+                        if isinstance(gate_data, dict):
+                            gate_flags[gate_name] = bool(gate_data.get("passed"))
+                scenario_flags[scenario_name] = {
+                    "ready": bool(scenario_data.get("ready")),
+                    "score": scenario_data.get("score", 0.0),
+                    "gates": gate_flags,
+                }
 
         return {
             "should_consider_llm": event.intervention.should_consider_llm,
@@ -195,14 +220,9 @@ class InterventionDispatcher:
             "reason_codes": event.intervention.reason_codes,
             "blockers": sorted(blockers),
             "flags": {
-                "editing_app": _passed("editing_app"),
-                "dwell_satisfied": _passed("dwell"),
-                "paragraph_stable": _passed("stable_paragraph"),
-                "typing_pause_satisfied": "typing_pause_satisfied" in selected_reasons,
-                "cooldown_dedupe_passed": "cooldown_dedupe_passed" in selected_reasons,
-                "sustained_writing_observed": "sustained_writing_observed" in selected_reasons,
-                "idle_after_sustained_writing": "idle_after_sustained_writing" in selected_reasons,
-                "document_cooldown_passed": "document_cooldown_passed" in selected_reasons,
+                "common": common_flags,
+                "scenarios": scenario_flags,
+                "selected_scenario": selected,
             },
         }
 

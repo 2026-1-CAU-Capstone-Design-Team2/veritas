@@ -12,6 +12,10 @@ from .models import AppTextResult, OcrResult, ScreenContextEvent, UiAutomationRe
 from .ocr_engine import OcrEngine
 from .powerpoint_com import PowerPointComReader
 from .scenario_scheduler import ScenarioScheduler
+from .scenarios import (
+    IdleAfterWritingScenario,
+    WholeDocumentReviewScenario,
+)
 from .screen_capture import ScreenCapture
 from .store import ScreenContextStore
 from .ui_automation import UiAutomationReader
@@ -48,16 +52,29 @@ class ScreenContextService:
         self.ui_reader = UiAutomationReader()
         self.content_filter = ContentFilter()
         self.store = ScreenContextStore(root)
-        self.intervention_detector = InterventionDetector()
+
+        # Build one shared scenario list and inject it into every component
+        # that depends on it (detector, scheduler, dispatcher). This replaces
+        # the previous sequence where the detector's default scenarios were
+        # used to seed the scheduler and the scheduler was then attached back
+        # to the detector via a post-construction setter — which would silently
+        # drift if anyone replaced detector.scenarios at runtime.
+        scenarios = [
+            IdleAfterWritingScenario(),
+            WholeDocumentReviewScenario(),
+        ]
         self.scenario_scheduler = ScenarioScheduler(
             self.store,
-            weights=self.intervention_detector.scenario_weights,
+            scenarios=scenarios,
             console_log=console_log,
         )
-        self.intervention_detector.scheduler = self.scenario_scheduler
+        self.intervention_detector = InterventionDetector(
+            scenarios=scenarios,
+            scheduler=self.scenario_scheduler,
+        )
         self.intervention_dispatcher = InterventionDispatcher(
             self.store,
-            scenarios={s.name: s for s in self.intervention_detector.scenarios},
+            scenarios={s.name: s for s in scenarios},
             console_log=console_log,
         )
 

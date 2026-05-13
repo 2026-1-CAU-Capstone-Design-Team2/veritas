@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from typing import Any
 
 from .models import FilteredScreenContext, InterventionDecision, WindowContext
@@ -155,8 +156,16 @@ class InterventionDetector:
         scheduler_snapshot: dict[str, Any] | None = None
         selected_name: str | None = None
         if ready_names and self.scheduler is not None:
-            selected_name = self.scheduler.select(current_snapshot["document_key"], ready_names)
-            scheduler_snapshot = self.scheduler.snapshot(current_snapshot["document_key"])
+            # Single `now` flows through select+charge+snapshot so lazy decay
+            # is applied exactly once per capture, not twice as in the old
+            # split select() / charge() / snapshot() chain.
+            now = time.time()
+            selected_name = self.scheduler.select_and_charge(
+                current_snapshot["document_key"], ready_names, now=now
+            )
+            scheduler_snapshot = self.scheduler.snapshot(
+                current_snapshot["document_key"], now=now
+            )
         elif ready_names:
             selected_name = ready_names[0]
 
@@ -190,10 +199,6 @@ class InterventionDetector:
                     "scheduler": scheduler_snapshot,
                 },
             )
-
-        if self.scheduler is not None:
-            self.scheduler.charge(current_snapshot["document_key"], selected_name)
-            scheduler_snapshot = self.scheduler.snapshot(current_snapshot["document_key"])
 
         selected = scenario_results[selected_name]
         return InterventionDecision(

@@ -80,7 +80,7 @@ flowchart TD
 
 1. **공통 게이트** — 모든 시나리오의 사전 조건. 하나라도 실패하면 즉시 `intervention_type="none"`으로 종료합니다.
 2. **시나리오 fan-out** — 등록된 모든 `ScenarioType.evaluate()`를 호출합니다. ready 여부와 무관하게 모두 평가해 telemetry에 남깁니다.
-3. **CFS 선택** — ready된 시나리오들 중 `ScenarioScheduler.select()`이 vruntime이 가장 낮은 하나만 고릅니다. 선택된 시나리오에만 `charge()`로 vruntime을 더합니다.
+3. **CFS 선택** — ready된 시나리오들 중 `ScenarioScheduler.select_and_charge()`가 단일 락 · 단일 `now`로 가장 낮은 vruntime을 고르고 vruntime을 가산합니다. 이전의 `select()`+`charge()` 분리 호출은 같은 capture 안에서 lazy decay가 두 번 적용될 수 있어 단일 메서드로 합쳐졌습니다.
 
 ```mermaid
 flowchart TD
@@ -90,9 +90,8 @@ flowchart TD
     C -- "pass" --> D["fan-out: scenario.evaluate(ctx)"]
     D --> E{"ready set 비어 있음?"}
     E -- "Yes" --> Z
-    E -- "No" --> F["ScenarioScheduler.select(document_key, ready)"]
-    F --> G["ScenarioScheduler.charge(document_key, selected)"]
-    G --> H["InterventionDecision(intervention_type=selected)"]
+    E -- "No" --> F["ScenarioScheduler.select_and_charge(document_key, ready)"]
+    F --> H["InterventionDecision(intervention_type=selected)"]
 ```
 
 ## 편집 앱 기준
@@ -199,10 +198,10 @@ confidence >= 0.55
 
 `ScenarioScheduler`는 Linux CFS에서 영감을 받은 vruntime 기반 선택기입니다. `document_key` 단위로 state를 분리해 한 문서의 활동이 다른 문서의 선택을 흔들지 않습니다.
 
-### select / charge
+### select_and_charge
 
-- `select(document_key, ready_names)`: ready 후보 중 `(vruntime, initial_vruntime, name)` 순으로 가장 작은 하나 반환.
-- `charge(document_key, name)`: 선택된 시나리오의 vruntime에 `vruntime_increment`를 더하고 `last_activity_at` 갱신.
+- `select_and_charge(document_key, ready_names, *, now=None)`: 단일 락 · 단일 `now` 안에서 ready 후보 중 `(vruntime, initial_vruntime, name)`이 가장 작은 시나리오를 고르고 그 vruntime에 `vruntime_increment`를 더한 뒤 `last_activity_at`을 갱신합니다.
+- `select` / `charge`도 개별 호출이 가능하지만, 같은 capture 안에서 두 메서드를 잇따라 호출하면 lazy decay가 두 번 적용되므로 검파(`InterventionDetector`)는 `select_and_charge`만 사용합니다.
 
 ### lazy decay
 
@@ -273,7 +272,14 @@ python main.py --output-dir ./output --phase chat --screen-debug
 - `writing_context`: 시나리오 hook 결과가 merge된 최종 형태 — `full_text`, `current_paragraph`, `focused_sentence`, `focus_scope`, `paragraph_source`/`rect`, `changed_text`, `confidence`, (`full_document_excerpt`)
 - `activity_context`: history count, same document count, dwell ratio, paragraph fingerprint, typing pause metadata, `selected_scenario`, `selected_scenario_metadata`
 - `intervention_flag`: `should_consider_llm`, `intervention_type`, `selected_scenario`, priority, score, reason codes, blockers, flags
-   - flags의 시나리오별 reason 키(`typing_pause_satisfied`, `sustained_writing_observed` 등)는 **선택된 시나리오의 reasons에서만** 추출됩니다. 다른 시나리오가 ready 였는지 알고 싶으면 `metadata.scenarios.<name>.ready`를 보세요.
+   - `flags`는 시나리오별로 분리됩니다:
+     ```
+     flags:
+       common:    { editing_app, dwell, stable_paragraph }
+       scenarios: { <scenario_name>: { ready, score, gates: { <gate>: bool } } }
+       selected_scenario: <name> | None
+     ```
+   - 한 시나리오의 게이트 통과 여부는 `flags.scenarios.<name>.gates.<gate>`에서 보세요. 어느 시나리오가 발사됐는지는 `flags.selected_scenario`로 확인합니다. 모든 시나리오가 평가되므로 선택되지 않은 시나리오의 ready/gate 결과도 같은 자리에 남습니다.
 - `tool_routing_hint`: 시나리오 hook이 채운 `tone`/`preferred_action`/`signals`
 - `intervention`: detector metadata 원본 (scenarios fan-out 결과 전체 포함)
 
@@ -348,9 +354,9 @@ python test/test_ocr_result.py --duration-sec 15 --interval-sec 3 --ocr-language
    - `evaluate(context)` 구현 — gate 결과를 모아 `ScenarioEvaluation` 반환.
    - 필요 시 `writing_context_overrides()` / `tool_routing_hint_overrides()` 구현으로 payload 분기.
 2. `__init__.py`에 export 추가.
-3. `InterventionDetector.__init__`의 기본 `scenarios` 리스트에 인스턴스 추가 (또는 외부 주입).
+3. `ScreenContextService.__init__`의 `scenarios` 리스트에 인스턴스 추가.
 
-dispatcher 코드는 건드릴 필요가 없습니다. CFS 가중치도 `intervention_detector.scenario_weights` property가 자동으로 수집해 `ScenarioScheduler`에 전달합니다.
+`ScreenContextService`가 동일한 scenarios 리스트를 `ScenarioScheduler(scenarios=...)`, `InterventionDetector(scenarios=..., scheduler=...)`, `InterventionDispatcher(scenarios={...})`에 한꺼번에 주입하므로 한 곳에서만 등록하면 됩니다. dispatcher 분기, CFS 가중치 계산, scheduler 주입은 모두 자동입니다.
 
 ## 설계 원칙
 
