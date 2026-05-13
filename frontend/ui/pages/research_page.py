@@ -292,6 +292,13 @@ class ResearchProgressPoller(QThread):
 
 class ResearchPage(QWidget):
 	workspaceChanged = Signal(str)
+	# Fired when AutoSurvey reserves a new `runs/<id>/` directory mid-run.
+	# Carries (workspaceId, displayName). Unlike `workspaceChanged` (emitted
+	# at completion to drive full page refreshes), this is a *light* event:
+	# subscribers should update their workspace pointer + clear ephemeral
+	# views (sidebar footer, chat bubbles) without re-running heavy page
+	# refresh logic that would clobber the in-progress research display.
+	workspaceCreated = Signal(str, str)
 
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
@@ -515,9 +522,11 @@ class ResearchPage(QWidget):
 		"""Route each backend progress event to the right view update.
 
 		Stage handlers are intentionally small and side-effect-only:
-		- `doc_fetched`     → add a pending DocumentBar
-		- `doc_summarized`  → activate the matching bar
-		- any other stage   → refresh the gray single-line progress label
+		- `workspace_created` → swap to the new workspace (info tiles +
+		  emit `workspaceCreated` so sidebar/chat reset live)
+		- `doc_fetched`       → add a pending DocumentBar
+		- `doc_summarized`    → activate the matching bar
+		- any other stage     → refresh the gray single-line progress label
 		The latest message wins on the progress label, mirroring the previous
 		behavior.
 		"""
@@ -528,7 +537,9 @@ class ResearchPage(QWidget):
 			stage = str(event.get("stage") or "").strip()
 			detail = event.get("detail") if isinstance(event.get("detail"), dict) else {}
 			message = str(event.get("message") or "")
-			if stage == "doc_fetched":
+			if stage == "workspace_created":
+				self._adopt_new_workspace(detail)
+			elif stage == "doc_fetched":
 				self._add_pending_document_bar(detail)
 			elif stage == "doc_summarized":
 				self._activate_document_bar(detail)
@@ -536,6 +547,28 @@ class ResearchPage(QWidget):
 				latest_message = message
 		if latest_message:
 			self._set_progress_line(latest_message)
+
+	def _adopt_new_workspace(self, detail: dict) -> None:
+		"""Reflect a freshly-reserved workspace in the result card.
+
+		Updates the info tiles (작업 이름 / 저장 경로) so the user sees the
+		final workspace id and path as soon as term-grounding finishes,
+		instead of waiting for the whole AutoSurvey run. Also broadcasts a
+		`workspaceCreated` signal so the sidebar and chat panels can sync.
+		"""
+		workspace_id = str(detail.get("workspaceId") or "").strip()
+		if not workspace_id:
+			return
+		name = str(detail.get("name") or workspace_id)
+		path = str(detail.get("path") or "").strip()
+		self._workspace_id = workspace_id
+		self.info_job_name.set_value(workspace_id)
+		if path:
+			self.info_save_path.set_value(path)
+			self._final_path = Path(path) / "final.md"
+		self.info_doc_count.set_value(f"{len(self._doc_bars)}건")
+		self.info_row_widget.setVisible(True)
+		self.workspaceCreated.emit(workspace_id, name)
 
 	def _set_progress_line(self, message: str) -> None:
 		text = " ".join(message.split())
