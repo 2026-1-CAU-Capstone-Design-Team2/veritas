@@ -11,13 +11,15 @@ router = APIRouter()
 
 
 @router.post("/api/v1/screen-monitoring/start")
-async def start_screen_monitoring(payload: ScreenMonitoringStartRequest | None = None) -> dict[str, Any]:
+def start_screen_monitoring(payload: ScreenMonitoringStartRequest | None = None) -> dict[str, Any]:
+    # May internally rebuild the runtime / monitor thread — keep off the
+    # event loop so concurrent polling requests stay responsive.
     workspace_id = payload.workspaceId if payload is not None else None
     return screen_monitoring_service.start_monitoring(workspace_id)
 
 
 @router.post("/api/v1/screen-monitoring/stop")
-async def stop_screen_monitoring() -> dict[str, Any]:
+def stop_screen_monitoring() -> dict[str, Any]:
     return screen_monitoring_service.stop_monitoring()
 
 

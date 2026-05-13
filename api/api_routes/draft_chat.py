@@ -12,17 +12,18 @@ router = APIRouter()
 
 
 @router.post("/api/v1/draft/generate")
-async def draft_generate(payload: DraftGenerateRequest) -> dict[str, Any]:
+def draft_generate(payload: DraftGenerateRequest) -> dict[str, Any]:
+    # Sync LLM call — plain `def` keeps the event loop responsive.
     return draft_chat_service.generate_draft(payload.workspaceId, payload.prompt)
 
 
 @router.post("/api/v1/draft/{draftId}/regenerate")
-async def draft_regenerate(draftId: str, payload: DraftRegenerateRequest) -> dict[str, Any]:
+def draft_regenerate(draftId: str, payload: DraftRegenerateRequest) -> dict[str, Any]:
     return draft_chat_service.regenerate_draft(draftId, payload.prompt)
 
 
 @router.post("/api/v1/chat/messages")
-async def chat_send(payload: ChatMessageRequest) -> dict[str, str]:
+def chat_send(payload: ChatMessageRequest) -> dict[str, str]:
     return draft_chat_service.send_chat_message(payload.workspaceId, payload.message, payload.mode)
 
 

@@ -64,6 +64,16 @@ RAG over generated markdown outputs, and schema-driven chat tool use.
   URL hyperlink (uses `QDesktopServices.openUrl`, auto-prepends `https://`
   when the URL has no scheme), and a `doc_NNN.md ↗` button that opens the
   corresponding `summary/doc_<docId>.md` in the OS default viewer.
+- FastAPI handlers that perform synchronous blocking work (`POST /research/jobs`,
+  `POST /workspaces/switch`, `POST /chat/messages`, `POST /draft/generate`,
+  `POST /draft/{id}/regenerate`, `POST /document-assist/analyze`,
+  `POST /document-assist/chat/messages`, `POST /feedback/analyze`,
+  `POST /screen-monitoring/{start,stop}`) are declared as plain `def`, not
+  `async def`. FastAPI dispatches `def` handlers to its thread pool instead of
+  running them on the event loop, so a long-running call (AutoSurvey, LLM
+  inference, registry rebuild) cannot freeze every other request. Without
+  this, the progress poller, workspace switch, and page-refresh calls all
+  queued behind the in-flight research job and the UI appeared frozen.
 - Collected-document bars stream in live as `AutoSurveyWorkflow` runs.
   `_fetch_one` emits a `doc_fetched` progress event after a non-duplicate
   record is committed, carrying `{doc_id, title, url, final_url, domain}`;

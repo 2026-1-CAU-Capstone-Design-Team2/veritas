@@ -11,7 +11,12 @@ router = APIRouter()
 
 
 @router.post("/api/v1/research/jobs", status_code=201)
-async def research_job_create(payload: ResearchJobCreateRequest) -> dict[str, Any]:
+def research_job_create(payload: ResearchJobCreateRequest) -> dict[str, Any]:
+    # Plain `def` (not `async def`) so FastAPI runs this in its thread pool.
+    # AutoSurvey is a long-running blocking workflow; if this were `async def`,
+    # the event loop would freeze for the entire run and every other request
+    # — including the progress poller and workspace switch — would queue
+    # behind it, making the UI appear frozen.
     return research_service.create_research_job(
         payload.workspaceId,
         payload.instruction,
