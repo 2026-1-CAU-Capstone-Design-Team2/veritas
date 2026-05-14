@@ -577,22 +577,22 @@ class MainWindow(QMainWindow):
 		}
 
 		QFrame#SidebarFooterCard {
-			background-color: rgba(255, 255, 255, 0.06);
-			border: 1px solid rgba(148, 163, 184, 0.24);
+			background-color: rgba(99, 102, 241, 0.18);
+			border: 1px solid rgba(165, 180, 252, 0.55);
 			border-radius: 11px;
 		}
 
 		QLabel#SidebarFooterTitle {
-			color: #E2E8F0;
+			color: #C7D2FE;
 			font-size: 11px;
 			font-weight: 800;
 			letter-spacing: 0.3px;
 		}
 
 		QLabel#SidebarFooterDesc {
-			color: #94A3B8;
-			font-size: 10px;
-			font-weight: 600;
+			color: #F8FAFC;
+			font-size: 14px;
+			font-weight: 700;
 		}
 
 		QPushButton#SidebarWorkspaceButton {
