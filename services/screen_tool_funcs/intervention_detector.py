@@ -75,6 +75,7 @@ class InterventionDetector:
     ) -> InterventionDecision:
         history_events = history_events or []
         current_snapshot = self._snapshot(window=window, filtered=filtered)
+        # recent = 과거 리스너 이벤트에 이번 캡쳐를 붙이고, history_window 크기만큼 자른다. (최대 history_window 개의 이벤트를 고려한다.)
         recent = (history_events + [current_snapshot])[-self.history_window:]
         same_document_events = [
             event for event in recent if self._document_key(event) == current_snapshot["document_key"]
@@ -140,6 +141,18 @@ class InterventionDetector:
                 },
             )
 
+        # `now`를 한 번 만들어 get_state/select_and_charge/snapshot에 공유.
+        # last_fired_at/last_fired_doc_chars는 fan-out 전에 읽어 cooldown 게이트에 전달.
+        now = time.time()
+        last_fired_at: dict[str, float] = {}
+        last_fired_doc_chars: dict[str, int] = {}
+        if self.scheduler is not None:
+            state = self.scheduler.get_state(
+                current_snapshot["document_key"], now=now
+            )
+            last_fired_at = dict(state.last_fired_at)
+            last_fired_doc_chars = dict(state.last_fired_doc_chars)
+
         scenario_ctx = ScenarioContext(
             window=window,
             filtered=filtered,
@@ -147,6 +160,8 @@ class InterventionDetector:
             same_document_events=same_document_events,
             document_key=current_snapshot["document_key"],
             paragraph_fingerprint=current_snapshot["paragraph_fingerprint"],
+            last_fired_at=last_fired_at,
+            last_fired_doc_chars=last_fired_doc_chars,
         )
         scenario_results: dict[str, ScenarioEvaluation] = {}
         for scenario in self.scenarios:
@@ -156,12 +171,13 @@ class InterventionDetector:
         scheduler_snapshot: dict[str, Any] | None = None
         selected_name: str | None = None
         if ready_names and self.scheduler is not None:
-            # Single `now` flows through select+charge+snapshot so lazy decay
-            # is applied exactly once per capture, not twice as in the old
-            # split select() / charge() / snapshot() chain.
-            now = time.time()
+            # 발동 시점의 정규화 문서 길이 — 글자수 기반 cooldown 판정용
+            doc_chars = len(" ".join((filtered.active_editor_text or "").split()))
             selected_name = self.scheduler.select_and_charge(
-                current_snapshot["document_key"], ready_names, now=now
+                current_snapshot["document_key"],
+                ready_names,
+                now=now,
+                doc_chars=doc_chars,
             )
             scheduler_snapshot = self.scheduler.snapshot(
                 current_snapshot["document_key"], now=now

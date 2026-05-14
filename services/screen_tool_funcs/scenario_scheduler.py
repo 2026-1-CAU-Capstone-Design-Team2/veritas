@@ -27,6 +27,12 @@ class ScenarioSchedulerState:
     last_decay_at: float = 0.0
     last_activity_at: float = 0.0
     last_reset_at: float = 0.0
+    # {시나리오명: unix_ts} — 각 시나리오가 마지막으로 선택(발동)된 캡처 시각.
+    # 시간 기반 cooldown 게이트가 읽음. 
+    last_fired_at: dict[str, float] = field(default_factory=dict)
+    # {시나리오명: 발동 시점의 정규화 문서 길이}. last_fired_at과 짝을 이루는 보조 데이터.
+    # "직전 리뷰 이후 추가된 글자 수" 같은 글자수 기반 cooldown 판정에 사용.
+    last_fired_doc_chars: dict[str, int] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -36,6 +42,8 @@ class ScenarioSchedulerState:
             "last_decay_at": self.last_decay_at,
             "last_activity_at": self.last_activity_at,
             "last_reset_at": self.last_reset_at,
+            "last_fired_at": dict(self.last_fired_at),
+            "last_fired_doc_chars": dict(self.last_fired_doc_chars),
         }
 
     @classmethod
@@ -53,6 +61,14 @@ class ScenarioSchedulerState:
             last_decay_at=float(payload.get("last_decay_at") or 0.0),
             last_activity_at=float(payload.get("last_activity_at") or 0.0),
             last_reset_at=float(payload.get("last_reset_at") or 0.0),
+            last_fired_at={
+                str(k): float(v)
+                for k, v in (payload.get("last_fired_at") or {}).items()
+            },
+            last_fired_doc_chars={
+                str(k): int(v)
+                for k, v in (payload.get("last_fired_doc_chars") or {}).items()
+            },
         )
 
 
@@ -179,6 +195,7 @@ class ScenarioScheduler:
         ready_names: list[str],
         *,
         now: float | None = None,
+        doc_chars: int | None = None,
     ) -> str | None:
         """Pick the winner and charge its vruntime in a single decay step.
 
@@ -206,6 +223,11 @@ class ScenarioScheduler:
             current = state.vruntimes.get(selected, self.weights[selected].initial_vruntime)
             state.vruntimes[selected] = current + self.weights[selected].vruntime_increment
             state.last_activity_at = now
+            # 당첨 시나리오의 마지막 발동 시각 기록
+            state.last_fired_at[selected] = now
+            if doc_chars is not None:
+                # 발동 시점의 문서 길이 기록
+                state.last_fired_doc_chars[selected] = doc_chars
             return selected
 
     def snapshot(self, document_key: str, *, now: float | None = None) -> dict[str, Any]:
@@ -217,6 +239,8 @@ class ScenarioScheduler:
             "last_decay_at": state.last_decay_at,
             "last_activity_at": state.last_activity_at,
             "last_reset_at": state.last_reset_at,
+            "last_fired_at": dict(state.last_fired_at),
+            "last_fired_doc_chars": dict(state.last_fired_doc_chars),
         }
 
     def flush_all(self) -> None:
@@ -335,6 +359,9 @@ class ScenarioScheduler:
         for name, weight in self.weights.items():
             state.vruntimes[name] = weight.initial_vruntime
             state.initial_vruntimes[name] = weight.initial_vruntime
+        # 발동 기록 초기화 → 모든 cooldown 면제
+        state.last_fired_at.clear()
+        state.last_fired_doc_chars.clear()
         state.last_decay_at = now
         state.last_activity_at = now
         state.last_reset_at = now

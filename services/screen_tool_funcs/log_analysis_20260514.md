@@ -37,7 +37,9 @@
 
 ## 3. 발견된 문제
 
-### P1 — `review_cooldown`이 사실상 작동 불가 (구조적 버그)
+### P1 — `review_cooldown`이 사실상 작동 불가 (구조적 버그) — ✅ 해결됨 (2026-05-14)
+
+> 아래는 로그가 드러낸 버그의 분석 기록이다. 수정 내용은 §4 참조.
 
 **증상**: `long_static_review`가 16:32:01 → 16:32:51 → 16:33:41, **약 50초 간격으로 반복 발동**. 설정값은 `cooldown_min_seconds=600.0`인데 50초마다 뚫림.
 
@@ -49,9 +51,9 @@
 
 로그가 이를 그대로 증명: 첫 발동 후 9캡처(=45~50초)가 지나 이벤트가 윈도우에서 사라지자마자 16:32:51에 재발동.
 
-**같은 잠복 버그**: `WholeDocumentReviewScenario._document_cooldown_status` (`cooldown_min_seconds=300.0`)도 동일 구조. 다만 `sustained_writing` 등 추가 게이트가 가려서 아직 증상이 안 드러났을 뿐.
+**같은 잠복 버그**: `WholeDocumentReviewScenario._document_cooldown_status` (`cooldown_min_seconds=300.0`)도 동일 구조였음. `sustained_writing` 등 추가 게이트가 가려서 증상이 안 드러났을 뿐 — 이번 수정에서 함께 고침(§4).
 
-**CFS도 thro틀 못 함**: long_static의 vruntime이 13→13.5→14로 오르긴 하나, ~50초 간격의 decay가 increment를 거의 상쇄. 게다가 ready set에서 경쟁 상대가 거의 없어(`idle`은 자체 cooldown, `whole`은 ready 안 됨) CFS가 long_static을 "지게" 만들 일이 없음. **결국 cooldown 게이트가 유일한 throttle인데 그게 깨져 있어 아무것도 throttle하지 못함.**
+**CFS도 throttle 못 함**: long_static의 vruntime이 13→13.5→14로 오르긴 하나, ~50초 간격의 decay가 increment를 거의 상쇄. 게다가 ready set에서 경쟁 상대가 거의 없어(`idle`은 자체 cooldown, `whole`은 ready 안 됨) CFS가 long_static을 "지게" 만들 일이 없음. **결국 cooldown 게이트가 유일한 throttle인데 그게 깨져 있어 아무것도 throttle하지 못했음** — 이제 cooldown 게이트가 제대로 작동하므로 throttle이 복구됨.
 
 ### P2 — LLM 레이턴시 >> 캡처 주기 → 큐 적체
 
@@ -88,21 +90,29 @@ if last_review_event is None:
 
 **문제의 본질**: 쿨다운을 "최근 N개 이벤트 메모리"로 구현했는데, 그 메모리(~45초)가 `cooldown_min_seconds`(600초)보다 훨씬 짧다. 시간 기반 쿨다운을 윈도우 기반 자료구조 위에 올린 불일치.
 
-**방향성 (구현 전 합의 필요)**:
-- 쿨다운 판정을 `history_events` 윈도우가 아니라 **별도의 영속 상태**에서 읽어야 함. 후보:
-  - `ScenarioScheduler`의 per-document 상태에 `last_fired_at[scenario_name]`을 같이 저장 (이미 디스크 영속·문서 단위라 자연스러움).
-  - 또는 `store`가 시나리오별 마지막 개입 시각을 따로 보관.
-- `WholeDocumentReviewScenario`도 같은 방식으로 함께 고쳐야 함 (동일 잠복 버그).
+### 적용된 수정 (2026-05-14)
+
+쿨다운 판정을 `history_events` 윈도우 스캔에서 **`ScenarioScheduler`의 문서 단위 영속 상태**로 옮겼다. 이 상태는 이미 RAM 캐시 + 디스크 영속 + 부팅 hydrate를 갖추고 있어, 추가 디스크 I/O 없이 발동 기록을 "잊지 않고" 보관한다.
+
+- **`ScenarioSchedulerState`** — `last_fired_at: dict[str, float]`(시나리오별 마지막 발동 unix_ts)와 `last_fired_doc_chars: dict[str, int]`(그 시점의 정규화 문서 길이) 필드 추가. `to_payload`/`from_payload` 직렬화 포함.
+- **`select_and_charge(..., doc_chars=...)`** — 당첨 시나리오에 대해 `last_fired_at[selected] = now`, `last_fired_doc_chars[selected] = doc_chars` 기록.
+- **`_maybe_reset`** — reset 시 두 dict를 clear(문서를 "잊는" 것과 일관).
+- **`intervention_detector.decide()`** — fan-out 전에 scheduler에서 두 맵을 읽어 `ScenarioContext`에 전달, `select_and_charge`에 정규화 문서 길이를 함께 넘김. `now`를 한 번만 만들어 공유.
+- **`LongStaticReviewScenario._review_cooldown_status`** — `last_fired_at[name]`과 현재 시각의 **시간 비교**로 재작성 (`elapsed >= cooldown_min_seconds`).
+- **`WholeDocumentReviewScenario._document_cooldown_status`** — `last_fired_at` + `last_fired_doc_chars` 기반으로 재작성. 판정 로직(`passed = time_ok and chars_ok`)은 **동작 보존**, 데이터 출처만 교체.
+- 죽은 코드가 된 `_elapsed_seconds`(양 시나리오)는 제거.
+
+검증: `cooldown_min_seconds`가 history 윈도우 크기와 무관하게 실제로 강제됨 (`long_static` 600초 / `whole_document` 300초 — 윈도우를 벗어난 시점에도 정상 차단·통과).
 
 ---
 
 ## 5. 우선순위 요약
 
-| 순위 | 문제 | 영향 | 성격 |
+| 순위 | 문제 | 영향 | 상태 |
 |------|------|------|------|
-| P1 | `review_cooldown` 윈도우 한계로 무력화 | `long_static_review` ~50초마다 반복 발동, 노이즈 | 구조적 버그 — 수정 필요 |
-| P2 | LLM 레이턴시 ≫ 캡처 주기 | 큐 적체, 응답 지연 누적 | 성능/아키텍처 |
-| P3 | stale 개입 전달 | 사용자가 이미 지나간 내용에 조언 | P2의 결과 — 소비 시 staleness 검사 필요 |
-| P4 | long_static 답변이 문장 단위에 집중 | 시나리오 의도와 결과 불일치 | 프롬프트 설계 |
+| P1 | `review_cooldown` 윈도우 한계로 무력화 | `long_static_review` ~50초마다 반복 발동, 노이즈 | ✅ **해결됨** — scheduler 영속 상태 기반 시간 비교로 전환 (§4) |
+| P2 | LLM 레이턴시 ≫ 캡처 주기 | 큐 적체, 응답 지연 누적 | 미해결 — 성능/아키텍처 |
+| P3 | stale 개입 전달 | 사용자가 이미 지나간 내용에 조언 | 미해결 — P2의 결과, 소비 시 staleness 검사 필요 |
+| P4 | long_static 답변이 문장 단위에 집중 | 시나리오 의도와 결과 불일치 | 미해결 — 프롬프트 설계 |
 
-P1이 이번 변경(`long_static_review` 추가)이 직접 노출시킨 버그이므로 먼저 다룰 대상. P2/P3는 그 다음 별도 논의.
+P1은 해결 완료(§4 참조). 남은 P2/P3/P4는 별도 논의 대상.

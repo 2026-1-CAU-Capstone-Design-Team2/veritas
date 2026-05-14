@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -54,6 +55,12 @@ class ScenarioContext:
     same_document_events: list[dict[str, Any]]
     document_key: str
     paragraph_fingerprint: str
+    # 문서 단위 {시나리오명: 마지막 발동 unix_ts}. detector가 scheduler 상태에서
+    # 읽어 채움. 시간 기반 cooldown 게이트가 사용.
+    last_fired_at: dict[str, float] = field(default_factory=dict)
+    # 문서 단위 {시나리오명: 마지막 발동 시점의 정규화 문서 길이}. 
+    # whole_document_review의 "리뷰 이후 추가된 글자 수" 판정에 사용.
+    last_fired_doc_chars: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -145,13 +152,8 @@ class ScenarioType(ABC):
         *,
         min_chars: int = 20,
     ) -> bool:
-        """Whether the current paragraph itself carries enough text to act on.
-
-        Paragraph-scoped scenarios (those whose intervention focuses on the
-        paragraph the cursor sits in) call this as one of their gates. Document-
-        scoped scenarios do not call it, so a short current paragraph never
-        blocks them. The common stable_paragraph gate intentionally no longer
-        checks paragraph length — it only asserts the capture is trustworthy.
+        """현재 문단(`filtered.current_paragraph_text`)이 `min_chars` 이상인지 판정.
+        문단 단위 시나리오가 자기 게이트로 호출하는 공유 헬퍼.
         """
         paragraph = " ".join((filtered.current_paragraph_text or "").split())
         return len(paragraph) >= min_chars
@@ -196,9 +198,7 @@ class IdleAfterWritingScenario(ScenarioType):
             document_key=context.document_key,
             paragraph_fingerprint=context.paragraph_fingerprint,
         )
-        # The common stable_paragraph gate no longer checks paragraph length, so
-        # this paragraph-scoped scenario asserts it for itself. Document-scoped
-        # scenarios skip this and are not blocked by a short current paragraph.
+        # 현재 문단 길이 게이트 — 문단 단위 시나리오가 자기 책임으로 확인
         paragraph_chars = len(
             " ".join((context.filtered.current_paragraph_text or "").split())
         )
@@ -243,8 +243,7 @@ class IdleAfterWritingScenario(ScenarioType):
         else:
             evaluation.blockers.append("cooldown_or_duplicate")
 
-        # Hard prerequisite, not a graded signal: contributes a blocker but no
-        # score, so the existing 0.0-0.8 score range and priority threshold hold.
+        # 점수 없는 순수 prerequisite: blocker에만 기여
         if substantial_paragraph_passed:
             evaluation.reasons.append("substantial_paragraph")
         else:
@@ -431,10 +430,12 @@ class WholeDocumentReviewScenario(ScenarioType):
         idle = self._idle_after_sustained_status(context.same_document_events)
         idle_passed = bool(idle.get("passed"))
         cooldown = self._document_cooldown_status(
-            history_events=context.history_events,
-            document_key=context.document_key,
-            current_text=self._normalized_active_text(
-                context.same_document_events[-1] if context.same_document_events else {}
+            last_fired_at=context.last_fired_at,
+            last_fired_doc_chars=context.last_fired_doc_chars,
+            current_chars=len(
+                self._normalized_active_text(
+                    context.same_document_events[-1] if context.same_document_events else {}
+                )
             ),
         )
         cooldown_passed = bool(cooldown.get("passed"))
@@ -618,23 +619,16 @@ class WholeDocumentReviewScenario(ScenarioType):
     def _document_cooldown_status(
         self,
         *,
-        history_events: list[dict[str, Any]],
-        document_key: str,
-        current_text: str,
+        last_fired_at: dict[str, float],
+        last_fired_doc_chars: dict[str, int],
+        current_chars: int,
     ) -> dict[str, Any]:
-        last_review_event: dict[str, Any] | None = None
-        for event in reversed(history_events):
-            intervention = event.get("intervention") or {}
-            if not intervention.get("should_consider_llm"):
-                continue
-            if intervention.get("intervention_type") != self.name:
-                continue
-            if _event_document_key(event) != document_key:
-                continue
-            last_review_event = event
-            break
-
-        if last_review_event is None:
+        """직전 발동 시각(`last_fired_at`)과 그 시점의 문서 길이
+        (`last_fired_doc_chars`)를 받아, 경과 시간이 `cooldown_min_seconds`
+        이상이고 추가된 글자 수가 `cooldown_min_added_chars` 이상이면 통과.
+        """
+        last_at = last_fired_at.get(self.name)
+        if last_at is None:
             return {
                 "passed": True,
                 "reason": "no_prior_review",
@@ -642,17 +636,16 @@ class WholeDocumentReviewScenario(ScenarioType):
                 "min_added_chars": self.cooldown_min_added_chars,
             }
 
-        previous_text = self._normalized_active_text(last_review_event)
-        added_chars = max(len(current_text) - len(previous_text), 0)
-        elapsed_seconds = self._elapsed_seconds(last_review_event)
-        # Fail-closed: if we can't determine elapsed time, treat cooldown as active.
-        time_ok = elapsed_seconds is not None and elapsed_seconds >= self.cooldown_min_seconds
+        previous_chars = last_fired_doc_chars.get(self.name, 0)
+        added_chars = max(current_chars - previous_chars, 0)
+        elapsed_seconds = max(time.time() - last_at, 0.0)
+        time_ok = elapsed_seconds >= self.cooldown_min_seconds
         chars_ok = added_chars >= self.cooldown_min_added_chars
         passed = time_ok and chars_ok
         return {
             "passed": passed,
             "reason": "ok" if passed else "cooldown_active",
-            "elapsed_seconds": elapsed_seconds,
+            "elapsed_seconds": round(elapsed_seconds, 1),
             "added_chars_since_last": added_chars,
             "min_seconds": self.cooldown_min_seconds,
             "min_added_chars": self.cooldown_min_added_chars,
@@ -664,22 +657,6 @@ class WholeDocumentReviewScenario(ScenarioType):
         filtered = event.get("filtered") or {}
         text = str(filtered.get("active_editor_text") or "")
         return " ".join(text.split()).strip()
-
-    def _elapsed_seconds(self, event: dict[str, Any]) -> float | None:
-        from datetime import datetime
-
-        captured_at = event.get("captured_at")
-        if not captured_at:
-            return None
-        try:
-            parsed = datetime.fromisoformat(str(captured_at))
-        except ValueError:
-            return None
-        try:
-            now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
-        except Exception:
-            now = datetime.now()
-        return max((now - parsed).total_seconds(), 0.0)
 
 
 class LongStaticReviewScenario(ScenarioType):
@@ -730,10 +707,7 @@ class LongStaticReviewScenario(ScenarioType):
 
         static = self._prolonged_static_status(context.same_document_events)
         static_passed = bool(static.get("passed"))
-        cooldown = self._review_cooldown_status(
-            history_events=context.history_events,
-            document_key=context.document_key,
-        )
+        cooldown = self._review_cooldown_status(context.last_fired_at)
         cooldown_passed = bool(cooldown.get("passed"))
 
         evaluation.gate_results = {
@@ -862,38 +836,24 @@ class LongStaticReviewScenario(ScenarioType):
             "min_document_chars": self.min_document_chars,
         }
 
-    def _review_cooldown_status(
-        self,
-        *,
-        history_events: list[dict[str, Any]],
-        document_key: str,
-    ) -> dict[str, Any]:
-        last_review_event: dict[str, Any] | None = None
-        for event in reversed(history_events):
-            intervention = event.get("intervention") or {}
-            if not intervention.get("should_consider_llm"):
-                continue
-            if intervention.get("intervention_type") != self.name:
-                continue
-            if _event_document_key(event) != document_key:
-                continue
-            last_review_event = event
-            break
-
-        if last_review_event is None:
+    def _review_cooldown_status(self, last_fired_at: dict[str, float]) -> dict[str, Any]:
+        """`last_fired_at[self.name]`(직전 발동 시각)과 현재 시각을 비교해,
+        경과가 `cooldown_min_seconds` 이상이면 통과시키는 시간 기반 cooldown.
+        """
+        last_at = last_fired_at.get(self.name)
+        if last_at is None:
             return {
                 "passed": True,
                 "reason": "no_prior_review",
                 "min_seconds": self.cooldown_min_seconds,
             }
 
-        elapsed_seconds = self._elapsed_seconds(last_review_event)
-        # Fail-closed: if we can't determine elapsed time, treat cooldown as active.
-        passed = elapsed_seconds is not None and elapsed_seconds >= self.cooldown_min_seconds
+        elapsed_seconds = max(time.time() - last_at, 0.0)
+        passed = elapsed_seconds >= self.cooldown_min_seconds
         return {
             "passed": passed,
             "reason": "ok" if passed else "cooldown_active",
-            "elapsed_seconds": elapsed_seconds,
+            "elapsed_seconds": round(elapsed_seconds, 1),
             "min_seconds": self.cooldown_min_seconds,
         }
 
@@ -913,19 +873,3 @@ class LongStaticReviewScenario(ScenarioType):
             return False, 0.0
         similarity = difflib.SequenceMatcher(None, previous, current).ratio()
         return similarity >= self.idle_similarity_threshold, similarity
-
-    def _elapsed_seconds(self, event: dict[str, Any]) -> float | None:
-        from datetime import datetime
-
-        captured_at = event.get("captured_at")
-        if not captured_at:
-            return None
-        try:
-            parsed = datetime.fromisoformat(str(captured_at))
-        except ValueError:
-            return None
-        try:
-            now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
-        except Exception:
-            now = datetime.now()
-        return max((now - parsed).total_seconds(), 0.0)
