@@ -26,6 +26,7 @@ from PySide6.QtGui import (
 	QPixmap,
 	QRadialGradient,
 	QShortcut,
+	QTextCursor,
 	QTextDocument,
 	QWheelEvent,
 )
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
 	QScrollArea,
 	QSizeGrip,
 	QSizePolicy,
+	QTextBrowser,
 	QTextEdit,
 	QVBoxLayout,
 	QWidget,
@@ -56,10 +58,10 @@ def add_text_breakpoints(text: str, chunk_size: int = 24) -> str:
 
 
 def _render_assistant_markdown(text: str) -> str:
-	"""Render an assistant message (markdown) to Qt rich text.
+	"""Render an assistant message (markdown) to an HTML fragment.
 
-	Assistant answers stream in as markdown; a RichText QLabel shows the
-	formatted result instead of raw `**` / `#` / table syntax. Prefers the
+	A finished assistant answer is parsed once and shown in a QTextBrowser as
+	formatted HTML instead of raw `**` / `#` / table syntax. Prefers the
 	`markdown` package (correct GFM tables); falls back to Qt's own markdown
 	parser so formatting still works even when that package is not installed.
 	"""
@@ -229,6 +231,9 @@ class SuggestionCard(QFrame):
 		body.setTextFormat(Qt.PlainText)
 		body.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
 		body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+		# Keep the text pinned to the top: the last card may be stretched to
+		# fill the panel, and its text should not float to the middle.
+		body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
 		layout.addLayout(header)
 		layout.addWidget(body)
@@ -316,7 +321,8 @@ class SuggestionList(QFrame):
 				self.updateGeometry()
 			return
 
-		for item in self._suggestions:
+		last_index = len(self._suggestions) - 1
+		for index, item in enumerate(self._suggestions):
 			card = SuggestionCard(
 				item.get("category", "수정"),
 				item.get("text", item.get("description", "")),
@@ -324,13 +330,13 @@ class SuggestionList(QFrame):
 			)
 			card.set_card_width(self._content_width())
 			self._cards.append(card)
-			self.layout.addWidget(card, 0)
+			# The last card carries the stretch factor so it grows down to the
+			# bottom of the panel — no blank gap trails the list. Earlier cards
+			# keep their natural height. In hug_content mode the frame is sized
+			# to the content, so there is no slack for it to absorb.
+			self.layout.addWidget(card, 1 if index == last_index else 0)
 
 		self.count_label.setText(f"{len(self._suggestions)}개")
-		# In hug mode the trailing stretch only ever absorbs sub-pixel rounding
-		# slack — the frame itself is sized to the content, so it cannot open a
-		# real gap. In fill mode it pins the cards to the top as before.
-		self.layout.addStretch(1)
 		self.schedule_width_update()
 		self.schedule_scroll_to_bottom()
 		if self._hug_content:
@@ -585,13 +591,77 @@ class TypingIndicator(QWidget):
 			painter.drawEllipse(QPointF(cx, cy), radius, radius)
 
 
+class _BubbleTextBrowser(QTextBrowser):
+	"""Read-only QTextBrowser used as a chat-message body.
+
+	It grows to fit its content (the inner scrollbar is disabled) so the bubble
+	height tracks the message. While a streamed answer is still arriving the
+	raw text is shown verbatim — fast, no markdown parse per token — and the
+	finished answer is rendered from markdown to HTML exactly once.
+	"""
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self.setObjectName("AssistBubbleText")
+		self.setReadOnly(True)
+		self.setOpenExternalLinks(True)
+		self.setFrameShape(QFrame.NoFrame)
+		self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+		self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+		self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+		self.setTextInteractionFlags(
+			Qt.TextSelectableByMouse
+			| Qt.TextSelectableByKeyboard
+			| Qt.LinksAccessibleByMouse
+		)
+		self.viewport().setAutoFillBackground(False)
+		self.document().setDocumentMargin(0)
+		self.document().contentsChanged.connect(self._sync_height)
+
+	def set_plain(self, text: str) -> None:
+		self.setPlainText(text or "")
+
+	def append_plain(self, chunk: str) -> None:
+		"""Append a streamed chunk at the end — O(chunk), unlike re-setting the
+		whole document with setPlainText() on every token."""
+		cursor = QTextCursor(self.document())
+		cursor.movePosition(QTextCursor.End)
+		cursor.insertText(chunk)
+
+	def set_html(self, html: str) -> None:
+		self.setHtml(html or "")
+
+	def refresh_height(self) -> None:
+		self._sync_height()
+
+	def _sync_height(self) -> None:
+		"""Pin the widget height to the document height so the bubble — not an
+		inner scrollbar — grows with the message."""
+		width = self.viewport().width()
+		if width <= 0:
+			return
+		doc = self.document()
+		doc.setTextWidth(width)
+		height = int(math.ceil(doc.size().height())) + 2
+		if height != self.height():
+			self.setFixedHeight(height)
+
+	def resizeEvent(self, event) -> None:  # type: ignore[override]
+		super().resizeEvent(event)
+		self._sync_height()
+
+	def wheelEvent(self, event) -> None:  # type: ignore[override]
+		# Don't consume wheel scrolling — let it bubble up to the chat panel's
+		# scroll area so the conversation scrolls when hovering over a message.
+		event.ignore()
+
+
 class ChatMessageBubble(QFrame):
 	def __init__(self, sender: str, message: str, is_user: bool, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self._is_user = is_user
-		# Kept verbatim for clipboard copy — the displayed label inserts
-		# zero-width breakpoints via add_text_breakpoints, which we don't
-		# want landing in the user's clipboard.
+		# The original message text, kept so the copy button yields clean text
+		# rather than anything re-extracted from the rendered HTML.
 		self._raw_message = message or ""
 		self.setObjectName("AssistUserBubble" if is_user else "AssistAiBubble")
 		self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
@@ -603,25 +673,21 @@ class ChatMessageBubble(QFrame):
 		meta = QLabel(sender)
 		meta.setObjectName("AssistBubbleMeta")
 
-		self.text = QLabel()
-		text = self.text
-		text.setObjectName("AssistBubbleText")
-		text.setWordWrap(True)
-		text.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
-		text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-		# User messages are shown verbatim; assistant answers arrive as markdown
-		# and are rendered to rich text so headings/lists/tables/code display
-		# formatted instead of as raw syntax.
+		self.text = _BubbleTextBrowser()
+		# User messages and the live streaming view are shown as raw text — fast,
+		# no markdown parse on the per-token path. A finished assistant answer is
+		# rendered from markdown to HTML once, via set_markdown(); an empty
+		# assistant bubble is a streaming turn about to begin, so it stays in
+		# raw-text mode until then.
 		if is_user:
-			text.setTextFormat(Qt.PlainText)
-			text.setText(add_text_breakpoints(message))
+			self.text.set_plain(message or "")
+		elif message:
+			self.text.set_html(_render_assistant_markdown(message))
 		else:
-			text.setTextFormat(Qt.RichText)
-			text.setOpenExternalLinks(True)
-			text.setText(_render_assistant_markdown(message))
+			self.text.set_plain("")
 
 		layout.addWidget(meta)
-		layout.addWidget(text)
+		layout.addWidget(self.text)
 
 		# Animated 'generating…' indicator, shown in place of `text` while a
 		# streaming answer has not produced its first token yet.
@@ -648,7 +714,7 @@ class ChatMessageBubble(QFrame):
 		"""Show the animated typing indicator in place of the answer text.
 
 		Used on an assistant bubble between the request and its first streamed
-		token; the first ``set_text`` call flips it back off.
+		token; the first ``append_text`` call flips it back off.
 		"""
 		if self.typing is None:
 			return
@@ -661,31 +727,52 @@ class ChatMessageBubble(QFrame):
 		else:
 			self.typing.stop()
 
-	def set_text(self, raw: str) -> None:
-		"""Update the message body while keeping the raw text for copy."""
-		self._raw_message = raw or ""
-		# Defensive: the label can be torn down (panel cleared / window closed)
-		# while a streaming answer is still arriving.
+	def append_text(self, chunk: str) -> None:
+		"""Append one streamed chunk as raw text.
+
+		Appends only the new chunk (O(chunk)) instead of re-setting the whole
+		answer every token, so streaming stays fast as the answer grows. The
+		finished answer is re-rendered once from markdown via set_markdown().
+		"""
+		if not chunk:
+			return
+		# Defensive: the browser can be torn down (panel cleared / window
+		# closed) while a streaming answer is still arriving.
 		if not _qt_is_alive(self.text):
 			return
-		if self._is_user:
-			self.text.setText(add_text_breakpoints(self._raw_message))
-		else:
-			self.text.setText(_render_assistant_markdown(self._raw_message))
-		# The first streamed token (or finalize/cancel) ends the typing phase.
+		self.text.append_plain(chunk)
+		# The first streamed token ends the typing phase.
+		self.set_typing(False)
+
+	def set_markdown(self, raw: str) -> None:
+		"""Render *raw* markdown to HTML once and show it — used when a streamed
+		answer is finalised, so the expensive parse happens a single time.
+		"""
+		self._raw_message = raw or ""
+		if not _qt_is_alive(self.text):
+			return
+		self.text.set_html(_render_assistant_markdown(self._raw_message))
 		self.set_typing(False)
 
 	def _copy_to_clipboard(self) -> None:
+		# `_raw_message` is filled in by set_markdown() once the answer is
+		# finalised; mid-stream it is still empty, so fall back to whatever raw
+		# text the browser is currently showing.
+		text = self._raw_message
+		if not text and _qt_is_alive(self.text):
+			text = self.text.toPlainText()
 		app = QApplication.instance()
 		if app is not None:
-			app.clipboard().setText(self._raw_message)
+			app.clipboard().setText(text)
 		if self.copy_button is not None:
 			self.copy_button.show_copied()
 
 	def set_bubble_width(self, max_width: int) -> None:
 		self.setMaximumWidth(max_width)
-		self.text.setMaximumWidth(max(80, max_width - 22))
-		self.text.updateGeometry()
+		# The browser fills the bubble width; nudge it to re-measure its height
+		# for the new wrap width (and after a font-zoom change).
+		if _qt_is_alive(self.text):
+			self.text.refresh_height()
 
 
 class ChatPanel(QFrame):
@@ -730,6 +817,13 @@ class ChatPanel(QFrame):
 		root.addWidget(title)
 		root.addWidget(self.scroll, 1)
 		self._bubbles: list[ChatMessageBubble] = []
+		self._streaming_chunks: list[str] = []
+		# Throttles scroll-to-bottom: a burst of streamed chunks coalesces into
+		# one scroll per tick instead of queuing fresh timers on every token.
+		self._scroll_timer = QTimer(self)
+		self._scroll_timer.setSingleShot(True)
+		self._scroll_timer.setInterval(55)
+		self._scroll_timer.timeout.connect(self._scroll_to_bottom)
 		self._apply_bubble_font()
 
 	# -- chat answer text zoom (Ctrl +/-) --------------------------------
@@ -738,12 +832,12 @@ class ChatPanel(QFrame):
 		"""Push the current bubble font size onto this panel.
 
 		A stylesheet set on the panel itself wins over the window-level
-		`QLabel#AssistBubbleText` rule for every bubble beneath it, so zoom
-		only has to touch this one selector. Bubble heights change with the
+		`QTextBrowser#AssistBubbleText` rule for every bubble beneath it, so
+		zoom only has to touch this one selector. Bubble heights change with the
 		font, so widths/scroll are refreshed on the next ticks.
 		"""
 		self.setStyleSheet(
-			f"QLabel#AssistBubbleText {{ font-size: {self._bubble_font_pt}px; }}"
+			f"QTextBrowser#AssistBubbleText {{ font-size: {self._bubble_font_pt}px; }}"
 		)
 		for delay in (0, 30):
 			QTimer.singleShot(delay, self._update_bubble_widths)
@@ -785,7 +879,7 @@ class ChatPanel(QFrame):
 		bubble = self.add_message(sender, "", False)
 		bubble.set_typing(True)
 		self._streaming_bubble = bubble
-		self._streaming_buffer = ""
+		self._streaming_chunks = []
 		return bubble
 
 	def _live_streaming_bubble(self) -> ChatMessageBubble | None:
@@ -805,40 +899,40 @@ class ChatPanel(QFrame):
 		bubble = self._live_streaming_bubble()
 		if bubble is None:
 			return
-		self._streaming_buffer = (getattr(self, "_streaming_buffer", "") or "") + chunk
-		bubble.set_text(self._streaming_buffer)
+		self._streaming_chunks.append(chunk)
+		bubble.append_text(chunk)
 		self.schedule_scroll_to_bottom()
 
 	def finalize_streaming_assistant(self, text: str | None = None) -> None:
 		bubble = self._live_streaming_bubble()
 		if bubble is None:
 			self._streaming_bubble = None
-			self._streaming_buffer = ""
+			self._streaming_chunks = []
 			return
-		final_text = text if text is not None else getattr(self, "_streaming_buffer", "")
-		bubble.set_text(final_text or "")
+		final_text = text if text is not None else "".join(self._streaming_chunks)
+		bubble.set_markdown(final_text or "")
 		self._streaming_bubble = None
-		self._streaming_buffer = ""
+		self._streaming_chunks = []
 		self.schedule_scroll_to_bottom()
 
 	def cancel_streaming_assistant(self, error_text: str) -> None:
 		bubble = self._live_streaming_bubble()
 		if bubble is None:
 			self._streaming_bubble = None
-			self._streaming_buffer = ""
+			self._streaming_chunks = []
 			return
-		current = getattr(self, "_streaming_buffer", "")
+		current = "".join(self._streaming_chunks)
 		display = f"{current}\n\n[오류] {error_text}" if current else f"[오류] {error_text}"
-		bubble.set_text(display)
+		bubble.set_markdown(display)
 		self._streaming_bubble = None
-		self._streaming_buffer = ""
+		self._streaming_chunks = []
 		self.schedule_scroll_to_bottom()
 
 	def clear_messages(self) -> None:
 		# Drop any in-flight streaming reference *first*: the bubble it points
 		# at is about to be deleted, and a late chunk must not touch it.
 		self._streaming_bubble = None
-		self._streaming_buffer = ""
+		self._streaming_chunks = []
 		while self.layout.count():
 			item = self.layout.takeAt(0)
 			self._dispose_layout_item(item)
@@ -859,11 +953,17 @@ class ChatPanel(QFrame):
 				self._dispose_layout_item(layout.takeAt(0))
 
 	def schedule_scroll_to_bottom(self) -> None:
-		for delay in (0, 25, 80):
-			QTimer.singleShot(delay, self._scroll_to_bottom)
+		# Throttle: while it is already armed, extra chunks are no-ops, so a
+		# burst coalesces into a single scroll instead of three timers per token.
+		if not self._scroll_timer.isActive():
+			self._scroll_timer.start()
 
 	def _scroll_to_bottom(self) -> None:
-		self._update_bubble_widths()
+		# While a stream is live only the streaming bubble grows, and it keeps
+		# its own height current via contentsChanged → _sync_height; re-flowing
+		# every other (unchanged) bubble each tick would be wasted work.
+		if self._live_streaming_bubble() is None:
+			self._update_bubble_widths()
 		self.container.adjustSize()
 		bar = self.scroll.verticalScrollBar()
 		bar.setValue(bar.maximum())
@@ -1197,11 +1297,12 @@ class DocumentAssistWindow(QWidget):
 				font-size: 11px;
 				font-weight: 800;
 			}
-			QLabel#AssistBubbleText {
+			QTextBrowser#AssistBubbleText {
 				color: #1F2937;
 				font-size: 14px;
 				font-weight: 600;
-				line-height: 1.55;
+				background: transparent;
+				border: none;
 			}
 			QFrame#AssistInputBar {
 				background-color: #FFFFFF;
