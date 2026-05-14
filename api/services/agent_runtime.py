@@ -265,8 +265,13 @@ class AgentRuntime:
         reference_urls: list[str] | None = None,
         job_id: str | None = None,
         max_docs: int | None = None,
+        scout_docs: int | None = None,
+        collect_batch_size: int | None = None,
     ) -> dict[str, Any]:
+        from datetime import datetime, timezone
+
         started_at = time.perf_counter()
+        started_wall = datetime.now(timezone.utc)
         request = self._append_reference_sites(instruction, reference_urls or [])
         self._reset_research_progress(job_id=job_id, instruction=instruction)
         self._emit_research_progress("term_grounding", "주제어 추출 중...")
@@ -279,26 +284,39 @@ class AgentRuntime:
             self._publish_new_workspace(workspace_dir, request)
         except Exception as e:
             print(f"[workspace][publish][warn] {e}")
-        registry, run_store_service, rag_service = build_registry(
-            llm=self.llm,
-            run_root=workspace_dir,
-            batch_size=int(os.getenv("VERITAS_BATCH_SIZE", "5")),
-            max_context=int(os.getenv("VERITAS_MAX_CONTEXT", "16384")),
-            enable_screen_context=False,
-        )
-        # A per-request maxDocs (set by the user in the research page) takes
-        # precedence; otherwise fall back to the VERITAS_MAX_DOCS env default.
+        # AutoSurvey pacing — per-request values from the research page
+        # (maxDocs) and 설정 > 고급 설정 > 조사 진행 방식 (scoutDocs /
+        # collectBatchSize) take precedence; otherwise the VERITAS_* env
+        # defaults apply. collectBatchSize doubles as the document_summarize
+        # batch size so one collect cycle maps to one batch summary.
         resolved_max_docs = (
             int(max_docs)
             if max_docs is not None and int(max_docs) > 0
             else int(os.getenv("VERITAS_MAX_DOCS", "15"))
         )
+        resolved_collect_batch_size = (
+            int(collect_batch_size)
+            if collect_batch_size is not None and int(collect_batch_size) > 0
+            else int(os.getenv("VERITAS_BATCH_SIZE", "5"))
+        )
+        resolved_scout_docs = (
+            int(scout_docs)
+            if scout_docs is not None and int(scout_docs) > 0
+            else int(os.getenv("VERITAS_SCOUT_DOCS", "3"))
+        )
+        registry, run_store_service, rag_service = build_registry(
+            llm=self.llm,
+            run_root=workspace_dir,
+            batch_size=resolved_collect_batch_size,
+            max_context=int(os.getenv("VERITAS_MAX_CONTEXT", "16384")),
+            enable_screen_context=False,
+        )
         workflow = AutoSurveyWorkflow(
             registry=registry,
             run_store_service=run_store_service,
             max_docs=resolved_max_docs,
-            collect_batch_size=int(os.getenv("VERITAS_BATCH_SIZE", "5")),
-            scout_docs=int(os.getenv("VERITAS_SCOUT_DOCS", "3")),
+            collect_batch_size=resolved_collect_batch_size,
+            scout_docs=resolved_scout_docs,
             progress_callback=self._emit_research_progress,
         )
         result = workflow.run_all(
@@ -342,6 +360,22 @@ class AgentRuntime:
         final_report = self._read_excerpt(final_path, max_chars=1_000_000)
         if not isinstance(final_report, str):
             final_report = ""
+        elapsed_seconds = round(time.perf_counter() - started_at, 3)
+        # Persist run timing into the workspace (summary/timing.json) so the
+        # elapsed time survives completion and an API restart — the in-memory
+        # job dict is the only other place it lives, and that is lost on restart.
+        try:
+            run_store_service.save_timing(
+                {
+                    "startedAt": started_wall.isoformat().replace("+00:00", "Z"),
+                    "completedAt": datetime.now(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "elapsedSeconds": elapsed_seconds,
+                }
+            )
+        except Exception as e:
+            print(f"[timing][warn] failed to persist run timing: {e}")
         return {
             "request": request,
             "workspace_id": workspace_dir.name,
@@ -349,7 +383,7 @@ class AgentRuntime:
             "max_docs": getattr(workflow, "max_docs", None),
             "final_path": str(final_path) if final_path else None,
             "indexed_chunks": indexed_chunks,
-            "elapsed_seconds": round(time.perf_counter() - started_at, 3),
+            "elapsed_seconds": elapsed_seconds,
             "documents": document_summaries,
             "document_count": len(document_summaries),
             "non_duplicate_document_count": len(document_summaries),

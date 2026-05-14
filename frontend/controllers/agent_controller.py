@@ -62,6 +62,8 @@ class AgentController:
 		instruction: str,
 		reference_urls: list[str],
 		max_docs: int | None = None,
+		scout_docs: int | None = None,
+		collect_batch_size: int | None = None,
 	) -> dict[str, Any]:
 		payload: dict[str, Any] = {
 			"workspaceId": workspace_id,
@@ -70,6 +72,10 @@ class AgentController:
 		}
 		if max_docs is not None:
 			payload["maxDocs"] = int(max_docs)
+		if scout_docs is not None:
+			payload["scoutDocs"] = int(scout_docs)
+		if collect_batch_size is not None:
+			payload["collectBatchSize"] = int(collect_batch_size)
 		return api_client.post(
 			"/api/v1/research/jobs",
 			payload,

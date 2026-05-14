@@ -18,6 +18,9 @@ class RunPathManager:
         self.plan_path = self.summary_dir / "plan.json"
         self.query_state_path = self.summary_dir / "query_state.json"
         self.plan_history_path = self.summary_dir / "plan_history.json"
+        # Run timing (start / end / elapsed) — persisted so the elapsed time
+        # survives completion and an API restart, not just a live frontend run.
+        self.timing_path = self.summary_dir / "timing.json"
         self.final_path = self.root / "final.md"
 
     def prepare_dirs(self) -> None:
