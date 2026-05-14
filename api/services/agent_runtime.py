@@ -335,6 +335,10 @@ class AgentRuntime:
 
         final_path = run_store_service.final_path
         records = self._read_index_records(index_path)
+        # `_document_summaries` already drops duplicates, so its length is the
+        # count of actually-collected documents — the value the UI shows as
+        # "수집된 문서 수". Duplicates in index.json must never inflate it.
+        document_summaries = self._document_summaries(records)
         final_report = self._read_excerpt(final_path, max_chars=1_000_000)
         if not isinstance(final_report, str):
             final_report = ""
@@ -346,11 +350,9 @@ class AgentRuntime:
             "final_path": str(final_path) if final_path else None,
             "indexed_chunks": indexed_chunks,
             "elapsed_seconds": round(time.perf_counter() - started_at, 3),
-            "documents": self._document_summaries(records),
-            "document_count": len(records),
-            "non_duplicate_document_count": len(
-                [record for record in records if not record.get("duplicate_of")]
-            ),
+            "documents": document_summaries,
+            "document_count": len(document_summaries),
+            "non_duplicate_document_count": len(document_summaries),
             "failed_documents": failed_documents,
             "final_report": final_report,
             "final_report_excerpt": final_report[:6000].strip(),
@@ -582,6 +584,12 @@ class AgentRuntime:
     def _document_summaries(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         documents: list[dict[str, Any]] = []
         for record in records:
+            # Duplicates are not collected documents — they carry no clean_md
+            # and no summary file, and hold a ``dup_*`` id. They stay in
+            # index.json only to short-circuit re-fetching the same URL, so
+            # they are excluded from every user-facing document list and count.
+            if record.get("duplicate_of"):
+                continue
             url = str(record.get("final_url") or record.get("url") or "").strip()
             title = str(record.get("title") or url or record.get("doc_id") or "Untitled").strip()
             documents.append(

@@ -196,8 +196,12 @@ final_result = workflow.run_final()
    - 이미 수집된 URL인지 확인
    - `fetch_webpage`로 페이지 수집
    - 중복 문서 검사 (Jaccard 유사도 0.82 이상)
-   - 고유 문서만 저장
-3. `max_docs`에 도달하면 중단
+   - 고유 문서만 **보존 문서**로 저장 — `doc_id`는 `_fetch_one`에서 미리
+     할당하지 않고 `write_fetched_record`가 write 시점에 보존 문서 수로
+     연속 할당(`000`, `001`, ...)한다. fetch 실패(`fetch_error_*`)와
+     중복(`dup_*`)은 별도 id 네임스페이스로 분리되어 보존 문서 번호를
+     소비하거나 가로채지 않는다.
+3. `max_docs`에 도달하면 중단 (`_kept_record_count()` = 보존 문서 수 기준)
 
 ### Summarize 단계 — clean_md를 읽는 두 개의 독립 소비자 (체인 아님)
 - **배치 요약** (수집 루프 안, `phase="batch"`): 사이클의 새 문서 `clean_md`를

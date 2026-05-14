@@ -673,9 +673,11 @@ class AutoSurveyWorkflow:
         )
 
     def _fetch_one(self, title_hint: str, url: str, query: str) -> dict[str, Any]:
-        records = self.run_store_service.load_records()
-        doc_id = self.run_store_service.next_doc_id(len(records))
-
+        # The doc_id is not pre-allocated here: it is assigned by the run store
+        # at write time, and only kept (successfully fetched, non-duplicate)
+        # documents get a contiguous ``doc_*`` number. Fetch errors and
+        # duplicates get their own (``fetch_error_*`` / ``dup_*``) ids so they
+        # never collide with — or shift — kept-document numbering.
         domain = urlparse(url).netloc or url
         self._emit_progress(
             "fetch_webpage",
@@ -688,12 +690,11 @@ class AutoSurveyWorkflow:
             max_chars=25000,
         )
         if not fetch_result.success:
-            self.run_store_service.write_fetch_error_note(
-                doc_id=doc_id,
+            error_id = self.run_store_service.write_fetch_error_note(
                 url=url,
                 error=fetch_result.error or "unknown error",
             )
-            return {"status": "fetch_error", "doc_id": doc_id}
+            return {"status": "fetch_error", "doc_id": error_id}
 
         fetched = fetch_result.data
         stored_url = self._canonicalize_url(getattr(fetched, "url", "") or url) or url
@@ -709,8 +710,7 @@ class AutoSurveyWorkflow:
             title=fetched.title or title_hint or "Untitled",
         )
         if is_dup and duplicate_of is not None:
-            self.run_store_service.write_duplicate_record(
-                doc_id=doc_id,
+            dup_id = self.run_store_service.write_duplicate_record(
                 title=fetched.title or title_hint or "Untitled",
                 url=stored_url,
                 final_url=stored_final_url,
@@ -721,13 +721,12 @@ class AutoSurveyWorkflow:
             )
             return {
                 "status": "duplicate",
-                "doc_id": doc_id,
+                "doc_id": dup_id,
                 "duplicate_of": duplicate_of,
                 "duplicate_score": dup_score,
             }
 
-        self.run_store_service.write_fetched_record(
-            doc_id=doc_id,
+        doc_id = self.run_store_service.write_fetched_record(
             title=fetched.title or title_hint or "Untitled",
             url=stored_url,
             final_url=stored_final_url,
