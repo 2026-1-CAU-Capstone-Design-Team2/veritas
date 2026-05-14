@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
 	QButtonGroup,
 	QFileDialog,
@@ -22,6 +23,7 @@ from ...api_common import STATE
 from ...components.buttons import AppButton
 from ...components.cards import CardWidget
 from ...controllers import AgentController
+from .research_page import DocCountStepper
 
 
 class FlowLayout(QLayout):
@@ -117,6 +119,101 @@ BUILTIN_DOCUMENT_TOOLS = [
 	"raw",
 ]
 
+# 조사 진행 방식 — defaults + frontend-enforced bounds for how the AutoSurvey
+# LLM paces its research. The plan count has no real upper limit, so
+# MAX_RESEARCH_PLAN_COUNT is just a large practical cap (the stepper needs a
+# finite maximum).
+DEFAULT_RESEARCH_SAMPLE_COUNT = 3
+MIN_RESEARCH_SAMPLE_COUNT = 3
+MAX_RESEARCH_SAMPLE_COUNT = 5
+DEFAULT_RESEARCH_PLAN_COUNT = 5
+MIN_RESEARCH_PLAN_COUNT = 5
+MAX_RESEARCH_PLAN_COUNT = 9999
+
+
+class _CollapsibleHeader(QPushButton):
+	"""Flat, full-width header for a CollapsibleSection.
+
+	Reads as a card title rather than a button; a hand-painted chevron on the
+	right edge points right when collapsed and down when expanded. The glyph is
+	painted (not a text character) so it stays crisp and exactly placed.
+	"""
+
+	def __init__(self, title: str, parent: QWidget | None = None) -> None:
+		super().__init__(title, parent)
+		self.setObjectName("AdvancedToggleHeader")
+		self.setCheckable(True)
+		self.setCursor(Qt.PointingHandCursor)
+		self.setFocusPolicy(Qt.NoFocus)
+		self.setFixedHeight(30)
+		self.setStyleSheet(
+			"QPushButton#AdvancedToggleHeader {"
+			" background-color: transparent; border: none; text-align: left;"
+			" padding: 0px; color: #0F172A; font-size: 14px; font-weight: 800; }"
+			"QPushButton#AdvancedToggleHeader:hover { color: #4F46E5; }"
+		)
+
+	def paintEvent(self, event) -> None:  # type: ignore[override]
+		super().paintEvent(event)  # title text + hover colour from the stylesheet
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.Antialiasing, True)
+		color = QColor("#4F46E5") if self.underMouse() else QColor("#475569")
+		pen = QPen(color)
+		pen.setWidthF(2.0)
+		pen.setCapStyle(Qt.RoundCap)
+		pen.setJoinStyle(Qt.RoundJoin)
+		painter.setPen(pen)
+		cx = self.width() - 13.0
+		cy = self.height() / 2.0 + 0.5
+		arm = 4.0
+		path = QPainterPath()
+		if self.isChecked():  # expanded -> chevron points down
+			path.moveTo(cx - arm, cy - arm * 0.55)
+			path.lineTo(cx, cy + arm * 0.55)
+			path.lineTo(cx + arm, cy - arm * 0.55)
+		else:  # collapsed -> chevron points right
+			path.moveTo(cx - arm * 0.55, cy - arm)
+			path.lineTo(cx + arm * 0.55, cy)
+			path.lineTo(cx - arm * 0.55, cy + arm)
+		painter.drawPath(path)
+
+
+class CollapsibleSection(CardWidget):
+	"""A CardWidget whose body collapses behind a clickable header.
+
+	Reuses the settings page's card surface (white panel, rounded border,
+	shadow) so the toggle reads as part of the same design language as the
+	other setting cards.
+	"""
+
+	def __init__(
+		self,
+		title: str,
+		expanded: bool = False,
+		parent: QWidget | None = None,
+	) -> None:
+		super().__init__(parent=parent)
+
+		self._header = _CollapsibleHeader(title)
+		self._header.toggled.connect(self._on_toggled)
+
+		self._body = QWidget()
+		self.body_layout = QVBoxLayout(self._body)
+		self.body_layout.setContentsMargins(0, 6, 0, 0)
+		self.body_layout.setSpacing(14)
+
+		self.layout.addWidget(self._header)
+		self.layout.addWidget(self._body)
+
+		self._header.setChecked(expanded)
+		self._body.setVisible(expanded)
+
+	def add_widget(self, widget: QWidget) -> None:
+		self.body_layout.addWidget(widget)
+
+	def _on_toggled(self, checked: bool) -> None:
+		self._body.setVisible(checked)
+
 
 class SettingsPage(QWidget):
 	defaultWorkspaceChanged = Signal(str)
@@ -140,6 +237,9 @@ class SettingsPage(QWidget):
 		self._settings.setdefault("model", {}).setdefault("modelName", "0.8B")
 		self._settings.setdefault("localAccess", {})
 		self._settings.setdefault("documentTools", {}).setdefault("custom", [])
+		research_defaults = self._settings.setdefault("research", {})
+		research_defaults.setdefault("sampleCount", DEFAULT_RESEARCH_SAMPLE_COUNT)
+		research_defaults.setdefault("planCount", DEFAULT_RESEARCH_PLAN_COUNT)
 		self._model_buttons: dict[str, QPushButton] = {}
 
 		root = QVBoxLayout(self)
@@ -148,7 +248,7 @@ class SettingsPage(QWidget):
 
 		root.addWidget(self._build_model_card())
 		root.addWidget(self._build_local_access_card())
-		root.addWidget(self._build_document_tools_card())
+		root.addWidget(self._build_advanced_section())
 		root.addStretch(1)
 
 	def _build_model_card(self) -> CardWidget:
@@ -231,8 +331,22 @@ class SettingsPage(QWidget):
 		self._load_local_access_settings()
 		return card
 
-	def _build_document_tools_card(self) -> CardWidget:
-		card = CardWidget("새로운 문서 작업 도구 추가")
+	def _build_advanced_section(self) -> CollapsibleSection:
+		"""고급 설정: a collapsed-by-default card holding the less-used settings —
+		the document-tool registry and the AutoSurvey research pacing."""
+		section = CollapsibleSection("고급 설정", expanded=False)
+		section.add_widget(self._build_document_tools_section())
+		section.add_widget(self._divider())
+		section.add_widget(self._build_research_method_section())
+		return section
+
+	def _build_document_tools_section(self) -> QWidget:
+		section = QWidget()
+		layout = QVBoxLayout(section)
+		layout.setContentsMargins(0, 0, 0, 0)
+		layout.setSpacing(12)
+
+		layout.addWidget(self._subsection_title("새로운 문서 작업 도구 추가"))
 
 		subtitle = QLabel(
 			"VERITAS가 '문서 작업' 화면으로 인식하는 편집 도구입니다. "
@@ -240,12 +354,12 @@ class SettingsPage(QWidget):
 		)
 		subtitle.setObjectName("PageSubtitle")
 		subtitle.setWordWrap(True)
-		card.layout.addWidget(subtitle)
+		layout.addWidget(subtitle)
 
 		# --- 현재 지원되는 도구: 읽기 전용 칩 ---
 		builtin_label = QLabel("현재 지원되는 도구")
 		builtin_label.setObjectName("CardPrimary")
-		card.layout.addWidget(builtin_label)
+		layout.addWidget(builtin_label)
 
 		chip_container = QWidget()
 		chip_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
@@ -255,17 +369,17 @@ class SettingsPage(QWidget):
 			chip.setObjectName("ToolChip")
 			chip.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 			chip_flow.addWidget(chip)
-		card.layout.addWidget(chip_container)
+		layout.addWidget(chip_container)
 
 		# --- 직접 추가한 도구: 목록 ---
 		custom_label = QLabel("직접 추가한 도구")
 		custom_label.setObjectName("CardPrimary")
-		card.layout.addWidget(custom_label)
+		layout.addWidget(custom_label)
 
 		self.document_tool_list = QListWidget()
 		self.document_tool_list.setObjectName("SettingsFolderList")
 		self.document_tool_list.setMinimumHeight(108)
-		card.layout.addWidget(self.document_tool_list)
+		layout.addWidget(self.document_tool_list)
 
 		# --- 추가 입력 영역: 라벨이 붙은 한 줄 폼 ---
 		add_row = QFrame()
@@ -308,7 +422,7 @@ class SettingsPage(QWidget):
 		add_layout.addLayout(name_col, 2)
 		add_layout.addLayout(id_col, 3)
 		add_layout.addWidget(add_tool_button, 0, Qt.AlignBottom)
-		card.layout.addWidget(add_row)
+		layout.addWidget(add_row)
 
 		# --- 액션 버튼 ---
 		action_row = QHBoxLayout()
@@ -323,15 +437,117 @@ class SettingsPage(QWidget):
 		action_row.addWidget(remove_button)
 		action_row.addWidget(clear_button)
 		action_row.addWidget(save_button)
-		card.layout.addLayout(action_row)
+		layout.addLayout(action_row)
 
 		self.document_tools_status = QLabel()
 		self.document_tools_status.setObjectName("SettingsStatus")
 		self.document_tools_status.setWordWrap(True)
-		card.layout.addWidget(self.document_tools_status)
+		layout.addWidget(self.document_tools_status)
 
 		self._load_document_tools_settings()
-		return card
+		return section
+
+	def _build_research_method_section(self) -> QWidget:
+		section = QWidget()
+		layout = QVBoxLayout(section)
+		layout.setContentsMargins(0, 0, 0, 0)
+		layout.setSpacing(12)
+
+		layout.addWidget(self._subsection_title("조사 진행 방식"))
+
+		subtitle = QLabel(
+			"AutoSurvey LLM이 자료 조사를 진행하는 방식을 설정합니다. "
+			"최초 샘플링 개수와 각 플랜당 조사 개수를 조절할 수 있습니다."
+		)
+		subtitle.setObjectName("PageSubtitle")
+		subtitle.setWordWrap(True)
+		layout.addWidget(subtitle)
+
+		# Same −/＋ stepper widget the 조사 페이지 uses for "최대 조사 문서 수";
+		# the min/max passed here are the frontend-enforced bounds.
+		self.research_sample_input = DocCountStepper(
+			MIN_RESEARCH_SAMPLE_COUNT,
+			MAX_RESEARCH_SAMPLE_COUNT,
+			DEFAULT_RESEARCH_SAMPLE_COUNT,
+		)
+		layout.addWidget(
+			self._research_param_row(
+				"최초 샘플링 개수",
+				f"조사를 시작할 때 LLM이 처음으로 살펴볼 자료 샘플의 개수입니다. "
+				f"({MIN_RESEARCH_SAMPLE_COUNT}~{MAX_RESEARCH_SAMPLE_COUNT}개, "
+				f"기본값 {DEFAULT_RESEARCH_SAMPLE_COUNT}개)",
+				self.research_sample_input,
+			)
+		)
+
+		self.research_plan_input = DocCountStepper(
+			MIN_RESEARCH_PLAN_COUNT,
+			MAX_RESEARCH_PLAN_COUNT,
+			DEFAULT_RESEARCH_PLAN_COUNT,
+		)
+		layout.addWidget(
+			self._research_param_row(
+				"각 플랜당 조사 개수",
+				f"LLM이 세운 각 조사 플랜마다 한 번에 조사할 자료의 개수입니다. "
+				f"(최소 {MIN_RESEARCH_PLAN_COUNT}개, 최대 무제한 · "
+				f"기본값 {DEFAULT_RESEARCH_PLAN_COUNT}개)",
+				self.research_plan_input,
+			)
+		)
+
+		action_row = QHBoxLayout()
+		action_row.setSpacing(8)
+		action_row.addStretch(1)
+		reset_button = AppButton("기본값", variant="ghost")
+		reset_button.clicked.connect(self._reset_research_method_settings)
+		save_button = AppButton("조사 방식 저장")
+		save_button.clicked.connect(self._save_research_method_settings)
+		action_row.addWidget(reset_button)
+		action_row.addWidget(save_button)
+		layout.addLayout(action_row)
+
+		self.research_method_status = QLabel()
+		self.research_method_status.setObjectName("SettingsStatus")
+		self.research_method_status.setWordWrap(True)
+		layout.addWidget(self.research_method_status)
+
+		self._load_research_method_settings()
+		return section
+
+	def _research_param_row(self, title: str, hint: str, field: QWidget) -> QFrame:
+		"""A title/hint + control row, styled like the 조사 페이지's count card so
+		the advanced settings stay visually consistent with the rest of the app."""
+		row = QFrame()
+		row.setObjectName("ResearchCountCard")
+		row_layout = QHBoxLayout(row)
+		row_layout.setContentsMargins(16, 13, 16, 13)
+		row_layout.setSpacing(14)
+
+		text_col = QVBoxLayout()
+		text_col.setContentsMargins(0, 0, 0, 0)
+		text_col.setSpacing(3)
+		title_label = QLabel(title)
+		title_label.setObjectName("ResearchCountTitle")
+		hint_label = QLabel(hint)
+		hint_label.setObjectName("ResearchCountHint")
+		hint_label.setWordWrap(True)
+		text_col.addWidget(title_label)
+		text_col.addWidget(hint_label)
+
+		row_layout.addLayout(text_col, 1)
+		row_layout.addWidget(field, 0, Qt.AlignVCenter)
+		return row
+
+	def _subsection_title(self, text: str) -> QLabel:
+		label = QLabel(text)
+		label.setStyleSheet("font-size: 13px; font-weight: 800; color: #0F172A;")
+		return label
+
+	def _divider(self) -> QFrame:
+		line = QFrame()
+		line.setFixedHeight(1)
+		line.setStyleSheet("background-color: #E2E8F0; border: none;")
+		return line
 
 	def _load_model_settings(self) -> None:
 		model_settings = self._settings.get("model", {})
@@ -495,6 +711,39 @@ class SettingsPage(QWidget):
 			self.document_tools_status.setText(f"{lead}{count}개 도구가 추가되어 있습니다.")
 		else:
 			self.document_tools_status.setText(f"{lead}추가한 문서 작업 도구가 없습니다.")
+
+	def _load_research_method_settings(self) -> None:
+		research_settings = self._settings.get("research", {})
+		sample_count = research_settings.get("sampleCount", DEFAULT_RESEARCH_SAMPLE_COUNT)
+		plan_count = research_settings.get("planCount", DEFAULT_RESEARCH_PLAN_COUNT)
+		try:
+			self.research_sample_input.setValue(int(sample_count))
+		except (TypeError, ValueError):
+			self.research_sample_input.setValue(DEFAULT_RESEARCH_SAMPLE_COUNT)
+		try:
+			self.research_plan_input.setValue(int(plan_count))
+		except (TypeError, ValueError):
+			self.research_plan_input.setValue(DEFAULT_RESEARCH_PLAN_COUNT)
+		self._update_research_method_status()
+
+	def _reset_research_method_settings(self) -> None:
+		self.research_sample_input.setValue(DEFAULT_RESEARCH_SAMPLE_COUNT)
+		self.research_plan_input.setValue(DEFAULT_RESEARCH_PLAN_COUNT)
+		self._save_research_method_settings()
+
+	def _save_research_method_settings(self) -> None:
+		self._settings["research"] = {
+			"sampleCount": self.research_sample_input.value(),
+			"planCount": self.research_plan_input.value(),
+		}
+		self._update_research_method_status("조사 진행 방식 설정이 저장되었습니다.")
+
+	def _update_research_method_status(self, prefix: str | None = None) -> None:
+		lead = f"{prefix} · " if prefix else ""
+		self.research_method_status.setText(
+			f"{lead}최초 샘플링 {self.research_sample_input.value()}개 · "
+			f"플랜당 {self.research_plan_input.value()}개"
+		)
 
 	def set_default_workspace_by_name(self, _workspace_name: str) -> None:
 		return
