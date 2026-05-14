@@ -2,8 +2,20 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import QPoint, Qt, Signal, QTimer
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QKeyEvent, QMouseEvent
+from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal, QTimer
+from PySide6.QtGui import (
+	QAction,
+	QColor,
+	QCloseEvent,
+	QKeyEvent,
+	QKeySequence,
+	QMouseEvent,
+	QPainter,
+	QPainterPath,
+	QPen,
+	QShortcut,
+	QWheelEvent,
+)
 from PySide6.QtWidgets import (
 	QApplication,
 	QFrame,
@@ -180,25 +192,37 @@ class SuggestionCard(QFrame):
 
 
 class SuggestionList(QFrame):
-	def __init__(self, parent: QWidget | None = None) -> None:
+	# When ``hug_content`` is set the card sizes itself to its actual content
+	# instead of claiming whatever slice of the window the layout offers, so
+	# no blank space trails the last suggestion. It still refuses to grow past
+	# this share of the parent's height — beyond that the list scrolls (still
+	# no trailing gap). Left off, the card keeps the default fill behaviour for
+	# callers that give it a whole panel (e.g. DocumentAssistPage).
+	MAX_HEIGHT_RATIO = 0.55
+
+	def __init__(self, parent: QWidget | None = None, *, hug_content: bool = False) -> None:
 		super().__init__(parent)
 		self.setObjectName("AssistSectionCard")
+		self._hug_content = hug_content
+		if hug_content:
+			# Maximum: take exactly the content height when it fits, never more.
+			self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 		self._suggestions: list[dict[str, str]] = []
 		self._cards: list[SuggestionCard] = []
 
-		root = QVBoxLayout(self)
-		root.setContentsMargins(12, 12, 12, 12)
-		root.setSpacing(8)
+		self._root = QVBoxLayout(self)
+		self._root.setContentsMargins(12, 12, 12, 12)
+		self._root.setSpacing(8)
 
 		header = QHBoxLayout()
 		header.setSpacing(8)
 
-		title = QLabel("실시간 수정 결과")
-		title.setObjectName("AssistSectionTitle")
+		self._title = QLabel("실시간 수정 결과")
+		self._title.setObjectName("AssistSectionTitle")
 		self.count_label = QLabel("0개")
 		self.count_label.setObjectName("AssistSubText")
 
-		header.addWidget(title)
+		header.addWidget(self._title)
 		header.addStretch(1)
 		header.addWidget(self.count_label)
 
@@ -207,6 +231,7 @@ class SuggestionList(QFrame):
 		self.scroll.setFrameShape(QFrame.NoFrame)
 		self.scroll.setObjectName("AssistScrollArea")
 		self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+		self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
 		self.container = QWidget()
 		self.container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
@@ -220,8 +245,8 @@ class SuggestionList(QFrame):
 		self.empty.setAlignment(Qt.AlignCenter)
 		self.empty.setWordWrap(True)
 
-		root.addLayout(header)
-		root.addWidget(self.scroll, 1)
+		self._root.addLayout(header)
+		self._root.addWidget(self.scroll, 1)
 		self.set_suggestions([])
 
 	def set_suggestions(self, suggestions: list[dict[str, str]]) -> None:
@@ -230,9 +255,12 @@ class SuggestionList(QFrame):
 		self._cards = []
 		if not self._suggestions:
 			self.layout.addWidget(self.empty)
+			self.empty.show()
 			self.count_label.setText("0개")
 			self.layout.addStretch(1)
 			self.schedule_width_update()
+			if self._hug_content:
+				self.updateGeometry()
 			return
 
 		for item in self._suggestions:
@@ -246,9 +274,14 @@ class SuggestionList(QFrame):
 			self.layout.addWidget(card, 0)
 
 		self.count_label.setText(f"{len(self._suggestions)}개")
+		# In hug mode the trailing stretch only ever absorbs sub-pixel rounding
+		# slack — the frame itself is sized to the content, so it cannot open a
+		# real gap. In fill mode it pins the cards to the top as before.
 		self.layout.addStretch(1)
 		self.schedule_width_update()
 		self.schedule_scroll_to_bottom()
+		if self._hug_content:
+			self.updateGeometry()
 
 	def add_suggestion(self, category: str, text: str, tone: str = "working") -> None:
 		items = [dict(item) for item in self._suggestions]
@@ -272,10 +305,46 @@ class SuggestionList(QFrame):
 	def resizeEvent(self, event) -> None:  # type: ignore[override]
 		super().resizeEvent(event)
 		self.schedule_width_update()
+		# The height cap tracks the parent, which changes as the window
+		# resizes — re-query our sizeHint so the cap stays in sync.
+		if self._hug_content:
+			self.updateGeometry()
 
 	def showEvent(self, event) -> None:  # type: ignore[override]
 		super().showEvent(event)
 		self.schedule_width_update()
+		if self._hug_content:
+			self.updateGeometry()
+
+	def sizeHint(self) -> QSize:  # type: ignore[override]
+		hint = super().sizeHint()
+		if self._hug_content:
+			hint.setHeight(self._preferred_height())
+		return hint
+
+	def _preferred_height(self) -> int:
+		"""Height that exactly wraps the current content, capped so a long
+		list scrolls instead of crowding out the chat panel."""
+		margins = self._root.contentsMargins()
+		chrome = margins.top() + margins.bottom() + self._root.spacing()
+		header_h = max(
+			self._title.sizeHint().height(),
+			self.count_label.sizeHint().height(),
+		)
+		# +2px rounding cushion so the list never shows a scrollbar while it
+		# actually fits; the trailing stretch soaks up the slack.
+		content_h = self.container.sizeHint().height() + 2
+		total = chrome + header_h + content_h
+		cap = self._max_height()
+		if cap:
+			total = min(total, cap)
+		return max(96, total)
+
+	def _max_height(self) -> int:
+		parent = self.parentWidget()
+		if parent is None:
+			return 0
+		return max(160, int(parent.height() * self.MAX_HEIGHT_RATIO))
 
 	def _content_width(self) -> int:
 		return max(120, self.scroll.viewport().width() - 2)
@@ -285,6 +354,9 @@ class SuggestionList(QFrame):
 		self.container.setMinimumWidth(width)
 		for card in self._cards:
 			card.set_card_width(width)
+		# Card heights (word-wrapped text) just changed — refresh our hint.
+		if self._hug_content:
+			self.updateGeometry()
 
 	def _clear(self) -> None:
 		while self.layout.count():
@@ -294,9 +366,86 @@ class SuggestionList(QFrame):
 				widget.setParent(None)
 
 
+class CopyButton(QPushButton):
+	"""Icon-only button that copies a chat message to the clipboard.
+
+	The conventional "two overlapping sheets" copy glyph is hand-painted so it
+	looks identical regardless of which window's stylesheet is active, and
+	briefly swaps to a green checkmark as copy confirmation.
+	"""
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self.setObjectName("ChatCopyButton")
+		self.setCursor(Qt.PointingHandCursor)
+		self.setFixedSize(22, 22)
+		self.setToolTip("답변 복사")
+		self.setStyleSheet(
+			"QPushButton#ChatCopyButton { background-color: transparent; border: none; "
+			"border-radius: 6px; }"
+			"QPushButton#ChatCopyButton:hover { background-color: rgba(15, 23, 42, 0.07); }"
+		)
+		self._copied = False
+		self._reset_timer = QTimer(self)
+		self._reset_timer.setSingleShot(True)
+		self._reset_timer.setInterval(1300)
+		self._reset_timer.timeout.connect(self._reset_state)
+
+	def show_copied(self) -> None:
+		self._copied = True
+		self.setToolTip("복사됨")
+		self._reset_timer.start()
+		self.update()
+
+	def _reset_state(self) -> None:
+		self._copied = False
+		self.setToolTip("답변 복사")
+		self.update()
+
+	def paintEvent(self, event) -> None:  # type: ignore[override]
+		super().paintEvent(event)  # hover background from the stylesheet
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.Antialiasing, True)
+		center = self.rect().center()
+		cx, cy = center.x() + 0.5, center.y() + 0.5
+
+		if self._copied:
+			pen = QPen(QColor("#15803D"))
+			pen.setWidthF(1.7)
+			pen.setCapStyle(Qt.RoundCap)
+			pen.setJoinStyle(Qt.RoundJoin)
+			painter.setPen(pen)
+			check = QPainterPath()
+			check.moveTo(cx - 4.2, cy + 0.4)
+			check.lineTo(cx - 1.2, cy + 3.4)
+			check.lineTo(cx + 4.6, cy - 3.6)
+			painter.drawPath(check)
+			return
+
+		color = QColor("#0F172A") if self.underMouse() else QColor("#94A3B8")
+		pen = QPen(color)
+		pen.setWidthF(1.4)
+		pen.setJoinStyle(Qt.RoundJoin)
+		painter.setPen(pen)
+		# Back sheet peeks out to the top-right; the front sheet is filled so it
+		# cleanly occludes the overlapping back-sheet edges.
+		back = QRectF(cx - 2.4, cy - 5.8, 8.2, 8.2)
+		front = QRectF(cx - 5.8, cy - 2.4, 8.2, 8.2)
+		painter.drawRoundedRect(back, 1.8, 1.8)
+		front_path = QPainterPath()
+		front_path.addRoundedRect(front, 1.8, 1.8)
+		painter.fillPath(front_path, QColor("#FFFFFF"))
+		painter.drawPath(front_path)
+
+
 class ChatMessageBubble(QFrame):
 	def __init__(self, sender: str, message: str, is_user: bool, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
+		self._is_user = is_user
+		# Kept verbatim for clipboard copy — the displayed label inserts
+		# zero-width breakpoints via add_text_breakpoints, which we don't
+		# want landing in the user's clipboard.
+		self._raw_message = message or ""
 		self.setObjectName("AssistUserBubble" if is_user else "AssistAiBubble")
 		self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
@@ -306,6 +455,7 @@ class ChatMessageBubble(QFrame):
 
 		meta = QLabel(sender)
 		meta.setObjectName("AssistBubbleMeta")
+
 		self.text = QLabel(add_text_breakpoints(message))
 		text = self.text
 		text.setObjectName("AssistBubbleText")
@@ -317,6 +467,31 @@ class ChatMessageBubble(QFrame):
 		layout.addWidget(meta)
 		layout.addWidget(text)
 
+		# Only AI answers are copyable; user messages already came from them.
+		# The copy button sits in a footer row, aligned to the bottom-right.
+		self.copy_button: CopyButton | None = None
+		if not is_user:
+			footer = QHBoxLayout()
+			footer.setContentsMargins(0, 0, 0, 0)
+			footer.setSpacing(0)
+			footer.addStretch(1)
+			self.copy_button = CopyButton()
+			self.copy_button.clicked.connect(self._copy_to_clipboard)
+			footer.addWidget(self.copy_button, 0, Qt.AlignVCenter)
+			layout.addLayout(footer)
+
+	def set_text(self, raw: str) -> None:
+		"""Update the message body while keeping the raw text for copy."""
+		self._raw_message = raw or ""
+		self.text.setText(add_text_breakpoints(self._raw_message))
+
+	def _copy_to_clipboard(self) -> None:
+		app = QApplication.instance()
+		if app is not None:
+			app.clipboard().setText(self._raw_message)
+		if self.copy_button is not None:
+			self.copy_button.show_copied()
+
 	def set_bubble_width(self, max_width: int) -> None:
 		self.setMaximumWidth(max_width)
 		self.text.setMaximumWidth(max(80, max_width - 22))
@@ -324,9 +499,16 @@ class ChatMessageBubble(QFrame):
 
 
 class ChatPanel(QFrame):
+	# Chat-answer text size. The base is bumped up from the old 12px (the
+	# answers read too small) and Ctrl +/- steps it between these bounds.
+	_BASE_FONT_PT = 14
+	_MIN_FONT_PT = 9
+	_MAX_FONT_PT = 30
+
 	def __init__(self, title_text: str = "문서 채팅", parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("AssistSectionCard")
+		self._bubble_font_pt = self._BASE_FONT_PT
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(12, 12, 12, 12)
@@ -358,6 +540,38 @@ class ChatPanel(QFrame):
 		root.addWidget(title)
 		root.addWidget(self.scroll, 1)
 		self._bubbles: list[ChatMessageBubble] = []
+		self._apply_bubble_font()
+
+	# -- chat answer text zoom (Ctrl +/-) --------------------------------
+
+	def _apply_bubble_font(self) -> None:
+		"""Push the current bubble font size onto this panel.
+
+		A stylesheet set on the panel itself wins over the window-level
+		`QLabel#AssistBubbleText` rule for every bubble beneath it, so zoom
+		only has to touch this one selector. Bubble heights change with the
+		font, so widths/scroll are refreshed on the next ticks.
+		"""
+		self.setStyleSheet(
+			f"QLabel#AssistBubbleText {{ font-size: {self._bubble_font_pt}px; }}"
+		)
+		for delay in (0, 30):
+			QTimer.singleShot(delay, self._update_bubble_widths)
+		self.schedule_scroll_to_bottom()
+
+	def zoom_chat_text(self, step: int) -> None:
+		"""Grow/shrink the chat answer text by ``step`` points, clamped."""
+		new_pt = max(self._MIN_FONT_PT, min(self._MAX_FONT_PT, self._bubble_font_pt + step))
+		if new_pt == self._bubble_font_pt:
+			return
+		self._bubble_font_pt = new_pt
+		self._apply_bubble_font()
+
+	def reset_chat_zoom(self) -> None:
+		if self._bubble_font_pt == self._BASE_FONT_PT:
+			return
+		self._bubble_font_pt = self._BASE_FONT_PT
+		self._apply_bubble_font()
 
 	def add_message(self, sender: str, message: str, is_user: bool) -> ChatMessageBubble:
 		self.empty.hide()
@@ -390,7 +604,7 @@ class ChatPanel(QFrame):
 		if bubble is None:
 			return
 		self._streaming_buffer = (getattr(self, "_streaming_buffer", "") or "") + chunk
-		bubble.text.setText(add_text_breakpoints(self._streaming_buffer))
+		bubble.set_text(self._streaming_buffer)
 		self.schedule_scroll_to_bottom()
 
 	def finalize_streaming_assistant(self, text: str | None = None) -> None:
@@ -398,7 +612,7 @@ class ChatPanel(QFrame):
 		if bubble is None:
 			return
 		final_text = text if text is not None else getattr(self, "_streaming_buffer", "")
-		bubble.text.setText(add_text_breakpoints(final_text or ""))
+		bubble.set_text(final_text or "")
 		self._streaming_bubble = None
 		self._streaming_buffer = ""
 		self.schedule_scroll_to_bottom()
@@ -409,7 +623,7 @@ class ChatPanel(QFrame):
 			return
 		current = getattr(self, "_streaming_buffer", "")
 		display = f"{current}\n\n[오류] {error_text}" if current else f"[오류] {error_text}"
-		bubble.text.setText(add_text_breakpoints(display))
+		bubble.set_text(display)
 		self._streaming_bubble = None
 		self._streaming_buffer = ""
 		self.schedule_scroll_to_bottom()
@@ -446,7 +660,12 @@ class ChatPanel(QFrame):
 
 	def resizeEvent(self, event) -> None:  # type: ignore[override]
 		super().resizeEvent(event)
+		# Re-flow bubbles to the new width immediately, then once more on the
+		# next tick in case the scroll viewport size lagged this event by a
+		# frame — this is what keeps the answers sized proportionally to the
+		# window as the user drags its edge.
 		self._update_bubble_widths()
+		QTimer.singleShot(0, self._update_bubble_widths)
 
 	def _bubble_width(self) -> int:
 		viewport_width = max(280, self.scroll.viewport().width())
@@ -535,8 +754,10 @@ class DocumentAssistWindow(QWidget):
 		super().__init__(parent)
 		self.setWindowTitle("Veritas Assist")
 		self.setWindowFlags(Qt.Window | Qt.Tool | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
-		self.resize(560, 760)
-		self.setMinimumSize(380, 540)
+		# Wider default/min footprint — the previous 560/380 px made the chat
+		# answers feel cramped horizontally.
+		self.resize(680, 820)
+		self.setMinimumSize(470, 580)
 		self.setAttribute(Qt.WA_TranslucentBackground, True)
 		self.setMouseTracking(True)
 		self._resize_margin = 8
@@ -547,7 +768,27 @@ class DocumentAssistWindow(QWidget):
 
 		self._build_ui()
 		self._apply_stylesheet()
+		self._install_chat_zoom_shortcuts()
 		self._load_demo_data()
+
+	def _install_chat_zoom_shortcuts(self) -> None:
+		"""Ctrl +/- (and Ctrl+0) resize the chat answer text.
+
+		`QShortcut` with the default WindowShortcut context fires no matter
+		which child widget holds focus — including the chat input — so the
+		zoom works while the user is typing.
+		"""
+		bindings = (
+			("Ctrl++", lambda: self.chat_panel.zoom_chat_text(1)),
+			("Ctrl+=", lambda: self.chat_panel.zoom_chat_text(1)),
+			("Ctrl+-", lambda: self.chat_panel.zoom_chat_text(-1)),
+			("Ctrl+0", self.chat_panel.reset_chat_zoom),
+		)
+		self._chat_zoom_shortcuts: list[QShortcut] = []
+		for sequence, handler in bindings:
+			shortcut = QShortcut(QKeySequence(sequence), self)
+			shortcut.activated.connect(handler)
+			self._chat_zoom_shortcuts.append(shortcut)
 
 	def _build_ui(self) -> None:
 		root = QVBoxLayout(self)
@@ -575,14 +816,18 @@ class DocumentAssistWindow(QWidget):
 		content_layout.setContentsMargins(12, 10, 12, 8)
 		content_layout.setSpacing(10)
 
-		self.suggestion_list = SuggestionList()
+		self.suggestion_list = SuggestionList(hug_content=True)
 		self.chat_panel = ChatPanel()
+		# Keep the chat usable even when a long suggestion list claims its cap.
+		self.chat_panel.setMinimumHeight(160)
 		self.input_bar = ChatInputBar()
 		self.input_bar.sendRequested.connect(self.on_message_submitted)
 		self.input_bar.modeChanged.connect(self._on_mode_changed)
 
-		content_layout.addWidget(self.suggestion_list, 2)
-		content_layout.addWidget(self.chat_panel, 3)
+		# suggestion_list sizes itself to its content (stretch 0); the chat
+		# panel absorbs all remaining space so no blank gap trails the list.
+		content_layout.addWidget(self.suggestion_list, 0)
+		content_layout.addWidget(self.chat_panel, 1)
 		content_layout.addWidget(self.input_bar)
 
 		grip_row = QHBoxLayout()
@@ -623,7 +868,7 @@ class DocumentAssistWindow(QWidget):
 			QWidget {
 				color: #111827;
 				font-family: 'Segoe UI Variable', 'Segoe UI', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
-				font-size: 12px;
+				font-size: 13px;
 			}
 			QFrame#AssistPanel {
 				background-color: #F8FAFC;
@@ -734,13 +979,14 @@ class DocumentAssistWindow(QWidget):
 			}
 			QLabel#AssistBubbleMeta {
 				color: #6B7280;
-				font-size: 10px;
+				font-size: 11px;
 				font-weight: 800;
 			}
 			QLabel#AssistBubbleText {
 				color: #1F2937;
-				font-size: 12px;
+				font-size: 14px;
 				font-weight: 600;
+				line-height: 1.55;
 			}
 			QFrame#AssistInputBar {
 				background-color: #FFFFFF;
@@ -753,6 +999,7 @@ class DocumentAssistWindow(QWidget):
 				border-radius: 11px;
 				padding: 8px 10px;
 				color: #111827;
+				font-size: 13px;
 				selection-background-color: #BFDBFE;
 				selection-color: #111827;
 			}
@@ -889,6 +1136,18 @@ class DocumentAssistWindow(QWidget):
 	def showEvent(self, event) -> None:  # type: ignore[override]
 		super().showEvent(event)
 		self.visibilityChanged.emit(True)
+
+	def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
+		# Ctrl + wheel mirrors the Ctrl +/- shortcut for chat answer zoom.
+		if event.modifiers() & Qt.ControlModifier:
+			delta = event.angleDelta().y()
+			if delta > 0:
+				self.chat_panel.zoom_chat_text(1)
+			elif delta < 0:
+				self.chat_panel.zoom_chat_text(-1)
+			event.accept()
+			return
+		super().wheelEvent(event)
 
 	def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
 		if event.button() == Qt.LeftButton:

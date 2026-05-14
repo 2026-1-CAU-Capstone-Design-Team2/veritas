@@ -4,8 +4,8 @@ import html
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QMouseEvent
+from PySide6.QtCore import QObject, QPointF, QThread, Qt, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import (
 	QFrame,
 	QHBoxLayout,
@@ -23,71 +23,145 @@ from PySide6.QtWidgets import (
 from ...api_common import current_workspace_id, load_bootstrap_state
 from ...components.buttons import AppButton
 from ...components.cards import CardWidget
+from ...components.progress import ResearchProgressBar
 from ...controllers import AgentController, JobCategory, get_job_manager
 
+# Bounds for the user-configurable "max documents to research" control.
+# The default mirrors the backend VERITAS_MAX_DOCS fallback (15).
+MIN_RESEARCH_DOCS = 1
+MAX_RESEARCH_DOCS = 50
+DEFAULT_RESEARCH_DOCS = 15
 
-class StatusPill(QPushButton):
-	"""Top-of-card status indicator.
 
-	- "completed" → green ● 완료 (non-clickable)
-	- "failed"    → red ● 오류 (clickable; opens the error message popup)
-	- "running"   → blue ● 진행 중 (non-clickable)
-	- "idle"      → hidden
+class CircleGlyphButton(QToolButton):
+	"""Round button whose glyph (＋ / − / ✕) is painted as centered strokes.
+
+	Qt centers button *text* by its line box, so a '+' or 'x' character ends
+	up visibly above/below the true center of a circular button. Stroking the
+	glyph through the widget's exact center fixes that and stays crisp at any
+	size; the circle background, border and hover state still come from the
+	stylesheet via the base ``paintEvent``.
 	"""
 
-	BASE_STYLE = (
-		"QPushButton#StatusPill {{ background-color: {bg}; color: {fg}; "
-		"border: 1px solid {border}; border-radius: 12px; padding: 4px 12px; "
-		"font-size: 12px; font-weight: 800; }}"
-		"QPushButton#StatusPill:hover {{ background-color: {hover_bg}; }}"
-	)
-
-	def __init__(self, parent: QWidget | None = None) -> None:
+	def __init__(
+		self,
+		glyph: str,
+		color: str,
+		hover_color: str,
+		diameter: int,
+		parent: QWidget | None = None,
+	) -> None:
 		super().__init__(parent)
-		self.setObjectName("StatusPill")
+		self._glyph = glyph  # "plus" | "minus" | "cross"
+		self._color = QColor(color)
+		self._hover_color = QColor(hover_color)
+		self._disabled_color = QColor("#CBD5E1")
+		self.setFixedSize(diameter, diameter)
 		self.setCursor(Qt.PointingHandCursor)
-		self._error_message: str = ""
-		self.clicked.connect(self._on_clicked)
-		self.set_state("idle")
+		self.setFocusPolicy(Qt.NoFocus)
 
-	def set_state(self, state: str, error_message: str = "") -> None:
-		self._error_message = error_message or ""
-		if state == "completed":
-			self.setVisible(True)
-			self.setEnabled(False)
-			self.setCursor(Qt.ArrowCursor)
-			self.setText("● 완료")
-			self.setStyleSheet(self.BASE_STYLE.format(
-				bg="#DCFCE7", fg="#15803D", border="#86EFAC", hover_bg="#DCFCE7"
-			))
-			self.setToolTip("조사가 완료되었습니다.")
-		elif state == "failed":
-			self.setVisible(True)
-			self.setEnabled(True)
-			self.setCursor(Qt.PointingHandCursor)
-			self.setText("● 오류")
-			self.setStyleSheet(self.BASE_STYLE.format(
-				bg="#FEE2E2", fg="#B91C1C", border="#FCA5A5", hover_bg="#FECACA"
-			))
-			self.setToolTip("클릭하면 오류 메시지를 확인할 수 있습니다.")
-		elif state == "running":
-			self.setVisible(True)
-			self.setEnabled(False)
-			self.setCursor(Qt.ArrowCursor)
-			self.setText("● 진행 중")
-			self.setStyleSheet(self.BASE_STYLE.format(
-				bg="#DBEAFE", fg="#1D4ED8", border="#BFDBFE", hover_bg="#DBEAFE"
-			))
-			self.setToolTip("AutoSurvey workflow를 실행하고 있습니다.")
+	def enterEvent(self, event) -> None:  # type: ignore[override]
+		super().enterEvent(event)
+		self.update()
+
+	def leaveEvent(self, event) -> None:  # type: ignore[override]
+		super().leaveEvent(event)
+		self.update()
+
+	def paintEvent(self, event) -> None:  # type: ignore[override]
+		super().paintEvent(event)  # stylesheet-driven circle + hover background
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.Antialiasing, True)
+		if not self.isEnabled():
+			color = self._disabled_color
+		elif self.underMouse():
+			color = self._hover_color
 		else:
-			self.setVisible(False)
-			self.setEnabled(False)
-			self._error_message = ""
+			color = self._color
+		pen = QPen(color)
+		pen.setWidthF(max(1.7, self.width() * 0.075))
+		pen.setCapStyle(Qt.RoundCap)
+		painter.setPen(pen)
+		cx = self.width() / 2.0
+		cy = self.height() / 2.0
+		arm = min(self.width(), self.height()) * 0.23
+		if self._glyph == "plus":
+			painter.drawLine(QPointF(cx - arm, cy), QPointF(cx + arm, cy))
+			painter.drawLine(QPointF(cx, cy - arm), QPointF(cx, cy + arm))
+		elif self._glyph == "minus":
+			painter.drawLine(QPointF(cx - arm, cy), QPointF(cx + arm, cy))
+		else:  # cross
+			painter.drawLine(QPointF(cx - arm, cy - arm), QPointF(cx + arm, cy + arm))
+			painter.drawLine(QPointF(cx - arm, cy + arm), QPointF(cx + arm, cy - arm))
 
-	def _on_clicked(self) -> None:
-		if not self._error_message:
-			return
-		QMessageBox.critical(self, "조사 오류", self._error_message)
+
+class DocCountStepper(QFrame):
+	"""Rounded −/＋ stepper for the '최대 조사 문서 수' value.
+
+	A polished stand-in for a bare QSpinBox: large round hit targets, a clear
+	centered value, and the two buttons disabling themselves at the range
+	bounds. Exposes the small slice of the QSpinBox API the page relies on
+	(:meth:`value`).
+	"""
+
+	valueChanged = Signal(int)
+
+	def __init__(
+		self,
+		minimum: int,
+		maximum: int,
+		value: int,
+		parent: QWidget | None = None,
+	) -> None:
+		super().__init__(parent)
+		self.setObjectName("DocCountStepper")
+		self._min = minimum
+		self._max = maximum
+		self._value = max(minimum, min(maximum, value))
+
+		layout = QHBoxLayout(self)
+		layout.setContentsMargins(6, 6, 6, 6)
+		layout.setSpacing(8)
+
+		self._minus = CircleGlyphButton("minus", "#4F46E5", "#4338CA", 32)
+		self._minus.setObjectName("StepperButton")
+		self._minus.setToolTip("문서 수 줄이기")
+		self._minus.clicked.connect(lambda: self._step(-1))
+
+		self._value_label = QLabel()
+		self._value_label.setObjectName("StepperValue")
+		self._value_label.setAlignment(Qt.AlignCenter)
+		self._value_label.setMinimumWidth(58)
+
+		self._plus = CircleGlyphButton("plus", "#4F46E5", "#4338CA", 32)
+		self._plus.setObjectName("StepperButton")
+		self._plus.setToolTip("문서 수 늘리기")
+		self._plus.clicked.connect(lambda: self._step(1))
+
+		layout.addWidget(self._minus)
+		layout.addWidget(self._value_label, 1)
+		layout.addWidget(self._plus)
+
+		self._sync()
+
+	def value(self) -> int:
+		return self._value
+
+	def setValue(self, value: int) -> None:
+		clamped = max(self._min, min(self._max, int(value)))
+		changed = clamped != self._value
+		self._value = clamped
+		self._sync()
+		if changed:
+			self.valueChanged.emit(self._value)
+
+	def _step(self, delta: int) -> None:
+		self.setValue(self._value + delta)
+
+	def _sync(self) -> None:
+		self._value_label.setText(f"{self._value} 개")
+		self._minus.setEnabled(self._value > self._min)
+		self._plus.setEnabled(self._value < self._max)
 
 
 class InfoTile(QFrame):
@@ -236,6 +310,10 @@ class DocumentBar(QFrame):
 		self._open_button.setText(f"{summary_path.name} ↗")
 		self._open_button.setToolTip(str(summary_path))
 
+	def is_summary_ready(self) -> bool:
+		"""True once this document has been summarized (doc_summarized event)."""
+		return self._summary_path is not None
+
 	def _apply_pending_state(self) -> None:
 		self._summary_path = None
 		self._open_button.setEnabled(False)
@@ -300,11 +378,34 @@ class ResearchPage(QWidget):
 	# refresh logic that would clobber the in-progress research display.
 	workspaceCreated = Signal(str, str)
 
+	# Progress is driven by *document count* against the user-requested total
+	# (`_max_docs`), not by backend stage names. The collection loop owns the
+	# `_COUNT_BAND_START`..`_COUNT_BAND_END` slice of the bar — within it the
+	# percentage is purely "docs done / docs requested". Stages before the
+	# first document get a small floor so the bar is not pinned at 0 while the
+	# agent plans; the post-collection stages fill the remaining tail.
+	_PRE_FLOOR = {
+		"term_grounding": 3.0,
+		"query_plan": 6.0,
+		"web_search": 9.0,
+		"fetch_webpage": 9.0,
+	}
+	_TAIL_FLOOR = {
+		"final_report": 92.0,
+		"indexing": 97.0,
+		"completed": 100.0,
+	}
+	_COUNT_BAND_START = 10.0
+	_COUNT_BAND_END = 90.0
+
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self._url_rows: list[tuple[QFrame, QLineEdit]] = []
 		self._workspace_id = current_workspace_id()
 		self._progress_poller: ResearchProgressPoller | None = None
+		# How many documents the next run should collect. Mirrors the spin box
+		# below; also used as the denominator for the count-based progress bar.
+		self._max_docs = DEFAULT_RESEARCH_DOCS
 		# Controller-side document model keyed by doc_id. Bars are created on
 		# `doc_fetched` events and activated on `doc_summarized`. The final
 		# response reconciles anything that polling may have missed.
@@ -337,11 +438,8 @@ class ResearchPage(QWidget):
 		reference_label = QLabel("레퍼런스 사이트")
 		reference_label.setObjectName("CardPrimary")
 
-		add_url_btn = QToolButton()
+		add_url_btn = CircleGlyphButton("plus", "#FFFFFF", "#FFFFFF", 30)
 		add_url_btn.setObjectName("RoundAddButton")
-		add_url_btn.setText("+")
-		add_url_btn.setFixedSize(30, 30)
-		add_url_btn.setCursor(Qt.PointingHandCursor)
 		add_url_btn.setToolTip("레퍼런스 URL 추가")
 		add_url_btn.clicked.connect(lambda: self.add_reference_url())
 
@@ -357,6 +455,39 @@ class ResearchPage(QWidget):
 		guide.setObjectName("CardSecondary")
 		guide.setWordWrap(True)
 
+		# User-configurable cap on how many documents AutoSurvey collects,
+		# presented as a self-contained settings row so it reads as a
+		# deliberate control rather than a stray field.
+		count_card = QFrame()
+		count_card.setObjectName("ResearchCountCard")
+		count_card_layout = QHBoxLayout(count_card)
+		count_card_layout.setContentsMargins(16, 13, 16, 13)
+		count_card_layout.setSpacing(14)
+
+		count_text_col = QVBoxLayout()
+		count_text_col.setContentsMargins(0, 0, 0, 0)
+		count_text_col.setSpacing(3)
+		count_title = QLabel("최대 조사 문서 수")
+		count_title.setObjectName("ResearchCountTitle")
+		count_hint = QLabel(
+			f"AutoSurvey가 수집할 문서 수입니다. 기본 {DEFAULT_RESEARCH_DOCS}개이며 "
+			f"{MIN_RESEARCH_DOCS}~{MAX_RESEARCH_DOCS}개 범위에서 조절할 수 있습니다."
+		)
+		count_hint.setObjectName("ResearchCountHint")
+		count_hint.setWordWrap(True)
+		count_text_col.addWidget(count_title)
+		count_text_col.addWidget(count_hint)
+
+		self.doc_count_stepper = DocCountStepper(
+			MIN_RESEARCH_DOCS, MAX_RESEARCH_DOCS, DEFAULT_RESEARCH_DOCS
+		)
+		self.doc_count_stepper.setToolTip(
+			f"조사할 문서 수를 {MIN_RESEARCH_DOCS}~{MAX_RESEARCH_DOCS}개 범위에서 설정합니다."
+		)
+
+		count_card_layout.addLayout(count_text_col, 1)
+		count_card_layout.addWidget(self.doc_count_stepper, 0, Qt.AlignVCenter)
+
 		action_row = QHBoxLayout()
 		action_row.addStretch(1)
 		self.run_button = AppButton("조사 실행")
@@ -367,28 +498,19 @@ class ResearchPage(QWidget):
 		content_card.layout.addWidget(self.research_input)
 		content_card.layout.addLayout(reference_header)
 		content_card.layout.addLayout(self.url_list)
+		content_card.layout.addWidget(count_card)
 		content_card.layout.addWidget(guide)
 		content_card.layout.addLayout(action_row)
 		root.addWidget(content_card)
 
 		result_card = CardWidget("조사 결과")
 		self._final_path: Path | None = None
+		self._progress_estimate = 0.0
+		self._research_error_message = ""
 
-		header_row = QHBoxLayout()
-		header_row.setContentsMargins(0, 0, 0, 0)
-		header_row.setSpacing(8)
-		self.status_pill = StatusPill()
-		header_row.addWidget(self.status_pill, 0, Qt.AlignLeft)
-		header_row.addStretch(1)
-		result_card.layout.addLayout(header_row)
-
-		self.progress_line = QLabel("")
-		self.progress_line.setObjectName("ResearchProgressLine")
-		self.progress_line.setWordWrap(False)
-		self.progress_line.setTextFormat(Qt.PlainText)
-		self.progress_line.setStyleSheet("color: #9CA3AF; font-size: 12px; font-weight: 500;")
-		self.progress_line.setVisible(False)
-		result_card.layout.addWidget(self.progress_line)
+		self.progress_bar = ResearchProgressBar()
+		self.progress_bar.errorClicked.connect(self._show_research_error)
+		result_card.layout.addWidget(self.progress_bar)
 
 		info_row = QHBoxLayout()
 		info_row.setContentsMargins(0, 0, 0, 0)
@@ -448,11 +570,8 @@ class ResearchPage(QWidget):
 		url_input.setPlaceholderText("https://example.com/report")
 		url_input.setText(url)
 
-		remove_btn = QToolButton()
+		remove_btn = CircleGlyphButton("cross", "#64748B", "#B91C1C", 26)
 		remove_btn.setObjectName("UrlRemoveButton")
-		remove_btn.setText("x")
-		remove_btn.setFixedSize(26, 26)
-		remove_btn.setCursor(Qt.PointingHandCursor)
 		remove_btn.setToolTip("URL 삭제")
 		remove_btn.clicked.connect(lambda _checked=False, target=row: self._remove_reference_url(target))
 
@@ -474,12 +593,14 @@ class ResearchPage(QWidget):
 
 		self._workspace_id = current_workspace_id()
 		reference_urls = self.get_reference_urls()
+		self._max_docs = self.doc_count_stepper.value()
 		started = get_job_manager().submit(
 			JobCategory.RESEARCH,
 			AgentController().run_research,
 			self._workspace_id,
 			instruction,
 			reference_urls,
+			self._max_docs,
 			on_success=self._on_research_finished,
 			on_error=self._on_research_failed,
 		)
@@ -493,15 +614,19 @@ class ResearchPage(QWidget):
 		self.info_row_widget.setVisible(False)
 		self.documents_header.setVisible(False)
 		self.result_empty.setVisible(False)
-		self.status_pill.set_state("running")
-		self.progress_line.setText("조사 준비 중...")
-		self.progress_line.setVisible(True)
+		self._progress_estimate = 0.0
+		self._research_error_message = ""
+		self.progress_bar.start()
 		self._start_progress_poller()
 
 	def _sync_busy_state(self) -> None:
 		"""Reflect the global JobManager state on this page's controls."""
 		manager = get_job_manager()
-		self.run_button.setEnabled(not manager.is_blocked(JobCategory.RESEARCH))
+		can_run = not manager.is_blocked(JobCategory.RESEARCH)
+		self.run_button.setEnabled(can_run)
+		# The doc-count cap belongs to the *next* run; lock it while one is
+		# already in flight so it can't look like it affects the live job.
+		self.doc_count_stepper.setEnabled(can_run)
 
 	def _start_progress_poller(self) -> None:
 		self._stop_progress_poller()
@@ -522,6 +647,7 @@ class ResearchPage(QWidget):
 		"""Route each backend progress event to the right view update.
 
 		Stage handlers are intentionally small and side-effect-only:
+<<<<<<< HEAD
 		- `workspace_created` → swap to the new workspace (info tiles +
 		  emit `workspaceCreated` so sidebar/chat reset live)
 		- `doc_fetched`       → add a pending DocumentBar
@@ -529,8 +655,21 @@ class ResearchPage(QWidget):
 		- any other stage     → refresh the gray single-line progress label
 		The latest message wins on the progress label, mirroring the previous
 		behavior.
+=======
+		- `doc_fetched`     → add a pending DocumentBar
+		- `doc_summarized`  → activate the matching bar
+		- every stage       → advance the progress-bar estimate
+		The latest message wins on the progress-bar caption, mirroring the
+		previous single-line behavior.
+>>>>>>> 86373f7ad4e339460fa911e3cd3a1ea8a23abe8c
 		"""
+		# A final batch can still be queued cross-thread after the poller is
+		# stopped and the result already rendered; dropping it here keeps a
+		# stale event from flipping the completed bar back to "running".
+		if self._progress_poller is None:
+			return
 		latest_message = ""
+		before = self._progress_estimate
 		for event in items:
 			if not isinstance(event, dict):
 				continue
@@ -543,11 +682,13 @@ class ResearchPage(QWidget):
 				self._add_pending_document_bar(detail)
 			elif stage == "doc_summarized":
 				self._activate_document_bar(detail)
+			self._bump_progress_estimate(stage)
 			if message:
 				latest_message = message
-		if latest_message:
-			self._set_progress_line(latest_message)
+		if self._progress_estimate != before or latest_message:
+			self.progress_bar.set_progress(self._progress_estimate, latest_message or None)
 
+<<<<<<< HEAD
 	def _adopt_new_workspace(self, detail: dict) -> None:
 		"""Reflect a freshly-reserved workspace in the result card.
 
@@ -576,6 +717,49 @@ class ResearchPage(QWidget):
 			text = text[:197] + "..."
 		self.progress_line.setText(text)
 		self.progress_line.setVisible(True)
+=======
+	def _bump_progress_estimate(self, stage: str) -> None:
+		"""Advance the monotonic progress estimate after one backend stage.
+
+		The headline number is count-based: within the collection band the
+		percentage is simply "documents done / documents requested". Stages
+		before the first document only raise a small floor; the closing
+		stages (final report, indexing, completed) fill the tail. The
+		estimate never moves backward.
+		"""
+		stage = (stage or "").strip()
+		tail = self._TAIL_FLOOR.get(stage)
+		if tail is not None:
+			target = tail
+		else:
+			target = max(self._PRE_FLOOR.get(stage, 0.0), self._count_progress())
+		self._progress_estimate = min(100.0, max(self._progress_estimate, target))
+
+	def _count_progress(self) -> float:
+		"""Percentage derived purely from how many of the requested documents
+		have been collected so far, scaled across the collection band.
+
+		A document that has been fetched but not yet summarized counts as
+		half done; a summarized document counts as whole. This is what makes
+		the bar read as "전체 N개 중 몇 개 진행" rather than a stage guess.
+		"""
+		total = max(1, self._max_docs)
+		fetched = len(self._doc_bars)
+		if fetched == 0:
+			# Nothing collected yet — let the pre-collection floors drive the
+			# bar rather than pinning it at the band start.
+			return 0.0
+		summarized = sum(
+			1 for bar in self._doc_bars.values() if bar.is_summary_ready()
+		)
+		done = min(float(total), (fetched + summarized) / 2.0)
+		span = self._COUNT_BAND_END - self._COUNT_BAND_START
+		return self._COUNT_BAND_START + (done / total) * span
+
+	def _doc_count_text(self) -> str:
+		"""Caption for the '수집된 문서 수' tile — collected vs. requested."""
+		return f"{len(self._doc_bars)} / {self._max_docs}건"
+>>>>>>> 86373f7ad4e339460fa911e3cd3a1ea8a23abe8c
 
 	def _add_pending_document_bar(self, detail: dict) -> None:
 		doc_id = str(detail.get("doc_id") or "").strip()
@@ -590,7 +774,7 @@ class ResearchPage(QWidget):
 		# First arrival flips the section from "empty" to "list-of-bars".
 		self.documents_header.setVisible(True)
 		self.result_empty.setVisible(False)
-		self.info_doc_count.set_value(f"{len(self._doc_bars)}건")
+		self.info_doc_count.set_value(self._doc_count_text())
 		self.info_row_widget.setVisible(True)
 
 	def _activate_document_bar(self, detail: dict) -> None:
@@ -611,7 +795,6 @@ class ResearchPage(QWidget):
 	def _on_research_finished(self, response: dict[str, Any]) -> None:
 		# Button re-enable is handled by JobManager.busy_changed → _sync_busy_state.
 		self._stop_progress_poller()
-		self.progress_line.setVisible(False)
 		try:
 			load_bootstrap_state()
 		except Exception:
@@ -619,7 +802,13 @@ class ResearchPage(QWidget):
 		workspace_name = str(response.get("workspaceName") or response.get("workspaceId") or "")
 		if workspace_name:
 			self.workspaceChanged.emit(workspace_name)
-		self._render_result(response)
+		self._render_result(response, from_live=True)
+
+	def _show_research_error(self) -> None:
+		"""Surface the persisted error detail when the failed bar is clicked."""
+		if not self._research_error_message:
+			return
+		QMessageBox.critical(self, "조사 오류", self._research_error_message)
 
 	def set_workspace_by_name(self, _workspace_name: str) -> None:
 		self._workspace_id = current_workspace_id()
@@ -655,33 +844,41 @@ class ResearchPage(QWidget):
 	def _on_research_failed(self, message: str) -> None:
 		# Button re-enable is handled by JobManager.busy_changed → _sync_busy_state.
 		self._stop_progress_poller()
-		self.progress_line.setVisible(False)
 		self._clear_documents()
 		self.info_row_widget.setVisible(False)
 		self.documents_header.setVisible(False)
 		self.result_empty.setVisible(False)
-		self.status_pill.set_state("failed", error_message=message or "알 수 없는 오류가 발생했습니다.")
+		self._research_error_message = message or "알 수 없는 오류가 발생했습니다."
+		self.progress_bar.mark_failed(self._research_error_message)
 
-	def _render_result(self, response: dict[str, Any]) -> None:
+	def _render_result(self, response: dict[str, Any], from_live: bool = False) -> None:
 		"""Apply final/persisted job state to the result card.
 
-		Header info (status pill, info tiles) is always refreshed from the
+		Header info (progress bar, info tiles) is always refreshed from the
 		response. Document bars are *reconciled* in place: bars that were
 		already created from live events are kept and merely have their
 		summary path filled in if needed; bars for documents that the live
 		stream missed are appended. This preserves the realtime UX while
 		guaranteeing the final view matches the persisted truth.
+
+		`from_live` is True only when called straight off a just-finished run,
+		in which case the completed bar animates to 100%; when restoring a
+		persisted job it snaps there instead.
 		"""
 		status = str(response.get("status") or "").lower().strip()
 		error_message = str(response.get("error") or "").strip()
 		if status == "completed":
-			self.status_pill.set_state("completed")
+			self._research_error_message = ""
+			self.progress_bar.mark_completed(animate=from_live)
 		elif status == "failed":
-			self.status_pill.set_state("failed", error_message=error_message or "조사 작업이 실패했습니다.")
+			self._research_error_message = error_message or "조사 작업이 실패했습니다."
+			self.progress_bar.mark_failed(self._research_error_message)
 		elif status == "running":
-			self.status_pill.set_state("running")
+			self._research_error_message = ""
+			self.progress_bar.restore_running(self._progress_estimate)
 		else:
-			self.status_pill.set_state("idle")
+			self._research_error_message = ""
+			self.progress_bar.set_idle()
 
 		documents = response.get("documents", [])
 		if not isinstance(documents, list):
@@ -696,6 +893,15 @@ class ResearchPage(QWidget):
 		)
 		final_path_raw = str(response.get("finalPath") or "").strip()
 		self._final_path = Path(final_path_raw) if final_path_raw else None
+
+		# Persisted/finished jobs carry the doc cap they ran with; adopt it so
+		# the count tile's denominator matches what this job actually used.
+		max_docs_value = response.get("maxDocs")
+		try:
+			if max_docs_value is not None and int(max_docs_value) > 0:
+				self._max_docs = int(max_docs_value)
+		except (TypeError, ValueError):
+			pass
 
 		self.info_job_name.set_value(job_name)
 		self.info_save_path.set_value(final_path_raw or "-")
@@ -736,7 +942,7 @@ class ResearchPage(QWidget):
 				summary_path = summary_dir / f"doc_{doc_id}.md"
 				if summary_path.exists():
 					bar.set_summary_ready(summary_path)
-		self.info_doc_count.set_value(f"{len(self._doc_bars)}건")
+		self.info_doc_count.set_value(self._doc_count_text())
 
 	def _summary_dir_from_final_path(self, final_path: Path | None) -> Path | None:
 		if final_path is None:
@@ -757,7 +963,8 @@ class ResearchPage(QWidget):
 
 	def _show_message(self, text: str) -> None:
 		self._clear_documents()
-		self.status_pill.set_state("idle")
+		self._research_error_message = ""
+		self.progress_bar.set_idle()
 		self.info_row_widget.setVisible(False)
 		self.documents_header.setVisible(False)
 		self.result_empty.setText(text)
