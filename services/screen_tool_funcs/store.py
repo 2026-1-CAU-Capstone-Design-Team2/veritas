@@ -97,26 +97,9 @@ class ScreenContextStore:
         return records[-limit:]
 
     def enqueue_intervention(self, payload: dict[str, Any]) -> None:
-        """Append one approved intervention to the durable FIFO queue.
-
-        Earlier versions used latest_intervention.json as the effective queue and
-        rewrote intervention_queue.json with only the newest payload. That made
-        screen assists fragile: a newly approved event could overwrite an older
-        pending event, and consume_interventions could clear the whole queue even
-        when only one item was requested. The chat-side consumer now gets a real
-        FIFO queue while latest_intervention.json remains a diagnostic snapshot.
-        """
+        # 단일 슬롯 큐로 구현.
         with self._lock:
-            queue = self._load_pending_interventions_unlocked()
-            event_id = str(payload.get("event_id") or "").strip()
-            if event_id:
-                queue = [
-                    item
-                    for item in queue
-                    if str(item.get("event_id") or "").strip() != event_id
-                ]
-            queue.append(payload)
-            queue = queue[-50:]
+            queue = [payload]
 
             self._write_json_atomic(self.latest_intervention_path, payload, indent=2)
             self._write_pending_interventions_unlocked(queue)

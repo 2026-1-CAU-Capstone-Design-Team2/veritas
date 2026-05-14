@@ -23,9 +23,17 @@ from .ui_automation import UiAutomationReader
 from .window_context import WindowContextReader
 
 
+"""
+producer: ScreenContextService 폴링 스레드 -> decide() -> dispatcher.dispatch() -> store.enqueue_intervention() (디스크 intervention_queue.json에 append)
+
+consumer: ChatAgent._screen_intervention_loop — 별도 스레드. consume(limit=1) -> answer_screen_intervention()에서 ~30초 블로킹 LLM 호출 -> 반복
+"""
 class ScreenContextService:
     """OCR/PID를 주기적으로 수집하고 agent용 최종 context를 저장합니다."""
+    # consumer 중단으로 인해 큐에 끼인 항목을 점유로 간주하지 않기 위해 LLM timeout 시간보다 큰 경우에만 큐에 남은 항목을 인플라이트로 간주하도록 함
+    INTERVENTION_MAX_INFLIGHT_SEC = 300.0
 
+    # 수집기/필터/detector/scheduler/dispatcher 구성, 공유 시나리오 리스트 주입
     def __init__(
         self,
         root: str | Path,
@@ -85,6 +93,7 @@ class ScreenContextService:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
+    # 한 번 캡처: 텍스트 수집 -> filtered -> decide -> 이벤트 저장 -> dispatch
     def capture_once(self) -> ScreenContextEvent:
         window = self.window_reader.read_foreground()
         app_text = self._read_app_text_first(window)
@@ -115,10 +124,12 @@ class ScreenContextService:
             previous_text=self._previous_active_text,
         )
         history_events = self.store.load_recent(self.intervention_detector.history_window - 1)
+        pipeline_busy = self._intervention_pipeline_busy()
         intervention = self.intervention_detector.decide(
             window=window,
             filtered=filtered,
             history_events=history_events,
+            schedule=not pipeline_busy,
         )
         diagnostics = self.diagnose_capture(
             window=window,
@@ -145,6 +156,22 @@ class ScreenContextService:
         self._log_capture_event(event)
         return event
 
+    # 큐에 in-flight 개입이 있으면 True. consumer가 LLM 처리 동안 큐에서 제거하지 않으므로 큐 non-empty = 파이프라인 점유
+    # consumer 중단으로 끼인 항목(captured_at age > INTERVENTION_MAX_INFLIGHT_SEC)은 제외
+    def _intervention_pipeline_busy(self) -> bool:
+        pending = self.store.load_pending_interventions(limit=1)
+        if not pending:
+            return False
+        captured_at = str(pending[0].get("captured_at") or "").strip()
+        if not captured_at:
+            return True
+        try:
+            age = (datetime.now() - datetime.fromisoformat(captured_at)).total_seconds()
+        except ValueError:
+            return True
+        return age <= self.INTERVENTION_MAX_INFLIGHT_SEC
+
+    # 저장된 이벤트로부터 진단 dict를 재계산
     def diagnose_event(self, event: ScreenContextEvent) -> dict:
         return self.diagnose_capture(
             window=event.window,
@@ -155,6 +182,7 @@ class ScreenContextService:
             intervention=event.intervention,
         )
 
+    # 캡처 구성요소로 진단 dict 생성 (텍스트 유무/소스/confidence/개입 여부)
     def diagnose_capture(
         self,
         *,
@@ -202,6 +230,7 @@ class ScreenContextService:
             },
         }
 
+    # active_editor_text가 어느 소스(app_text/UIA/OCR)에서 왔는지 판별
     def _diagnose_text_source(
         self,
         *,
@@ -221,6 +250,7 @@ class ScreenContextService:
             return "ocr"
         return "filtered"
 
+    # scenario_scheduler 시작 + 폴링 스레드 기동
     def start_polling(self) -> None:
         if self._thread and self._thread.is_alive():
             return
@@ -230,18 +260,22 @@ class ScreenContextService:
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
 
+    # 폴링 스레드 정지 + scenario_scheduler 정지(상태 flush)
     def stop_polling(self) -> None:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=self.interval_sec + 1)
         self.scenario_scheduler.stop()
 
+    # 폴링 스레드가 살아있는지 여부
     def is_polling(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
 
+    # 마지막 폴링 사이클의 에러 메시지 (없으면 None)
     def last_poll_error(self) -> str | None:
         return self._last_poll_error
 
+    # interval_sec 주기로 capture_once를 반복 실행하는 폴링 루프
     def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
             started_at = time.monotonic()
@@ -256,6 +290,7 @@ class ScreenContextService:
             remaining = max(self.interval_sec - elapsed, 0.0)
             self._stop_event.wait(remaining)
 
+    # 캡처 이벤트를 capture log에 기록, console_log면 콘솔에도 출력
     def _log_capture_event(self, event: ScreenContextEvent) -> None:
         diagnostics = event.diagnostics or {}
         blockers = diagnostics.get("intervention_blockers") or []
@@ -334,6 +369,7 @@ class ScreenContextService:
                 f"event={event.event_id} no_readable_text errors={extractor_errors}"
             )
 
+    # 디버그용: 추출 텍스트 길이·미리보기를 콘솔 출력
     def _log_debug_text(self, event: ScreenContextEvent, diagnostics: dict) -> None:
         filtered = event.filtered
         print(
@@ -352,6 +388,7 @@ class ScreenContextService:
                 f"preview={self._preview_text(event.ocr.text)!r}"
             )
 
+    # 디버그용: 공통 게이트/시나리오 게이트/선택 결과를 콘솔 출력
     def _log_debug_decision(self, event: ScreenContextEvent) -> None:
         metadata = event.intervention.metadata or {}
         common_checks = metadata.get("common_checks") or {}
@@ -393,6 +430,7 @@ class ScreenContextService:
                 f"vruntimes={vruntimes}"
             )
 
+    # 공통 게이트별 디버그 출력 문자열 포맷
     def _format_common_check_detail(self, name: str, check: dict) -> str:
         reason = str(check.get("reason") or "")
         if name == "editing_app":
@@ -414,20 +452,24 @@ class ScreenContextService:
             )
         return f"reason={reason}"
 
+    # 텍스트를 공백 정규화 후 limit 길이로 잘라 미리보기 문자열 생성
     def _preview_text(self, text: str, *, limit: int = 220) -> str:
         value = " ".join(str(text or "").split()).strip()
         if len(value) <= limit:
             return value
         return value[: limit - 3] + "..."
 
+    # 현재 시각 기반 이벤트 ID 생성 (YYYYMMDD_HHMMSS_us)
     def _new_event_id(self) -> str:
         return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
+    # 텍스트 추출 대상 앱이면 UI Automation으로 focused 텍스트를 읽음
     def _read_text_first(self, window) -> UiAutomationResult:
         if not self._is_text_extraction_target(window):
             return UiAutomationResult(error="skipped: foreground app is not a text extraction target.")
         return self.ui_reader.read_focused(window)
 
+    # foreground 앱이 텍스트 추출 대상인지(프로세스명·확장자) 판별
     def _is_text_extraction_target(self, window) -> bool:
         process_name = (window.process_name or "").lower()
         if process_name in {
@@ -449,13 +491,16 @@ class ScreenContextService:
         title = (window.window_title or "").lower()
         return any(title.endswith(ext) or ext in title for ext in (".txt", ".md", ".doc", ".hwp", ".ppt", ".pptx"))
 
+    # UI Automation 결과가 쓸 만한지(텍스트 존재 + 품질) 판별
     def _is_usable_text_source(self, result: UiAutomationResult) -> bool:
         return bool(result.text and result.source_quality in {"primary", "usable"})
 
+    # 앱 전용 reader로 텍스트를 읽음 (현재 PowerPoint COM만)
     def _read_app_text_first(self, window) -> AppTextResult:
         if (window.process_name or "").lower() == "powerpnt.exe":
             return self.powerpoint_reader.read_active_slide(window)
         return AppTextResult(error="skipped: no app-specific text reader.")
 
+    # 앱 전용 추출 결과가 쓸 만한지(텍스트 존재 + 품질) 판별
     def _is_usable_app_text(self, result: AppTextResult) -> bool:
         return bool(result.text and result.source_quality in {"primary", "usable"})

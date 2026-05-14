@@ -66,12 +66,15 @@ class InterventionDetector:
             for scenario in self.scenarios
         }
 
+    # decide()는 캡처 시점의 window/filtered/history_events를 바탕으로 intervention 여부와 시나리오 선택을 결정한다.
+    # schedule=True인 경우 시나리오 스코어링 후 CFS 스케줄링까지 수행, False인 경우 common gate와 시나리오 게이트 결과만 반환 (CFS 스케줄링은 하지 않음)
     def decide(
         self,
         *,
         window: WindowContext,
         filtered: FilteredScreenContext,
         history_events: list[dict[str, Any]] | None = None,
+        schedule: bool = True,
     ) -> InterventionDecision:
         history_events = history_events or []
         current_snapshot = self._snapshot(window=window, filtered=filtered)
@@ -175,7 +178,7 @@ class InterventionDetector:
         ready_names = [name for name, ev in scenario_results.items() if ev.ready]
         scheduler_snapshot: dict[str, Any] | None = None
         selected_name: str | None = None
-        if ready_names and self.scheduler is not None:
+        if schedule and ready_names and self.scheduler is not None:
             # 발동 시점의 정규화 문서 길이 — 글자수 기반 cooldown 판정용
             doc_chars = len(" ".join((filtered.active_editor_text or "").split()))
             selected_name = self.scheduler.select_and_charge(
@@ -187,7 +190,7 @@ class InterventionDetector:
             scheduler_snapshot = self.scheduler.snapshot(
                 current_snapshot["document_key"], now=now
             )
-        elif ready_names:
+        elif schedule and ready_names:
             selected_name = ready_names[0]
 
         scenarios_meta = {
