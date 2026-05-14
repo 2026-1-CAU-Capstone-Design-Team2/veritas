@@ -52,7 +52,13 @@ class ApiClient:
         request = urllib.request.Request(url, method="GET")
         return self._send_json(request)
 
-    def post(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def post(
+        self,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         data = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             self._url(path),
@@ -60,7 +66,7 @@ class ApiClient:
             method="POST",
             headers={"Content-Type": "application/json"},
         )
-        return self._send_json(request)
+        return self._send_json(request, timeout=timeout)
 
     def delete(self, path: str, query: dict[str, Any] | None = None) -> dict[str, Any]:
         request = urllib.request.Request(self._url(path, query), method="DELETE")
@@ -166,9 +172,14 @@ class ApiClient:
         cleaned = {k: v for k, v in query.items() if v is not None}
         return f"{url}?{urlencode(cleaned)}" if cleaned else url
 
-    def _send_json(self, request: urllib.request.Request) -> dict[str, Any]:
+    def _send_json(
+        self,
+        request: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         try:
-            with urllib.request.urlopen(request, timeout=600) as response:
+            with urllib.request.urlopen(request, timeout=timeout or 600) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", errors="ignore")

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 _STATE_COLORS = {
 	"running": ("#6366F1", "#3B82F6", "#E0E7FF", "#3730A3", "#C7D2FE"),
 	"completed": ("#34D399", "#10B981", "#DCFCE7", "#15803D", "#86EFAC"),
+	"partial": ("#FBBF24", "#F59E0B", "#FEF3C7", "#B45309", "#FCD34D"),
 	"failed": ("#F87171", "#EF4444", "#FEE2E2", "#B91C1C", "#FCA5A5"),
 }
 _TRACK_BG = "#E8EDF4"
@@ -163,6 +164,7 @@ class ResearchProgressBar(QFrame):
 	_STATE_LABEL = {
 		"running": "진행 중",
 		"completed": "완료",
+		"partial": "일부 오류 발생",
 		"failed": "오류",
 	}
 
@@ -255,6 +257,27 @@ class ResearchProgressBar(QFrame):
 		self._apply_chip("completed")
 		self._apply_caption("조사가 완료되었습니다.", "#15803D")
 
+	def mark_partial(self, animate: bool = True) -> None:
+		"""Run finished, but some documents failed to summarize.
+
+		The bar fills to 100% in amber and stays clickable so the page can
+		surface the per-document failure list via :attr:`errorClicked`.
+		"""
+		self._state = "partial"
+		self._error_message = ""
+		self.setCursor(Qt.PointingHandCursor)
+		self.setVisible(True)
+		self._track.set_state("partial")
+		if animate:
+			self._track.animate_to(1.0)
+		else:
+			self._track.set_ratio_immediate(1.0)
+		self._apply_chip("partial")
+		self._apply_caption(
+			"일부 문서 요약에 실패했습니다. 클릭하면 실패한 문서를 확인할 수 있습니다.",
+			"#B45309",
+		)
+
 	def mark_failed(self, error_message: str = "") -> None:
 		self._state = "failed"
 		self._error_message = error_message or ""
@@ -300,11 +323,9 @@ class ResearchProgressBar(QFrame):
 		)
 
 	def mousePressEvent(self, event) -> None:  # type: ignore[override]
-		if (
-			event.button() == Qt.LeftButton
-			and self._state == "failed"
-			and self._error_message
-		):
+		# Both "failed" (error message) and "partial" (failed-document list)
+		# are clickable; the page decides which detail to surface.
+		if event.button() == Qt.LeftButton and self._state in ("failed", "partial"):
 			self.errorClicked.emit()
 			event.accept()
 			return

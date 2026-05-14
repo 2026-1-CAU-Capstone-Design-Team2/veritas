@@ -299,6 +299,7 @@ class AutoSurveyWorkflow:
                 "skipped_duplicate_doc_ids": [],
                 "skipped_not_in_cycle_doc_ids": [],
                 "failed_doc_ids": [],
+                "failed_documents": [],
                 "batch_result": {"batch_files": [], "count": 0},
             }
 
@@ -334,6 +335,22 @@ class AutoSurveyWorkflow:
                 detail={
                     "doc_id": doc_id_str,
                     "summary_path": summary_path_str,
+                },
+            )
+        for failed in data.get("failed_documents", []) or []:
+            if not isinstance(failed, dict):
+                continue
+            doc_id_str = str(failed.get("docId") or "").strip()
+            if not doc_id_str:
+                continue
+            reason = str(failed.get("reason") or "요약 실패").strip()
+            self._emit_progress(
+                "doc_failed",
+                f"요약 실패: doc_{doc_id_str}",
+                detail={
+                    "doc_id": doc_id_str,
+                    "title": str(failed.get("title") or doc_id_str),
+                    "reason": reason,
                 },
             )
         return data
@@ -571,6 +588,14 @@ class AutoSurveyWorkflow:
 
         final_result = self.run_final(user_request=user_request)
 
+        summarize_results = [reference_summarize_result, scout_summarize_result]
+        summarize_results.extend(
+            iteration.get("summarize_result")
+            for iteration in iterations
+            if isinstance(iteration, dict)
+        )
+        failed_documents = self._aggregate_failed_documents(summarize_results)
+
         return {
             "grounding": grounding,
             "reference_collect_result": reference_collect_result,
@@ -581,7 +606,39 @@ class AutoSurveyWorkflow:
             "active_plan": active_plan,
             "iterations": iterations,
             "final_result": final_result,
+            "failed_documents": failed_documents,
         }
+
+    def _aggregate_failed_documents(
+        self,
+        summarize_results: list[Any],
+    ) -> list[dict[str, str]]:
+        """Collect per-document summarization failures across every cycle.
+
+        Each ``run_summarize`` call returns its own ``failed_documents`` list;
+        this merges them (deduped by docId) so the run as a whole can report
+        exactly which documents could not be summarized and why.
+        """
+        aggregated: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for result in summarize_results:
+            if not isinstance(result, dict):
+                continue
+            for failed in result.get("failed_documents", []) or []:
+                if not isinstance(failed, dict):
+                    continue
+                doc_id = str(failed.get("docId") or "").strip()
+                if not doc_id or doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                aggregated.append(
+                    {
+                        "docId": doc_id,
+                        "title": str(failed.get("title") or doc_id),
+                        "reason": str(failed.get("reason") or "요약 실패"),
+                    }
+                )
+        return aggregated
 
     def _already_seen_url(self, records: list[DocRecord], url: str) -> bool:
         canonical_url = self._canonicalize_url(url)

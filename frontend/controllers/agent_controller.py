@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Iterator
 
 from ..api_common import api_client
+
+
+# An AutoSurvey run blocks the POST /research/jobs request for the whole
+# workflow (the route is synchronous by design). Allow a long ceiling so a
+# normal multi-document run on a local model is not cut off mid-run by the
+# default request timeout — the run continues server-side regardless, but a
+# client-side timeout would surface as a spurious "오류" in the UI.
+RESEARCH_JOB_TIMEOUT_SEC = float(os.getenv("VERITAS_RESEARCH_JOB_TIMEOUT_SEC", "5400"))
 
 
 class AgentController:
@@ -61,7 +70,11 @@ class AgentController:
 		}
 		if max_docs is not None:
 			payload["maxDocs"] = int(max_docs)
-		return api_client.post("/api/v1/research/jobs", payload)
+		return api_client.post(
+			"/api/v1/research/jobs",
+			payload,
+			timeout=RESEARCH_JOB_TIMEOUT_SEC,
+		)
 
 	def list_research_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
 		response = api_client.get("/api/v1/research/jobs", {"limit": limit})

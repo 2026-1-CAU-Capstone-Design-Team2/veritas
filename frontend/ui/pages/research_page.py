@@ -260,6 +260,7 @@ class DocumentBar(QFrame):
 		)
 		self.doc_id = str(doc_id or "")
 		self._summary_path: Path | None = None
+		self._failed = False
 
 		layout = QHBoxLayout(self)
 		layout.setContentsMargins(12, 10, 12, 10)
@@ -306,13 +307,41 @@ class DocumentBar(QFrame):
 	def set_summary_ready(self, summary_path: Path) -> None:
 		"""Mark this document's summary as available and enable the open button."""
 		self._summary_path = summary_path
+		self._failed = False
 		self._open_button.setEnabled(True)
 		self._open_button.setText(f"{summary_path.name} ↗")
 		self._open_button.setToolTip(str(summary_path))
 
+	def set_failed(self, reason: str = "") -> None:
+		"""Mark this document's summarization as failed after all retries.
+
+		The run continues for the other documents; this row just turns red so
+		the failure is visible without making the whole run look failed.
+		"""
+		self._summary_path = None
+		self._failed = True
+		self._open_button.setEnabled(False)
+		self._open_button.setText("요약 실패")
+		self._open_button.setToolTip(reason or "요약에 실패했습니다.")
+		self._open_button.setStyleSheet(
+			"QPushButton { background-color: #FEE2E2; color: #B91C1C; "
+			"border: 1px solid #FCA5A5; border-radius: 8px; padding: 6px 10px; "
+			"font-size: 11px; font-weight: 800; }"
+			"QPushButton:disabled { background-color: #FEE2E2; color: #B91C1C; "
+			"border-color: #FCA5A5; }"
+		)
+		self.setStyleSheet(
+			"QFrame#ResearchDocumentBar { background-color: #FEF2F2; "
+			"border: 1px solid #FCA5A5; border-radius: 10px; }"
+		)
+
 	def is_summary_ready(self) -> bool:
 		"""True once this document has been summarized (doc_summarized event)."""
 		return self._summary_path is not None
+
+	def is_failed(self) -> bool:
+		"""True once this document's summarization has been marked failed."""
+		return self._failed
 
 	def _apply_pending_state(self) -> None:
 		self._summary_path = None
@@ -337,29 +366,63 @@ class ResearchProgressPoller(QThread):
 	"""
 
 	events = Signal(list)
+	# Emitted when the backend's progress sequence rewinds — i.e. a new run
+	# started and reset its counter. The page drops any stale view state so the
+	# live caption / percentage track the new run instead of the previous one.
+	reset_detected = Signal()
 
 	def __init__(self, parent: QObject | None = None) -> None:
 		super().__init__(parent)
 		self._cursor = 0
 		self._stop = False
 		self._sleep_ms = 800
+		# The backend keeps a process-wide progress buffer that is only reset
+		# once the new run actually starts on its worker thread. The first poll
+		# therefore just baselines the cursor at the current tail; the real
+		# run's events arrive afterwards and are caught by the rewind check.
+		self._primed = False
 
 	def request_stop(self) -> None:
 		self._stop = True
 
 	def reset(self) -> None:
 		self._cursor = 0
+		self._primed = False
 
 	def run(self) -> None:  # type: ignore[override]
 		while not self._stop:
 			try:
-				response = AgentController().get_research_progress(since=self._cursor, limit=100)
-				items = response.get("items", []) if isinstance(response, dict) else []
-				if isinstance(items, list) and items:
-					self._cursor = int(response.get("nextCursor") or self._cursor)
-					valid = [item for item in items if isinstance(item, dict)]
-					if valid:
-						self.events.emit(valid)
+				response = AgentController().get_research_progress(
+					since=self._cursor, limit=100
+				)
+				if isinstance(response, dict):
+					latest_seq = int(response.get("latestSeq") or 0)
+					if not self._primed:
+						# Skip whatever is already buffered (previous run) and
+						# start tracking from the current tail.
+						self._primed = True
+						self._cursor = latest_seq
+					else:
+						if latest_seq < self._cursor:
+							# Sequence went backwards -> a fresh run began and
+							# reset the backend counter. Rewind and replay it.
+							self._cursor = 0
+							self.reset_detected.emit()
+							response = AgentController().get_research_progress(
+								since=0, limit=100
+							)
+						items = (
+							response.get("items", [])
+							if isinstance(response, dict)
+							else []
+						)
+						if isinstance(items, list) and items:
+							self._cursor = int(
+								response.get("nextCursor") or self._cursor
+							)
+							valid = [it for it in items if isinstance(it, dict)]
+							if valid:
+								self.events.emit(valid)
 			except Exception:
 				pass
 			elapsed = 0
@@ -507,6 +570,9 @@ class ResearchPage(QWidget):
 		self._final_path: Path | None = None
 		self._progress_estimate = 0.0
 		self._research_error_message = ""
+		# Per-document summarization failures for the current/last run, used to
+		# drive the "일부 오류 발생" progress-bar state and its detail popup.
+		self._research_failed_documents: list[dict[str, Any]] = []
 
 		self.progress_bar = ResearchProgressBar()
 		self.progress_bar.errorClicked.connect(self._show_research_error)
@@ -616,6 +682,7 @@ class ResearchPage(QWidget):
 		self.result_empty.setVisible(False)
 		self._progress_estimate = 0.0
 		self._research_error_message = ""
+		self._research_failed_documents = []
 		self.progress_bar.start()
 		self._start_progress_poller()
 
@@ -632,6 +699,7 @@ class ResearchPage(QWidget):
 		self._stop_progress_poller()
 		poller = ResearchProgressPoller(self)
 		poller.events.connect(self._on_progress_events)
+		poller.reset_detected.connect(self._on_progress_reset)
 		self._progress_poller = poller
 		poller.start()
 
@@ -651,10 +719,10 @@ class ResearchPage(QWidget):
 		  emit `workspaceCreated` so sidebar/chat reset live)
 		- `doc_fetched`       → add a pending DocumentBar
 		- `doc_summarized`    → activate the matching bar
-		- any other stage     → refresh the gray single-line progress label
-    
-		The latest message wins on the progress-bar caption, mirroring the
-		previous single-line behavior.
+		- `doc_failed`        → mark the matching bar as failed
+
+		The latest message becomes the progress-bar caption, so the area under
+		the bar shows the agent's current activity in real time.
 		"""
 		# A final batch can still be queued cross-thread after the poller is
 		# stopped and the result already rendered; dropping it here keeps a
@@ -662,7 +730,6 @@ class ResearchPage(QWidget):
 		if self._progress_poller is None:
 			return
 		latest_message = ""
-		before = self._progress_estimate
 		for event in items:
 			if not isinstance(event, dict):
 				continue
@@ -675,11 +742,29 @@ class ResearchPage(QWidget):
 				self._add_pending_document_bar(detail)
 			elif stage == "doc_summarized":
 				self._activate_document_bar(detail)
+			elif stage == "doc_failed":
+				self._fail_document_bar(detail)
 			self._bump_progress_estimate(stage)
 			if message:
 				latest_message = message
-		if self._progress_estimate != before or latest_message:
-			self.progress_bar.set_progress(self._progress_estimate, latest_message or None)
+		# Always push the running estimate and the latest backend message so the
+		# bar keeps inching forward and the caption shows the agent's current
+		# activity (검색 중 / 수집 중 / 요약 중 ...) in real time.
+		self.progress_bar.set_progress(self._progress_estimate)
+		if latest_message:
+			self.progress_bar.set_caption(latest_message)
+
+	def _on_progress_reset(self) -> None:
+		"""The poller saw the backend rewind its progress counter — a new run
+		started. Drop any stale bars/estimate the poller picked up from the
+		previous run before its cursor caught the reset."""
+		if self._progress_poller is None:
+			return
+		self._clear_documents()
+		self._progress_estimate = 0.0
+		self._research_error_message = ""
+		self._research_failed_documents = []
+		self.progress_bar.start()
 
 	def _bump_progress_estimate(self, stage: str) -> None:
 		"""Advance the monotonic progress estimate after one backend stage.
@@ -741,12 +826,6 @@ class ResearchPage(QWidget):
 		self.info_row_widget.setVisible(True)
 		self.workspaceCreated.emit(workspace_id, name)
 
-	def _set_progress_line(self, message: str) -> None:
-		text = " ".join(message.split())
-		if len(text) > 200:
-			text = text[:197] + "..."
-		self.progress_line.setText(text)
-		self.progress_line.setVisible(True)
 	def _doc_count_text(self) -> str:
 		"""Caption for the '수집된 문서 수' tile — collected vs. requested."""
 		return f"{len(self._doc_bars)} / {self._max_docs}건"
@@ -782,6 +861,30 @@ class ResearchPage(QWidget):
 			return
 		bar.set_summary_ready(Path(summary_path_str))
 
+	def _fail_document_bar(self, detail: dict) -> None:
+		"""Mark a document's bar red after its summarization failed all retries.
+
+		The run keeps going for the other documents; this only flips the one
+		row so the failure is visible live instead of sitting at "요약 대기 중".
+		"""
+		doc_id = str(detail.get("doc_id") or "").strip()
+		if not doc_id:
+			return
+		bar = self._doc_bars.get(doc_id)
+		if bar is None:
+			# Failure event with no prior fetch bar (polling lag): create one so
+			# the failed document still shows up in the list.
+			title = str(detail.get("title") or doc_id)
+			index = len(self._doc_bars) + 1
+			bar = DocumentBar(index=index, doc_id=doc_id, title=title, url="")
+			self._doc_bars[doc_id] = bar
+			self.documents_container.addWidget(bar)
+			self.documents_header.setVisible(True)
+			self.result_empty.setVisible(False)
+			self.info_doc_count.set_value(self._doc_count_text())
+			self.info_row_widget.setVisible(True)
+		bar.set_failed(str(detail.get("reason") or ""))
+
 	def _on_research_finished(self, response: dict[str, Any]) -> None:
 		# Button re-enable is handled by JobManager.busy_changed → _sync_busy_state.
 		self._stop_progress_poller()
@@ -795,10 +898,33 @@ class ResearchPage(QWidget):
 		self._render_result(response, from_live=True)
 
 	def _show_research_error(self) -> None:
-		"""Surface the persisted error detail when the failed bar is clicked."""
-		if not self._research_error_message:
+		"""Surface the persisted failure detail when the progress bar is clicked.
+
+		Two cases share the clickable progress bar: a partial run (some
+		documents failed to summarize) shows the per-document failure list; a
+		fully failed run shows the single error message.
+		"""
+		if self._research_failed_documents:
+			QMessageBox.warning(
+				self,
+				"일부 문서 요약 실패",
+				self._format_failed_documents(self._research_failed_documents),
+			)
 			return
-		QMessageBox.critical(self, "조사 오류", self._research_error_message)
+		if self._research_error_message:
+			QMessageBox.critical(self, "조사 오류", self._research_error_message)
+
+	@staticmethod
+	def _format_failed_documents(failed_documents: list[dict[str, Any]]) -> str:
+		lines: list[str] = []
+		for item in failed_documents:
+			if not isinstance(item, dict):
+				continue
+			doc_id = str(item.get("docId") or "?")
+			title = str(item.get("title") or doc_id)
+			reason = str(item.get("reason") or "사유 불명")
+			lines.append(f"• 문서 {doc_id} — {title}\n   사유: {reason}")
+		return "\n\n".join(lines) if lines else "실패한 문서 정보가 없습니다."
 
 	def set_workspace_by_name(self, _workspace_name: str) -> None:
 		self._workspace_id = current_workspace_id()
@@ -838,6 +964,7 @@ class ResearchPage(QWidget):
 		self.info_row_widget.setVisible(False)
 		self.documents_header.setVisible(False)
 		self.result_empty.setVisible(False)
+		self._research_failed_documents = []
 		self._research_error_message = message or "알 수 없는 오류가 발생했습니다."
 		self.progress_bar.mark_failed(self._research_error_message)
 
@@ -857,9 +984,20 @@ class ResearchPage(QWidget):
 		"""
 		status = str(response.get("status") or "").lower().strip()
 		error_message = str(response.get("error") or "").strip()
+		failed_documents = response.get("failedDocuments", [])
+		if not isinstance(failed_documents, list):
+			failed_documents = []
+		failed_documents = [d for d in failed_documents if isinstance(d, dict)]
+		self._research_failed_documents = failed_documents
+
 		if status == "completed":
 			self._research_error_message = ""
 			self.progress_bar.mark_completed(animate=from_live)
+		elif status == "partial":
+			# Some documents failed to summarize but the run as a whole
+			# finished — a partial success, not an outright failure.
+			self._research_error_message = ""
+			self.progress_bar.mark_partial(animate=from_live)
 		elif status == "failed":
 			self._research_error_message = error_message or "조사 작업이 실패했습니다."
 			self.progress_bar.mark_failed(self._research_error_message)
@@ -898,17 +1036,44 @@ class ResearchPage(QWidget):
 		self.info_row_widget.setVisible(True)
 
 		self._reconcile_documents(documents)
+		# Flip any failed documents red. Done after reconcile so it overrides
+		# the default pending/ready state for those rows.
+		self._apply_failed_documents(failed_documents)
 
+		# The document list is always shown when there are bars: a partial
+		# failure must never hide the documents that succeeded.
 		if self._doc_bars:
 			self.documents_header.setVisible(True)
 			self.result_empty.setVisible(False)
 		else:
 			self.documents_header.setVisible(False)
-			if status == "completed":
+			if status in ("completed", "partial"):
 				self.result_empty.setText("수집된 문서가 없습니다.")
 				self.result_empty.setVisible(True)
 			else:
 				self.result_empty.setVisible(False)
+
+	def _apply_failed_documents(self, failed_documents: list[dict[str, Any]]) -> None:
+		"""Mark every failed document's bar red, creating a bar if one is missing.
+
+		A failed document has no ``doc_*.md`` file, so ``_reconcile_documents``
+		leaves its bar in the pending state — this turns those rows into the
+		explicit "요약 실패" state.
+		"""
+		for item in failed_documents:
+			doc_id = str(item.get("docId") or "").strip()
+			if not doc_id:
+				continue
+			bar = self._doc_bars.get(doc_id)
+			if bar is None:
+				title = str(item.get("title") or doc_id)
+				index = len(self._doc_bars) + 1
+				bar = DocumentBar(index=index, doc_id=doc_id, title=title, url="")
+				self._doc_bars[doc_id] = bar
+				self.documents_container.addWidget(bar)
+			bar.set_failed(str(item.get("reason") or ""))
+		if failed_documents:
+			self.info_doc_count.set_value(self._doc_count_text())
 
 	def _reconcile_documents(self, documents: list[dict[str, Any]]) -> None:
 		"""Merge the authoritative document list from the API response with
@@ -954,6 +1119,7 @@ class ResearchPage(QWidget):
 	def _show_message(self, text: str) -> None:
 		self._clear_documents()
 		self._research_error_message = ""
+		self._research_failed_documents = []
 		self.progress_bar.set_idle()
 		self.info_row_widget.setVisible(False)
 		self.documents_header.setVisible(False)

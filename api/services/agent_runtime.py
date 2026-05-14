@@ -317,7 +317,21 @@ class AgentRuntime:
                 index_path=Path(index_path) if index_path is not None else None,
                 clear_first=True,
             )
-        self._emit_research_progress("completed", "조사 완료", final=True)
+
+        failed_documents = (
+            result.get("failed_documents", []) if isinstance(result, dict) else []
+        )
+        if not isinstance(failed_documents, list):
+            failed_documents = []
+
+        if failed_documents:
+            self._emit_research_progress(
+                "completed",
+                f"조사 완료 · 요약 실패 {len(failed_documents)}건",
+                final=True,
+            )
+        else:
+            self._emit_research_progress("completed", "조사 완료", final=True)
 
         final_path = run_store_service.final_path
         records = self._read_index_records(index_path)
@@ -337,6 +351,7 @@ class AgentRuntime:
             "non_duplicate_document_count": len(
                 [record for record in records if not record.get("duplicate_of")]
             ),
+            "failed_documents": failed_documents,
             "final_report": final_report,
             "final_report_excerpt": final_report[:6000].strip(),
             "workflow_result": self._compact_workflow_result(result),
