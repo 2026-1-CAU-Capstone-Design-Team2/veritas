@@ -23,36 +23,45 @@ except Exception:  # pragma: no cover - optional dependency
 # Minimal CSS so QTextDocument renders tables with visible borders and
 # reasonable spacing. QTextDocument supports a subset of CSS; the rules below
 # are known to work for tables, code blocks, and quotes.
-_DOC_STYLE = """
+def _doc_style(font_size: str | None = "13px") -> str:
+	"""Build the embedded stylesheet.
+
+	``font_size`` is omitted from the ``body`` rule when ``None`` so the host
+	widget's own font drives sizing — needed for the chat bubbles, whose font
+	size is controlled by a Ctrl +/- zoom stylesheet on the widget.
+	"""
+	body_size = f" font-size: {font_size};" if font_size else ""
+	return f"""
 <style>
-body { font-family: 'Segoe UI Variable', 'Segoe UI', 'Malgun Gothic', 'Noto Sans KR', sans-serif; font-size: 13px; color: #1F2937; line-height: 1.55; }
-h1, h2, h3, h4 { color: #0F172A; font-weight: 800; margin: 18px 0 8px 0; }
-h1 { font-size: 22px; }
-h2 { font-size: 18px; }
-h3 { font-size: 15px; }
-p { margin: 6px 0; }
-code { background-color: #F1F5F9; color: #0F172A; padding: 1px 4px; border-radius: 4px; font-family: 'Consolas', 'Cascadia Mono', monospace; font-size: 12px; }
-pre { background-color: #0F172A; color: #E2E8F0; padding: 10px 12px; border-radius: 8px; font-family: 'Consolas', 'Cascadia Mono', monospace; font-size: 12px; }
-pre code { background: transparent; color: inherit; padding: 0; }
-blockquote { border-left: 3px solid #C7D2FE; color: #4B5563; margin: 8px 0; padding: 2px 10px; }
-ul, ol { margin: 6px 0 6px 20px; }
-li { margin: 2px 0; }
-table { border-collapse: collapse; margin: 10px 0; width: 100%; }
-th, td { border: 1px solid #CBD5E1; padding: 6px 9px; text-align: left; vertical-align: top; }
-th { background-color: #F1F5F9; color: #0F172A; font-weight: 700; }
-tr:nth-child(even) td { background-color: #F8FAFC; }
-a { color: #2563EB; text-decoration: none; }
-hr { border: none; border-top: 1px solid #E2E8F0; margin: 14px 0; }
+body {{ font-family: 'Segoe UI Variable', 'Segoe UI', 'Malgun Gothic', 'Noto Sans KR', sans-serif;{body_size} color: #1F2937; line-height: 1.55; }}
+h1, h2, h3, h4 {{ color: #0F172A; font-weight: 800; margin: 18px 0 8px 0; }}
+h1 {{ font-size: 22px; }}
+h2 {{ font-size: 18px; }}
+h3 {{ font-size: 15px; }}
+p {{ margin: 6px 0; }}
+code {{ background-color: #F1F5F9; color: #0F172A; padding: 1px 4px; border-radius: 4px; font-family: 'Consolas', 'Cascadia Mono', monospace; font-size: 12px; }}
+pre {{ background-color: #0F172A; color: #E2E8F0; padding: 10px 12px; border-radius: 8px; font-family: 'Consolas', 'Cascadia Mono', monospace; font-size: 12px; }}
+pre code {{ background: transparent; color: inherit; padding: 0; }}
+blockquote {{ border-left: 3px solid #C7D2FE; color: #4B5563; margin: 8px 0; padding: 2px 10px; }}
+ul, ol {{ margin: 6px 0 6px 20px; }}
+li {{ margin: 2px 0; }}
+table {{ border-collapse: collapse; margin: 10px 0; width: 100%; }}
+th, td {{ border: 1px solid #CBD5E1; padding: 6px 9px; text-align: left; vertical-align: top; }}
+th {{ background-color: #F1F5F9; color: #0F172A; font-weight: 700; }}
+tr:nth-child(even) td {{ background-color: #F8FAFC; }}
+a {{ color: #2563EB; text-decoration: none; }}
+hr {{ border: none; border-top: 1px solid #E2E8F0; margin: 14px 0; }}
 </style>
 """
 
 
-def render_markdown_html(text: str) -> str:
+def render_markdown_html(text: str, *, font_size: str | None = "13px") -> str:
 	"""Convert markdown to a self-contained HTML fragment for QTextEdit.
 
 	Returns an HTML string with embedded stylesheet. If the optional `markdown`
 	package is missing, returns an empty string so callers can fall back to
-	`setMarkdown`.
+	`setMarkdown`. Pass ``font_size=None`` to let the host widget's font drive
+	the base text size.
 	"""
 	source = _normalize_for_qt(text or "")
 	if _markdown is None:
@@ -67,7 +76,7 @@ def render_markdown_html(text: str) -> str:
 		],
 		output_format="html5",
 	)
-	return f"{_DOC_STYLE}\n{html_body}"
+	return f"{_doc_style(font_size)}\n{html_body}"
 
 
 def apply_markdown(widget, text: str) -> None:

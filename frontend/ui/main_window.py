@@ -842,30 +842,30 @@ class MainWindow(QMainWindow):
 		}
 
 		QToolButton#AssistModeButton {
-			background-color: #F8FAFC;
-			color: #111827;
+			background-color: #F1F5F9;
+			color: #475569;
 			border: 1px solid #D1D5DB;
-			border-radius: 11px;
-			padding: 0px 8px;
-			font-size: 12px;
-			font-weight: 850;
+			border-radius: 23px;
+			padding: 0px;
+			font-size: 24px;
+			font-weight: 500;
 		}
 
 		QToolButton#AssistModeButton:hover {
-			background-color: #EEF2FF;
+			background-color: #E0E7FF;
 			border-color: #818CF8;
 			color: #3730A3;
 		}
 
-		QToolButton#AssistModeButton:checked {
-			background-color: #3730A3;
-			border-color: #3730A3;
+		QToolButton#AssistModeButton[researchActive="true"] {
+			background-color: #1E3A8A;
+			border-color: #1E3A8A;
 			color: #FFFFFF;
 		}
 
-		QToolButton#AssistModeButton:checked:hover {
-			background-color: #312E81;
-			border-color: #312E81;
+		QToolButton#AssistModeButton[researchActive="true"]:hover {
+			background-color: #1E40AF;
+			border-color: #1E40AF;
 			color: #FFFFFF;
 		}
 
