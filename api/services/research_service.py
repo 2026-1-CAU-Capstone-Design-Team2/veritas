@@ -18,6 +18,7 @@ def create_research_job(
     workspace_id: str | None,
     instruction: str,
     reference_urls: list[str],
+    max_docs: int | None = None,
 ) -> dict[str, Any]:
     instruction_text = instruction.strip()
     if not instruction_text:
@@ -31,6 +32,7 @@ def create_research_job(
         "workspaceName": _workspace_name(selected_workspace_id),
         "instruction": instruction_text,
         "referenceUrls": [url.strip() for url in reference_urls if url.strip()],
+        "maxDocs": max_docs,
         "status": "running",
         "submittedAt": utc_now_iso(),
     }
@@ -42,6 +44,7 @@ def create_research_job(
             instruction=instruction_text,
             reference_urls=job["referenceUrls"],
             job_id=job_id,
+            max_docs=max_docs,
         )
     except Exception as e:
         job["status"] = "failed"
@@ -63,6 +66,7 @@ def create_research_job(
             "status": "completed",
             "workspaceId": result_workspace_id,
             "workspaceName": result_workspace_name,
+            "maxDocs": result.get("max_docs") or max_docs,
             "completedAt": utc_now_iso(),
             "summary": final_excerpt,
             "finalPath": result.get("final_path"),

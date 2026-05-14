@@ -32,6 +32,9 @@ class ResearchJobCreateRequest(BaseModel):
     workspaceId: str | None = None
     instruction: str
     referenceUrls: list[str] = Field(default_factory=list)
+    # How many documents AutoSurvey should collect. When omitted the runtime
+    # falls back to the VERITAS_MAX_DOCS environment default (15).
+    maxDocs: int | None = Field(default=None, ge=1, le=50)
 
 
 class DocumentAssistAnalyzeRequest(BaseModel):
@@ -52,6 +55,15 @@ class SettingsModelRequest(BaseModel):
 
 class SettingsLocalAccessRequest(BaseModel):
     folderPaths: list[str] = Field(default_factory=list)
+
+
+class DocumentToolItem(BaseModel):
+    name: str
+    identifier: str = ""
+
+
+class SettingsDocumentToolsRequest(BaseModel):
+    customTools: list[DocumentToolItem] = Field(default_factory=list)
 
 
 class TypingContextRequest(BaseModel):

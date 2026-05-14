@@ -52,5 +52,8 @@ STATE: dict[str, Any] = {
         "localAccess": {
             "folderPaths": [],
         },
+        "documentTools": {
+            "custom": [],
+        },
     },
 }

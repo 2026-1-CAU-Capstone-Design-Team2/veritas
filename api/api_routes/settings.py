@@ -4,7 +4,11 @@ from typing import Any
 
 from fastapi import APIRouter
 
-from ..api_models import SettingsLocalAccessRequest, SettingsModelRequest
+from ..api_models import (
+    SettingsDocumentToolsRequest,
+    SettingsLocalAccessRequest,
+    SettingsModelRequest,
+)
 from ..services import settings_service
 
 router = APIRouter()
@@ -23,3 +27,10 @@ async def settings_model_update(payload: SettingsModelRequest) -> dict[str, Any]
 @router.put("/api/v1/settings/local-access")
 async def settings_local_access_update(payload: SettingsLocalAccessRequest) -> dict[str, Any]:
     return settings_service.update_local_access(payload.folderPaths)
+
+
+@router.put("/api/v1/settings/document-tools")
+async def settings_document_tools_update(payload: SettingsDocumentToolsRequest) -> dict[str, Any]:
+    return settings_service.update_document_tools(
+        [tool.model_dump() for tool in payload.customTools]
+    )

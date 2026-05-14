@@ -32,6 +32,9 @@ STATE: dict[str, object] = {
         "localAccess": {
             "folderPaths": [],
         },
+        "documentTools": {
+            "custom": [],
+        },
     },
 }
 

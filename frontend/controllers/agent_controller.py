@@ -52,15 +52,16 @@ class AgentController:
 		workspace_id: str,
 		instruction: str,
 		reference_urls: list[str],
+		max_docs: int | None = None,
 	) -> dict[str, Any]:
-		return api_client.post(
-			"/api/v1/research/jobs",
-			{
-				"workspaceId": workspace_id,
-				"instruction": instruction,
-				"referenceUrls": reference_urls,
-			},
-		)
+		payload: dict[str, Any] = {
+			"workspaceId": workspace_id,
+			"instruction": instruction,
+			"referenceUrls": reference_urls,
+		}
+		if max_docs is not None:
+			payload["maxDocs"] = int(max_docs)
+		return api_client.post("/api/v1/research/jobs", payload)
 
 	def list_research_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
 		response = api_client.get("/api/v1/research/jobs", {"limit": limit})
@@ -77,6 +78,12 @@ class AgentController:
 
 	def get_feedback_result(self, file_id: str) -> dict[str, Any]:
 		return api_client.get(f"/api/v1/feedback/results/{file_id}")
+
+	def update_document_tools(self, custom_tools: list[dict[str, str]]) -> dict[str, Any]:
+		return api_client.put(
+			"/api/v1/settings/document-tools",
+			{"customTools": custom_tools},
+		)
 
 	def get_document_summary(self, workspace_id: str) -> str:
 		response = api_client.get(f"/api/v1/documents/{workspace_id}/summary")
