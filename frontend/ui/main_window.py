@@ -802,10 +802,12 @@ class MainWindow(QMainWindow):
 			font-weight: 800;
 		}
 
-		QLabel#AssistBubbleText {
+		QTextBrowser#AssistBubbleText {
 			color: #1F2937;
 			font-size: 12px;
 			font-weight: 600;
+			background: transparent;
+			border: none;
 		}
 
 		QFrame#AssistInputBar {

@@ -42,7 +42,9 @@
       "Bash(python -c \"import markdown; print\\('markdown', markdown.__version__\\)\")",
       "Bash(pip list *)",
       "Bash(git diff *)",
-      "Bash(git checkout *)"
+      "Bash(git checkout *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('frontend/ui/markdown_view.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python _mathtest.py)"
     ]
   }
 }
