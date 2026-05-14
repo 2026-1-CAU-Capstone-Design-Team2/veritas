@@ -4,3 +4,4 @@ __pycache__/
 *.py[cod]
 /test/_screen_poll_output/
 /runs/
+.claude/

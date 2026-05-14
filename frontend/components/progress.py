@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import time
+
 from PySide6.QtCore import (
 	Property,
 	QEasingCurve,
 	QPropertyAnimation,
 	QRectF,
+	QTimer,
 	Qt,
 	Signal,
 )
@@ -23,9 +26,24 @@ from PySide6.QtWidgets import (
 _STATE_COLORS = {
 	"running": ("#6366F1", "#3B82F6", "#E0E7FF", "#3730A3", "#C7D2FE"),
 	"completed": ("#34D399", "#10B981", "#DCFCE7", "#15803D", "#86EFAC"),
+	"partial": ("#FBBF24", "#F59E0B", "#FEF3C7", "#B45309", "#FCD34D"),
 	"failed": ("#F87171", "#EF4444", "#FEE2E2", "#B91C1C", "#FCA5A5"),
 }
 _TRACK_BG = "#E8EDF4"
+
+
+def _format_duration(seconds: float, *, precise: bool = False) -> str:
+	"""Human-readable elapsed time.
+
+	``precise`` keeps the sub-second decimal ('12.3초') for a finished run; the
+	live ticking display drops it ('12초') so it does not read as jittery.
+	A minute or longer is shown as 'M분 S초' either way.
+	"""
+	seconds = max(0.0, float(seconds))
+	if seconds < 60.0:
+		return f"{seconds:.1f}초" if precise else f"{int(seconds)}초"
+	minutes, secs = divmod(int(round(seconds)), 60)
+	return f"{minutes}분 {secs}초"
 
 
 class _ProgressTrack(QWidget):
@@ -163,6 +181,7 @@ class ResearchProgressBar(QFrame):
 	_STATE_LABEL = {
 		"running": "진행 중",
 		"completed": "완료",
+		"partial": "일부 오류 발생",
 		"failed": "오류",
 	}
 
@@ -175,6 +194,13 @@ class ResearchProgressBar(QFrame):
 		)
 		self._state = "idle"
 		self._error_message = ""
+		# Wall-clock start of the current live run; set by start() and consumed
+		# by the terminal-state handlers to compute the total elapsed time.
+		self._start_time: float | None = None
+		# Ticks once a second while running so the elapsed time counts up live.
+		self._elapsed_timer = QTimer(self)
+		self._elapsed_timer.setInterval(1000)
+		self._elapsed_timer.timeout.connect(self._tick_elapsed)
 
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(14, 12, 14, 12)
@@ -198,13 +224,25 @@ class ResearchProgressBar(QFrame):
 		self._track.ratioChanged.connect(self._on_ratio_changed)
 		layout.addWidget(self._track)
 
+		footer = QHBoxLayout()
+		footer.setContentsMargins(0, 0, 0, 0)
+		footer.setSpacing(10)
 		self._caption = QLabel("")
 		self._caption.setWordWrap(False)
 		self._caption.setTextFormat(Qt.PlainText)
 		self._caption.setStyleSheet(
 			"color: #64748B; font-size: 12px; font-weight: 600;"
 		)
-		layout.addWidget(self._caption)
+		footer.addWidget(self._caption, 1)
+		# Total elapsed time, parked at the bottom-right corner and filled in
+		# once the run reaches a terminal state (completed / partial / failed).
+		self._elapsed = QLabel("")
+		self._elapsed.setTextFormat(Qt.PlainText)
+		self._elapsed.setStyleSheet(
+			"color: #94A3B8; font-size: 11px; font-weight: 700;"
+		)
+		footer.addWidget(self._elapsed, 0, Qt.AlignRight | Qt.AlignVCenter)
+		layout.addLayout(footer)
 
 		self.set_idle()
 
@@ -213,6 +251,9 @@ class ResearchProgressBar(QFrame):
 	def set_idle(self) -> None:
 		self._state = "idle"
 		self._error_message = ""
+		self._start_time = None
+		self._elapsed_timer.stop()
+		self._elapsed.setText("")
 		self.setCursor(Qt.ArrowCursor)
 		self.setVisible(False)
 
@@ -220,6 +261,9 @@ class ResearchProgressBar(QFrame):
 		"""Reset to a fresh running state at 0%."""
 		self._state = "running"
 		self._error_message = ""
+		self._start_time = time.monotonic()
+		self._tick_elapsed()
+		self._elapsed_timer.start()
 		self.setCursor(Qt.ArrowCursor)
 		self.setVisible(True)
 		self._track.set_state("running")
@@ -254,6 +298,29 @@ class ResearchProgressBar(QFrame):
 			self._track.set_ratio_immediate(1.0)
 		self._apply_chip("completed")
 		self._apply_caption("조사가 완료되었습니다.", "#15803D")
+		self._finish_timing()
+
+	def mark_partial(self, animate: bool = True) -> None:
+		"""Run finished, but some documents failed to summarize.
+
+		The bar fills to 100% in amber and stays clickable so the page can
+		surface the per-document failure list via :attr:`errorClicked`.
+		"""
+		self._state = "partial"
+		self._error_message = ""
+		self.setCursor(Qt.PointingHandCursor)
+		self.setVisible(True)
+		self._track.set_state("partial")
+		if animate:
+			self._track.animate_to(1.0)
+		else:
+			self._track.set_ratio_immediate(1.0)
+		self._apply_chip("partial")
+		self._apply_caption(
+			"일부 문서 요약에 실패했습니다. 클릭하면 실패한 문서를 확인할 수 있습니다.",
+			"#B45309",
+		)
+		self._finish_timing()
 
 	def mark_failed(self, error_message: str = "") -> None:
 		self._state = "failed"
@@ -263,11 +330,16 @@ class ResearchProgressBar(QFrame):
 		self._track.set_state("failed")
 		self._apply_chip("failed")
 		self._apply_caption("클릭하면 오류 메시지를 확인할 수 있습니다.", "#B91C1C")
+		self._finish_timing()
 
 	def restore_running(self, percent: float, caption: str = "") -> None:
 		"""Show a persisted in-flight job without the count-up animation."""
 		self._state = "running"
 		self._error_message = ""
+		# A restored job has no frontend start time — no elapsed total to show.
+		self._start_time = None
+		self._elapsed_timer.stop()
+		self._elapsed.setText("")
 		self.setCursor(Qt.ArrowCursor)
 		self.setVisible(True)
 		self._track.set_state("running")
@@ -279,6 +351,29 @@ class ResearchProgressBar(QFrame):
 
 	def _on_ratio_changed(self, ratio: float) -> None:
 		self._percent.setText(f"{int(round(ratio * 100))}%")
+
+	def _tick_elapsed(self) -> None:
+		"""Refresh the live elapsed-time readout while a run is in progress."""
+		if self._start_time is None:
+			self._elapsed_timer.stop()
+			return
+		elapsed = time.monotonic() - self._start_time
+		self._elapsed.setText(f"진행 시간 {_format_duration(elapsed)}")
+
+	def _finish_timing(self) -> None:
+		"""Freeze the elapsed time once a run reaches a terminal state.
+
+		Only live runs are timed — start() records a wall-clock start. A job
+		restored from the API has no frontend start time, so the label is
+		cleared instead of showing a stale duration.
+		"""
+		self._elapsed_timer.stop()
+		if self._start_time is None:
+			self._elapsed.setText("")
+			return
+		elapsed = time.monotonic() - self._start_time
+		self._start_time = None
+		self._elapsed.setText(f"총 소요 시간 {_format_duration(elapsed, precise=True)}")
 
 	def _apply_chip(self, state: str) -> None:
 		_s, _e, bg, fg, border = _STATE_COLORS.get(state, _STATE_COLORS["running"])
@@ -300,11 +395,9 @@ class ResearchProgressBar(QFrame):
 		)
 
 	def mousePressEvent(self, event) -> None:  # type: ignore[override]
-		if (
-			event.button() == Qt.LeftButton
-			and self._state == "failed"
-			and self._error_message
-		):
+		# Both "failed" (error message) and "partial" (failed-document list)
+		# are clickable; the page decides which detail to surface.
+		if event.button() == Qt.LeftButton and self._state in ("failed", "partial"):
 			self.errorClicked.emit()
 			event.accept()
 			return

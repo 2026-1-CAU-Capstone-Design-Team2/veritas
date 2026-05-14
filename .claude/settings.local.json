@@ -18,7 +18,16 @@
       "Bash(curl -s -m 4 http://127.0.0.1:8080/props)",
       "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('PROPS KEYS:', list\\(d.keys\\(\\)\\)\\); print\\('n_ctx:', d.get\\('n_ctx'\\) or \\(d.get\\('default_generation_settings'\\) or {}\\).get\\('n_ctx'\\)\\); print\\('default_generation_settings keys:', list\\(\\(d.get\\('default_generation_settings'\\) or {}\\).keys\\(\\)\\)\\)\")",
       "PowerShell(head -15)",
-      "Bash(sed -n '100,160p' db/workspace_sync.py)"
+      "Bash(sed -n '100,160p' db/workspace_sync.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('frontend/ui/pages/research_page.py',encoding='utf-8'\\).read\\(\\)\\); print\\('research_page.py syntax OK'\\)\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('frontend/ui/pages/research_page.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('frontend/ui/windows/document_assist_window.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('frontend/ui/markdown_view.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('ui/sidebar.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('ui/sidebar.py',encoding='utf-8-sig'\\).read\\(\\)\\); print\\('syntax OK \\(file has a pre-existing UTF-8 BOM\\)'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('ui/sidebar.py',encoding='utf-8-sig'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"print\\(open\\('ui/pages/__init__.py',encoding='utf-8-sig'\\).read\\(\\)\\)\")"
     ]
   }
 }

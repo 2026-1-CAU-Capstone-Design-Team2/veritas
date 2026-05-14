@@ -1,10 +1,25 @@
 # document_summarize_tool
 
-수집된 문서를 **문서별 markdown 요약**으로 만들고, 이를 N개 단위로 묶어 **batch 요약**을 생성하는 tool입니다. AutoSurvey workflow의 `summarize` 단계에서 호출됩니다.
+각 문서의 **정제 Markdown(`clean_md/<doc_id>.md`)** 을 읽어 **문서별 요약**(`summary/doc_*.md`)과 **batch 요약**(`summary/batch_*.md`)을 만드는 tool입니다. AutoSurvey workflow가 호출합니다.
 
 ---
 
-## 무엇이 바뀌었나
+## per-doc 요약과 batch 요약 — clean_md의 두 독립 소비자
+
+per-doc 요약과 batch 요약은 **체인이 아니라, 같은 `clean_md`를 각각 읽는 독립 소비자**입니다.
+
+| | 입력 | 출력 | 호출 시점 | 용도 |
+| --- | --- | --- | --- | --- |
+| per-doc 요약 | `clean_md/<id>.md` | `summary/doc_*.md` | 조사 **종료 시 1회** (`summarize_docs=True`) | 출처 카드 / 인용 / 검증 UI |
+| batch 요약 | `clean_md/<id>.md` ×N | `summary/batch_*.md` | 수집 **루프 안** (`rebuild_batches=True`) | gap 분석 → replan, 최종 보고서 입력 |
+
+- **batch 요약은 per-doc 요약이 아니라 clean_md를 직접 읽습니다.** 요약-of-요약으로 인한 이중 손실을 피해, gap 분석이 본문 깊이를 그대로 보게 합니다.
+- **per-doc 요약은 수집 루프의 임계 경로에서 빠집니다.** replan에 관여하지 않는 UX 디스크립터이므로, 루프 안에서 매 사이클 돌리면 수렴만 느려집니다. 그래서 루프가 끝난 뒤 한 번에 전체 문서를 요약합니다.
+- `_read_batch_documents()`는 각 clean_md를 `single_pass_budget // batch_size`로 캡해 batch 한 건이 모델 context를 넘지 않게 합니다.
+
+---
+
+## 무엇이 바뀌었나 (per-doc 요약 경로)
 
 기존에는 모든 문서를 길이와 무관하게 `text[:max_context]`로 **하드 절단**한 뒤 한 번에 요약했습니다. `max_context`(기본 16384자)를 넘는 문서는 뒷부분이 통째로 버려졌습니다.
 
@@ -81,19 +96,26 @@ _INPUT_CONTEXT_FRACTION = 0.5   # window의 절반만 입력 본문에 사용
 
 ```text
 overwrite       (default false) 기존 문서/batch 요약을 덮어쓸지 여부
-doc_ids         (optional)      cycle 범위 문서 ID 목록. 주어지면 해당 문서만 요약
-rebuild_batches (default true)  문서 요약 후 batch 요약 생성 여부
+doc_ids         (optional)      cycle 범위 문서 ID 목록. batch 요약을 이 문서들로 한정
+rebuild_batches (default true)  batch 요약을 (재)생성할지 — clean_md를 직접 읽음
+summarize_docs  (default true)  per-document 요약(summary/doc_*.md) 생성 여부
 ```
+
+workflow의 `run_summarize(phase=...)`가 이 플래그들을 설정합니다:
+`phase="batch"` → `summarize_docs=False, rebuild_batches=True` (수집 루프),
+`phase="per_doc"` → `summarize_docs=True, rebuild_batches=False` (조사 종료 시),
+`phase="all"` → 둘 다 (standalone `--phase summarize`).
 
 ### 출력 (`ToolResult.data`)
 
 ```text
 summarized_doc_ids / skipped_existing_doc_ids / skipped_invalid_doc_ids /
 skipped_duplicate_doc_ids / skipped_not_in_cycle_doc_ids / failed_doc_ids
+failed_documents = [{"docId", "title", "reason"}, ...]
 batch_result = {"batch_files": [...], "count": N}
 ```
 
-분기 경로와 무관하게 per-document 요약은 동일한 스키마(`DOC_SUMMARY_PROMPT`의 JSON)를 따르므로, `_render_doc_summary_from_record()`와 batch 요약 로직은 변경 없이 그대로 동작합니다.
+per-document 요약은 동일한 스키마(`DOC_SUMMARY_PROMPT`의 JSON)를 따르므로 `_render_doc_summary_from_record()`는 그대로 동작합니다.
 
 ---
 

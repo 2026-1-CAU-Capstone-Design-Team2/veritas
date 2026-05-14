@@ -841,26 +841,32 @@ class MainWindow(QMainWindow):
 			background-color: #2563EB;
 		}
 
-		QToolButton#AssistModeButton {
-			background-color: #F8FAFC;
-			color: #111827;
+		QPushButton#AssistModeButton {
+			background-color: #F1F5F9;
+			color: #475569;
 			border: 1px solid #D1D5DB;
 			border-radius: 11px;
-			padding: 0px 8px;
-			font-size: 12px;
-			font-weight: 850;
+			padding: 0px;
+			font-size: 13px;
+			font-weight: 800;
 		}
 
-		QToolButton#AssistModeButton:hover {
-			background-color: #EEF2FF;
+		QPushButton#AssistModeButton:hover {
+			background-color: #E0E7FF;
 			border-color: #818CF8;
 			color: #3730A3;
 		}
 
-		QToolButton#AssistModeButton::menu-indicator {
-			image: none;
-			width: 0px;
-			height: 0px;
+		QPushButton#AssistModeButton[researchActive="true"] {
+			background-color: #1E3A8A;
+			border-color: #1E3A8A;
+			color: #FFFFFF;
+		}
+
+		QPushButton#AssistModeButton[researchActive="true"]:hover {
+			background-color: #1E40AF;
+			border-color: #1E40AF;
+			color: #FFFFFF;
 		}
 
 		QFrame#ComposerCard {
@@ -1413,10 +1419,24 @@ class MainWindow(QMainWindow):
 			border-color: #E2E8F0;
 		}
 
-		QLabel#StepperValue {
+		QLineEdit#StepperValue {
 			font-size: 15px;
 			font-weight: 800;
 			color: #0F172A;
+			background: transparent;
+			border: none;
+			padding: 0px;
+		}
+
+		QLineEdit#StepperValue:focus {
+			background: #EEF2FF;
+			border-radius: 6px;
+		}
+
+		QLabel#StepperUnit {
+			font-size: 13px;
+			font-weight: 700;
+			color: #64748B;
 		}
 
 		QLabel#ResearchCountTitle {

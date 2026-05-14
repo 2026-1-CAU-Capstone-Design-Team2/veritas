@@ -4,7 +4,6 @@ import re
 
 from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal, QTimer
 from PySide6.QtGui import (
-	QAction,
 	QColor,
 	QCloseEvent,
 	QKeyEvent,
@@ -14,6 +13,7 @@ from PySide6.QtGui import (
 	QPainterPath,
 	QPen,
 	QShortcut,
+	QTextDocument,
 	QWheelEvent,
 )
 from PySide6.QtWidgets import (
@@ -22,16 +22,16 @@ from PySide6.QtWidgets import (
 	QGraphicsDropShadowEffect,
 	QHBoxLayout,
 	QLabel,
-	QMenu,
 	QPushButton,
 	QScrollArea,
 	QSizeGrip,
 	QSizePolicy,
 	QTextEdit,
-	QToolButton,
 	QVBoxLayout,
 	QWidget,
 )
+
+from ..markdown_view import render_markdown_html
 
 
 def add_text_breakpoints(text: str, chunk_size: int = 24) -> str:
@@ -40,6 +40,46 @@ def add_text_breakpoints(text: str, chunk_size: int = 24) -> str:
 		return "\u200b".join(token[index : index + chunk_size] for index in range(0, len(token), chunk_size))
 
 	return re.sub(r"\S{32,}", break_long_token, text)
+
+
+def _render_assistant_markdown(text: str) -> str:
+	"""Render an assistant message (markdown) to Qt rich text.
+
+	Assistant answers stream in as markdown; a RichText QLabel shows the
+	formatted result instead of raw `**` / `#` / table syntax. Prefers the
+	`markdown` package (correct GFM tables); falls back to Qt's own markdown
+	parser so formatting still works even when that package is not installed.
+	"""
+	rendered = render_markdown_html(text or "", font_size=None)
+	if rendered:
+		return rendered
+	doc = QTextDocument()
+	doc.setMarkdown(text or "")
+	return doc.toHtml()
+
+
+try:
+	from shiboken6 import isValid as _shiboken_is_valid
+except Exception:  # pragma: no cover - shiboken6 ships with PySide6
+	_shiboken_is_valid = None
+
+
+def _qt_is_alive(obj: object) -> bool:
+	"""True when *obj*'s underlying Qt C++ object still exists.
+
+	A streaming chat answer can outlive the bubble it is writing into \u2014 e.g.
+	a workspace switch (research completion) clears the panel mid-stream. A
+	late chunk that touches the freed QLabel would otherwise raise
+	``RuntimeError: Internal C++ object already deleted``.
+	"""
+	if obj is None:
+		return False
+	if _shiboken_is_valid is None:
+		return True
+	try:
+		return bool(_shiboken_is_valid(obj))
+	except Exception:
+		return False
 
 
 class ChatInputEdit(QTextEdit):
@@ -456,13 +496,22 @@ class ChatMessageBubble(QFrame):
 		meta = QLabel(sender)
 		meta.setObjectName("AssistBubbleMeta")
 
-		self.text = QLabel(add_text_breakpoints(message))
+		self.text = QLabel()
 		text = self.text
 		text.setObjectName("AssistBubbleText")
 		text.setWordWrap(True)
-		text.setTextFormat(Qt.PlainText)
 		text.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
 		text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+		# User messages are shown verbatim; assistant answers arrive as markdown
+		# and are rendered to rich text so headings/lists/tables/code display
+		# formatted instead of as raw syntax.
+		if is_user:
+			text.setTextFormat(Qt.PlainText)
+			text.setText(add_text_breakpoints(message))
+		else:
+			text.setTextFormat(Qt.RichText)
+			text.setOpenExternalLinks(True)
+			text.setText(_render_assistant_markdown(message))
 
 		layout.addWidget(meta)
 		layout.addWidget(text)
@@ -483,7 +532,14 @@ class ChatMessageBubble(QFrame):
 	def set_text(self, raw: str) -> None:
 		"""Update the message body while keeping the raw text for copy."""
 		self._raw_message = raw or ""
-		self.text.setText(add_text_breakpoints(self._raw_message))
+		# Defensive: the label can be torn down (panel cleared / window closed)
+		# while a streaming answer is still arriving.
+		if not _qt_is_alive(self.text):
+			return
+		if self._is_user:
+			self.text.setText(add_text_breakpoints(self._raw_message))
+		else:
+			self.text.setText(_render_assistant_markdown(self._raw_message))
 
 	def _copy_to_clipboard(self) -> None:
 		app = QApplication.instance()
@@ -581,12 +637,9 @@ class ChatPanel(QFrame):
 
 		row = QHBoxLayout()
 		row.setContentsMargins(0, 0, 0, 0)
-		if is_user:
-			row.addStretch(1)
-			row.addWidget(bubble, 0, Qt.AlignRight)
-		else:
-			row.addWidget(bubble, 0, Qt.AlignLeft)
-			row.addStretch(1)
+		# Both user and assistant bubbles span the full panel width so the chat
+		# fills the screen horizontally; sender is distinguished by colour.
+		row.addWidget(bubble, 1)
 
 		insert_at = max(0, self.layout.count() - 1)
 		self.layout.insertLayout(insert_at, row)
@@ -599,8 +652,21 @@ class ChatPanel(QFrame):
 		self._streaming_buffer = ""
 		return bubble
 
-	def append_streaming_chunk(self, chunk: str) -> None:
+	def _live_streaming_bubble(self) -> ChatMessageBubble | None:
+		"""Return the streaming bubble only if its C++ object still exists.
+
+		``clear_messages()`` / workspace switches can delete the bubble while a
+		streamed answer is still arriving; a stale reference here would crash
+		on the next chunk.
+		"""
 		bubble = getattr(self, "_streaming_bubble", None)
+		if bubble is None or not _qt_is_alive(bubble):
+			self._streaming_bubble = None
+			return None
+		return bubble
+
+	def append_streaming_chunk(self, chunk: str) -> None:
+		bubble = self._live_streaming_bubble()
 		if bubble is None:
 			return
 		self._streaming_buffer = (getattr(self, "_streaming_buffer", "") or "") + chunk
@@ -608,8 +674,10 @@ class ChatPanel(QFrame):
 		self.schedule_scroll_to_bottom()
 
 	def finalize_streaming_assistant(self, text: str | None = None) -> None:
-		bubble = getattr(self, "_streaming_bubble", None)
+		bubble = self._live_streaming_bubble()
 		if bubble is None:
+			self._streaming_bubble = None
+			self._streaming_buffer = ""
 			return
 		final_text = text if text is not None else getattr(self, "_streaming_buffer", "")
 		bubble.set_text(final_text or "")
@@ -618,8 +686,10 @@ class ChatPanel(QFrame):
 		self.schedule_scroll_to_bottom()
 
 	def cancel_streaming_assistant(self, error_text: str) -> None:
-		bubble = getattr(self, "_streaming_bubble", None)
+		bubble = self._live_streaming_bubble()
 		if bubble is None:
+			self._streaming_bubble = None
+			self._streaming_buffer = ""
 			return
 		current = getattr(self, "_streaming_buffer", "")
 		display = f"{current}\n\n[오류] {error_text}" if current else f"[오류] {error_text}"
@@ -629,6 +699,10 @@ class ChatPanel(QFrame):
 		self.schedule_scroll_to_bottom()
 
 	def clear_messages(self) -> None:
+		# Drop any in-flight streaming reference *first*: the bubble it points
+		# at is about to be deleted, and a late chunk must not touch it.
+		self._streaming_bubble = None
+		self._streaming_buffer = ""
 		while self.layout.count():
 			item = self.layout.takeAt(0)
 			self._dispose_layout_item(item)
@@ -669,7 +743,7 @@ class ChatPanel(QFrame):
 
 	def _bubble_width(self) -> int:
 		viewport_width = max(280, self.scroll.viewport().width())
-		return max(220, int(viewport_width * 0.94))
+		return max(220, viewport_width - 2)
 
 	def _update_bubble_widths(self) -> None:
 		width = self._bubble_width()
@@ -684,26 +758,22 @@ class ChatInputBar(QFrame):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("AssistInputBar")
-		self._mode = "research"
+		# RAG ("채팅") is the default chat mode; "조사" (research) is the opt-in
+		# mode. The mode button shows the active one and toggles between them.
+		self._mode = "rag"
 
 		layout = QHBoxLayout(self)
 		layout.setContentsMargins(10, 8, 10, 8)
 		layout.setSpacing(8)
 
-		self.mode_button = QToolButton()
+		# A rounded-rectangle toggle: it shows the active mode ("채팅" by default)
+		# and clicking it flips straight to "조사" — research mode — turning navy
+		# to signal it is on.
+		self.mode_button = QPushButton("채팅")
 		self.mode_button.setObjectName("AssistModeButton")
-		self.mode_button.setPopupMode(QToolButton.InstantPopup)
 		self.mode_button.setCursor(Qt.PointingHandCursor)
-		self.mode_button.setFixedSize(82, 46)
-
-		mode_menu = QMenu(self.mode_button)
-		research_action = QAction("자료조사", self)
-		research_action.triggered.connect(lambda: self.set_mode("research"))
-		rag_action = QAction("RAG", self)
-		rag_action.triggered.connect(lambda: self.set_mode("rag"))
-		mode_menu.addAction(research_action)
-		mode_menu.addAction(rag_action)
-		self.mode_button.setMenu(mode_menu)
+		self.mode_button.setFixedSize(60, 46)
+		self.mode_button.clicked.connect(self._toggle_mode)
 
 		self.input = ChatInputEdit()
 		self.input.setObjectName("AssistChatInput")
@@ -722,16 +792,25 @@ class ChatInputBar(QFrame):
 		layout.addWidget(self.send_button)
 		self.set_mode(self._mode, emit=False)
 
+	def _toggle_mode(self) -> None:
+		"""Flip between the default RAG ("채팅") and research ("조사") modes."""
+		self.set_mode("rag" if self._mode == "research" else "research")
+
 	def set_mode(self, mode: str, emit: bool = True) -> None:
-		self._mode = "rag" if mode == "rag" else "research"
-		if self._mode == "rag":
-			self.mode_button.setText("RAG")
-			self.mode_button.setToolTip("RAG 모드")
-			self.input.setPlaceholderText("RAG 모드로 질문하기...")
-		else:
-			self.mode_button.setText("자료조사")
-			self.mode_button.setToolTip("자료조사 모드")
+		self._mode = "research" if mode == "research" else "rag"
+		is_research = self._mode == "research"
+		# The label doubles as the state read-out; the navy "active" styling is
+		# driven by a dynamic property + repolish.
+		self.mode_button.setText("조사" if is_research else "채팅")
+		self.mode_button.setProperty("researchActive", is_research)
+		self.mode_button.style().unpolish(self.mode_button)
+		self.mode_button.style().polish(self.mode_button)
+		if is_research:
+			self.mode_button.setToolTip("자료조사 모드 사용 중 (눌러서 끄기)")
 			self.input.setPlaceholderText("자료조사 모드로 질문하기...")
+		else:
+			self.mode_button.setToolTip("자료조사 모드 켜기")
+			self.input.setPlaceholderText("문서에 대해 질문하기...")
 		if emit:
 			self.modeChanged.emit(self._mode)
 
@@ -1017,24 +1096,29 @@ class DocumentAssistWindow(QWidget):
 			QPushButton#AssistSendButton:hover {
 				background-color: #2563EB;
 			}
-			QToolButton#AssistModeButton {
-				background-color: #F8FAFC;
-				color: #111827;
+			QPushButton#AssistModeButton {
+				background-color: #F1F5F9;
+				color: #475569;
 				border: 1px solid #D1D5DB;
 				border-radius: 11px;
-				padding: 0px 8px;
-				font-size: 12px;
-				font-weight: 850;
+				padding: 0px;
+				font-size: 13px;
+				font-weight: 800;
 			}
-			QToolButton#AssistModeButton:hover {
-				background-color: #EEF2FF;
+			QPushButton#AssistModeButton:hover {
+				background-color: #E0E7FF;
 				border-color: #818CF8;
 				color: #3730A3;
 			}
-			QToolButton#AssistModeButton::menu-indicator {
-				image: none;
-				width: 0px;
-				height: 0px;
+			QPushButton#AssistModeButton[researchActive="true"] {
+				background-color: #1E3A8A;
+				border-color: #1E3A8A;
+				color: #FFFFFF;
+			}
+			QPushButton#AssistModeButton[researchActive="true"]:hover {
+				background-color: #1E40AF;
+				border-color: #1E40AF;
+				color: #FFFFFF;
 			}
 			QMenu {
 				background-color: #FFFFFF;
@@ -1114,8 +1198,13 @@ class DocumentAssistWindow(QWidget):
 		self.input_bar.input.clear()
 
 	def _on_mode_changed(self, mode: str) -> None:
-		label = "RAG" if mode == "rag" else "자료조사"
-		self.title_bar.status.setText(label)
+		# RAG is the implicit default, so it gets no badge; only the opt-in
+		# 자료조사 mode is surfaced. Switching back to RAG restores the
+		# default status text.
+		if mode == "research":
+			self.title_bar.status.setText("자료조사")
+		else:
+			self.title_bar.status.setText("● 분석 중")
 
 	def on_message_submitted(self, message: str) -> None:
 		# The user bubble is drawn by ChatBus subscribers (MainWindow + WritePage)

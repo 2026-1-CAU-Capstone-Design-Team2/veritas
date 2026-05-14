@@ -138,9 +138,9 @@ def _scan_run_workspaces() -> list[dict[str, Any]]:
         summary_dir = path / "summary"
         final_path = path / "final.md"
         index_path = summary_dir / "index.json"
-        request_path = summary_dir / "request.txt"
+        request_path = summary_dir / "request.md"
         has_summaries = summary_dir.exists() and any(summary_dir.glob("doc_*.md"))
-        # `request.txt` is materialized by `_publish_new_workspace` as soon
+        # `request.md` is materialized by `_publish_new_workspace` as soon
         # as the workspace dir is reserved, so a workspace that's currently
         # being researched also shows up here (with status="running").
         has_request = request_path.exists()
