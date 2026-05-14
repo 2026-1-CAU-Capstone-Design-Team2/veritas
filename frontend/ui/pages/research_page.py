@@ -647,21 +647,14 @@ class ResearchPage(QWidget):
 		"""Route each backend progress event to the right view update.
 
 		Stage handlers are intentionally small and side-effect-only:
-<<<<<<< HEAD
 		- `workspace_created` → swap to the new workspace (info tiles +
 		  emit `workspaceCreated` so sidebar/chat reset live)
 		- `doc_fetched`       → add a pending DocumentBar
 		- `doc_summarized`    → activate the matching bar
 		- any other stage     → refresh the gray single-line progress label
-		The latest message wins on the progress label, mirroring the previous
-		behavior.
-=======
-		- `doc_fetched`     → add a pending DocumentBar
-		- `doc_summarized`  → activate the matching bar
-		- every stage       → advance the progress-bar estimate
+    
 		The latest message wins on the progress-bar caption, mirroring the
 		previous single-line behavior.
->>>>>>> 86373f7ad4e339460fa911e3cd3a1ea8a23abe8c
 		"""
 		# A final batch can still be queued cross-thread after the poller is
 		# stopped and the result already rendered; dropping it here keeps a
@@ -688,36 +681,6 @@ class ResearchPage(QWidget):
 		if self._progress_estimate != before or latest_message:
 			self.progress_bar.set_progress(self._progress_estimate, latest_message or None)
 
-<<<<<<< HEAD
-	def _adopt_new_workspace(self, detail: dict) -> None:
-		"""Reflect a freshly-reserved workspace in the result card.
-
-		Updates the info tiles (작업 이름 / 저장 경로) so the user sees the
-		final workspace id and path as soon as term-grounding finishes,
-		instead of waiting for the whole AutoSurvey run. Also broadcasts a
-		`workspaceCreated` signal so the sidebar and chat panels can sync.
-		"""
-		workspace_id = str(detail.get("workspaceId") or "").strip()
-		if not workspace_id:
-			return
-		name = str(detail.get("name") or workspace_id)
-		path = str(detail.get("path") or "").strip()
-		self._workspace_id = workspace_id
-		self.info_job_name.set_value(workspace_id)
-		if path:
-			self.info_save_path.set_value(path)
-			self._final_path = Path(path) / "final.md"
-		self.info_doc_count.set_value(f"{len(self._doc_bars)}건")
-		self.info_row_widget.setVisible(True)
-		self.workspaceCreated.emit(workspace_id, name)
-
-	def _set_progress_line(self, message: str) -> None:
-		text = " ".join(message.split())
-		if len(text) > 200:
-			text = text[:197] + "..."
-		self.progress_line.setText(text)
-		self.progress_line.setVisible(True)
-=======
 	def _bump_progress_estimate(self, stage: str) -> None:
 		"""Advance the monotonic progress estimate after one backend stage.
 
@@ -756,10 +719,37 @@ class ResearchPage(QWidget):
 		span = self._COUNT_BAND_END - self._COUNT_BAND_START
 		return self._COUNT_BAND_START + (done / total) * span
 
+	def _adopt_new_workspace(self, detail: dict) -> None:
+		"""Reflect a freshly-reserved workspace in the result card.
+
+		Updates the info tiles (작업 이름 / 저장 경로) so the user sees the
+		final workspace id and path as soon as term-grounding finishes,
+		instead of waiting for the whole AutoSurvey run. Also broadcasts a
+		`workspaceCreated` signal so the sidebar and chat panels can sync.
+		"""
+		workspace_id = str(detail.get("workspaceId") or "").strip()
+		if not workspace_id:
+			return
+		name = str(detail.get("name") or workspace_id)
+		path = str(detail.get("path") or "").strip()
+		self._workspace_id = workspace_id
+		self.info_job_name.set_value(workspace_id)
+		if path:
+			self.info_save_path.set_value(path)
+			self._final_path = Path(path) / "final.md"
+		self.info_doc_count.set_value(f"{len(self._doc_bars)}건")
+		self.info_row_widget.setVisible(True)
+		self.workspaceCreated.emit(workspace_id, name)
+
+	def _set_progress_line(self, message: str) -> None:
+		text = " ".join(message.split())
+		if len(text) > 200:
+			text = text[:197] + "..."
+		self.progress_line.setText(text)
+		self.progress_line.setVisible(True)
 	def _doc_count_text(self) -> str:
 		"""Caption for the '수집된 문서 수' tile — collected vs. requested."""
 		return f"{len(self._doc_bars)} / {self._max_docs}건"
->>>>>>> 86373f7ad4e339460fa911e3cd3a1ea8a23abe8c
 
 	def _add_pending_document_bar(self, detail: dict) -> None:
 		doc_id = str(detail.get("doc_id") or "").strip()
