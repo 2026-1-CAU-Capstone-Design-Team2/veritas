@@ -42,6 +42,30 @@ def add_text_breakpoints(text: str, chunk_size: int = 24) -> str:
 	return re.sub(r"\S{32,}", break_long_token, text)
 
 
+try:
+	from shiboken6 import isValid as _shiboken_is_valid
+except Exception:  # pragma: no cover - shiboken6 ships with PySide6
+	_shiboken_is_valid = None
+
+
+def _qt_is_alive(obj: object) -> bool:
+	"""True when *obj*'s underlying Qt C++ object still exists.
+
+	A streaming chat answer can outlive the bubble it is writing into \u2014 e.g.
+	a workspace switch (research completion) clears the panel mid-stream. A
+	late chunk that touches the freed QLabel would otherwise raise
+	``RuntimeError: Internal C++ object already deleted``.
+	"""
+	if obj is None:
+		return False
+	if _shiboken_is_valid is None:
+		return True
+	try:
+		return bool(_shiboken_is_valid(obj))
+	except Exception:
+		return False
+
+
 class ChatInputEdit(QTextEdit):
 	sendRequested = Signal()
 
@@ -483,6 +507,10 @@ class ChatMessageBubble(QFrame):
 	def set_text(self, raw: str) -> None:
 		"""Update the message body while keeping the raw text for copy."""
 		self._raw_message = raw or ""
+		# Defensive: the label can be torn down (panel cleared / window closed)
+		# while a streaming answer is still arriving.
+		if not _qt_is_alive(self.text):
+			return
 		self.text.setText(add_text_breakpoints(self._raw_message))
 
 	def _copy_to_clipboard(self) -> None:
@@ -599,8 +627,21 @@ class ChatPanel(QFrame):
 		self._streaming_buffer = ""
 		return bubble
 
-	def append_streaming_chunk(self, chunk: str) -> None:
+	def _live_streaming_bubble(self) -> ChatMessageBubble | None:
+		"""Return the streaming bubble only if its C++ object still exists.
+
+		``clear_messages()`` / workspace switches can delete the bubble while a
+		streamed answer is still arriving; a stale reference here would crash
+		on the next chunk.
+		"""
 		bubble = getattr(self, "_streaming_bubble", None)
+		if bubble is None or not _qt_is_alive(bubble):
+			self._streaming_bubble = None
+			return None
+		return bubble
+
+	def append_streaming_chunk(self, chunk: str) -> None:
+		bubble = self._live_streaming_bubble()
 		if bubble is None:
 			return
 		self._streaming_buffer = (getattr(self, "_streaming_buffer", "") or "") + chunk
@@ -608,8 +649,10 @@ class ChatPanel(QFrame):
 		self.schedule_scroll_to_bottom()
 
 	def finalize_streaming_assistant(self, text: str | None = None) -> None:
-		bubble = getattr(self, "_streaming_bubble", None)
+		bubble = self._live_streaming_bubble()
 		if bubble is None:
+			self._streaming_bubble = None
+			self._streaming_buffer = ""
 			return
 		final_text = text if text is not None else getattr(self, "_streaming_buffer", "")
 		bubble.set_text(final_text or "")
@@ -618,8 +661,10 @@ class ChatPanel(QFrame):
 		self.schedule_scroll_to_bottom()
 
 	def cancel_streaming_assistant(self, error_text: str) -> None:
-		bubble = getattr(self, "_streaming_bubble", None)
+		bubble = self._live_streaming_bubble()
 		if bubble is None:
+			self._streaming_bubble = None
+			self._streaming_buffer = ""
 			return
 		current = getattr(self, "_streaming_buffer", "")
 		display = f"{current}\n\n[오류] {error_text}" if current else f"[오류] {error_text}"
@@ -629,6 +674,10 @@ class ChatPanel(QFrame):
 		self.schedule_scroll_to_bottom()
 
 	def clear_messages(self) -> None:
+		# Drop any in-flight streaming reference *first*: the bubble it points
+		# at is about to be deleted, and a late chunk must not touch it.
+		self._streaming_bubble = None
+		self._streaming_buffer = ""
 		while self.layout.count():
 			item = self.layout.takeAt(0)
 			self._dispose_layout_item(item)

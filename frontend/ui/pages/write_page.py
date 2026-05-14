@@ -69,6 +69,10 @@ class WritePage(QWidget):
 
 	def refresh(self) -> None:
 		self._workspace_id = current_workspace_id()
+		# Clearing the panel deletes any in-flight streaming bubble; drop the
+		# streaming flag too so late chunks from the previous workspace's turn
+		# are ignored instead of writing into a freed widget.
+		self._streaming = False
 		self.chat_panel.clear_messages()
 		try:
 			history = self._controller.get_chat_history(self._workspace_id)
