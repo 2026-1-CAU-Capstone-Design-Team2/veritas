@@ -92,22 +92,77 @@ def apply_markdown(widget, text: str) -> None:
 	widget.setMarkdown(text or "")
 
 
+_TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
+_BULLET_ITEM = re.compile(r"^\s*[-*+]\s+\S")
+_ORDERED_ITEM = re.compile(r"^\s*\d+[.)]\s+\S")
+_ORDERED_FIRST = re.compile(r"^\s*1[.)]\s+\S")
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
+_BLOCKQUOTE = re.compile(r"^\s*>")
+_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+
+def _is_list_item(line: str) -> bool:
+	return bool(_BULLET_ITEM.match(line) or _ORDERED_ITEM.match(line))
+
+
+def _needs_blank_before(line: str, prev: str) -> bool:
+	"""True when *line* opens a block construct that Python-Markdown only
+	recognises after a blank line, while *prev* is paragraph text it would
+	otherwise be swallowed into — which is why such blocks show up as raw
+	``-`` / ``|`` / ``#`` syntax in answers that omit the blank line.
+	"""
+	if not prev.strip():
+		return False
+	if _TABLE_ROW.match(line):
+		return not _TABLE_ROW.match(prev)
+	if _HEADING.match(line):
+		return True
+	if _BLOCKQUOTE.match(line):
+		return not _BLOCKQUOTE.match(prev)
+	# Lists: a bullet, or the first item of an ordered list. Ordered lists only
+	# trigger on "1." so prose like "2026. was a turning point" is left alone;
+	# later items don't need this since their prev is already a list item.
+	if _BULLET_ITEM.match(line) or _ORDERED_FIRST.match(line):
+		if _is_list_item(prev):
+			return False
+		# An indented prev line is a continuation/nested block — keep it joined.
+		return prev[:1] not in (" ", "\t")
+	return False
+
+
 def _normalize_for_qt(text: str) -> str:
 	"""Light pre-processing that improves parity with external previewers.
 
-	- Ensure a blank line before/after pipe tables so the parser detects them.
-	- Strip BOM/zero-width chars that occasionally land in LLM outputs.
+	LLM answers frequently omit the blank line Python-Markdown needs before a
+	block construct (list, table, heading, blockquote); without it the block
+	is absorbed into the preceding paragraph and renders as raw syntax. We
+	insert the missing blank line, skipping the insides of fenced code blocks
+	so their contents are never rewritten. BOM/zero-width chars that land in
+	LLM output are also stripped.
 	"""
 	normalized = text.replace("﻿", "").replace("​", "")
 	lines = normalized.split("\n")
 	out: list[str] = []
-	for index, line in enumerate(lines):
-		looks_like_table_row = bool(re.match(r"^\s*\|.*\|\s*$", line))
+	in_fence = False
+	fence_char = ""
+	for line in lines:
+		fence = _FENCE.match(line)
+		if fence:
+			marker = fence.group(1)[0]
+			if not in_fence:
+				in_fence, fence_char = True, marker
+			elif marker == fence_char:
+				in_fence, fence_char = False, ""
+			out.append(line)
+			continue
+		if in_fence:
+			out.append(line)
+			continue
 		prev = out[-1] if out else ""
-		if looks_like_table_row and prev and not re.match(r"^\s*\|", prev) and prev.strip():
+		if _needs_blank_before(line, prev):
 			out.append("")
 		out.append(line)
-	# Ensure trailing blank line after a table block so following text renders.
-	if out and re.match(r"^\s*\|", out[-1]):
+	# Ensure a trailing blank line after a table block so following text renders.
+	if out and _TABLE_ROW.match(out[-1]):
 		out.append("")
 	return "\n".join(out)

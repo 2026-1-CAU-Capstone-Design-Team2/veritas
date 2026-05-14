@@ -841,38 +841,32 @@ class MainWindow(QMainWindow):
 			background-color: #2563EB;
 		}
 
-		QToolButton#AssistModeButton {
+		QPushButton#AssistModeButton {
 			background-color: #F1F5F9;
 			color: #475569;
 			border: 1px solid #D1D5DB;
-			border-radius: 23px;
+			border-radius: 11px;
 			padding: 0px;
-			font-size: 24px;
-			font-weight: 500;
+			font-size: 13px;
+			font-weight: 800;
 		}
 
-		QToolButton#AssistModeButton:hover {
+		QPushButton#AssistModeButton:hover {
 			background-color: #E0E7FF;
 			border-color: #818CF8;
 			color: #3730A3;
 		}
 
-		QToolButton#AssistModeButton[researchActive="true"] {
+		QPushButton#AssistModeButton[researchActive="true"] {
 			background-color: #1E3A8A;
 			border-color: #1E3A8A;
 			color: #FFFFFF;
 		}
 
-		QToolButton#AssistModeButton[researchActive="true"]:hover {
+		QPushButton#AssistModeButton[researchActive="true"]:hover {
 			background-color: #1E40AF;
 			border-color: #1E40AF;
 			color: #FFFFFF;
-		}
-
-		QToolButton#AssistModeButton::menu-indicator {
-			image: none;
-			width: 0px;
-			height: 0px;
 		}
 
 		QFrame#ComposerCard {

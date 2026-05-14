@@ -22,13 +22,11 @@ from PySide6.QtWidgets import (
 	QGraphicsDropShadowEffect,
 	QHBoxLayout,
 	QLabel,
-	QMenu,
 	QPushButton,
 	QScrollArea,
 	QSizeGrip,
 	QSizePolicy,
 	QTextEdit,
-	QToolButton,
 	QVBoxLayout,
 	QWidget,
 )
@@ -760,23 +758,22 @@ class ChatInputBar(QFrame):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("AssistInputBar")
-		# RAG is the implicit default chat mode and is never surfaced in the
-		# UI; "자료조사" is an opt-in extra the user can toggle on.
+		# RAG ("채팅") is the default chat mode; "조사" (research) is the opt-in
+		# mode. The mode button shows the active one and toggles between them.
 		self._mode = "rag"
 
 		layout = QHBoxLayout(self)
 		layout.setContentsMargins(10, 8, 10, 8)
 		layout.setSpacing(8)
 
-		# A circular "+" affordance: clicking it pops a small menu just above
-		# the button with the opt-in 자료조사 mode. RAG is the implicit default
-		# and is never surfaced. When 자료조사 is active the circle turns navy.
-		self.mode_button = QToolButton()
+		# A rounded-rectangle toggle: it shows the active mode ("채팅" by default)
+		# and clicking it flips straight to "조사" — research mode — turning navy
+		# to signal it is on.
+		self.mode_button = QPushButton("채팅")
 		self.mode_button.setObjectName("AssistModeButton")
-		self.mode_button.setText("+")
 		self.mode_button.setCursor(Qt.PointingHandCursor)
-		self.mode_button.setFixedSize(46, 46)
-		self.mode_button.clicked.connect(self._show_mode_menu)
+		self.mode_button.setFixedSize(60, 46)
+		self.mode_button.clicked.connect(self._toggle_mode)
 
 		self.input = ChatInputEdit()
 		self.input.setObjectName("AssistChatInput")
@@ -795,27 +792,16 @@ class ChatInputBar(QFrame):
 		layout.addWidget(self.send_button)
 		self.set_mode(self._mode, emit=False)
 
-	def _show_mode_menu(self) -> None:
-		"""Pop a small mode menu just above the + button.
-
-		The single 자료조사 entry toggles the opt-in research mode; choosing it
-		while research is already active switches back to the default RAG mode.
-		"""
-		menu = QMenu(self)
-		action = menu.addAction("자료조사")
-		action.setCheckable(True)
-		action.setChecked(self._mode == "research")
-		hint = menu.sizeHint()
-		anchor = self.mode_button.mapToGlobal(QPoint(0, 0))
-		pos = QPoint(anchor.x(), anchor.y() - hint.height() - 6)
-		chosen = menu.exec(pos)
-		if chosen is action:
-			self.set_mode("rag" if self._mode == "research" else "research")
+	def _toggle_mode(self) -> None:
+		"""Flip between the default RAG ("채팅") and research ("조사") modes."""
+		self.set_mode("rag" if self._mode == "research" else "research")
 
 	def set_mode(self, mode: str, emit: bool = True) -> None:
 		self._mode = "research" if mode == "research" else "rag"
 		is_research = self._mode == "research"
-		# Drive the navy "active" styling via a dynamic property + repolish.
+		# The label doubles as the state read-out; the navy "active" styling is
+		# driven by a dynamic property + repolish.
+		self.mode_button.setText("조사" if is_research else "채팅")
 		self.mode_button.setProperty("researchActive", is_research)
 		self.mode_button.style().unpolish(self.mode_button)
 		self.mode_button.style().polish(self.mode_button)
@@ -1110,34 +1096,29 @@ class DocumentAssistWindow(QWidget):
 			QPushButton#AssistSendButton:hover {
 				background-color: #2563EB;
 			}
-			QToolButton#AssistModeButton {
+			QPushButton#AssistModeButton {
 				background-color: #F1F5F9;
 				color: #475569;
 				border: 1px solid #D1D5DB;
-				border-radius: 23px;
+				border-radius: 11px;
 				padding: 0px;
-				font-size: 24px;
-				font-weight: 500;
+				font-size: 13px;
+				font-weight: 800;
 			}
-			QToolButton#AssistModeButton:hover {
+			QPushButton#AssistModeButton:hover {
 				background-color: #E0E7FF;
 				border-color: #818CF8;
 				color: #3730A3;
 			}
-			QToolButton#AssistModeButton[researchActive="true"] {
+			QPushButton#AssistModeButton[researchActive="true"] {
 				background-color: #1E3A8A;
 				border-color: #1E3A8A;
 				color: #FFFFFF;
 			}
-			QToolButton#AssistModeButton[researchActive="true"]:hover {
+			QPushButton#AssistModeButton[researchActive="true"]:hover {
 				background-color: #1E40AF;
 				border-color: #1E40AF;
 				color: #FFFFFF;
-			}
-			QToolButton#AssistModeButton::menu-indicator {
-				image: none;
-				width: 0px;
-				height: 0px;
 			}
 			QMenu {
 				background-color: #FFFFFF;
