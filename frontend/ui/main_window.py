@@ -857,6 +857,18 @@ class MainWindow(QMainWindow):
 			color: #3730A3;
 		}
 
+		QToolButton#AssistModeButton:checked {
+			background-color: #3730A3;
+			border-color: #3730A3;
+			color: #FFFFFF;
+		}
+
+		QToolButton#AssistModeButton:checked:hover {
+			background-color: #312E81;
+			border-color: #312E81;
+			color: #FFFFFF;
+		}
+
 		QToolButton#AssistModeButton::menu-indicator {
 			image: none;
 			width: 0px;

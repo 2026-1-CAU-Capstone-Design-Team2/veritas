@@ -4,7 +4,6 @@ import re
 
 from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal, QTimer
 from PySide6.QtGui import (
-	QAction,
 	QColor,
 	QCloseEvent,
 	QKeyEvent,
@@ -22,7 +21,6 @@ from PySide6.QtWidgets import (
 	QGraphicsDropShadowEffect,
 	QHBoxLayout,
 	QLabel,
-	QMenu,
 	QPushButton,
 	QScrollArea,
 	QSizeGrip,
@@ -733,26 +731,23 @@ class ChatInputBar(QFrame):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("AssistInputBar")
-		self._mode = "research"
+		# RAG is the implicit default chat mode and is never surfaced in the
+		# UI; "자료조사" is an opt-in extra the user can toggle on.
+		self._mode = "rag"
 
 		layout = QHBoxLayout(self)
 		layout.setContentsMargins(10, 8, 10, 8)
 		layout.setSpacing(8)
 
+		# A checkable toggle, not a mode picker: unchecked = RAG (default),
+		# checked = 자료조사. RAG itself is intentionally never labelled.
 		self.mode_button = QToolButton()
 		self.mode_button.setObjectName("AssistModeButton")
-		self.mode_button.setPopupMode(QToolButton.InstantPopup)
+		self.mode_button.setText("자료조사")
+		self.mode_button.setCheckable(True)
 		self.mode_button.setCursor(Qt.PointingHandCursor)
 		self.mode_button.setFixedSize(82, 46)
-
-		mode_menu = QMenu(self.mode_button)
-		research_action = QAction("자료조사", self)
-		research_action.triggered.connect(lambda: self.set_mode("research"))
-		rag_action = QAction("RAG", self)
-		rag_action.triggered.connect(lambda: self.set_mode("rag"))
-		mode_menu.addAction(research_action)
-		mode_menu.addAction(rag_action)
-		self.mode_button.setMenu(mode_menu)
+		self.mode_button.toggled.connect(self._on_mode_button_toggled)
 
 		self.input = ChatInputEdit()
 		self.input.setObjectName("AssistChatInput")
@@ -771,16 +766,22 @@ class ChatInputBar(QFrame):
 		layout.addWidget(self.send_button)
 		self.set_mode(self._mode, emit=False)
 
+	def _on_mode_button_toggled(self, checked: bool) -> None:
+		self.set_mode("research" if checked else "rag")
+
 	def set_mode(self, mode: str, emit: bool = True) -> None:
-		self._mode = "rag" if mode == "rag" else "research"
-		if self._mode == "rag":
-			self.mode_button.setText("RAG")
-			self.mode_button.setToolTip("RAG 모드")
-			self.input.setPlaceholderText("RAG 모드로 질문하기...")
-		else:
-			self.mode_button.setText("자료조사")
-			self.mode_button.setToolTip("자료조사 모드")
+		self._mode = "research" if mode == "research" else "rag"
+		is_research = self._mode == "research"
+		# Keep the toggle in sync without re-entering the toggled handler.
+		self.mode_button.blockSignals(True)
+		self.mode_button.setChecked(is_research)
+		self.mode_button.blockSignals(False)
+		if is_research:
+			self.mode_button.setToolTip("자료조사 모드 사용 중 (눌러서 끄기)")
 			self.input.setPlaceholderText("자료조사 모드로 질문하기...")
+		else:
+			self.mode_button.setToolTip("자료조사 모드 켜기")
+			self.input.setPlaceholderText("문서에 대해 질문하기...")
 		if emit:
 			self.modeChanged.emit(self._mode)
 
@@ -1080,6 +1081,16 @@ class DocumentAssistWindow(QWidget):
 				border-color: #818CF8;
 				color: #3730A3;
 			}
+			QToolButton#AssistModeButton:checked {
+				background-color: #3730A3;
+				border-color: #3730A3;
+				color: #FFFFFF;
+			}
+			QToolButton#AssistModeButton:checked:hover {
+				background-color: #312E81;
+				border-color: #312E81;
+				color: #FFFFFF;
+			}
 			QToolButton#AssistModeButton::menu-indicator {
 				image: none;
 				width: 0px;
@@ -1163,8 +1174,13 @@ class DocumentAssistWindow(QWidget):
 		self.input_bar.input.clear()
 
 	def _on_mode_changed(self, mode: str) -> None:
-		label = "RAG" if mode == "rag" else "자료조사"
-		self.title_bar.status.setText(label)
+		# RAG is the implicit default, so it gets no badge; only the opt-in
+		# 자료조사 mode is surfaced. Switching back to RAG restores the
+		# default status text.
+		if mode == "research":
+			self.title_bar.status.setText("자료조사")
+		else:
+			self.title_bar.status.setText("● 분석 중")
 
 	def on_message_submitted(self, message: str) -> None:
 		# The user bubble is drawn by ChatBus subscribers (MainWindow + WritePage)

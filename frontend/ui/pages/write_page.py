@@ -10,7 +10,8 @@ from ..windows.document_assist_window import ChatInputBar, ChatPanel
 class WritePage(QWidget):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
-		self._mode = "research"
+		# RAG is the implicit default chat mode; 자료조사 is opt-in.
+		self._mode = "rag"
 		self._workspace_id = current_workspace_id()
 		self._controller = AgentController()
 		self._bus = get_chat_bus()
