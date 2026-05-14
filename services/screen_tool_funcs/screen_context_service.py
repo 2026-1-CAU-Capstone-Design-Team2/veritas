@@ -62,7 +62,8 @@ class ScreenContextService:
         self.powerpoint_reader = PowerPointComReader()
         self.ui_reader = UiAutomationReader()
         self.content_filter = ContentFilter()
-        self.store = ScreenContextStore(root)
+        # console_log(=--screen-debug)면 capture log를 debug/에 기록
+        self.store = ScreenContextStore(root, debug=console_log)
 
         # Build one shared scenario list and inject it into every component
         # that depends on it (detector, scheduler, dispatcher). This replaces
@@ -96,6 +97,7 @@ class ScreenContextService:
         self._last_poll_error: str | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._debug_stats = self._new_debug_stats()
 
     # 한 번 캡처: 텍스트 수집 -> filtered -> decide -> 이벤트 저장 -> dispatch
     def capture_once(self) -> ScreenContextEvent:
@@ -260,6 +262,8 @@ class ScreenContextService:
             return
 
         self._stop_event.clear()
+        self._debug_stats = self._new_debug_stats()
+        self._debug_stats["started_at"] = datetime.now().isoformat(timespec="seconds")
         self.scenario_scheduler.start()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
@@ -270,6 +274,9 @@ class ScreenContextService:
         if self._thread:
             self._thread.join(timeout=self.interval_sec + 1)
         self.scenario_scheduler.stop()
+        # debug 모드면 세션 통계 1줄을 capture log 끝에 append
+        if self.console_log:
+            self._write_debug_stats_summary()
 
     # 폴링 스레드가 살아있는지 여부
     def is_polling(self) -> bool:
@@ -340,6 +347,8 @@ class ScreenContextService:
         if not self.console_log:
             return
 
+        self._accumulate_debug_stats(event)
+
         base = (
             f"[screen_context][capture] event={event.event_id} "
             f"process={window.process_name or '-'} "
@@ -372,6 +381,67 @@ class ScreenContextService:
                 "[screen_context][capture][warn] "
                 f"event={event.event_id} no_readable_text errors={extractor_errors}"
             )
+
+    # debug 모드 세션 통계 누적기 초기 구조
+    def _new_debug_stats(self) -> dict:
+        return {
+            "started_at": None,
+            "total_captures": 0,
+            "common_passed": 0,
+            "common_blocked": 0,
+            "block_reasons": {},
+            "scenarios": {},
+            "interventions_queued": 0,
+        }
+
+    # 캡처 1건의 결정 결과를 debug 세션 통계에 누적
+    def _accumulate_debug_stats(self, event: ScreenContextEvent) -> None:
+        stats = self._debug_stats
+        stats["total_captures"] += 1
+        meta = event.intervention.metadata or {}
+        common_checks = meta.get("common_checks") or {}
+        blockers = [
+            name
+            for name, check in common_checks.items()
+            if isinstance(check, dict) and not check.get("passed")
+        ]
+        if blockers:
+            stats["common_blocked"] += 1
+            for name in blockers:
+                stats["block_reasons"][name] = stats["block_reasons"].get(name, 0) + 1
+        else:
+            stats["common_passed"] += 1
+        for name, scenario in (meta.get("scenarios") or {}).items():
+            if not isinstance(scenario, dict):
+                continue
+            entry = stats["scenarios"].setdefault(name, {"ready": 0, "selected": 0})
+            if scenario.get("ready"):
+                entry["ready"] += 1
+        selected = meta.get("selected")
+        if selected:
+            entry = stats["scenarios"].setdefault(selected, {"ready": 0, "selected": 0})
+            entry["selected"] += 1
+        if event.intervention.should_consider_llm:
+            stats["interventions_queued"] += 1
+
+    # debug 모드 종료 시 세션 통계 1줄을 capture log 끝에 append
+    def _write_debug_stats_summary(self) -> None:
+        stats = self._debug_stats
+        summary = {
+            "type": "session_stats",
+            "session_id": self.store.capture_session_id,
+            "started_at": stats.get("started_at"),
+            "ended_at": datetime.now().isoformat(timespec="seconds"),
+            "total_captures": stats["total_captures"],
+            "common_gate": {
+                "passed": stats["common_passed"],
+                "blocked": stats["common_blocked"],
+                "block_reasons": stats["block_reasons"],
+            },
+            "scenarios": stats["scenarios"],
+            "interventions_queued": stats["interventions_queued"],
+        }
+        self.store.append_capture_log(summary)
 
     # 디버그용: 추출 텍스트 길이·미리보기를 콘솔 출력
     def _log_debug_text(self, event: ScreenContextEvent, diagnostics: dict) -> None:

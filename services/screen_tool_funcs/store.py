@@ -23,7 +23,7 @@ class ScreenContextStore:
     CAPTURE_LOG_ROTATE_KEEP = 3
     CAPTURE_LOG_SESSION_RETENTION = 20
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, debug: bool = False) -> None:
         self.root = Path(root)
         self.screen_dir = self.root / "screen_context"
         self.events_path = self.screen_dir / "events.jsonl"
@@ -31,7 +31,8 @@ class ScreenContextStore:
         self.intervention_log_path = self.screen_dir / "interventions.jsonl"
         self.intervention_queue_path = self.screen_dir / "intervention_queue.json"
         self.latest_intervention_path = self.screen_dir / "latest_intervention.json"
-        self.capture_log_dir = self.screen_dir / "capture_logs"
+        # debug 모드면 capture log를 capture_logs/ 대신 debug/에 기록
+        self.capture_log_dir = self.screen_dir / ("debug" if debug else "capture_logs")
         self.scheduler_dir = self.screen_dir / "scheduler_state"
         self.capture_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.capture_log_path = self.capture_log_dir / f"capture_{self.capture_session_id}.jsonl"
@@ -254,12 +255,7 @@ class ScreenContextStore:
             pass
 
     def _prune_capture_log_sessions(self) -> None:
-        """Keep the most recent CAPTURE_LOG_SESSION_RETENTION session files.
-
-        Capture logs are written per service-session and never overwritten, so
-        the directory grows unbounded across reboots. We prune at construction
-        time, ranking by mtime descending and deleting the tail.
-        """
+        """capture_log_dir의 capture 세션 파일을 mtime 기준 최근 RETENTION개만 남김."""
         retention = max(self.CAPTURE_LOG_SESSION_RETENTION, 1)
         try:
             files = list(self.capture_log_dir.glob("capture_*.jsonl*"))
