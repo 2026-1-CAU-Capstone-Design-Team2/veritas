@@ -16,6 +16,7 @@ from .powerpoint_com import PowerPointComReader
 from .scenario_scheduler import ScenarioScheduler, ScenarioSchedulerState, ScenarioWeights
 from .scenarios import (
     IdleAfterWritingScenario,
+    LongStaticReviewScenario,
     ScenarioContext,
     ScenarioEvaluation,
     ScenarioType,
@@ -36,6 +37,7 @@ __all__ = [
     "InterventionDecision",
     "InterventionDetector",
     "InterventionDispatcher",
+    "LongStaticReviewScenario",
     "OcrEngine",
     "OcrResult",
     "PowerPointComReader",

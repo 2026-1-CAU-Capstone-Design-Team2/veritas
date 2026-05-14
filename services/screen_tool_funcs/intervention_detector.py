@@ -248,9 +248,18 @@ class InterventionDetector:
     def _has_stable_paragraph(self, filtered: FilteredScreenContext) -> bool:
         paragraph = " ".join((filtered.current_paragraph_text or "").split())
         source = filtered.current_paragraph_source or ""
+        if not source:
+            return False
         if source == "ocr_same_as_full_text":
+            # OCR confidence is a flat constant, so paragraph length stays the
+            # only available trustworthiness proxy for OCR-sourced captures.
             return len(paragraph) >= self.min_ocr_paragraph_chars and filtered.confidence >= 0.55
-        return bool(source and len(paragraph) >= self.min_paragraph_chars and filtered.confidence >= 0.8)
+        # UIA/app-text extraction is precise: a short current paragraph is still
+        # a correct extraction, so this common gate no longer applies a length
+        # floor here. Per-paragraph length is now a scenario-level gate (see
+        # ScenarioType._has_substantial_paragraph) so document-scoped scenarios
+        # are not blocked by a short current paragraph.
+        return filtered.confidence >= 0.8
 
     def _make_document_key(self, window: WindowContext) -> str:
         process_name = (window.process_name or "").lower()

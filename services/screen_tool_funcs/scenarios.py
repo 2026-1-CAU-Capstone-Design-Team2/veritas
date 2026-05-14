@@ -139,6 +139,23 @@ class ScenarioType(ABC):
                 result[key] = value
         return result
 
+    def _has_substantial_paragraph(
+        self,
+        filtered: FilteredScreenContext,
+        *,
+        min_chars: int = 20,
+    ) -> bool:
+        """Whether the current paragraph itself carries enough text to act on.
+
+        Paragraph-scoped scenarios (those whose intervention focuses on the
+        paragraph the cursor sits in) call this as one of their gates. Document-
+        scoped scenarios do not call it, so a short current paragraph never
+        blocks them. The common stable_paragraph gate intentionally no longer
+        checks paragraph length — it only asserts the capture is trustworthy.
+        """
+        paragraph = " ".join((filtered.current_paragraph_text or "").split())
+        return len(paragraph) >= min_chars
+
 
 class IdleAfterWritingScenario(ScenarioType):
     """User wrote, then paused on the same paragraph -> request gentle continuation."""
@@ -179,6 +196,15 @@ class IdleAfterWritingScenario(ScenarioType):
             document_key=context.document_key,
             paragraph_fingerprint=context.paragraph_fingerprint,
         )
+        # The common stable_paragraph gate no longer checks paragraph length, so
+        # this paragraph-scoped scenario asserts it for itself. Document-scoped
+        # scenarios skip this and are not blocked by a short current paragraph.
+        paragraph_chars = len(
+            " ".join((context.filtered.current_paragraph_text or "").split())
+        )
+        substantial_paragraph_passed = self._has_substantial_paragraph(
+            context.filtered, min_chars=self.min_paragraph_chars
+        )
 
         evaluation.gate_results = {
             "typing_pause": self._gate_result(
@@ -195,6 +221,14 @@ class IdleAfterWritingScenario(ScenarioType):
                     "paragraph_fingerprint": context.paragraph_fingerprint,
                 },
             ),
+            "substantial_paragraph": self._gate_result(
+                substantial_paragraph_passed,
+                "substantial_paragraph" if substantial_paragraph_passed else "paragraph_too_short",
+                {
+                    "current_paragraph_chars": paragraph_chars,
+                    "min_paragraph_chars": self.min_paragraph_chars,
+                },
+            ),
         }
 
         if typing_pause_passed:
@@ -208,6 +242,13 @@ class IdleAfterWritingScenario(ScenarioType):
             evaluation.reasons.append("cooldown_dedupe_passed")
         else:
             evaluation.blockers.append("cooldown_or_duplicate")
+
+        # Hard prerequisite, not a graded signal: contributes a blocker but no
+        # score, so the existing 0.0-0.8 score range and priority threshold hold.
+        if substantial_paragraph_passed:
+            evaluation.reasons.append("substantial_paragraph")
+        else:
+            evaluation.blockers.append("paragraph_too_short")
 
         evaluation.ready = not evaluation.blockers
         evaluation.priority = "high" if evaluation.ready and evaluation.score >= 0.7 else "medium"
@@ -623,6 +664,255 @@ class WholeDocumentReviewScenario(ScenarioType):
         filtered = event.get("filtered") or {}
         text = str(filtered.get("active_editor_text") or "")
         return " ".join(text.split()).strip()
+
+    def _elapsed_seconds(self, event: dict[str, Any]) -> float | None:
+        from datetime import datetime
+
+        captured_at = event.get("captured_at")
+        if not captured_at:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(captured_at))
+        except ValueError:
+            return None
+        try:
+            now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+        except Exception:
+            now = datetime.now()
+        return max((now - parsed).total_seconds(), 0.0)
+
+
+class LongStaticReviewScenario(ScenarioType):
+    """Editor left open and unchanged for a long stretch -> proofread + suggest.
+
+    Covers the case where the user has finished writing or is re-reading their
+    own text without editing. Unlike idle_after_writing / whole_document_review,
+    this scenario fires precisely when *no* writing activity is observed: the
+    `prolonged_static` gate requires the document text to stay unchanged across
+    several consecutive captures. The other two scenarios block themselves in
+    that same situation (no change-before-pause, no chars added), so the ready
+    sets do not collide in practice.
+
+    Scheduled with a high initial vruntime so that, on the rare capture where it
+    shares the ready set with another scenario, CFS picks it last. Re-firing on
+    the same document is throttled by the `review_cooldown` gate, since when
+    this scenario is the only ready one it would otherwise be selected on every
+    capture.
+    """
+
+    name = "long_static_review"
+    priority = "low"
+    initial_vruntime = 10.0
+    vruntime_increment = 3.0
+    review_char_limit = 6000
+
+    def __init__(
+        self,
+        *,
+        min_static_captures: int = 3,
+        min_document_chars: int = 200,
+        idle_similarity_threshold: float = 0.99,
+        cooldown_min_seconds: float = 600.0,
+        initial_vruntime: float | None = None,
+        vruntime_increment: float | None = None,
+    ) -> None:
+        super().__init__(
+            initial_vruntime=initial_vruntime,
+            vruntime_increment=vruntime_increment,
+        )
+        self.min_static_captures = min_static_captures
+        self.min_document_chars = min_document_chars
+        self.idle_similarity_threshold = idle_similarity_threshold
+        self.cooldown_min_seconds = cooldown_min_seconds
+
+    def evaluate(self, context: ScenarioContext) -> ScenarioEvaluation:
+        evaluation = ScenarioEvaluation(name=self.name, priority=self.priority)
+
+        static = self._prolonged_static_status(context.same_document_events)
+        static_passed = bool(static.get("passed"))
+        cooldown = self._review_cooldown_status(
+            history_events=context.history_events,
+            document_key=context.document_key,
+        )
+        cooldown_passed = bool(cooldown.get("passed"))
+
+        evaluation.gate_results = {
+            "prolonged_static": self._gate_result(
+                static_passed,
+                "prolonged_static_observed" if static_passed else "not_static_long_enough",
+                static,
+            ),
+            "review_cooldown": self._gate_result(
+                cooldown_passed,
+                "review_cooldown_passed" if cooldown_passed else "review_cooldown_active",
+                cooldown,
+            ),
+        }
+
+        if static_passed:
+            evaluation.score += 0.5
+            evaluation.reasons.append("prolonged_static_observed")
+        else:
+            evaluation.blockers.append("not_static_long_enough")
+
+        if cooldown_passed:
+            evaluation.score += 0.3
+            evaluation.reasons.append("review_cooldown_passed")
+        else:
+            evaluation.blockers.append("review_cooldown_active")
+
+        evaluation.ready = not evaluation.blockers
+        evaluation.priority = "medium" if evaluation.ready else "low"
+        evaluation.metadata = {
+            "prolonged_static": static,
+            "review_cooldown": cooldown,
+        }
+        return evaluation
+
+    def writing_context_overrides(
+        self,
+        *,
+        filtered: FilteredScreenContext,
+        base: dict[str, Any],
+    ) -> dict[str, Any]:
+        review_text = self._build_review_text(filtered.active_editor_text)
+        return {
+            "focus_scope": "full_document",
+            "recent_sentences": review_text,
+            "focused_sentence": "",
+            "full_document_excerpt": review_text,
+        }
+
+    def tool_routing_hint_overrides(
+        self,
+        *,
+        event: Any,
+        base: dict[str, Any],
+        focused_sentence: str,
+    ) -> dict[str, Any]:
+        return {
+            "tone": "proofreading_review",
+            "preferred_action": "review_whole_document",
+        }
+
+    def _build_review_text(self, text: str) -> str:
+        normalized = " ".join(str(text or "").split()).strip()
+        limit = self.review_char_limit
+        if len(normalized) <= limit:
+            return (
+                "The user has kept this document open without editing for a "
+                "while and may be re-reading it. Proofread the document below, "
+                "point out typos or awkward phrasing, and suggest what to write "
+                f"next or what to add:\n{normalized}"
+            )
+        head_limit = limit // 2
+        tail_limit = limit - head_limit
+        return (
+            "The user has kept this document open without editing for a while "
+            "and may be re-reading it. The document is too long, so proofread "
+            "this beginning/end excerpt, point out typos or awkward phrasing, "
+            "and suggest what to add. Mention that the middle was omitted. "
+            f"Full document chars={len(normalized)}.\n"
+            f"[BEGINNING]\n{normalized[:head_limit]}\n"
+            f"[END]\n{normalized[-tail_limit:]}"
+        )
+
+    def _prolonged_static_status(
+        self,
+        same_document_events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not same_document_events:
+            return {
+                "passed": False,
+                "reason": "no_history",
+                "static_capture_count": 0,
+                "min_static_captures": self.min_static_captures,
+            }
+
+        current_text = self._normalized_active_text(same_document_events[-1])
+        if len(current_text) < self.min_document_chars:
+            return {
+                "passed": False,
+                "reason": "document_too_short",
+                "static_capture_count": 0,
+                "min_static_captures": self.min_static_captures,
+                "current_text_chars": len(current_text),
+                "min_document_chars": self.min_document_chars,
+            }
+
+        static_capture_count = 0
+        last_similarity = 1.0
+        for event in reversed(same_document_events):
+            event_text = self._normalized_active_text(event)
+            is_static, similarity = self._is_static_text(event_text, current_text)
+            last_similarity = similarity
+            if not is_static:
+                break
+            static_capture_count += 1
+
+        passed = static_capture_count >= self.min_static_captures
+        return {
+            "passed": passed,
+            "reason": "ok" if passed else "not_static_long_enough",
+            "static_capture_count": static_capture_count,
+            "min_static_captures": self.min_static_captures,
+            "idle_similarity_threshold": self.idle_similarity_threshold,
+            "last_similarity": round(last_similarity, 4),
+            "current_text_chars": len(current_text),
+            "min_document_chars": self.min_document_chars,
+        }
+
+    def _review_cooldown_status(
+        self,
+        *,
+        history_events: list[dict[str, Any]],
+        document_key: str,
+    ) -> dict[str, Any]:
+        last_review_event: dict[str, Any] | None = None
+        for event in reversed(history_events):
+            intervention = event.get("intervention") or {}
+            if not intervention.get("should_consider_llm"):
+                continue
+            if intervention.get("intervention_type") != self.name:
+                continue
+            if _event_document_key(event) != document_key:
+                continue
+            last_review_event = event
+            break
+
+        if last_review_event is None:
+            return {
+                "passed": True,
+                "reason": "no_prior_review",
+                "min_seconds": self.cooldown_min_seconds,
+            }
+
+        elapsed_seconds = self._elapsed_seconds(last_review_event)
+        # Fail-closed: if we can't determine elapsed time, treat cooldown as active.
+        passed = elapsed_seconds is not None and elapsed_seconds >= self.cooldown_min_seconds
+        return {
+            "passed": passed,
+            "reason": "ok" if passed else "cooldown_active",
+            "elapsed_seconds": elapsed_seconds,
+            "min_seconds": self.cooldown_min_seconds,
+        }
+
+    def _normalized_active_text(self, event: dict[str, Any]) -> str:
+        filtered = event.get("filtered") or {}
+        text = str(filtered.get("active_editor_text") or "")
+        return " ".join(text.split()).strip()
+
+    def _is_static_text(self, previous: str, current: str) -> tuple[bool, float]:
+        if previous == current:
+            return True, 1.0
+        if not previous or not current:
+            return False, 0.0
+        length_delta = abs(len(current) - len(previous))
+        max_noise_chars = max(2, int(len(current) * 0.01))
+        if length_delta > max_noise_chars:
+            return False, 0.0
+        similarity = difflib.SequenceMatcher(None, previous, current).ratio()
+        return similarity >= self.idle_similarity_threshold, similarity
 
     def _elapsed_seconds(self, event: dict[str, Any]) -> float | None:
         from datetime import datetime

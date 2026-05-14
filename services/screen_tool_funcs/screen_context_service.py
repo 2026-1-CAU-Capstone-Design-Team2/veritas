@@ -14,6 +14,7 @@ from .powerpoint_com import PowerPointComReader
 from .scenario_scheduler import ScenarioScheduler
 from .scenarios import (
     IdleAfterWritingScenario,
+    LongStaticReviewScenario,
     WholeDocumentReviewScenario,
 )
 from .screen_capture import ScreenCapture
@@ -62,6 +63,7 @@ class ScreenContextService:
         scenarios = [
             IdleAfterWritingScenario(),
             WholeDocumentReviewScenario(),
+            LongStaticReviewScenario(),
         ]
         self.scenario_scheduler = ScenarioScheduler(
             self.store,
