@@ -141,27 +141,20 @@ class InterventionDetector:
                 },
             )
 
-        # `now`를 한 번 만들어 get_state/select_and_charge/snapshot에 공유.
-        # last_fired_at/last_fired_doc_chars는 fan-out 전에 읽어 cooldown 게이트에 전달.
-        now = time.time()
-        last_fired_at: dict[str, float] = {}
-        last_fired_doc_chars: dict[str, int] = {}
-        if self.scheduler is not None:
-            state = self.scheduler.get_state(
-                current_snapshot["document_key"], now=now
-            )
-            last_fired_at = dict(state.last_fired_at)
-            last_fired_doc_chars = dict(state.last_fired_doc_chars)
+        """
+           dwell() -> recent 기반 document key 일치 비율이 충분한가? [탐색 개수 : history_window, 탐색 대상 : same_document_events ]
+           stable_paragraph() -> 현재 단락이 충분히 길거나 OCR confidence가 충분히 높은가? [current_paragraph_text, current_paragraph_source, confidence]
+           typing_pause() -> 최근 입력 이벤트 후 충분한 무활동 시간이 지났는가? [최근 입력 이벤트 timestamp, 현재 timestamp, min_typing_pause_seconds]
+            
+        """
 
         scenario_ctx = ScenarioContext(
             window=window,
             filtered=filtered,
-            history_events=history_events,
-            same_document_events=same_document_events,
+            history_events=history_events,  # RAM에 유지, 잘리지 않은 원본 history
+            same_document_events=same_document_events, # recent 에서 document_key가 같은 이벤트들
             document_key=current_snapshot["document_key"],
             paragraph_fingerprint=current_snapshot["paragraph_fingerprint"],
-            last_fired_at=last_fired_at,
-            last_fired_doc_chars=last_fired_doc_chars,
         )
         scenario_results: dict[str, ScenarioEvaluation] = {}
         for scenario in self.scenarios:
@@ -171,13 +164,12 @@ class InterventionDetector:
         scheduler_snapshot: dict[str, Any] | None = None
         selected_name: str | None = None
         if ready_names and self.scheduler is not None:
-            # 발동 시점의 정규화 문서 길이 — 글자수 기반 cooldown 판정용
-            doc_chars = len(" ".join((filtered.active_editor_text or "").split()))
+            # Single `now` flows through select+charge+snapshot so lazy decay
+            # is applied exactly once per capture, not twice as in the old
+            # split select() / charge() / snapshot() chain.
+            now = time.time()
             selected_name = self.scheduler.select_and_charge(
-                current_snapshot["document_key"],
-                ready_names,
-                now=now,
-                doc_chars=doc_chars,
+                current_snapshot["document_key"], ready_names, now=now
             )
             scheduler_snapshot = self.scheduler.snapshot(
                 current_snapshot["document_key"], now=now
