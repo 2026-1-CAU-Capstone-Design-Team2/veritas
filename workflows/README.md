@@ -104,7 +104,12 @@ def run_summarize(
     """문서 요약. clean_md를 읽는다.
     phase="batch"   → 배치 요약만 (수집 루프 안에서 gap 분석/replan용)
     phase="per_doc" → per-doc 요약만 (조사 종료 시 1회, summary/doc_*.md)
-    phase="all"     → 둘 다 (standalone --phase summarize)"""
+    phase="all"     → 둘 다 (standalone --phase summarize)
+
+    per-doc 루프가 도는 phase("per_doc"/"all")에서는 document_summarize
+    tool에 progress_callback(_on_summarize_progress)을 넘겨, 문서별
+    document_summarize / doc_summarized / doc_failed 진행 이벤트를
+    실시간으로 흘려보낸다 — 진행률 막대 전진 + doc_*.md 카드 즉시 활성화."""
 
 def run_final(self, *, user_request: str | None = None) -> dict:
     """4단계: 최종 보고서 생성"""
@@ -202,7 +207,11 @@ final_result = workflow.run_final()
 - **per-doc 요약** (수집 루프 종료 후 1회, `phase="per_doc"`): 모든 `clean_md`를
   문서별로 요약해 `summary/doc_*.md`를 만듭니다. replan에 관여하지 않는 UX
   디스크립터(출처 카드/인용/검증용)이므로 루프 임계 경로에서 빼 종료 단계에
-  일괄 수행합니다.
+  일괄 수행합니다. 다만 이 일괄 단계 안에서도 `document_summarize` tool에
+  넘긴 `progress_callback`(`_on_summarize_progress`)을 통해 문서 하나가
+  시작/완료/실패할 때마다 진행 이벤트를 실시간 emit합니다 — 그래서 UI
+  진행률 막대가 per-doc 구간에서 멈췄다 튀지 않고 문서마다 전진하고,
+  `doc_*.md` 출처 카드도 요약이 끝나는 즉시 하나씩 활성화됩니다.
 
 ### Final 단계
 1. 모든 배치 요약 로드

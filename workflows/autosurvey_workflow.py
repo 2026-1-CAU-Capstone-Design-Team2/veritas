@@ -48,6 +48,56 @@ class AutoSurveyWorkflow:
         except Exception:
             pass
 
+    def _on_summarize_progress(self, kind: str, **info: Any) -> None:
+        """Translate per-document summary events from ``DocumentSummarizeTool``
+        into progress emissions.
+
+        The per-document summary loop is the long tail of a survey run — one LLM
+        call per document — so the tool streams an event as each document starts
+        and finishes. Mapping them to ``document_summarize`` / ``doc_summarized``
+        / ``doc_failed`` here keeps the progress bar advancing and activates each
+        source card the moment its summary lands, instead of one jump after the
+        whole loop completes.
+        """
+        doc_id_str = str(info.get("doc_id") or "").strip()
+        if not doc_id_str:
+            return
+        if kind == "doc_start":
+            title = str(info.get("title") or doc_id_str).strip() or doc_id_str
+            self._emit_progress(
+                "document_summarize",
+                f"문서 요약 중 ({title})",
+                detail={"phase": "per_doc", "doc_id": doc_id_str, "title": title},
+            )
+        elif kind == "doc_summarized":
+            try:
+                summary_path = self.run_store_service.paths.summary_path_for(
+                    int(doc_id_str)
+                )
+                summary_path_str = str(summary_path.resolve())
+            except Exception:
+                summary_path_str = ""
+            self._emit_progress(
+                "doc_summarized",
+                f"요약 완료: doc_{doc_id_str}",
+                detail={
+                    "doc_id": doc_id_str,
+                    "summary_path": summary_path_str,
+                },
+            )
+        elif kind == "doc_failed":
+            title = str(info.get("title") or doc_id_str).strip() or doc_id_str
+            reason = str(info.get("reason") or "요약 실패").strip()
+            self._emit_progress(
+                "doc_failed",
+                f"요약 실패: doc_{doc_id_str}",
+                detail={
+                    "doc_id": doc_id_str,
+                    "title": title,
+                    "reason": reason,
+                },
+            )
+
     def run_term_grounding(
         self,
         user_request: str,
@@ -338,44 +388,17 @@ class AutoSurveyWorkflow:
             doc_ids=doc_ids if do_batch else None,
             rebuild_batches=do_batch,
             summarize_docs=do_per_doc,
+            # Per-document summary events (start / summarized / failed) are
+            # streamed live from inside the tool's loop via this callback, so
+            # the progress bar advances and each source card activates the
+            # moment its summary lands — not all at once after the whole loop.
+            # Batch-only phases run no per-document loop, so they need no
+            # callback.
+            progress_callback=self._on_summarize_progress if do_per_doc else None,
         )
         if not result.success:
             raise RuntimeError(result.error)
-        data = result.data or {}
-        for summarized_id in data.get("summarized_doc_ids", []) or []:
-            doc_id_str = str(summarized_id)
-            try:
-                summary_path = self.run_store_service.paths.summary_path_for(
-                    int(doc_id_str)
-                )
-                summary_path_str = str(summary_path.resolve())
-            except Exception:
-                summary_path_str = ""
-            self._emit_progress(
-                "doc_summarized",
-                f"요약 완료: doc_{doc_id_str}",
-                detail={
-                    "doc_id": doc_id_str,
-                    "summary_path": summary_path_str,
-                },
-            )
-        for failed in data.get("failed_documents", []) or []:
-            if not isinstance(failed, dict):
-                continue
-            doc_id_str = str(failed.get("docId") or "").strip()
-            if not doc_id_str:
-                continue
-            reason = str(failed.get("reason") or "요약 실패").strip()
-            self._emit_progress(
-                "doc_failed",
-                f"요약 실패: doc_{doc_id_str}",
-                detail={
-                    "doc_id": doc_id_str,
-                    "title": str(failed.get("title") or doc_id_str),
-                    "reason": reason,
-                },
-            )
-        return data
+        return result.data or {}
 
     def run_final(self, *, user_request: str | None = None) -> dict[str, Any]:
         self._emit_progress("final_report", "최종 보고서 작성 중...")
