@@ -4,11 +4,32 @@ import json
 from pathlib import Path
 from typing import Any
 
-from core.prompts import DOC_SUMMARY_PROMPT, BATCH_SUMMARY_PROMPT
+from core.prompts import (
+    BATCH_SUMMARY_PROMPT,
+    DOC_CHUNK_NOTES_PROMPT,
+    DOC_SUMMARY_PROMPT,
+    DOC_SUMMARY_REDUCE_PROMPT,
+)
 from tools.tool import BaseTool, ToolResult
 
 
 class DocumentSummarizeTool(BaseTool):
+    # Safety bound on the number of chunks for the long-document map-reduce
+    # path. With a context-sized single-pass budget this is essentially never
+    # reached; it only guards against pathologically large inputs.
+    _MAX_DOC_CHUNKS = 16
+
+    # The single-pass budget is derived from the llama-server context window:
+    #   n_ctx (tokens) * _CHARS_PER_TOKEN * _INPUT_CONTEXT_FRACTION
+    # The remainder of the window is reserved for the system prompt and the
+    # generated summary. _CHARS_PER_TOKEN is deliberately conservative for
+    # mixed Korean/English text. This keeps ordinary long articles on the fast
+    # single-pass path; map-reduce only triggers for documents that genuinely
+    # cannot fit the model context.
+    _CHARS_PER_TOKEN = 2.5
+    _INPUT_CONTEXT_FRACTION = 0.5
+    _MAX_SINGLE_PASS_CHARS = 200000
+
     def __init__(
         self,
         schema: dict[str, Any],
@@ -55,6 +76,7 @@ class DocumentSummarizeTool(BaseTool):
                         "skipped_duplicate_doc_ids": [],
                         "skipped_not_in_cycle_doc_ids": [],
                         "failed_doc_ids": [],
+                        "failed_documents": [],
                         "batch_result": {"batch_files": [], "count": 0},
                     },
                 )
@@ -77,6 +99,17 @@ class DocumentSummarizeTool(BaseTool):
             skipped_duplicate_doc_ids = [r.doc_id for r in skipped_duplicates]
             skipped_not_in_cycle_doc_ids: list[str] = []
             failed_doc_ids: list[str] = []
+            # Per-document failure detail (doc_id + reason) so the UI can show
+            # exactly which documents could not be summarized and why, instead
+            # of treating the whole run as a failure.
+            failed_documents: list[dict[str, str]] = []
+
+            single_pass_budget = self._single_pass_budget()
+            print(
+                f"[summarize] single-pass budget={single_pass_budget} chars "
+                f"(n_ctx={getattr(self._llm, 'n_ctx', 'unknown')}); "
+                "documents above this size use chunked map-reduce"
+            )
 
             for record in valid_records:
                 if has_cycle_scope and record.doc_id not in target_doc_ids:
@@ -93,28 +126,20 @@ class DocumentSummarizeTool(BaseTool):
                 print(f"[summarize][new] doc_id={record.doc_id}")
 
                 try:
-                    summary_payload = self._llm.ask_json(
-                        DOC_SUMMARY_PROMPT,
-                        json.dumps(
-                            {
-                                "title_hint": record.title,
-                                "url": record.url,
-                                "final_url": record.final_url,
-                                "domain": record.domain,
-                                "title": record.title,
-                                "text": text[: self._max_context],
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                        reasoning=False,
-                        max_retries=self._json_retries,
-                        stream=getattr(self._llm, "stream_summary", False),
-                        stream_label=f"summary:{record.doc_id}",
+                    summary_payload = self._summarize_document(
+                        record, text, single_pass_budget
                     )
                 except Exception as e:
-                    print(f"[summarize][failed] doc_id={record.doc_id} reason={e}")
+                    reason = f"{type(e).__name__}: {e}"
+                    print(f"[summarize][failed] doc_id={record.doc_id} reason={reason}")
                     failed_doc_ids.append(record.doc_id)
+                    failed_documents.append(
+                        {
+                            "docId": record.doc_id,
+                            "title": record.title or record.doc_id,
+                            "reason": reason[:300],
+                        }
+                    )
                     continue
 
                 summary_md = self._render_doc_summary_from_record(record, summary_payload)
@@ -144,11 +169,194 @@ class DocumentSummarizeTool(BaseTool):
                     "skipped_duplicate_doc_ids": skipped_duplicate_doc_ids,
                     "skipped_not_in_cycle_doc_ids": skipped_not_in_cycle_doc_ids,
                     "failed_doc_ids": failed_doc_ids,
+                    "failed_documents": failed_documents,
                     "batch_result": batch_result,
                 },
             )
         except Exception as e:
             return ToolResult(success=False, error=f"Failed to summarize documents: {e}")
+
+    def _single_pass_budget(self) -> int:
+        """Character budget for summarizing a document in a single LLM call.
+
+        Derived from the llama-server context window when available, so the
+        map-reduce path only triggers for documents that genuinely cannot fit
+        the model context — not for ordinary long articles. Falls back to the
+        configured ``max_context`` when the window size is unknown.
+        """
+        n_ctx = getattr(self._llm, "n_ctx", 0) or 0
+        if n_ctx > 0:
+            derived = int(n_ctx * self._CHARS_PER_TOKEN * self._INPUT_CONTEXT_FRACTION)
+            budget = max(self._max_context, derived)
+        else:
+            budget = self._max_context
+        return max(2000, min(budget, self._MAX_SINGLE_PASS_CHARS))
+
+    def _summarize_document(self, record, text: str, budget: int) -> dict[str, Any]:
+        """Produce a document-summary payload, choosing single-pass or map-reduce.
+
+        Documents that fit within ``budget`` are summarized in one LLM call.
+        Longer documents are chunked, each chunk is turned into compact notes,
+        and the notes are reduced into one summary so that no part of an
+        over-long document is silently truncated away.
+        """
+        text = text or ""
+        if len(text) <= budget:
+            return self._summarize_single_pass(record, text, budget)
+        return self._summarize_map_reduce(record, text, budget)
+
+    def _summarize_single_pass(self, record, text: str, budget: int) -> dict[str, Any]:
+        return self._llm.ask_json(
+            DOC_SUMMARY_PROMPT,
+            json.dumps(
+                {
+                    "title_hint": record.title,
+                    "url": record.url,
+                    "final_url": record.final_url,
+                    "domain": record.domain,
+                    "title": record.title,
+                    "text": text[:budget],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            reasoning=False,
+            max_retries=self._json_retries,
+            stream=getattr(self._llm, "stream_summary", False),
+            stream_label=f"summary:{record.doc_id}",
+        )
+
+    def _summarize_map_reduce(self, record, text: str, budget: int) -> dict[str, Any]:
+        overlap = max(200, budget // 10)
+        chunks = self._chunk_text(text, budget, overlap)
+        print(
+            f"[summarize][map-reduce] doc_id={record.doc_id} "
+            f"chunks={len(chunks)} chars={len(text)}"
+        )
+
+        notes: list[str] = []
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_input = json.dumps(
+                {
+                    "title": record.title,
+                    "url": record.url,
+                    "domain": record.domain,
+                    "chunk_index": index,
+                    "chunk_total": len(chunks),
+                    "text": chunk,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            note = self._llm.ask(
+                DOC_CHUNK_NOTES_PROMPT,
+                chunk_input,
+                reasoning=False,
+                stream=getattr(self._llm, "stream_summary", False),
+                stream_label=f"summary:{record.doc_id}:chunk{index}/{len(chunks)}",
+            )
+            note = (note or "").strip()
+            if note and note.lower() != "(no substantive content)":
+                notes.append(f"[Part {index}/{len(chunks)}]\n{note}")
+
+        if not notes:
+            raise RuntimeError("map-reduce produced no usable chunk notes")
+
+        joined_notes = "\n\n".join(notes)
+        # Notes are already compressed; if they still exceed the budget for a
+        # pathologically long document, truncate here. This is far less harmful
+        # than truncating raw body text would be.
+        if len(joined_notes) > budget:
+            joined_notes = joined_notes[:budget]
+
+        reduce_input = json.dumps(
+            {
+                "title_hint": record.title,
+                "url": record.url,
+                "final_url": record.final_url,
+                "domain": record.domain,
+                "title": record.title,
+                "chunk_count": len(chunks),
+                "notes": joined_notes,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        try:
+            return self._llm.ask_json(
+                DOC_SUMMARY_REDUCE_PROMPT,
+                reduce_input,
+                reasoning=False,
+                max_retries=self._json_retries,
+                stream=getattr(self._llm, "stream_summary", False),
+                stream_label=f"summary:{record.doc_id}:reduce",
+            )
+        except Exception as e:
+            # The reduce JSON failed even on compact notes. Rather than losing a
+            # successfully-read long document, assemble a payload directly from
+            # the per-chunk notes.
+            print(f"[summarize][reduce-fallback] doc_id={record.doc_id} reason={e}")
+            return self._payload_from_notes(record, notes)
+
+    def _chunk_text(self, text: str, size: int, overlap: int) -> list[str]:
+        """Split text into overlapping chunks, preferring clean text boundaries."""
+        text = text or ""
+        if len(text) <= size:
+            return [text] if text.strip() else []
+
+        size = max(size, 1000)
+        overlap = min(max(overlap, 0), size // 2)
+
+        chunks: list[str] = []
+        n = len(text)
+        start = 0
+        last_end = 0
+        while start < n and len(chunks) < self._MAX_DOC_CHUNKS:
+            hard_end = min(start + size, n)
+            end = hard_end
+            if hard_end < n:
+                # Prefer to break on a paragraph/line/sentence boundary within
+                # the last fifth of the window so chunks are not cut mid-thought.
+                window_start = start + (size * 4) // 5
+                cut = max(
+                    text.rfind("\n\n", window_start, hard_end),
+                    text.rfind("\n", window_start, hard_end),
+                    text.rfind(". ", window_start, hard_end),
+                )
+                if cut > start:
+                    end = cut
+            chunks.append(text[start:end])
+            last_end = end
+            if end >= n:
+                break
+            start = end - overlap
+
+        # Safety net: if the chunk cap was reached before covering the whole
+        # document, fold the remaining tail into a final chunk so nothing is lost.
+        if last_end < n:
+            chunks.append(text[last_end:])
+
+        return [chunk.strip() for chunk in chunks if chunk.strip()]
+
+    def _payload_from_notes(self, record, notes: list[str]) -> dict[str, Any]:
+        """Build a doc-summary payload from chunk notes when reduce-JSON fails."""
+        note_lines: list[str] = []
+        for block in notes:
+            for line in block.splitlines():
+                stripped = line.strip().lstrip("-*•").strip()
+                if stripped and not stripped.startswith("[Part "):
+                    note_lines.append(stripped)
+
+        return {
+            "title": record.title or "Untitled",
+            "source_type": "",
+            "summary": " ".join(note_lines[:5]),
+            "key_points": note_lines[:8],
+            "reliability_notes": [
+                "Auto-assembled from per-chunk notes; reduce-step JSON synthesis failed.",
+            ],
+            "keywords": [],
+        }
 
     def _render_doc_summary_from_record(self, record, payload: dict[str, Any]) -> str:
         lines = [

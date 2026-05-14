@@ -72,6 +72,16 @@ class AgentRuntime:
         self._configure_workspace_runtime(self.output_dir)
 
     def _configure_workspace_runtime(self, output_dir: Path) -> None:
+        # Release the previous workspace's ChromaDB handles before swapping in a
+        # new registry. On Windows an open SQLite handle would otherwise keep the
+        # old workspace directory locked and undeletable.
+        previous_rag_service = getattr(self, "rag_service", None)
+        if previous_rag_service is not None:
+            try:
+                previous_rag_service.close()
+            except Exception as e:
+                print(f"[workspace][warn] failed to release previous RAG store: {e}")
+
         output_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir = output_dir
         self.registry, self.run_store_service, self.rag_service = build_registry(
