@@ -13,6 +13,7 @@ from PySide6.QtGui import (
 	QPainterPath,
 	QPen,
 	QShortcut,
+	QTextDocument,
 	QWheelEvent,
 )
 from PySide6.QtWidgets import (
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
 	QGraphicsDropShadowEffect,
 	QHBoxLayout,
 	QLabel,
+	QMenu,
 	QPushButton,
 	QScrollArea,
 	QSizeGrip,
@@ -31,6 +33,8 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
+from ..markdown_view import render_markdown_html
+
 
 def add_text_breakpoints(text: str, chunk_size: int = 24) -> str:
 	def break_long_token(match: re.Match[str]) -> str:
@@ -38,6 +42,22 @@ def add_text_breakpoints(text: str, chunk_size: int = 24) -> str:
 		return "\u200b".join(token[index : index + chunk_size] for index in range(0, len(token), chunk_size))
 
 	return re.sub(r"\S{32,}", break_long_token, text)
+
+
+def _render_assistant_markdown(text: str) -> str:
+	"""Render an assistant message (markdown) to Qt rich text.
+
+	Assistant answers stream in as markdown; a RichText QLabel shows the
+	formatted result instead of raw `**` / `#` / table syntax. Prefers the
+	`markdown` package (correct GFM tables); falls back to Qt's own markdown
+	parser so formatting still works even when that package is not installed.
+	"""
+	rendered = render_markdown_html(text or "", font_size=None)
+	if rendered:
+		return rendered
+	doc = QTextDocument()
+	doc.setMarkdown(text or "")
+	return doc.toHtml()
 
 
 try:
@@ -478,13 +498,22 @@ class ChatMessageBubble(QFrame):
 		meta = QLabel(sender)
 		meta.setObjectName("AssistBubbleMeta")
 
-		self.text = QLabel(add_text_breakpoints(message))
+		self.text = QLabel()
 		text = self.text
 		text.setObjectName("AssistBubbleText")
 		text.setWordWrap(True)
-		text.setTextFormat(Qt.PlainText)
 		text.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
 		text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+		# User messages are shown verbatim; assistant answers arrive as markdown
+		# and are rendered to rich text so headings/lists/tables/code display
+		# formatted instead of as raw syntax.
+		if is_user:
+			text.setTextFormat(Qt.PlainText)
+			text.setText(add_text_breakpoints(message))
+		else:
+			text.setTextFormat(Qt.RichText)
+			text.setOpenExternalLinks(True)
+			text.setText(_render_assistant_markdown(message))
 
 		layout.addWidget(meta)
 		layout.addWidget(text)
@@ -509,7 +538,10 @@ class ChatMessageBubble(QFrame):
 		# while a streaming answer is still arriving.
 		if not _qt_is_alive(self.text):
 			return
-		self.text.setText(add_text_breakpoints(self._raw_message))
+		if self._is_user:
+			self.text.setText(add_text_breakpoints(self._raw_message))
+		else:
+			self.text.setText(_render_assistant_markdown(self._raw_message))
 
 	def _copy_to_clipboard(self) -> None:
 		app = QApplication.instance()
@@ -607,12 +639,9 @@ class ChatPanel(QFrame):
 
 		row = QHBoxLayout()
 		row.setContentsMargins(0, 0, 0, 0)
-		if is_user:
-			row.addStretch(1)
-			row.addWidget(bubble, 0, Qt.AlignRight)
-		else:
-			row.addWidget(bubble, 0, Qt.AlignLeft)
-			row.addStretch(1)
+		# Both user and assistant bubbles span the full panel width so the chat
+		# fills the screen horizontally; sender is distinguished by colour.
+		row.addWidget(bubble, 1)
 
 		insert_at = max(0, self.layout.count() - 1)
 		self.layout.insertLayout(insert_at, row)
@@ -716,7 +745,7 @@ class ChatPanel(QFrame):
 
 	def _bubble_width(self) -> int:
 		viewport_width = max(280, self.scroll.viewport().width())
-		return max(220, int(viewport_width * 0.94))
+		return max(220, viewport_width - 2)
 
 	def _update_bubble_widths(self) -> None:
 		width = self._bubble_width()
@@ -739,15 +768,15 @@ class ChatInputBar(QFrame):
 		layout.setContentsMargins(10, 8, 10, 8)
 		layout.setSpacing(8)
 
-		# A checkable toggle, not a mode picker: unchecked = RAG (default),
-		# checked = 자료조사. RAG itself is intentionally never labelled.
+		# A circular "+" affordance: clicking it pops a small menu just above
+		# the button with the opt-in 자료조사 mode. RAG is the implicit default
+		# and is never surfaced. When 자료조사 is active the circle turns navy.
 		self.mode_button = QToolButton()
 		self.mode_button.setObjectName("AssistModeButton")
-		self.mode_button.setText("자료조사")
-		self.mode_button.setCheckable(True)
+		self.mode_button.setText("+")
 		self.mode_button.setCursor(Qt.PointingHandCursor)
-		self.mode_button.setFixedSize(82, 46)
-		self.mode_button.toggled.connect(self._on_mode_button_toggled)
+		self.mode_button.setFixedSize(46, 46)
+		self.mode_button.clicked.connect(self._show_mode_menu)
 
 		self.input = ChatInputEdit()
 		self.input.setObjectName("AssistChatInput")
@@ -766,16 +795,30 @@ class ChatInputBar(QFrame):
 		layout.addWidget(self.send_button)
 		self.set_mode(self._mode, emit=False)
 
-	def _on_mode_button_toggled(self, checked: bool) -> None:
-		self.set_mode("research" if checked else "rag")
+	def _show_mode_menu(self) -> None:
+		"""Pop a small mode menu just above the + button.
+
+		The single 자료조사 entry toggles the opt-in research mode; choosing it
+		while research is already active switches back to the default RAG mode.
+		"""
+		menu = QMenu(self)
+		action = menu.addAction("자료조사")
+		action.setCheckable(True)
+		action.setChecked(self._mode == "research")
+		hint = menu.sizeHint()
+		anchor = self.mode_button.mapToGlobal(QPoint(0, 0))
+		pos = QPoint(anchor.x(), anchor.y() - hint.height() - 6)
+		chosen = menu.exec(pos)
+		if chosen is action:
+			self.set_mode("rag" if self._mode == "research" else "research")
 
 	def set_mode(self, mode: str, emit: bool = True) -> None:
 		self._mode = "research" if mode == "research" else "rag"
 		is_research = self._mode == "research"
-		# Keep the toggle in sync without re-entering the toggled handler.
-		self.mode_button.blockSignals(True)
-		self.mode_button.setChecked(is_research)
-		self.mode_button.blockSignals(False)
+		# Drive the navy "active" styling via a dynamic property + repolish.
+		self.mode_button.setProperty("researchActive", is_research)
+		self.mode_button.style().unpolish(self.mode_button)
+		self.mode_button.style().polish(self.mode_button)
 		if is_research:
 			self.mode_button.setToolTip("자료조사 모드 사용 중 (눌러서 끄기)")
 			self.input.setPlaceholderText("자료조사 모드로 질문하기...")
@@ -1068,27 +1111,27 @@ class DocumentAssistWindow(QWidget):
 				background-color: #2563EB;
 			}
 			QToolButton#AssistModeButton {
-				background-color: #F8FAFC;
-				color: #111827;
+				background-color: #F1F5F9;
+				color: #475569;
 				border: 1px solid #D1D5DB;
-				border-radius: 11px;
-				padding: 0px 8px;
-				font-size: 12px;
-				font-weight: 850;
+				border-radius: 23px;
+				padding: 0px;
+				font-size: 24px;
+				font-weight: 500;
 			}
 			QToolButton#AssistModeButton:hover {
-				background-color: #EEF2FF;
+				background-color: #E0E7FF;
 				border-color: #818CF8;
 				color: #3730A3;
 			}
-			QToolButton#AssistModeButton:checked {
-				background-color: #3730A3;
-				border-color: #3730A3;
+			QToolButton#AssistModeButton[researchActive="true"] {
+				background-color: #1E3A8A;
+				border-color: #1E3A8A;
 				color: #FFFFFF;
 			}
-			QToolButton#AssistModeButton:checked:hover {
-				background-color: #312E81;
-				border-color: #312E81;
+			QToolButton#AssistModeButton[researchActive="true"]:hover {
+				background-color: #1E40AF;
+				border-color: #1E40AF;
 				color: #FFFFFF;
 			}
 			QToolButton#AssistModeButton::menu-indicator {
