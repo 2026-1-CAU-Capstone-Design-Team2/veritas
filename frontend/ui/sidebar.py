@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, Property, QPropertyAnimation, QSize, Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
 	QComboBox,
@@ -33,7 +33,6 @@ class NavButton(QPushButton):
 		super().__init__(text, parent)
 		self.route = route
 		self._label_text = text
-		self._hover = 0.0
 		self._compact = False
 		self._icon_default = icon
 		self._icon_active = active_icon
@@ -47,10 +46,6 @@ class NavButton(QPushButton):
 		self.setFixedHeight(40)
 		self.toggled.connect(self._on_toggled)
 
-		self._anim = QPropertyAnimation(self, b"hoverProgress", self)
-		self._anim.setDuration(170)
-		self._anim.setEasingCurve(QEasingCurve.OutCubic)
-
 		self._apply_style()
 
 	def _on_toggled(self, checked: bool) -> None:
@@ -62,33 +57,31 @@ class NavButton(QPushButton):
 		self.setToolTip(self._label_text if compact else "")
 		self._apply_style()
 
-	@Property(float)
-	def hoverProgress(self) -> float:
-		return self._hover
-
-	@hoverProgress.setter
-	def hoverProgress(self, value: float) -> None:
-		self._hover = value
-		self._apply_style()
-
 	def enterEvent(self, event) -> None:  # type: ignore[override]
-		self._anim.stop()
-		self._anim.setStartValue(self._hover)
-		self._anim.setEndValue(1.0)
-		self._anim.start()
+		# Hover is a single dynamic-property flip + repolish — cheap, and the
+		# `[hovered="true"]` rule in the stylesheet does the actual highlight.
+		# (The old QPropertyAnimation re-ran setStyleSheet ~20 times per hover,
+		# each triggering a full style recomputation of the button.)
+		self._set_hovered(True)
 		super().enterEvent(event)
 
 	def leaveEvent(self, event) -> None:  # type: ignore[override]
-		self._anim.stop()
-		self._anim.setStartValue(self._hover)
-		self._anim.setEndValue(0.0)
-		self._anim.start()
+		self._set_hovered(False)
 		super().leaveEvent(event)
 
+	def _set_hovered(self, hovered: bool) -> None:
+		if self.property("hovered") == hovered:
+			return
+		self.setProperty("hovered", hovered)
+		self.style().unpolish(self)
+		self.style().polish(self)
+
 	def _apply_style(self) -> None:
-		p = self._hover
-		bg_alpha = int(0 + 18 * p)
-		left_pad = int(12 + 4 * p) if not self._compact else 0
+		# Static stylesheet — set once on construction and on compact toggle, not
+		# per animation frame. Hover state is driven by the `hovered` dynamic
+		# property; the checked rule is listed last so it wins for a checked
+		# button that is also hovered.
+		left_pad = 12 if not self._compact else 0
 		right_pad = 12 if not self._compact else 0
 		align = "left" if not self._compact else "center"
 		self.setStyleSheet(
@@ -99,9 +92,12 @@ class NavButton(QPushButton):
 				border-radius: 11px;
 				padding: 10px {right_pad}px 10px {left_pad}px;
 				color: #D6DBE5;
-				background-color: rgba(255, 255, 255, {bg_alpha});
+				background-color: rgba(255, 255, 255, 0);
 				font-size: 13px;
 				font-weight: 600;
+			}}
+			QPushButton#NavButton[hovered="true"] {{
+				background-color: rgba(255, 255, 255, 18);
 			}}
 			QPushButton#NavButton:checked {{
 				background-color: rgba(99, 102, 241, 48);

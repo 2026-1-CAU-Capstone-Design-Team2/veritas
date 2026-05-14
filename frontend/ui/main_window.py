@@ -33,7 +33,7 @@ from .pages.verify_page import VerifyPage
 from .pages.write_page import WritePage
 
 from .sidebar import Sidebar
-from .windows.document_assist_window import DocumentAssistWindow
+from .windows.document_assist_window import DocumentAssistWindow, render_history_html
 
 
 class ScreenEventPollWorker(QThread):
@@ -225,6 +225,9 @@ class MainWindow(QMainWindow):
 		self.document_assist_window.visibilityChanged.connect(self._on_assist_visibility_changed)
 		self.document_assist_window.hide()
 		self._assist_streaming = False
+		# Monotonic guard for the background history-hydration fetch — see
+		# _hydrate_assist_history_from_backend.
+		self._assist_history_token = 0
 		self._chat_bus.userMessageQueued.connect(self._on_chat_user_queued)
 		self._chat_bus.assistantStreamStarted.connect(self._on_chat_stream_started)
 		self._chat_bus.assistantChunk.connect(self._on_chat_stream_chunk)
@@ -337,11 +340,34 @@ class MainWindow(QMainWindow):
 			)
 
 	def _hydrate_assist_history_from_backend(self) -> None:
-		try:
-			history = self._agent_controller.get_chat_history(current_workspace_id())
-		except ApiError:
-			history = []
-		self.document_assist_window.hydrate_history(history)
+		# Fetch the history AND render its markdown on a worker thread — both the
+		# HTTP round-trip and the per-message parse used to run on the UI thread
+		# every time the assist window was shown.
+		self._assist_history_token += 1
+		token = self._assist_history_token
+		workspace_id = current_workspace_id()
+		controller = self._agent_controller
+
+		def _load() -> list:
+			history = controller.get_chat_history(workspace_id)
+			return render_history_html(history if isinstance(history, list) else [])
+
+		def _apply(prepared: object) -> None:
+			# Drop a stale result: a newer hydrate request, or a chat stream that
+			# started while we were fetching — applying now would clear the live
+			# streaming bubble.
+			if token != self._assist_history_token or self._assist_streaming:
+				return
+			self.document_assist_window.hydrate_history(
+				prepared if isinstance(prepared, list) else []
+			)
+
+		def _failed(_message: str) -> None:
+			if token != self._assist_history_token or self._assist_streaming:
+				return
+			self.document_assist_window.hydrate_history([])
+
+		get_job_manager().run_detached(_load, on_success=_apply, on_error=_failed)
 
 	def _on_chat_user_queued(self, _workspace_id: str, text: str) -> None:
 		# Both views render the user bubble in response to the bus event.
