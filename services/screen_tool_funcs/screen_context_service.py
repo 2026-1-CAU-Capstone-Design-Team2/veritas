@@ -13,8 +13,10 @@ from .ocr_engine import OcrEngine
 from .powerpoint_com import PowerPointComReader
 from .scenario_scheduler import ScenarioScheduler
 from .scenarios import (
+    BlankDocumentStartScenario,
     IdleAfterWritingScenario,
     LongStaticReviewScenario,
+    ParagraphChurnScenario,
     WholeDocumentReviewScenario,
 )
 from .screen_capture import ScreenCapture
@@ -72,6 +74,8 @@ class ScreenContextService:
             IdleAfterWritingScenario(),
             WholeDocumentReviewScenario(),
             LongStaticReviewScenario(),
+            ParagraphChurnScenario(),
+            BlankDocumentStartScenario(),
         ]
         self.scenario_scheduler = ScenarioScheduler(
             self.store,

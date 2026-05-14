@@ -15,8 +15,10 @@ from .ocr_engine import OcrEngine
 from .powerpoint_com import PowerPointComReader
 from .scenario_scheduler import ScenarioScheduler, ScenarioSchedulerState, ScenarioWeights
 from .scenarios import (
+    BlankDocumentStartScenario,
     IdleAfterWritingScenario,
     LongStaticReviewScenario,
+    ParagraphChurnScenario,
     ScenarioContext,
     ScenarioEvaluation,
     ScenarioType,
@@ -30,6 +32,7 @@ from .window_context import WindowContextReader
 
 __all__ = [
     "AppTextResult",
+    "BlankDocumentStartScenario",
     "BoundingBox",
     "ContentFilter",
     "FilteredScreenContext",
@@ -40,6 +43,7 @@ __all__ = [
     "LongStaticReviewScenario",
     "OcrEngine",
     "OcrResult",
+    "ParagraphChurnScenario",
     "PowerPointComReader",
     "ScenarioContext",
     "ScenarioEvaluation",

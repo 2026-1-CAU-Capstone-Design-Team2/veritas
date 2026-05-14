@@ -174,7 +174,7 @@ class IdleAfterWritingScenario(ScenarioType):
         min_changed_chars: int = 10,
         min_idle_captures: int = 2,
         idle_similarity_threshold: float = 0.985,
-        cooldown_events: int = 5,
+        cooldown_events: int = 3,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -689,7 +689,7 @@ class LongStaticReviewScenario(ScenarioType):
         min_static_captures: int = 3,
         min_document_chars: int = 200,
         idle_similarity_threshold: float = 0.99,
-        cooldown_min_seconds: float = 600.0,
+        cooldown_min_seconds: float = 240.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -873,3 +873,332 @@ class LongStaticReviewScenario(ScenarioType):
             return False, 0.0
         similarity = difflib.SequenceMatcher(None, previous, current).ratio()
         return similarity >= self.idle_similarity_threshold, similarity
+
+
+class ParagraphChurnScenario(ScenarioType):
+    """현재 문단을 작은 편집으로 계속 만지작거리는 '막힘' 상태 -> 대안 표현 제안.
+
+    idle_after_writing(멈춤)·whole_document_review(지속 대량작성)·
+    long_static_review(정적) 어디에도 안 걸리는 중간 상태를 노린다 — 텍스트가 매
+    캡처 조금씩 바뀌지만 순 진전이 거의 없는 구간. `small_churn` 게이트는 윈도우
+    내 변경 캡처가 많고, 캡처당 변화량이 작고, 누적 순변화도 작을 때만 통과한다.
+    """
+
+    name = "paragraph_churn"
+    priority = "medium"
+    initial_vruntime = 3.0
+    vruntime_increment = 2.0
+
+    def __init__(
+        self,
+        *,
+        churn_window: int = 6,
+        min_changed_captures: int = 3,
+        max_capture_delta: int = 15,
+        max_net_change: int = 25,
+        min_paragraph_chars: int = 20,
+        cooldown_min_seconds: float = 150.0,
+        initial_vruntime: float | None = None,
+        vruntime_increment: float | None = None,
+    ) -> None:
+        super().__init__(
+            initial_vruntime=initial_vruntime,
+            vruntime_increment=vruntime_increment,
+        )
+        self.churn_window = churn_window
+        self.min_changed_captures = min_changed_captures
+        self.max_capture_delta = max_capture_delta
+        self.max_net_change = max_net_change
+        self.min_paragraph_chars = min_paragraph_chars
+        self.cooldown_min_seconds = cooldown_min_seconds
+
+    def evaluate(self, context: ScenarioContext) -> ScenarioEvaluation:
+        evaluation = ScenarioEvaluation(name=self.name, priority=self.priority)
+
+        churn = self._small_churn_status(context.same_document_events)
+        churn_passed = bool(churn.get("passed"))
+        cooldown = self._churn_cooldown_status(context.last_fired_at)
+        cooldown_passed = bool(cooldown.get("passed"))
+        # 문단 단위 시나리오의 공유 prereq — 현재 문단이 개입할 만큼 충분한 길이인지
+        substantial_passed = self._has_substantial_paragraph(
+            context.filtered, min_chars=self.min_paragraph_chars
+        )
+
+        evaluation.gate_results = {
+            "small_churn": self._gate_result(
+                churn_passed,
+                "small_churn_observed" if churn_passed else "not_churning",
+                churn,
+            ),
+            "churn_cooldown": self._gate_result(
+                cooldown_passed,
+                "churn_cooldown_passed" if cooldown_passed else "churn_cooldown_active",
+                cooldown,
+            ),
+            "substantial_paragraph": self._gate_result(
+                substantial_passed,
+                "substantial_paragraph" if substantial_passed else "paragraph_too_short",
+                {
+                    "current_paragraph_chars": len(
+                        " ".join((context.filtered.current_paragraph_text or "").split())
+                    ),
+                    "min_paragraph_chars": self.min_paragraph_chars,
+                },
+            ),
+        }
+
+        if churn_passed:
+            evaluation.score += 0.5
+            evaluation.reasons.append("small_churn_observed")
+        else:
+            evaluation.blockers.append("not_churning")
+
+        if cooldown_passed:
+            evaluation.score += 0.3
+            evaluation.reasons.append("churn_cooldown_passed")
+        else:
+            evaluation.blockers.append("churn_cooldown_active")
+
+        # 점수 없는 순수 prerequisite: blocker에만 기여
+        if substantial_passed:
+            evaluation.reasons.append("substantial_paragraph")
+        else:
+            evaluation.blockers.append("paragraph_too_short")
+
+        evaluation.ready = not evaluation.blockers
+        evaluation.priority = "medium" if evaluation.ready else "low"
+        evaluation.metadata = {
+            "small_churn": churn,
+            "churn_cooldown": cooldown,
+        }
+        return evaluation
+
+    def writing_context_overrides(
+        self,
+        *,
+        filtered: FilteredScreenContext,
+        base: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {"focus_scope": "recent_writing"}
+
+    def tool_routing_hint_overrides(
+        self,
+        *,
+        event: Any,
+        base: dict[str, Any],
+        focused_sentence: str,
+    ) -> dict[str, Any]:
+        return {
+            "tone": "unstick",
+            "preferred_action": "revise_current_paragraph",
+        }
+
+    def _small_churn_status(
+        self,
+        same_document_events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        events = same_document_events[-self.churn_window:]
+        if len(events) < self.min_changed_captures + 1:
+            return {
+                "passed": False,
+                "reason": "insufficient_window_history",
+                "window_size": len(events),
+                "min_changed_captures": self.min_changed_captures,
+            }
+
+        changed_captures = 0
+        max_delta = 0
+        previous_text = self._normalized_active_text(events[0])
+        first_len = len(previous_text)
+        for event in events[1:]:
+            text = self._normalized_active_text(event)
+            if text != previous_text:
+                changed_captures += 1
+                max_delta = max(max_delta, abs(len(text) - len(previous_text)))
+            previous_text = text
+        net_change = abs(len(previous_text) - first_len)
+
+        passed = (
+            changed_captures >= self.min_changed_captures
+            and max_delta <= self.max_capture_delta
+            and net_change <= self.max_net_change
+        )
+        return {
+            "passed": passed,
+            "reason": "ok" if passed else "not_churning",
+            "window_size": len(events),
+            "changed_captures": changed_captures,
+            "max_capture_delta": max_delta,
+            "net_change": net_change,
+            "min_changed_captures": self.min_changed_captures,
+            "max_capture_delta_limit": self.max_capture_delta,
+            "max_net_change": self.max_net_change,
+        }
+
+    def _churn_cooldown_status(self, last_fired_at: dict[str, float]) -> dict[str, Any]:
+        """`last_fired_at[self.name]`과 현재 시각을 비교하는 시간 기반 cooldown."""
+        last_at = last_fired_at.get(self.name)
+        if last_at is None:
+            return {
+                "passed": True,
+                "reason": "no_prior_fire",
+                "min_seconds": self.cooldown_min_seconds,
+            }
+        elapsed_seconds = max(time.time() - last_at, 0.0)
+        passed = elapsed_seconds >= self.cooldown_min_seconds
+        return {
+            "passed": passed,
+            "reason": "ok" if passed else "cooldown_active",
+            "elapsed_seconds": round(elapsed_seconds, 1),
+            "min_seconds": self.cooldown_min_seconds,
+        }
+
+    def _normalized_active_text(self, event: dict[str, Any]) -> str:
+        filtered = event.get("filtered") or {}
+        text = str(filtered.get("active_editor_text") or "")
+        return " ".join(text.split()).strip()
+
+
+class BlankDocumentStartScenario(ScenarioType):
+    """거의 빈 문서를 열고 머물러 있는 상태 -> 시작 구조/방향 제안.
+
+    `near_empty_document` 게이트는 최근 연속 캡처가 모두 거의 비어 있을 때만
+    통과한다. 사용자가 타이핑을 시작하면 더는 '빈 문서'가 아니므로 자연 종료된다.
+    다른 시나리오가 없을 때만 마지막으로 선택되도록 높은 initial vruntime을 둔다.
+    """
+
+    name = "blank_document_start"
+    priority = "low"
+    initial_vruntime = 8.0
+    vruntime_increment = 2.0
+
+    def __init__(
+        self,
+        *,
+        max_document_chars: int = 30,
+        min_blank_captures: int = 3,
+        cooldown_min_seconds: float = 600.0,
+        initial_vruntime: float | None = None,
+        vruntime_increment: float | None = None,
+    ) -> None:
+        super().__init__(
+            initial_vruntime=initial_vruntime,
+            vruntime_increment=vruntime_increment,
+        )
+        self.max_document_chars = max_document_chars
+        self.min_blank_captures = min_blank_captures
+        self.cooldown_min_seconds = cooldown_min_seconds
+
+    def evaluate(self, context: ScenarioContext) -> ScenarioEvaluation:
+        evaluation = ScenarioEvaluation(name=self.name, priority=self.priority)
+
+        blank = self._near_empty_status(context.same_document_events)
+        blank_passed = bool(blank.get("passed"))
+        cooldown = self._start_cooldown_status(context.last_fired_at)
+        cooldown_passed = bool(cooldown.get("passed"))
+
+        evaluation.gate_results = {
+            "near_empty_document": self._gate_result(
+                blank_passed,
+                "near_empty_observed" if blank_passed else "document_not_empty",
+                blank,
+            ),
+            "start_cooldown": self._gate_result(
+                cooldown_passed,
+                "start_cooldown_passed" if cooldown_passed else "start_cooldown_active",
+                cooldown,
+            ),
+        }
+
+        if blank_passed:
+            evaluation.score += 0.5
+            evaluation.reasons.append("near_empty_observed")
+        else:
+            evaluation.blockers.append("document_not_empty")
+
+        if cooldown_passed:
+            evaluation.score += 0.3
+            evaluation.reasons.append("start_cooldown_passed")
+        else:
+            evaluation.blockers.append("start_cooldown_active")
+
+        evaluation.ready = not evaluation.blockers
+        evaluation.priority = "medium" if evaluation.ready else "low"
+        evaluation.metadata = {
+            "near_empty_document": blank,
+            "start_cooldown": cooldown,
+        }
+        return evaluation
+
+    def writing_context_overrides(
+        self,
+        *,
+        filtered: FilteredScreenContext,
+        base: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {"focus_scope": "full_document"}
+
+    def tool_routing_hint_overrides(
+        self,
+        *,
+        event: Any,
+        base: dict[str, Any],
+        focused_sentence: str,
+    ) -> dict[str, Any]:
+        return {
+            "tone": "kickoff",
+            "preferred_action": "continue_writing",
+        }
+
+    def _near_empty_status(
+        self,
+        same_document_events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        events = same_document_events[-self.min_blank_captures:]
+        if len(events) < self.min_blank_captures:
+            return {
+                "passed": False,
+                "reason": "insufficient_window_history",
+                "blank_capture_count": 0,
+                "min_blank_captures": self.min_blank_captures,
+            }
+
+        blank_capture_count = 0
+        last_chars = 0
+        for event in events:
+            last_chars = len(self._normalized_active_text(event))
+            if last_chars <= self.max_document_chars:
+                blank_capture_count += 1
+
+        passed = blank_capture_count >= self.min_blank_captures
+        return {
+            "passed": passed,
+            "reason": "ok" if passed else "document_not_empty",
+            "blank_capture_count": blank_capture_count,
+            "min_blank_captures": self.min_blank_captures,
+            "current_text_chars": last_chars,
+            "max_document_chars": self.max_document_chars,
+        }
+
+    def _start_cooldown_status(self, last_fired_at: dict[str, float]) -> dict[str, Any]:
+        """`last_fired_at[self.name]`과 현재 시각을 비교하는 시간 기반 cooldown."""
+        last_at = last_fired_at.get(self.name)
+        if last_at is None:
+            return {
+                "passed": True,
+                "reason": "no_prior_fire",
+                "min_seconds": self.cooldown_min_seconds,
+            }
+        elapsed_seconds = max(time.time() - last_at, 0.0)
+        passed = elapsed_seconds >= self.cooldown_min_seconds
+        return {
+            "passed": passed,
+            "reason": "ok" if passed else "cooldown_active",
+            "elapsed_seconds": round(elapsed_seconds, 1),
+            "min_seconds": self.cooldown_min_seconds,
+        }
+
+    def _normalized_active_text(self, event: dict[str, Any]) -> str:
+        filtered = event.get("filtered") or {}
+        text = str(filtered.get("active_editor_text") or "")
+        return " ".join(text.split()).strip()
