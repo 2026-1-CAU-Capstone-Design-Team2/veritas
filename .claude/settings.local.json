@@ -38,7 +38,11 @@
       "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -)",
       "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -c \"import ast; ast.parse\\(open\\('llm/llama_server_llm.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
       "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -c ' *)",
-      "Bash(git merge *)"
+      "Bash(git merge *)",
+      "Bash(python -c \"import markdown; print\\('markdown', markdown.__version__\\)\")",
+      "Bash(pip list *)",
+      "Bash(git diff *)",
+      "Bash(git checkout *)"
     ]
   }
 }

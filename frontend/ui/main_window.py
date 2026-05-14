@@ -122,7 +122,7 @@ class PlaceholderPage(QWidget):
 
 
 class MainWindow(QMainWindow):
-	STEP_ORDER = ["research", "verify", "draft", "document_assist", "write", "document", "feedback"]
+	STEP_ORDER = ["research", "document", "verify", "draft", "document_assist", "write", "feedback"]
 
 	def __init__(self) -> None:
 		super().__init__()
@@ -183,7 +183,7 @@ class MainWindow(QMainWindow):
 		self.assist_toggle_button.clicked.connect(self.toggle_document_assist_window)
 		top_hero_layout.addWidget(self.assist_toggle_button, 0, Qt.AlignTop)
 
-		self.stepper = WorkflowStepper(["조사", "검증", "초안 생성", "문서 보조", "채팅", "요약", "피드백"])
+		self.stepper = WorkflowStepper(["조사", "요약", "검증", "초안 생성", "문서 보조", "채팅", "피드백"])
 
 		self.pages = AnimatedStackedWidget()
 
