@@ -229,11 +229,11 @@ class Sidebar(QFrame):
 		nav_items = [
 			("\ub300\uc2dc\ubcf4\ub4dc", "dashboard", "dashboard.svg", "dashboard_active.svg"),
 			("\uc870\uc0ac", "research", "collect.svg", "collect_active.svg"),
+			("\uc694\uc57d", "document", "document.svg", "document_active.svg"),
 			("\uac80\uc99d", "verify", "verify.svg", "verify_active.svg"),
 			("\ucd08\uc548", "draft", "draft.svg", "draft_active.svg"),
 			("\ubb38\uc11c \ubcf4\uc870", "document_assist", "document_assist.svg", "document_assist_active.svg"),
 			("\ucc44\ud305", "write", "write.svg", "write_active.svg"),
-			("\ubb38\uc11c", "document", "document.svg", "document_active.svg"),
 			("\ud53c\ub4dc\ubc31", "feedback", "feedback.svg", "feedback_active.svg"),
 			("\uc124\uc815", "settings", "settings.svg", "settings_active.svg"),
 		]

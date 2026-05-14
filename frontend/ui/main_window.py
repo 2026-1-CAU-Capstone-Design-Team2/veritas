@@ -183,7 +183,7 @@ class MainWindow(QMainWindow):
 		self.assist_toggle_button.clicked.connect(self.toggle_document_assist_window)
 		top_hero_layout.addWidget(self.assist_toggle_button, 0, Qt.AlignTop)
 
-		self.stepper = WorkflowStepper(["조사", "검증", "초안 생성", "문서 보조", "채팅", "문서", "피드백"])
+		self.stepper = WorkflowStepper(["조사", "검증", "초안 생성", "문서 보조", "채팅", "요약", "피드백"])
 
 		self.pages = AnimatedStackedWidget()
 
@@ -491,7 +491,7 @@ class MainWindow(QMainWindow):
 			"draft": ("초안 생성", "선택한 워크스페이스를 바탕으로 복사 가능한 초안을 생성합니다."),
 			"document_assist": ("문서 보조", "실시간 문서 작성 보조 내용을 확인합니다."),
 			"write": ("AI 채팅", "워크스페이스 기반 AI와 채팅이 가능합니다."),
-			"document": ("문서", "스크랩 합본과 요약본을 검토합니다."),
+			"document": ("요약", "최종 보고서 요약본을 확인합니다."),
 			"feedback": ("문서 피드백", "약한 주장과 저신뢰 문장을 우선 교정합니다."),
 			"settings": ("설정", "모델명과 로컬 접근 폴더를 구성합니다."),
 		}
