@@ -1077,10 +1077,13 @@ class ResearchPage(QWidget):
 			documents = []
 		documents = [doc for doc in documents if isinstance(doc, dict)]
 
+		# "작업 이름" 타일은 term-grounding으로 만들어진 워크스페이스 이름을 보여준다.
+		# jobId(rs_xxxxx)는 그 이름이 없을 때만 폴백으로 사용 — jobId를 먼저 쓰면
+		# 라이브 중 _adopt_new_workspace가 채운 term 값이 가려진다.
 		job_name = str(
-			response.get("jobId")
-			or response.get("workspaceName")
+			response.get("workspaceName")
 			or response.get("workspaceId")
+			or response.get("jobId")
 			or "-"
 		)
 		final_path_raw = str(response.get("finalPath") or "").strip()

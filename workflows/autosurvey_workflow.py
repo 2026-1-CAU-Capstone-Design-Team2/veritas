@@ -289,7 +289,23 @@ class AutoSurveyWorkflow:
         *,
         overwrite: bool = False,
         doc_ids: list[str] | None = None,
+        phase: str = "all",
     ) -> dict[str, Any]:
+        """Summarize collected documents.
+
+        ``phase`` selects which work runs:
+        - ``"batch"``   — only (re)build batch summaries from clean_md. Used
+          inside the collect loop to drive gap analysis / replan.
+        - ``"per_doc"`` — only per-document summaries. Run once at the end of a
+          full survey: per-doc summaries are UX descriptors and do not feed the
+          collect/replan loop, so keeping them off the loop's critical path
+          speeds up convergence.
+        - ``"all"``     — both (standalone ``--phase summarize`` path).
+        """
+        phase = str(phase or "all").strip().lower()
+        do_per_doc = phase in ("all", "per_doc")
+        do_batch = phase in ("all", "batch")
+
         if doc_ids is not None and not doc_ids:
             print("[summarize][skip:no-new-docs] empty doc id list")
             return {
@@ -303,19 +319,25 @@ class AutoSurveyWorkflow:
                 "batch_result": {"batch_files": [], "count": 0},
             }
 
-        doc_count = len(doc_ids) if doc_ids is not None else 0
-        message = (
-            f"문서 요약 중: {doc_count}건" if doc_count > 0 else "문서 요약 중..."
-        )
+        if do_per_doc and not do_batch:
+            message = "문서 요약 중..."
+        else:
+            doc_count = len(doc_ids) if doc_ids is not None else 0
+            message = (
+                f"배치 요약 중: {doc_count}건" if doc_count > 0 else "배치 요약 중..."
+            )
         self._emit_progress(
             "document_summarize",
             message,
-            detail={"doc_count": doc_count, "doc_ids": doc_ids or []},
+            detail={"phase": phase, "doc_ids": doc_ids or []},
         )
         result = self.registry.get("document_summarize").run(
             overwrite=overwrite,
-            doc_ids=doc_ids,
-            rebuild_batches=True,
+            # Batch is cycle-scoped to the new docs; per-doc summarizes every
+            # collected document, so it runs un-scoped.
+            doc_ids=doc_ids if do_batch else None,
+            rebuild_batches=do_batch,
+            summarize_docs=do_per_doc,
         )
         if not result.success:
             raise RuntimeError(result.error)
@@ -389,6 +411,7 @@ class AutoSurveyWorkflow:
             reference_summarize_result = self.run_summarize(
                 overwrite=overwrite_summaries,
                 doc_ids=reference_collect_result.get("new_doc_ids", []),
+                phase="batch",
             )
         else:
             reference_summarize_result = {
@@ -417,6 +440,7 @@ class AutoSurveyWorkflow:
             scout_summarize_result = self.run_summarize(
                 overwrite=overwrite_summaries,
                 doc_ids=scout_collect_result.get("new_doc_ids", []),
+                phase="batch",
             )
         else:
             print("[summarize][skip:no-new-docs] scout cycle produced no new documents")
@@ -502,6 +526,7 @@ class AutoSurveyWorkflow:
             summarize_result = self.run_summarize(
                 overwrite=overwrite_summaries,
                 doc_ids=collect_result.get("new_doc_ids", []),
+                phase="batch",
             )
 
             gap_directions = self._gap_directions_from_summarize_result(summarize_result)
@@ -586,15 +611,21 @@ class AutoSurveyWorkflow:
                 print("[workflow] stopping loop: no remaining search queries after replan")
                 break
 
-        final_result = self.run_final(user_request=user_request)
-
-        summarize_results = [reference_summarize_result, scout_summarize_result]
-        summarize_results.extend(
-            iteration.get("summarize_result")
-            for iteration in iterations
-            if isinstance(iteration, dict)
+        # Per-document summaries run once here, after the collect/replan loop.
+        # They are UX descriptors (source cards / citations / verification) and
+        # do not feed gap analysis, so keeping them off the loop's critical path
+        # speeds convergence. This is the sole source of failed_documents.
+        per_doc_summarize_result = self.run_summarize(
+            overwrite=overwrite_summaries,
+            phase="per_doc",
         )
-        failed_documents = self._aggregate_failed_documents(summarize_results)
+        failed_documents = [
+            failed
+            for failed in (per_doc_summarize_result.get("failed_documents") or [])
+            if isinstance(failed, dict)
+        ]
+
+        final_result = self.run_final(user_request=user_request)
 
         return {
             "grounding": grounding,
@@ -605,40 +636,10 @@ class AutoSurveyWorkflow:
             "scout_summarize_result": scout_summarize_result,
             "active_plan": active_plan,
             "iterations": iterations,
+            "per_doc_summarize_result": per_doc_summarize_result,
             "final_result": final_result,
             "failed_documents": failed_documents,
         }
-
-    def _aggregate_failed_documents(
-        self,
-        summarize_results: list[Any],
-    ) -> list[dict[str, str]]:
-        """Collect per-document summarization failures across every cycle.
-
-        Each ``run_summarize`` call returns its own ``failed_documents`` list;
-        this merges them (deduped by docId) so the run as a whole can report
-        exactly which documents could not be summarized and why.
-        """
-        aggregated: list[dict[str, str]] = []
-        seen: set[str] = set()
-        for result in summarize_results:
-            if not isinstance(result, dict):
-                continue
-            for failed in result.get("failed_documents", []) or []:
-                if not isinstance(failed, dict):
-                    continue
-                doc_id = str(failed.get("docId") or "").strip()
-                if not doc_id or doc_id in seen:
-                    continue
-                seen.add(doc_id)
-                aggregated.append(
-                    {
-                        "docId": doc_id,
-                        "title": str(failed.get("title") or doc_id),
-                        "reason": str(failed.get("reason") or "요약 실패"),
-                    }
-                )
-        return aggregated
 
     def _already_seen_url(self, records: list[DocRecord], url: str) -> bool:
         canonical_url = self._canonicalize_url(url)

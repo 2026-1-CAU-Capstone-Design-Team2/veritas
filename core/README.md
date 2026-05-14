@@ -57,7 +57,7 @@ record = DocRecord(
     final_url="https://example.com/ai-ethics",
     domain="example.com",
     search_query="AI ethics research",
-    text_path="./output/corpus/raw_text/001.txt",
+    text_path="./output/clean_md/001.md",        # Crawl4AI 정제 Markdown
     html_path="./output/corpus/raw_html/001.html",
     summary_path="./output/summary/doc_001.md",
 )

@@ -308,12 +308,12 @@ class AgentRuntime:
             grounding=grounding,
         )
         indexed_chunks = None
-        summary_dir = getattr(run_store_service, "summary_dir", None)
+        clean_md_dir = getattr(run_store_service, "clean_md_dir", None)
         index_path = getattr(run_store_service, "index_path", None)
-        if summary_dir is not None:
+        if clean_md_dir is not None:
             self._emit_research_progress("indexing", "검색 색인 생성 중...")
             indexed_chunks = rag_service.index_autosurvey_output(
-                summary_dir=Path(summary_dir),
+                clean_md_dir=Path(clean_md_dir),
                 index_path=Path(index_path) if index_path is not None else None,
                 clear_first=True,
             )
@@ -402,7 +402,7 @@ class AgentRuntime:
         workspace until AutoSurvey completes minutes later.
 
         Steps:
-        1. Write `summary/request.txt` so the workspace passes the
+        1. Write `summary/request.md` so the workspace passes the
            "has any research evidence" filter in `_scan_run_workspaces`.
         2. Update the in-memory workspace catalog and the persisted
            `app_state.current_workspace_id` so `/api/v1/fe/bootstrap`
@@ -416,12 +416,12 @@ class AgentRuntime:
         try:
             summary_dir = workspace_dir / "summary"
             summary_dir.mkdir(parents=True, exist_ok=True)
-            (summary_dir / "request.txt").write_text(
+            (summary_dir / "request.md").write_text(
                 str(user_request or "").strip(),
                 encoding="utf-8",
             )
         except Exception as e:
-            print(f"[workspace][publish][warn] request.txt: {e}")
+            print(f"[workspace][publish][warn] request.md: {e}")
 
         # 2. Promote in-memory + persisted state.
         try:
@@ -530,12 +530,12 @@ class AgentRuntime:
         if self.rag_service.get_document_count() > 0:
             return
 
-        summary_dir = self.run_store_service.summary_dir
-        has_summary_docs = summary_dir.exists() and any(summary_dir.glob("doc_*.md"))
+        clean_md_dir = self.run_store_service.clean_md_dir
+        has_clean_md = clean_md_dir.exists() and any(clean_md_dir.glob("*.md"))
         indexed = 0
-        if has_summary_docs:
+        if has_clean_md:
             indexed = self.rag_service.index_autosurvey_output(
-                summary_dir=summary_dir,
+                clean_md_dir=clean_md_dir,
                 index_path=self.run_store_service.index_path,
                 clear_first=True,
             )

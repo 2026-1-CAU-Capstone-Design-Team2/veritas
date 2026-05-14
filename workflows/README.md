@@ -73,9 +73,10 @@ def run_all(
     """
     전체 파이프라인 실행:
     1. Plan: 검색 쿼리 계획 생성
-    2. Collect: 웹 검색 및 문서 수집
-    3. Summarize: 개별 요약 및 배치 요약
-    4. Final: 최종 보고서 생성
+    2. Collect: 웹 검색 및 문서 수집 (clean_md 저장)
+    3. (루프 내) 배치 요약 → gap 분석 → replan 반복
+    4. (루프 종료 후) per-doc 요약 일괄 수행
+    5. Final: 최종 보고서 생성
     
     Returns:
         {
@@ -96,8 +97,14 @@ def run_plan(self, user_request: str, *, force_plan: bool = False) -> dict:
 def run_collect(self, plan: dict) -> dict:
     """2단계: 웹 검색 및 문서 수집"""
 
-def run_summarize(self, *, overwrite: bool = False) -> dict:
-    """3단계: 문서 요약 생성"""
+def run_summarize(
+    self, *, overwrite: bool = False,
+    doc_ids: list[str] | None = None, phase: str = "all",
+) -> dict:
+    """문서 요약. clean_md를 읽는다.
+    phase="batch"   → 배치 요약만 (수집 루프 안에서 gap 분석/replan용)
+    phase="per_doc" → per-doc 요약만 (조사 종료 시 1회, summary/doc_*.md)
+    phase="all"     → 둘 다 (standalone --phase summarize)"""
 
 def run_final(self, *, user_request: str | None = None) -> dict:
     """4단계: 최종 보고서 생성"""
@@ -187,16 +194,24 @@ final_result = workflow.run_final()
    - 고유 문서만 저장
 3. `max_docs`에 도달하면 중단
 
-### Summarize 단계
-1. 비중복 문서 목록 로드
-2. 각 문서에 대해 `document_summarize` 실행
-3. 5개 문서마다 배치 요약 생성
-4. 요약 파일을 `summary/` 디렉토리에 저장
+### Summarize 단계 — clean_md를 읽는 두 개의 독립 소비자 (체인 아님)
+- **배치 요약** (수집 루프 안, `phase="batch"`): 사이클의 새 문서 `clean_md`를
+  `batch_size`개씩 묶어 배치 노트(`summary/batch_*.md`)를 만들고, 그 안의 Gap
+  섹션이 다음 replan 신호가 됩니다. per-doc 요약이 아니라 clean_md를 직접 읽어
+  요약-of-요약으로 인한 손실을 피합니다.
+- **per-doc 요약** (수집 루프 종료 후 1회, `phase="per_doc"`): 모든 `clean_md`를
+  문서별로 요약해 `summary/doc_*.md`를 만듭니다. replan에 관여하지 않는 UX
+  디스크립터(출처 카드/인용/검증용)이므로 루프 임계 경로에서 빼 종료 단계에
+  일괄 수행합니다.
 
 ### Final 단계
 1. 모든 배치 요약 로드
 2. `final_report` 도구로 최종 보고서 생성
 3. `final.md`로 저장
+
+### RAG 인덱싱 (workflow 종료 후, API runtime이 수행)
+RAG는 `summary/`가 아니라 **`clean_md/`** 를 인덱싱합니다. 요약은 lossy하므로
+답변 근거는 정제된 원문(`clean_md/<doc_id>.md`)에서 가져옵니다.
 
 ---
 

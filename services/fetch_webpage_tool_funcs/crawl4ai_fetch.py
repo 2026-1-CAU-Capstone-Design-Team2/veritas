@@ -174,18 +174,19 @@ def fetch_with_crawl4ai(
     url: str,
     timeout_sec: int,
     max_chars: int,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     """Fetch a page via Crawl4AI's HTTP-only crawler strategy.
 
-    Returns:
-        - ``dict`` with ``success=True`` and extracted markdown on success.
-        - ``dict`` with ``success=False`` and an ``error`` string when Crawl4AI
-          ran but the page could not be fetched / extracted.
-        - ``None`` when ``crawl4ai`` is not installed, signalling the caller to
-          fall back to the requests + BeautifulSoup path.
+    Returns a ``dict`` with ``success=True`` and the extracted markdown on
+    success, or ``success=False`` and an ``error`` string on any failure —
+    including ``crawl4ai`` not being installed. Crawl4AI is the only fetch
+    path: a failed fetch means the document is skipped, not fetched another way.
     """
     if not crawl4ai_available():
-        return None
+        return {
+            "success": False,
+            "error": "crawl4ai is not installed (pip install crawl4ai)",
+        }
 
     url = (url or "").strip()
     if not url:

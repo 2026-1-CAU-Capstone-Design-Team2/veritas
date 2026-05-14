@@ -154,7 +154,7 @@ def _sync_run_research_jobs() -> None:
 
         final_path = workspace_dir / "final.md"
         index_path = workspace_dir / "summary" / "index.json"
-        request_path = workspace_dir / "summary" / "request.txt"
+        request_path = workspace_dir / "summary" / "request.md"
         if not final_path.exists() and not index_path.exists():
             continue
 

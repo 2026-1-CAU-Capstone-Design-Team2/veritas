@@ -2,7 +2,7 @@
   "type": "function",
   "function": {
     "name": "fetch_webpage",
-    "description": "Fetch a webpage from a URL and extract its main content as clean Markdown. Uses Crawl4AI's HTTP-only crawler (no browser) with structure-preserving HTML-to-Markdown conversion, and falls back to a requests + BeautifulSoup extractor when Crawl4AI is unavailable or fails. Returns the extracted text plus metadata such as title and final URL.",
+    "description": "Fetch a webpage from a URL and extract its main content as clean Markdown using Crawl4AI's HTTP-only crawler (no browser) with structure-preserving HTML-to-Markdown conversion. Crawl4AI is the only fetch path: a URL it cannot fetch or extract is reported as a failure (the collect loop then moves on to another result). Returns the extracted Markdown text plus metadata such as title and final URL.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -17,7 +17,7 @@
         },
         "max_chars": {
           "type": "integer",
-          "description": "Maximum number of characters to keep from the extracted Markdown text. Raw HTML is archived separately for provenance at up to 2x this value.",
+          "description": "Maximum number of characters to keep from the extracted Markdown text. Raw HTML is archived separately for provenance and is not truncated.",
           "default": 25000
         }
       },
