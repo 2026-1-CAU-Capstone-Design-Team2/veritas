@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import math
 import re
+from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal, QTimer
+from PySide6.QtCore import (
+	QPoint,
+	QPointF,
+	QRectF,
+	QSize,
+	Qt,
+	QTimer,
+	Signal,
+)
 from PySide6.QtGui import (
+	QBrush,
 	QColor,
 	QCloseEvent,
 	QKeyEvent,
@@ -12,6 +23,8 @@ from PySide6.QtGui import (
 	QPainter,
 	QPainterPath,
 	QPen,
+	QPixmap,
+	QRadialGradient,
 	QShortcut,
 	QTextDocument,
 	QWheelEvent,
@@ -478,6 +491,100 @@ class CopyButton(QPushButton):
 		painter.drawPath(front_path)
 
 
+class TypingIndicator(QWidget):
+	"""Animated 'assistant is generating an answer' indicator.
+
+	Ports the 'pulse' loader from logo.html: the Veritas logo gently breathes
+	(scale + opacity) over a soft blue radial glow that pulses behind it.
+	Shown inside an assistant bubble in place of the answer text until the
+	first streamed token arrives, replacing the old static '…' placeholder.
+
+	A plain ``QTimer`` drives the motion: it is started/stopped explicitly by
+	``set_typing`` and never tied to show/hide events, so a transient hide — a
+	page switch, a layout reflow — can never silently freeze it.
+	"""
+
+	_SIZE = 40
+	_LOGO_SIZE = 22
+	_GLOW_BASE_RADIUS = 14.0
+	_TICK_MS = 40
+	_PERIOD_MS = 1400
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self._phase = 0.0
+		self.setFixedSize(self._SIZE, self._SIZE)
+		logo_path = (
+			Path(__file__).resolve().parent.parent
+			/ "public" / "images" / "veritas_logo.png"
+		)
+		pixmap = QPixmap(str(logo_path)) if logo_path.exists() else QPixmap()
+		if not pixmap.isNull():
+			pixmap = pixmap.scaled(
+				self._LOGO_SIZE * 2,
+				self._LOGO_SIZE * 2,
+				Qt.KeepAspectRatio,
+				Qt.SmoothTransformation,
+			)
+		self._logo = pixmap
+		self._timer = QTimer(self)
+		self._timer.setInterval(self._TICK_MS)
+		self._timer.timeout.connect(self._advance)
+
+	def _advance(self) -> None:
+		self._phase = (self._phase + self._TICK_MS / self._PERIOD_MS) % 1.0
+		self.update()
+
+	def start(self) -> None:
+		if not self._timer.isActive():
+			self._timer.start()
+
+	def stop(self) -> None:
+		self._timer.stop()
+
+	def paintEvent(self, event) -> None:  # type: ignore[override]
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.Antialiasing, True)
+		painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+		cx = self.width() / 2.0
+		cy = self.height() / 2.0
+		# Smooth 0 -> 1 -> 0 'breathing' value (ease-in-out), matching the
+		# logo.html 'pulse' keyframes (0%/100% small, 50% large).
+		breath = (1.0 - math.cos(2.0 * math.pi * self._phase)) / 2.0
+
+		# Pulsing radial glow behind the logo (scale 0.6..1.4, fades in/out).
+		glow_radius = self._GLOW_BASE_RADIUS * (0.6 + 0.8 * breath)
+		if glow_radius > 0.5:
+			gradient = QRadialGradient(cx, cy, glow_radius)
+			center = QColor(30, 98, 255)
+			center.setAlphaF(0.33 * breath)
+			edge = QColor(30, 98, 255, 0)
+			gradient.setColorAt(0.0, center)
+			gradient.setColorAt(0.65, edge)
+			gradient.setColorAt(1.0, edge)
+			painter.fillRect(self.rect(), QBrush(gradient))
+
+		# Breathing logo (scale 0.85..1.05, opacity 0.7..1.0).
+		logo_scale = 0.85 + 0.20 * breath
+		if not self._logo.isNull():
+			draw = self._LOGO_SIZE * logo_scale
+			painter.setOpacity(0.7 + 0.30 * breath)
+			painter.drawPixmap(
+				QRectF(cx - draw / 2.0, cy - draw / 2.0, draw, draw),
+				self._logo,
+				QRectF(self._logo.rect()),
+			)
+			painter.setOpacity(1.0)
+		else:
+			# Fallback when the logo asset is missing: a breathing blue dot.
+			radius = (self._LOGO_SIZE / 2.0) * logo_scale
+			dot = QColor(30, 98, 255)
+			dot.setAlphaF(0.7 + 0.30 * breath)
+			painter.setPen(Qt.NoPen)
+			painter.setBrush(dot)
+			painter.drawEllipse(QPointF(cx, cy), radius, radius)
+
+
 class ChatMessageBubble(QFrame):
 	def __init__(self, sender: str, message: str, is_user: bool, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
@@ -516,6 +623,14 @@ class ChatMessageBubble(QFrame):
 		layout.addWidget(meta)
 		layout.addWidget(text)
 
+		# Animated 'generating…' indicator, shown in place of `text` while a
+		# streaming answer has not produced its first token yet.
+		self.typing: TypingIndicator | None = None
+		if not is_user:
+			self.typing = TypingIndicator()
+			self.typing.hide()
+			layout.addWidget(self.typing, 0, Qt.AlignLeft)
+
 		# Only AI answers are copyable; user messages already came from them.
 		# The copy button sits in a footer row, aligned to the bottom-right.
 		self.copy_button: CopyButton | None = None
@@ -529,6 +644,23 @@ class ChatMessageBubble(QFrame):
 			footer.addWidget(self.copy_button, 0, Qt.AlignVCenter)
 			layout.addLayout(footer)
 
+	def set_typing(self, active: bool) -> None:
+		"""Show the animated typing indicator in place of the answer text.
+
+		Used on an assistant bubble between the request and its first streamed
+		token; the first ``set_text`` call flips it back off.
+		"""
+		if self.typing is None:
+			return
+		if not _qt_is_alive(self.typing) or not _qt_is_alive(self.text):
+			return
+		self.typing.setVisible(active)
+		self.text.setVisible(not active)
+		if active:
+			self.typing.start()
+		else:
+			self.typing.stop()
+
 	def set_text(self, raw: str) -> None:
 		"""Update the message body while keeping the raw text for copy."""
 		self._raw_message = raw or ""
@@ -540,6 +672,8 @@ class ChatMessageBubble(QFrame):
 			self.text.setText(add_text_breakpoints(self._raw_message))
 		else:
 			self.text.setText(_render_assistant_markdown(self._raw_message))
+		# The first streamed token (or finalize/cancel) ends the typing phase.
+		self.set_typing(False)
 
 	def _copy_to_clipboard(self) -> None:
 		app = QApplication.instance()
@@ -647,7 +781,9 @@ class ChatPanel(QFrame):
 		return bubble
 
 	def start_streaming_assistant(self, sender: str = "VERITAS") -> ChatMessageBubble:
-		bubble = self.add_message(sender, "…", False)
+		# Empty body + animated typing dots until the first token streams in.
+		bubble = self.add_message(sender, "", False)
+		bubble.set_typing(True)
 		self._streaming_bubble = bubble
 		self._streaming_buffer = ""
 		return bubble

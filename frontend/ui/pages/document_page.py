@@ -1,12 +1,44 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QLabel, QTextEdit, QVBoxLayout, QWidget
+import html
+import re
+
+from PySide6.QtWidgets import QLabel, QTextBrowser, QTextEdit, QVBoxLayout, QWidget
 
 from ...api_common import ApiError, current_workspace_id
 from ...components.badges import Badge
 from ...components.cards import CardWidget
 from ...controllers import AgentController
 from ..markdown_view import apply_markdown
+
+
+# Bare http(s) URLs in the collected-document list are turned into clickable
+# links; trailing sentence punctuation is kept out of the linked span.
+_URL_RE = re.compile(r"https?://[^\s<>\"']+")
+_URL_TRAIL = ".,;:!?"
+
+
+def _linkify_plain_text(text: str) -> str:
+	"""Render a plain-text block as HTML with bare http(s) URLs made clickable.
+
+	Whitespace and newlines are preserved (``white-space: pre-wrap``) so the
+	list still reads exactly like the original plain text — only the addresses
+	become links.
+	"""
+	out: list[str] = []
+	cursor = 0
+	for match in _URL_RE.finditer(text):
+		out.append(html.escape(text[cursor:match.start()]))
+		url = match.group(0)
+		trail = ""
+		while url and url[-1] in _URL_TRAIL:
+			trail = url[-1] + trail
+			url = url[:-1]
+		href = html.escape(url, quote=True)
+		out.append(f'<a href="{href}">{html.escape(url)}</a>{html.escape(trail)}')
+		cursor = match.end()
+	out.append(html.escape(text[cursor:]))
+	return f'<div style="white-space: pre-wrap;">{"".join(out)}</div>'
 
 
 class DocumentPage(QWidget):
@@ -38,9 +70,12 @@ class DocumentPage(QWidget):
 		merged_badge = Badge("제목 및 링크", "neutral")
 		merged_card.layout.addWidget(merged_badge)
 
-		self.merged_text = QTextEdit()
+		# QTextBrowser (not QTextEdit) so the collected-document addresses can be
+		# rendered as links that open in the system browser when clicked.
+		self.merged_text = QTextBrowser()
 		self.merged_text.setObjectName("DocEditor")
 		self.merged_text.setReadOnly(True)
+		self.merged_text.setOpenExternalLinks(True)
 		self.merged_text.setMinimumHeight(220)
 		merged_card.layout.addWidget(self.merged_text)
 		root.addWidget(merged_card)
@@ -62,4 +97,4 @@ class DocumentPage(QWidget):
 			apply_markdown(self.summary_text, summary)
 		else:
 			self.summary_text.setPlainText("아직 표시할 final.md가 없습니다. 조사 섹션에서 AutoSurvey를 먼저 실행하세요.")
-		self.merged_text.setPlainText(merged or "아직 수집 문서 목록이 없습니다.")
+		self.merged_text.setHtml(_linkify_plain_text(merged or "아직 수집 문서 목록이 없습니다."))
