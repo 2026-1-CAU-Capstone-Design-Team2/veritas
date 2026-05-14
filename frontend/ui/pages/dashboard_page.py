@@ -19,7 +19,7 @@ from db.db import get_connection, init_db
 
 from ...api_common import ApiError, load_bootstrap_state
 from ...components.cards import CardWidget
-from ...controllers import AgentController
+from ...controllers import AgentController, get_job_manager
 
 # Stored timestamps are written by the backend with SQLite ``datetime('now')``
 # or as ISO-8601 strings with a trailing ``Z`` — both UTC. The dashboard shows
@@ -36,6 +36,11 @@ class DashboardPage(QWidget):
 		self._stat_values: dict[str, QLabel] = {}
 		self._workspace_list = QVBoxLayout()
 		self._activity_list = QVBoxLayout()
+		# Last payload rendered — an unchanged refresh skips the widget rebuild
+		# entirely so an idle dashboard costs nothing. ``_loading`` coalesces
+		# overlapping ticks into one in-flight fetch.
+		self._last_data: dict | None = None
+		self._loading = False
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
@@ -70,24 +75,56 @@ class DashboardPage(QWidget):
 
 		self.load_dashboard_data()
 
+		# The dashboard polls the local SQLite DB. Keep that work off the UI
+		# thread (see load_dashboard_data) and only let the timer tick while the
+		# page is actually on screen — see showEvent / hideEvent.
 		self._refresh_timer = QTimer(self)
 		self._refresh_timer.setInterval(4000)
 		self._refresh_timer.timeout.connect(self.load_dashboard_data)
+
+	def showEvent(self, event) -> None:  # type: ignore[override]
+		super().showEvent(event)
+		self.load_dashboard_data()
 		self._refresh_timer.start()
+
+	def hideEvent(self, event) -> None:  # type: ignore[override]
+		super().hideEvent(event)
+		# No point polling the DB while another page is on screen.
+		self._refresh_timer.stop()
 
 	def refresh(self) -> None:
 		"""Public hook for document, workspace, or feedback events."""
 		self.load_dashboard_data()
 
 	def load_dashboard_data(self) -> None:
-		data = get_dashboard_summary()
+		"""Refresh the dashboard from the local DB on a worker thread.
 
-		self._stat_values["processed_docs"].setText(str(data["processed_docs"]))
-		self._stat_values["validated_workspaces"].setText(str(data["validated_workspaces"]))
-		self._stat_values["feedback_rate"].setText(f"{data['feedback_rate']}%")
+		``get_dashboard_summary`` opens and queries SQLite; running it inline
+		stutters the UI every few seconds. The result is applied back on the
+		main thread, and an unchanged payload skips the widget rebuild entirely.
+		"""
+		if self._loading:
+			return
+		self._loading = True
 
-		self._render_recent_workspaces(data["recent_workspaces"])
-		self._render_recent_activities(data["recent_activities"])
+		def _fetch() -> dict:
+			return get_dashboard_summary()
+
+		def _apply(data: object) -> None:
+			self._loading = False
+			if not isinstance(data, dict) or data == self._last_data:
+				return
+			self._last_data = data
+			self._stat_values["processed_docs"].setText(str(data["processed_docs"]))
+			self._stat_values["validated_workspaces"].setText(str(data["validated_workspaces"]))
+			self._stat_values["feedback_rate"].setText(f"{data['feedback_rate']}%")
+			self._render_recent_workspaces(data["recent_workspaces"])
+			self._render_recent_activities(data["recent_activities"])
+
+		def _failed(_message: str) -> None:
+			self._loading = False
+
+		get_job_manager().run_detached(_fetch, on_success=_apply, on_error=_failed)
 
 	def _create_stat_tile(self, key: str, label: str, value: str) -> QFrame:
 		tile = CardWidget()

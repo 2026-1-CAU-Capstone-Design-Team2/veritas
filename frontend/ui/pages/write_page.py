@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QFrame, QVBoxLayout, QWidget
 
-from ...api_common import ApiError, current_workspace_id
+from ...api_common import current_workspace_id
 from ...controllers import AgentController, JobCategory, get_chat_bus, get_job_manager
-from ..windows.document_assist_window import ChatInputBar, ChatPanel
+from ..windows.document_assist_window import ChatInputBar, ChatPanel, render_history_html
 
 
 class WritePage(QWidget):
@@ -16,6 +16,9 @@ class WritePage(QWidget):
 		self._controller = AgentController()
 		self._bus = get_chat_bus()
 		self._streaming = False
+		# Monotonic guard so an out-of-order history fetch can't overwrite a
+		# newer refresh (rapid page switches / workspace changes).
+		self._history_token = 0
 		self._build_ui()
 		self._connect_bus()
 		self.refresh()
@@ -75,12 +78,38 @@ class WritePage(QWidget):
 		# are ignored instead of writing into a freed widget.
 		self._streaming = False
 		self.chat_panel.clear_messages()
-		try:
-			history = self._controller.get_chat_history(self._workspace_id)
-		except ApiError:
-			history = []
+		self.chat_panel.add_message("VERITAS", "채팅 기록을 불러오는 중입니다...", False)
 
-		if not history:
+		# get_chat_history is a blocking HTTP call — run it off the UI thread so
+		# navigating to this page never freezes. The token guards against an
+		# out-of-order completion overwriting a newer refresh.
+		self._history_token += 1
+		token = self._history_token
+		workspace_id = self._workspace_id
+		controller = self._controller
+
+		def _load() -> list:
+			# Fetch AND render the markdown off the UI thread — render_history_html
+			# is pure, so the per-message parse never touches the main thread.
+			history = controller.get_chat_history(workspace_id)
+			return render_history_html(history if isinstance(history, list) else [])
+
+		def _apply(prepared: object) -> None:
+			if token != self._history_token:
+				return
+			self._render_history(prepared if isinstance(prepared, list) else [])
+
+		def _failed(_message: str) -> None:
+			if token != self._history_token:
+				return
+			self._render_history([])
+
+		get_job_manager().run_detached(_load, on_success=_apply, on_error=_failed)
+
+	def _render_history(self, prepared: list) -> None:
+		"""Build the chat panel from pre-rendered workspace history specs."""
+		self.chat_panel.clear_messages()
+		if not prepared:
 			self.chat_panel.add_message(
 				"VERITAS",
 				"메시지를 입력하면 선택한 워크스페이스의 지식베이스로 답변합니다.",
@@ -88,14 +117,19 @@ class WritePage(QWidget):
 			)
 			return
 
-		for item in history:
-			if not isinstance(item, dict):
+		for spec in prepared:
+			if not isinstance(spec, dict):
 				continue
-			role = str(item.get("role") or "")
-			text = str(item.get("text") or "")
+			text = str(spec.get("text") or "")
 			if not text:
 				continue
-			self.chat_panel.add_message("사용자" if role == "user" else "VERITAS", text, role == "user")
+			is_user = bool(spec.get("is_user"))
+			self.chat_panel.add_message(
+				"사용자" if is_user else "VERITAS",
+				text,
+				is_user,
+				rendered_html=spec.get("html") or None,
+			)
 
 	def _send_message(self, message: str) -> None:
 		text = message.rstrip("\n").strip()

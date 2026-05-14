@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
 
-from ...api_common import ApiError, current_workspace_id
+from ...api_common import current_workspace_id
 from ...components.badges import Badge
 from ...components.cards import CardWidget
-from ...controllers import AgentController
+from ...controllers import AgentController, get_job_manager
 from ..markdown_view import apply_markdown
 
 
@@ -14,6 +14,9 @@ class DocumentPage(QWidget):
 		super().__init__(parent)
 		self._workspace_id = current_workspace_id()
 		self._controller = AgentController()
+		# Monotonic guard so an out-of-order summary fetch can't overwrite a
+		# newer refresh (rapid page switches / workspace changes).
+		self._summary_token = 0
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
@@ -37,15 +40,33 @@ class DocumentPage(QWidget):
 
 	def refresh(self) -> None:
 		self._workspace_id = current_workspace_id()
-		try:
-			summary = self._controller.get_document_summary(self._workspace_id)
-		except ApiError as e:
-			self.summary_text.setPlainText(f"API 요청 실패: {e}")
-			return
+		self.summary_text.setPlainText("요약을 불러오는 중입니다...")
 
-		if summary.strip():
-			apply_markdown(self.summary_text, summary)
-		else:
-			self.summary_text.setPlainText(
-				"아직 표시할 final.md가 없습니다. 조사 섹션에서 AutoSurvey를 먼저 실행하세요."
-			)
+		# get_document_summary is a blocking HTTP call — run it off the UI
+		# thread so navigating to this page never freezes. The token guards
+		# against an out-of-order completion overwriting a newer refresh.
+		self._summary_token += 1
+		token = self._summary_token
+		workspace_id = self._workspace_id
+		controller = self._controller
+
+		def _load() -> str:
+			return controller.get_document_summary(workspace_id)
+
+		def _apply(summary: object) -> None:
+			if token != self._summary_token:
+				return
+			text = str(summary or "")
+			if text.strip():
+				apply_markdown(self.summary_text, text)
+			else:
+				self.summary_text.setPlainText(
+					"아직 표시할 final.md가 없습니다. 조사 섹션에서 AutoSurvey를 먼저 실행하세요."
+				)
+
+		def _failed(message: str) -> None:
+			if token != self._summary_token:
+				return
+			self.summary_text.setPlainText(f"API 요청 실패: {message}")
+
+		get_job_manager().run_detached(_load, on_success=_apply, on_error=_failed)

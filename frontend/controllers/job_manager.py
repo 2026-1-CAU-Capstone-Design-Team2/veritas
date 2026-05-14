@@ -110,6 +110,10 @@ class JobManager(QObject):
 	def __init__(self, parent: QObject | None = None) -> None:
 		super().__init__(parent)
 		self._active: set[str] = set()
+		# Detached background loads (chat history, document summary, dashboard
+		# data) are parked here so their QThread wrappers are not garbage
+		# collected mid-run. Each removes itself on `finished`.
+		self._detached: set["_JobThread"] = set()
 
 	@classmethod
 	def instance(cls) -> "JobManager":
@@ -201,6 +205,51 @@ class JobManager(QObject):
 		thread.finished.connect(_emit_finished)
 		thread.start()
 		return True
+
+	def run_detached(
+		self,
+		fn: Callable[..., Any],
+		*args: Any,
+		on_success: Callable[[Any], None] | None = None,
+		on_error: Callable[[str], None] | None = None,
+		on_done: Callable[[], None] | None = None,
+		**kwargs: Any,
+	) -> None:
+		"""Run `fn(*args, **kwargs)` on a worker thread with no busy semantics.
+
+		Unlike :meth:`submit`, this does not touch the job-exclusion matrix — it
+		is for non-exclusive background *reads* that must keep the UI thread free
+		(chat history, document summary, dashboard refresh) but must neither
+		block a chat / research run nor be blocked by one. Use it for anything
+		that today calls the HTTP API or the local DB straight from the UI
+		thread on page navigation.
+
+		Callbacks fire on the main thread:
+		    on_success(result)
+		    on_error(error_message)
+		    on_done()           # always, after success or error
+		"""
+		thread = _JobThread(fn, args, kwargs)
+		self._detached.add(thread)
+
+		def _emit_success(result: Any) -> None:
+			if on_success is not None:
+				on_success(result)
+
+		def _emit_error(message: str) -> None:
+			if on_error is not None:
+				on_error(message)
+
+		def _emit_finished() -> None:
+			if on_done is not None:
+				on_done()
+			self._detached.discard(thread)
+			thread.deleteLater()
+
+		thread.succeeded.connect(_emit_success)
+		thread.failed.connect(_emit_error)
+		thread.finished.connect(_emit_finished)
+		thread.start()
 
 
 def get_job_manager() -> JobManager:
