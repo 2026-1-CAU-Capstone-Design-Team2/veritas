@@ -254,6 +254,7 @@ class AgentRuntime:
         instruction: str,
         reference_urls: list[str] | None = None,
         job_id: str | None = None,
+        max_docs: int | None = None,
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
         request = self._append_reference_sites(instruction, reference_urls or [])
@@ -268,10 +269,17 @@ class AgentRuntime:
             max_context=int(os.getenv("VERITAS_MAX_CONTEXT", "16384")),
             enable_screen_context=False,
         )
+        # A per-request maxDocs (set by the user in the research page) takes
+        # precedence; otherwise fall back to the VERITAS_MAX_DOCS env default.
+        resolved_max_docs = (
+            int(max_docs)
+            if max_docs is not None and int(max_docs) > 0
+            else int(os.getenv("VERITAS_MAX_DOCS", "15"))
+        )
         workflow = AutoSurveyWorkflow(
             registry=registry,
             run_store_service=run_store_service,
-            max_docs=int(os.getenv("VERITAS_MAX_DOCS", "15")),
+            max_docs=resolved_max_docs,
             collect_batch_size=int(os.getenv("VERITAS_BATCH_SIZE", "5")),
             scout_docs=int(os.getenv("VERITAS_SCOUT_DOCS", "3")),
             progress_callback=self._emit_research_progress,
