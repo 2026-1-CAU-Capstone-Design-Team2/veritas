@@ -1341,4 +1341,77 @@ class MainWindow(QMainWindow):
 			font-size: 12px;
 			font-weight: 700;
 		}
+
+		QFrame#ResearchCountCard {
+			background-color: #F8FAFC;
+			border: 1px solid #E2E8F0;
+			border-radius: 12px;
+		}
+
+		QFrame#DocCountStepper {
+			background-color: #FFFFFF;
+			border: 1px solid #E2E8F0;
+			border-radius: 22px;
+		}
+
+		QToolButton#StepperButton {
+			background-color: #EEF2FF;
+			border: 1px solid #E0E7FF;
+			border-radius: 16px;
+		}
+
+		QToolButton#StepperButton:hover {
+			background-color: #E0E7FF;
+			border-color: #C7D2FE;
+		}
+
+		QToolButton#StepperButton:pressed {
+			background-color: #C7D2FE;
+		}
+
+		QToolButton#StepperButton:disabled {
+			background-color: #F1F5F9;
+			border-color: #E2E8F0;
+		}
+
+		QLabel#StepperValue {
+			font-size: 15px;
+			font-weight: 800;
+			color: #0F172A;
+		}
+
+		QLabel#ResearchCountTitle {
+			font-size: 13px;
+			font-weight: 800;
+			color: #0F172A;
+		}
+
+		QLabel#ResearchCountHint {
+			font-size: 11px;
+			font-weight: 600;
+			color: #94A3B8;
+		}
+
+		QLabel#ToolChip {
+			background-color: #EEF2FF;
+			color: #3730A3;
+			border: 1px solid #C7D2FE;
+			border-radius: 13px;
+			padding: 5px 12px;
+			font-size: 11px;
+			font-weight: 700;
+		}
+
+		QFrame#DocToolAddRow {
+			background-color: #F8FAFC;
+			border: 1px solid #E2E8F0;
+			border-radius: 12px;
+		}
+
+		QLabel#FieldLabel {
+			font-size: 11px;
+			font-weight: 700;
+			color: #64748B;
+			letter-spacing: 0.2px;
+		}
 		"""

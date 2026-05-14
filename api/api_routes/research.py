@@ -21,6 +21,7 @@ def research_job_create(payload: ResearchJobCreateRequest) -> dict[str, Any]:
         payload.workspaceId,
         payload.instruction,
         payload.referenceUrls,
+        payload.maxDocs,
     )
 
 
