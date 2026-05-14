@@ -22,3 +22,8 @@ def update_local_access(folder_paths: list[str]) -> dict[str, Any]:
 def update_document_tools(custom_tools: list[dict[str, Any]]) -> dict[str, Any]:
     document_tools = repo.set_document_tools_settings(custom_tools)
     return {"documentTools": document_tools, "updated": True}
+
+
+def update_research_method(sample_count: int, plan_count: int) -> dict[str, Any]:
+    research = repo.set_research_method_settings(sample_count, plan_count)
+    return {"research": research, "updated": True}

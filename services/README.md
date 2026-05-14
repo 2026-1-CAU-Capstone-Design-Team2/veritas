@@ -120,6 +120,7 @@ output_dir/
     ├── index.json              # 문서 레코드 인덱스 (보존 문서 + 중복 record)
     ├── request.md              # 사용자 요청
     ├── plan.json               # 리서치 계획
+    ├── timing.json             # 실행 시각/소요 시간 — 완료·재시작 후에도 소요 시간 표시
     ├── doc_000.md              # 개별 문서 요약 (조사 종료 시 일괄 생성, 보존 문서만)
     ├── doc_001.md
     ├── fetch_error_000.md      # Crawl4AI fetch 실패 노트 (doc_*.md와 번호 분리)

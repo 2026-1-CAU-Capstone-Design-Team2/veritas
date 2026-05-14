@@ -27,7 +27,18 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('ui/sidebar.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('ui/sidebar.py',encoding='utf-8-sig'\\).read\\(\\)\\); print\\('syntax OK \\(file has a pre-existing UTF-8 BOM\\)'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('ui/sidebar.py',encoding='utf-8-sig'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
-      "Bash(python -c \"print\\(open\\('ui/pages/__init__.py',encoding='utf-8-sig'\\).read\\(\\)\\)\")"
+      "Bash(python -c \"print\\(open\\('ui/pages/__init__.py',encoding='utf-8-sig'\\).read\\(\\)\\)\")",
+      "Bash(cd /c/Users/user/Desktop/veritas && find . -type f -name \"*.py\" | head -20)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('tools/document_summarize_tool/document_summarize_tool.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('workflows/autosurvey_workflow.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import workflows.autosurvey_workflow as w; import tools.document_summarize_tool.document_summarize_tool as d; print\\('import OK'\\); import inspect; print\\('run sig:', inspect.signature\\(d.DocumentSummarizeTool.run\\)\\); print\\('cb method:', hasattr\\(w.AutoSurveyWorkflow, '_on_summarize_progress'\\)\\)\")",
+      "Bash(curl -s -m 10 http://127.0.0.1:8081/v1/models)",
+      "Bash(curl -s -m 10 http://127.0.0.1:8081/props)",
+      "Bash(curl -s -m 30 -w \"\\\\nHTTP_STATUS:%{http_code}\\\\n\" -X POST http://127.0.0.1:8081/v1/embeddings -H \"Content-Type: application/json\" -d \"{\\\\\"model\\\\\":\\\\\"granite-embedding-97M-multilingual-r2-Q8_0.gguf\\\\\",\\\\\"input\\\\\":\\\\\"hello world\\\\\",\\\\\"encoding_format\\\\\":\\\\\"float\\\\\"}\")",
+      "Bash(python -)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -c \"import ast; ast.parse\\(open\\('llm/llama_server_llm.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -c ' *)",
+      "Bash(git merge *)"
     ]
   }
 }

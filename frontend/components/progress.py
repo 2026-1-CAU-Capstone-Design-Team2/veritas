@@ -286,7 +286,7 @@ class ResearchProgressBar(QFrame):
 		color = "#B91C1C" if self._state == "failed" else "#64748B"
 		self._apply_caption(caption, color)
 
-	def mark_completed(self, animate: bool = True) -> None:
+	def mark_completed(self, animate: bool = True, elapsed_seconds: float | None = None) -> None:
 		self._state = "completed"
 		self._error_message = ""
 		self.setCursor(Qt.ArrowCursor)
@@ -298,9 +298,9 @@ class ResearchProgressBar(QFrame):
 			self._track.set_ratio_immediate(1.0)
 		self._apply_chip("completed")
 		self._apply_caption("조사가 완료되었습니다.", "#15803D")
-		self._finish_timing()
+		self._finish_timing(elapsed_seconds)
 
-	def mark_partial(self, animate: bool = True) -> None:
+	def mark_partial(self, animate: bool = True, elapsed_seconds: float | None = None) -> None:
 		"""Run finished, but some documents failed to summarize.
 
 		The bar fills to 100% in amber and stays clickable so the page can
@@ -320,9 +320,9 @@ class ResearchProgressBar(QFrame):
 			"일부 문서 요약에 실패했습니다. 클릭하면 실패한 문서를 확인할 수 있습니다.",
 			"#B45309",
 		)
-		self._finish_timing()
+		self._finish_timing(elapsed_seconds)
 
-	def mark_failed(self, error_message: str = "") -> None:
+	def mark_failed(self, error_message: str = "", elapsed_seconds: float | None = None) -> None:
 		self._state = "failed"
 		self._error_message = error_message or ""
 		self.setCursor(Qt.PointingHandCursor)
@@ -330,7 +330,7 @@ class ResearchProgressBar(QFrame):
 		self._track.set_state("failed")
 		self._apply_chip("failed")
 		self._apply_caption("클릭하면 오류 메시지를 확인할 수 있습니다.", "#B91C1C")
-		self._finish_timing()
+		self._finish_timing(elapsed_seconds)
 
 	def restore_running(self, percent: float, caption: str = "") -> None:
 		"""Show a persisted in-flight job without the count-up animation."""
@@ -360,20 +360,31 @@ class ResearchProgressBar(QFrame):
 		elapsed = time.monotonic() - self._start_time
 		self._elapsed.setText(f"진행 시간 {_format_duration(elapsed)}")
 
-	def _finish_timing(self) -> None:
+	def _finish_timing(self, elapsed_override: float | None = None) -> None:
 		"""Freeze the elapsed time once a run reaches a terminal state.
 
-		Only live runs are timed — start() records a wall-clock start. A job
-		restored from the API has no frontend start time, so the label is
-		cleared instead of showing a stale duration.
+		The authoritative duration is ``elapsed_override`` — the backend-reported
+		``elapsedSeconds``, persisted in the workspace (summary/timing.json), so
+		it survives completion and an API restart. The frontend ``_start_time``
+		is only a fallback for a live run whose response carried no elapsed
+		value; a job restored from the API has no frontend start time at all.
 		"""
 		self._elapsed_timer.stop()
-		if self._start_time is None:
-			self._elapsed.setText("")
-			return
-		elapsed = time.monotonic() - self._start_time
+		elapsed: float | None = None
+		if elapsed_override is not None:
+			try:
+				value = float(elapsed_override)
+				if value >= 0.0:
+					elapsed = value
+			except (TypeError, ValueError):
+				elapsed = None
+		if elapsed is None and self._start_time is not None:
+			elapsed = time.monotonic() - self._start_time
 		self._start_time = None
-		self._elapsed.setText(f"총 소요 시간 {_format_duration(elapsed, precise=True)}")
+		if elapsed is None:
+			self._elapsed.setText("")
+		else:
+			self._elapsed.setText(f"총 소요 시간 {_format_duration(elapsed, precise=True)}")
 
 	def _apply_chip(self, state: str) -> None:
 		_s, _e, bg, fg, border = _STATE_COLORS.get(state, _STATE_COLORS["running"])

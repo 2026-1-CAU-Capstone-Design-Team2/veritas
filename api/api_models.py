@@ -35,6 +35,12 @@ class ResearchJobCreateRequest(BaseModel):
     # How many documents AutoSurvey should collect. When omitted the runtime
     # falls back to the VERITAS_MAX_DOCS environment default (15).
     maxDocs: int | None = Field(default=None, ge=1, le=50)
+    # AutoSurvey pacing from 설정 > 고급 설정 > 조사 진행 방식: the initial scout
+    # sample size and the per-plan collect/batch-summary cycle size. When
+    # omitted the runtime falls back to the VERITAS_SCOUT_DOCS / VERITAS_BATCH_SIZE
+    # environment defaults (3 / 5).
+    scoutDocs: int | None = Field(default=None, ge=1, le=50)
+    collectBatchSize: int | None = Field(default=None, ge=1, le=9999)
 
 
 class DocumentAssistAnalyzeRequest(BaseModel):
@@ -64,6 +70,14 @@ class DocumentToolItem(BaseModel):
 
 class SettingsDocumentToolsRequest(BaseModel):
     customTools: list[DocumentToolItem] = Field(default_factory=list)
+
+
+class SettingsResearchMethodRequest(BaseModel):
+    # 최초 샘플링 개수 (scout_docs) / 각 플랜당 조사 개수 (collect_batch_size).
+    # Bounds are lenient — the settings UI enforces the practical range; this
+    # only guards against garbage input.
+    sampleCount: int = Field(default=3, ge=1, le=50)
+    planCount: int = Field(default=5, ge=1, le=9999)
 
 
 class TypingContextRequest(BaseModel):

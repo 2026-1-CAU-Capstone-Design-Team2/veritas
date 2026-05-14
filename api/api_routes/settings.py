@@ -8,6 +8,7 @@ from ..api_models import (
     SettingsDocumentToolsRequest,
     SettingsLocalAccessRequest,
     SettingsModelRequest,
+    SettingsResearchMethodRequest,
 )
 from ..services import settings_service
 
@@ -34,3 +35,8 @@ async def settings_document_tools_update(payload: SettingsDocumentToolsRequest) 
     return settings_service.update_document_tools(
         [tool.model_dump() for tool in payload.customTools]
     )
+
+
+@router.put("/api/v1/settings/research-method")
+async def settings_research_method_update(payload: SettingsResearchMethodRequest) -> dict[str, Any]:
+    return settings_service.update_research_method(payload.sampleCount, payload.planCount)

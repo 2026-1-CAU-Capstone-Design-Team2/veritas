@@ -180,6 +180,17 @@ def set_document_tools_settings(custom_tools: list[dict[str, Any]]) -> dict[str,
     return STATE["settings"]["documentTools"]
 
 
+def set_research_method_settings(sample_count: int, plan_count: int) -> dict[str, Any]:
+    """Persist AutoSurvey pacing — initial scout sample size and per-plan
+    collect/batch-summary cycle size — so research runs honor the user's
+    설정 > 고급 설정 values."""
+    STATE["settings"]["research"] = {
+        "sampleCount": max(1, int(sample_count)),
+        "planCount": max(1, int(plan_count)),
+    }
+    return STATE["settings"]["research"]
+
+
 def get_current_workspace_id() -> str:
     return STATE["current_workspace_id"]
 

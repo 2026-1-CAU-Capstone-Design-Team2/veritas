@@ -19,6 +19,8 @@ def create_research_job(
     instruction: str,
     reference_urls: list[str],
     max_docs: int | None = None,
+    scout_docs: int | None = None,
+    collect_batch_size: int | None = None,
 ) -> dict[str, Any]:
     instruction_text = instruction.strip()
     if not instruction_text:
@@ -45,11 +47,14 @@ def create_research_job(
             reference_urls=job["referenceUrls"],
             job_id=job_id,
             max_docs=max_docs,
+            scout_docs=scout_docs,
+            collect_batch_size=collect_batch_size,
         )
     except Exception as e:
         job["status"] = "failed"
         job["error"] = str(e)
         job["completedAt"] = utc_now_iso()
+        job["elapsedSeconds"] = round(time.perf_counter() - started_at, 3)
         repo.save_research_job(job_id, job)
         raise HTTPException(status_code=502, detail=f"AutoSurvey workflow failed: {e}") from e
 
@@ -155,12 +160,21 @@ def _sync_run_research_jobs() -> None:
         final_path = workspace_dir / "final.md"
         index_path = workspace_dir / "summary" / "index.json"
         request_path = workspace_dir / "summary" / "request.md"
+        timing_path = workspace_dir / "summary" / "timing.json"
         if not final_path.exists() and not index_path.exists():
             continue
 
         documents = _read_index_documents(index_path)
-        submitted_at = _mtime_iso(request_path if request_path.exists() else workspace_dir)
-        completed_at = _mtime_iso(final_path if final_path.exists() else workspace_dir)
+        # summary/timing.json is the authoritative run-duration record (written
+        # by run_autosurvey). When present, prefer its real timestamps over the
+        # filesystem mtimes, which are only a wall-clock approximation.
+        timing = _read_timing(timing_path)
+        submitted_at = timing.get("startedAt") or _mtime_iso(
+            request_path if request_path.exists() else workspace_dir
+        )
+        completed_at = timing.get("completedAt") or _mtime_iso(
+            final_path if final_path.exists() else workspace_dir
+        )
         final_markdown = _read_text(final_path, max_chars=1_000_000)
         instruction = _read_text(request_path, max_chars=4000) or workspace_id
         # For finished runs, a document present in index.json with no summary
@@ -188,6 +202,7 @@ def _sync_run_research_jobs() -> None:
             "documents": documents,
             "failedDocuments": failed_documents,
             "documentCount": len(documents),
+            "elapsedSeconds": timing.get("elapsedSeconds"),
             "collectedDocuments": documents,
             "workflowResult": {},
         }
@@ -303,6 +318,16 @@ def _read_index_documents(index_path: Path) -> list[dict[str, str]]:
             }
         )
     return documents
+
+
+def _read_timing(timing_path: Path) -> dict[str, Any]:
+    """Load summary/timing.json — the persisted run-duration record. Returns an
+    empty dict when the file is missing (older runs predate the timing file)."""
+    try:
+        payload = json.loads(timing_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _read_text(path: Path, *, max_chars: int) -> str:
