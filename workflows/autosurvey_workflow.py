@@ -48,6 +48,56 @@ class AutoSurveyWorkflow:
         except Exception:
             pass
 
+    def _on_summarize_progress(self, kind: str, **info: Any) -> None:
+        """Translate per-document summary events from ``DocumentSummarizeTool``
+        into progress emissions.
+
+        The per-document summary loop is the long tail of a survey run — one LLM
+        call per document — so the tool streams an event as each document starts
+        and finishes. Mapping them to ``document_summarize`` / ``doc_summarized``
+        / ``doc_failed`` here keeps the progress bar advancing and activates each
+        source card the moment its summary lands, instead of one jump after the
+        whole loop completes.
+        """
+        doc_id_str = str(info.get("doc_id") or "").strip()
+        if not doc_id_str:
+            return
+        if kind == "doc_start":
+            title = str(info.get("title") or doc_id_str).strip() or doc_id_str
+            self._emit_progress(
+                "document_summarize",
+                f"문서 요약 중 ({title})",
+                detail={"phase": "per_doc", "doc_id": doc_id_str, "title": title},
+            )
+        elif kind == "doc_summarized":
+            try:
+                summary_path = self.run_store_service.paths.summary_path_for(
+                    int(doc_id_str)
+                )
+                summary_path_str = str(summary_path.resolve())
+            except Exception:
+                summary_path_str = ""
+            self._emit_progress(
+                "doc_summarized",
+                f"요약 완료: doc_{doc_id_str}",
+                detail={
+                    "doc_id": doc_id_str,
+                    "summary_path": summary_path_str,
+                },
+            )
+        elif kind == "doc_failed":
+            title = str(info.get("title") or doc_id_str).strip() or doc_id_str
+            reason = str(info.get("reason") or "요약 실패").strip()
+            self._emit_progress(
+                "doc_failed",
+                f"요약 실패: doc_{doc_id_str}",
+                detail={
+                    "doc_id": doc_id_str,
+                    "title": title,
+                    "reason": reason,
+                },
+            )
+
     def run_term_grounding(
         self,
         user_request: str,
@@ -338,44 +388,17 @@ class AutoSurveyWorkflow:
             doc_ids=doc_ids if do_batch else None,
             rebuild_batches=do_batch,
             summarize_docs=do_per_doc,
+            # Per-document summary events (start / summarized / failed) are
+            # streamed live from inside the tool's loop via this callback, so
+            # the progress bar advances and each source card activates the
+            # moment its summary lands — not all at once after the whole loop.
+            # Batch-only phases run no per-document loop, so they need no
+            # callback.
+            progress_callback=self._on_summarize_progress if do_per_doc else None,
         )
         if not result.success:
             raise RuntimeError(result.error)
-        data = result.data or {}
-        for summarized_id in data.get("summarized_doc_ids", []) or []:
-            doc_id_str = str(summarized_id)
-            try:
-                summary_path = self.run_store_service.paths.summary_path_for(
-                    int(doc_id_str)
-                )
-                summary_path_str = str(summary_path.resolve())
-            except Exception:
-                summary_path_str = ""
-            self._emit_progress(
-                "doc_summarized",
-                f"요약 완료: doc_{doc_id_str}",
-                detail={
-                    "doc_id": doc_id_str,
-                    "summary_path": summary_path_str,
-                },
-            )
-        for failed in data.get("failed_documents", []) or []:
-            if not isinstance(failed, dict):
-                continue
-            doc_id_str = str(failed.get("docId") or "").strip()
-            if not doc_id_str:
-                continue
-            reason = str(failed.get("reason") or "요약 실패").strip()
-            self._emit_progress(
-                "doc_failed",
-                f"요약 실패: doc_{doc_id_str}",
-                detail={
-                    "doc_id": doc_id_str,
-                    "title": str(failed.get("title") or doc_id_str),
-                    "reason": reason,
-                },
-            )
-        return data
+        return result.data or {}
 
     def run_final(self, *, user_request: str | None = None) -> dict[str, Any]:
         self._emit_progress("final_report", "최종 보고서 작성 중...")
@@ -650,9 +673,11 @@ class AutoSurveyWorkflow:
         )
 
     def _fetch_one(self, title_hint: str, url: str, query: str) -> dict[str, Any]:
-        records = self.run_store_service.load_records()
-        doc_id = self.run_store_service.next_doc_id(len(records))
-
+        # The doc_id is not pre-allocated here: it is assigned by the run store
+        # at write time, and only kept (successfully fetched, non-duplicate)
+        # documents get a contiguous ``doc_*`` number. Fetch errors and
+        # duplicates get their own (``fetch_error_*`` / ``dup_*``) ids so they
+        # never collide with — or shift — kept-document numbering.
         domain = urlparse(url).netloc or url
         self._emit_progress(
             "fetch_webpage",
@@ -665,12 +690,11 @@ class AutoSurveyWorkflow:
             max_chars=25000,
         )
         if not fetch_result.success:
-            self.run_store_service.write_fetch_error_note(
-                doc_id=doc_id,
+            error_id = self.run_store_service.write_fetch_error_note(
                 url=url,
                 error=fetch_result.error or "unknown error",
             )
-            return {"status": "fetch_error", "doc_id": doc_id}
+            return {"status": "fetch_error", "doc_id": error_id}
 
         fetched = fetch_result.data
         stored_url = self._canonicalize_url(getattr(fetched, "url", "") or url) or url
@@ -686,8 +710,7 @@ class AutoSurveyWorkflow:
             title=fetched.title or title_hint or "Untitled",
         )
         if is_dup and duplicate_of is not None:
-            self.run_store_service.write_duplicate_record(
-                doc_id=doc_id,
+            dup_id = self.run_store_service.write_duplicate_record(
                 title=fetched.title or title_hint or "Untitled",
                 url=stored_url,
                 final_url=stored_final_url,
@@ -698,13 +721,12 @@ class AutoSurveyWorkflow:
             )
             return {
                 "status": "duplicate",
-                "doc_id": doc_id,
+                "doc_id": dup_id,
                 "duplicate_of": duplicate_of,
                 "duplicate_score": dup_score,
             }
 
-        self.run_store_service.write_fetched_record(
-            doc_id=doc_id,
+        doc_id = self.run_store_service.write_fetched_record(
             title=fetched.title or title_hint or "Untitled",
             url=stored_url,
             final_url=stored_final_url,

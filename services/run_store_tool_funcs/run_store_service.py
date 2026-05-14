@@ -207,9 +207,6 @@ class RunStoreService:
                     pass
         return texts
 
-    def next_doc_id(self, record_count: int) -> str:
-        return f"{record_count:03d}"
-
     def is_zero_byte_file(self, path_str: str) -> bool:
         if not path_str:
             return True
@@ -429,16 +426,25 @@ class RunStoreService:
 
         return True, best, matched_doc_id
 
-    def write_fetch_error_note(self, doc_id: str, url: str, error: str) -> None:
+    def write_fetch_error_note(self, *, url: str, error: str) -> str:
+        """Record a Crawl4AI fetch failure as a standalone note; return its id.
+
+        A fetch error is not a document: it gets no ``DocRecord`` and no entry
+        in ``index.json``. The note is written under the ``fetch_error_*``
+        namespace so it never shares a number with a kept document's
+        ``doc_*.md`` summary.
+        """
+        existing = list(self.paths.summary_dir.glob("fetch_error_*.md"))
+        error_id = f"{len(existing):03d}"
         self.save_text(
-            self.paths.fetch_error_path(doc_id),
+            self.paths.fetch_error_path(error_id),
             f"# Fetch Error\n\nURL: {url}\n\nError: {error}\n",
         )
+        return f"fetch_error_{error_id}"
 
     def write_duplicate_record(
         self,
         *,
-        doc_id: str,
         title: str,
         url: str,
         final_url: str,
@@ -446,22 +452,21 @@ class RunStoreService:
         search_query: str,
         duplicate_of: str,
         duplicate_score: float,
-    ) -> None:
-        records = self.load_records()
-        index = len(records)
-        summary_path = self.paths.summary_path_for(index)
+    ) -> str:
+        """Record a duplicate hit and return its ``dup_*`` id.
 
-        duplicate_note = (
-            f"# Document {doc_id}\n\n"
-            f"- URL: {url}\n"
-            f"- Final URL: {final_url}\n"
-            f"- Duplicate of: {duplicate_of}\n"
-            f"- Similarity: {duplicate_score:.3f}\n"
-        )
-        self.save_text(summary_path, duplicate_note)
+        A duplicate is not a collected document: it never consumes a ``doc_*``
+        number, gets no ``doc_*.md`` summary file, and carries no text/html
+        paths. The record is still appended to ``index.json`` purely so the
+        same URL is not re-fetched later (see ``_already_seen_url``); it is
+        filtered out of every user-facing document list and count.
+        """
+        records = self.load_records()
+        dup_index = sum(1 for r in records if r.duplicate_of is not None)
+        dup_id = f"dup_{dup_index:03d}"
 
         record = DocRecord(
-            doc_id=doc_id,
+            doc_id=dup_id,
             title=title,
             url=url,
             final_url=final_url,
@@ -469,17 +474,17 @@ class RunStoreService:
             search_query=search_query,
             text_path="",
             html_path="",
-            summary_path=str(summary_path.resolve()),
+            summary_path="",
             duplicate_of=duplicate_of,
             duplicate_score=duplicate_score,
         )
         records.append(record)
         self.save_records(records)
+        return dup_id
 
     def write_fetched_record(
         self,
         *,
-        doc_id: str,
         title: str,
         url: str,
         final_url: str,
@@ -488,13 +493,23 @@ class RunStoreService:
         html: str,
         text: str,
         content_type: str = "",
-    ) -> None:
+    ) -> str:
+        """Store a successfully fetched document and return its doc_id.
+
+        The doc_id is allocated here, atomically with the append, as the count
+        of kept (non-duplicate) records — so kept documents are numbered
+        contiguously (``000``, ``001``, ...) no matter how many fetch errors or
+        duplicates occurred in between. Every on-disk artifact for the document
+        shares that number: ``clean_md/<id>.md``, ``corpus/raw_html/<id>.html``
+        and ``summary/doc_<id>.md``.
+        """
         records = self.load_records()
+        doc_id = f"{sum(1 for r in records if r.duplicate_of is None):03d}"
         html_path = self.paths.raw_html_dir / f"{doc_id}.html"
         # Crawl4AI clean Markdown — stored as .md so every text artifact in the
         # workspace is Markdown (raw HTML is the only non-.md document file).
         text_path = self.paths.clean_md_dir / f"{doc_id}.md"
-        summary_path = self.paths.summary_path_for(len(records))
+        summary_path = self.paths.summary_path_for(int(doc_id))
 
         self.save_text(html_path, html)
         self.save_text(text_path, text)
@@ -512,6 +527,7 @@ class RunStoreService:
         )
         records.append(record)
         self.save_records(records)
+        return doc_id
 
     def _normalize_query_list(self, payload: Any) -> list[str]:
         if not isinstance(payload, list):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from core.prompts import (
     BATCH_SUMMARY_PROMPT,
@@ -56,6 +56,7 @@ class DocumentSummarizeTool(BaseTool):
         doc_ids: list[str] | None = None,
         rebuild_batches: bool = True,
         summarize_docs: bool = True,
+        progress_callback: Callable[..., None] | None = None,
     ) -> ToolResult:
         """Summarize collected documents.
 
@@ -63,6 +64,13 @@ class DocumentSummarizeTool(BaseTool):
         ``rebuild_batches`` controls batch summaries. Both read the same source —
         each document's clean Markdown (``clean_md/<doc_id>.md``) — so per-doc and
         batch summary are independent consumers of clean_md, not a chain.
+
+        ``progress_callback`` (optional) is invoked once as the per-document loop
+        starts each document (``"doc_start"``) and once as it finishes
+        (``"doc_summarized"`` / ``"doc_failed"``). The per-document loop is the
+        long tail of a survey — one LLM call per document — so streaming an event
+        per document lets callers advance progress and activate source cards
+        one-by-one instead of in a single batch after the whole loop.
         """
         try:
             target_doc_ids = {
@@ -134,6 +142,12 @@ class DocumentSummarizeTool(BaseTool):
 
                 text = self._run_store_service.read_text_file(record.text_path)
                 print(f"[summarize][new] doc_id={record.doc_id}")
+                self._notify_progress(
+                    progress_callback,
+                    "doc_start",
+                    doc_id=record.doc_id,
+                    title=record.title or record.doc_id,
+                )
 
                 try:
                     summary_payload = self._summarize_document(
@@ -150,11 +164,24 @@ class DocumentSummarizeTool(BaseTool):
                             "reason": reason[:300],
                         }
                     )
+                    self._notify_progress(
+                        progress_callback,
+                        "doc_failed",
+                        doc_id=record.doc_id,
+                        title=record.title or record.doc_id,
+                        reason=reason[:300],
+                    )
                     continue
 
                 summary_md = self._render_doc_summary_from_record(record, summary_payload)
                 self._run_store_service.write_document_summary(record, summary_md)
                 summarized_doc_ids.append(record.doc_id)
+                self._notify_progress(
+                    progress_callback,
+                    "doc_summarized",
+                    doc_id=record.doc_id,
+                    title=record.title or record.doc_id,
+                )
 
             if skipped_not_in_cycle_doc_ids:
                 print(
@@ -185,6 +212,24 @@ class DocumentSummarizeTool(BaseTool):
             )
         except Exception as e:
             return ToolResult(success=False, error=f"Failed to summarize documents: {e}")
+
+    def _notify_progress(
+        self,
+        callback: Callable[..., None] | None,
+        kind: str,
+        **info: Any,
+    ) -> None:
+        """Best-effort per-document progress notification.
+
+        A progress callback is purely a UX side-channel: a failure here must
+        never abort summarization, so every exception is swallowed.
+        """
+        if callback is None:
+            return
+        try:
+            callback(kind, **info)
+        except Exception:
+            pass
 
     def _single_pass_budget(self) -> int:
         """Character budget for summarizing a document in a single LLM call.

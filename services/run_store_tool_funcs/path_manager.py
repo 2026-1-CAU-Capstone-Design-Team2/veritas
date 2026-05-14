@@ -32,5 +32,7 @@ class RunPathManager:
     def batch_path(self, batch_index: int):
         return self.summary_dir / f"batch_{batch_index:03d}.md"
 
-    def fetch_error_path(self, doc_id: str):
-        return self.summary_dir / f"doc_{doc_id}_error.md"
+    def fetch_error_path(self, error_id: str):
+        # Fetch-error notes live in their own ``fetch_error_*`` namespace so they
+        # never share a number with a kept document's ``doc_*.md`` summary.
+        return self.summary_dir / f"fetch_error_{error_id}.md"

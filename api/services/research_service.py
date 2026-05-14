@@ -285,6 +285,11 @@ def _read_index_documents(index_path: Path) -> list[dict[str, str]]:
     for record in records:
         if not isinstance(record, dict):
             continue
+        # Duplicates are not collected documents (see write_duplicate_record /
+        # agent_runtime._document_summaries); keep them out of the reloaded
+        # job's document list and count just like a freshly-finished run.
+        if record.get("duplicate_of"):
+            continue
         url = str(record.get("final_url") or record.get("url") or "").strip()
         title = str(record.get("title") or url or record.get("doc_id") or "Untitled").strip()
         documents.append(

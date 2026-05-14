@@ -764,17 +764,25 @@ class LLMClient:
                         all_embeddings.append(response.data[0].embedding)
                     except Exception as fallback_error:
                         fallback_failed = True
+                        # Surface the underlying server error verbatim — the
+                        # generic wrapper alone hides the actual cause (e.g. a
+                        # 500 "input is too large to process. increase the
+                        # physical batch size" when the embedding server's
+                        # -b / -ub is smaller than the longest input).
                         raise RuntimeError(
                             "Embedding request failed. "
                             f"endpoint={self.embed_base_url}, model={self.embed_model}. "
-                            "If llama-server is separate for embeddings, run with --embeddings "
-                            "and pass --embed-port (and optionally --embed-host)."
+                            f"Underlying error: {type(fallback_error).__name__}: {fallback_error}. "
+                            "If a separate embedding server is used, confirm it is started "
+                            "with --embeddings and that its physical batch size (-b / -ub) "
+                            "is large enough for the longest input chunk."
                         ) from fallback_error
 
                 if fallback_failed:
                     raise RuntimeError(
                         "Embedding batch request failed. "
-                        f"endpoint={self.embed_base_url}, model={self.embed_model}"
+                        f"endpoint={self.embed_base_url}, model={self.embed_model}. "
+                        f"Underlying error: {type(e).__name__}: {e}"
                     ) from e
 
         if self.trace_latency:

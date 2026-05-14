@@ -4,7 +4,7 @@
 
 - AutoSurvey 완료 후 API runtime은 `RAGService.index_autosurvey_output(clean_md_dir, index_path)`를 호출해 `clean_md/<doc_id>.md`(요약이 아닌 Crawl4AI 정제 원문)를 chunking하고 embedding server에 batch embedding을 요청합니다. 요약은 lossy하므로 RAG 답변 근거는 clean_md에서 가져옵니다.
 - API/CLI 기본 embedding endpoint는 `127.0.0.1:8081/v1/embeddings`입니다.
-- `RunStoreService.index_path`는 `summary/index.json`이며, UI 조사 결과의 문서 제목/링크/문서 수는 이 파일의 records를 기준으로 표시됩니다.
+- `RunStoreService.index_path`는 `summary/index.json`이며, UI 조사 결과의 문서 제목/링크/문서 수는 이 파일의 records 중 **보존 문서(중복 제외)** 를 기준으로 표시됩니다. 중복 record(`duplicate_of` 설정, `dup_*` id)는 같은 URL 재수집을 막기 위해 index.json에 남지만, 사용자에게 보이는 문서 목록·카운트에서는 제외됩니다.
 - `RunStoreService.final_path`는 `final.md`이며, UI 문서 화면의 요약본은 이 markdown 내용을 API가 저장한 workspace document state에서 읽어 표시합니다.
 - API research runtime은 workflow 시작 전에 lightweight term-grounding으로 workspace 이름을 정하고, 곧바로 `runs/<workspace>` 폴더에 `RunStoreService`와 ChromaDB를 생성합니다. Windows에서 열린 `chroma.sqlite3` 때문에 폴더 이동이 실패하지 않도록 pending 폴더 이동을 사용하지 않습니다.
 
@@ -72,10 +72,10 @@ class RunStoreService:
     def list_non_duplicate_records(self) -> list[DocRecord]
     def list_duplicate_records(self) -> list[DocRecord]
     
-    # 문서 저장/읽기
-    def write_fetched_record(...) -> None
-    def write_duplicate_record(...) -> None
-    def write_fetch_error_note(...) -> None
+    # 문서 저장/읽기 — write_* 는 doc_id를 인자로 받지 않고, 할당된 id를 반환한다
+    def write_fetched_record(...) -> str    # 보존 문서: 연속 "000","001",...
+    def write_duplicate_record(...) -> str  # 중복: "dup_000",... (doc_*.md 미생성)
+    def write_fetch_error_note(...) -> str  # fetch 실패: "fetch_error_000",...
     def write_document_summary(record, content) -> None
     def write_batch_summary(batch_index, content) -> None
     
@@ -117,14 +117,17 @@ output_dir/
 ├── corpus/
 │   └── raw_html/               # 원본 HTML 아카이브 (000.html, 001.html, ...)
 └── summary/
-    ├── index.json              # 문서 레코드 인덱스
+    ├── index.json              # 문서 레코드 인덱스 (보존 문서 + 중복 record)
     ├── request.md              # 사용자 요청
     ├── plan.json               # 리서치 계획
-    ├── doc_000.md              # 개별 문서 요약 (조사 종료 시 일괄 생성)
+    ├── doc_000.md              # 개별 문서 요약 (조사 종료 시 일괄 생성, 보존 문서만)
     ├── doc_001.md
+    ├── fetch_error_000.md      # Crawl4AI fetch 실패 노트 (doc_*.md와 번호 분리)
     ├── batch_001.md            # 배치 요약 (수집 루프 중 clean_md에서 생성)
     └── batch_002.md
 ```
+
+**문서 번호 체계** — `doc_id`는 **보존 문서(성공 fetch · 비중복)에만** 연속 할당됩니다(`000`, `001`, ...). 같은 번호의 `clean_md/<id>.md`, `corpus/raw_html/<id>.html`, `summary/doc_<id>.md`가 한 문서를 가리킵니다. fetch 실패는 `summary/fetch_error_*.md`(별도 네임스페이스 — `doc_*.md`와 번호가 충돌하지 않음), 중복은 `dup_*` id로 `index.json`에만 기록되고 요약 파일을 만들지 않습니다. 따라서 건너뛴 fetch나 중복이 보존 문서의 번호를 밀거나 가로채지 않으며, "수집된 문서 수"는 항상 보존 문서 수(≤ `max_docs`)와 일치합니다.
 
 ---
 
@@ -198,10 +201,10 @@ store = RunStoreService(root="./output")
 store.save_request("AI 윤리에 대한 최신 연구")
 store.save_plan({"search_queries": ["AI ethics", "AI safety"], ...})
 
-# 문서 레코드 관리
+# 문서 레코드 관리 — doc_id는 인자로 받지 않는다. write 시점에 보존 문서
+# 수로 자동 할당("000","001",...)되고, 할당된 id가 반환된다.
 records = store.load_records()
-store.write_fetched_record(
-    doc_id="001",
+doc_id = store.write_fetched_record(
     title="AI Ethics Overview",
     url="https://example.com/ai-ethics",
     ...
