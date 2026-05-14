@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import html
+import re
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, QPointF, QThread, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QMouseEvent, QPainter, QPen
+from PySide6.QtGui import (
+	QColor,
+	QDesktopServices,
+	QIntValidator,
+	QMouseEvent,
+	QPainter,
+	QPen,
+)
 from PySide6.QtWidgets import (
 	QFrame,
 	QHBoxLayout,
@@ -31,6 +39,23 @@ from ...controllers import AgentController, JobCategory, get_job_manager
 MIN_RESEARCH_DOCS = 1
 MAX_RESEARCH_DOCS = 50
 DEFAULT_RESEARCH_DOCS = 15
+
+
+def _soft_break_long_tokens(text: str, chunk: int = 24) -> str:
+	"""Insert zero-width break opportunities into long unbreakable tokens.
+
+	A word-wrap QLabel only breaks on whitespace, so a long token — a URL or a
+	filesystem path — reports its full width as the widget's minimum. Inside
+	the research page's scroll area that inflates the page's minimumSizeHint
+	and stretches the whole 조사 결과 pane (and its progress bar) horizontally.
+	Zero-width spaces give the label legal break points without changing the
+	visible text.
+	"""
+	def _break(match: re.Match[str]) -> str:
+		token = match.group(0)
+		return "​".join(token[i : i + chunk] for i in range(0, len(token), chunk))
+
+	return re.sub(rf"\S{{{chunk + 1},}}", _break, str(text or ""))
 
 
 class CircleGlyphButton(QToolButton):
@@ -98,10 +123,14 @@ class CircleGlyphButton(QToolButton):
 class DocCountStepper(QFrame):
 	"""Rounded −/＋ stepper for the '최대 조사 문서 수' value.
 
-	A polished stand-in for a bare QSpinBox: large round hit targets, a clear
-	centered value, and the two buttons disabling themselves at the range
-	bounds. Exposes the small slice of the QSpinBox API the page relies on
-	(:meth:`value`).
+	A polished stand-in for a bare QSpinBox: large round hit targets and a
+	center value the user can also type directly into. The typed value is
+	range-validated per keystroke (QIntValidator) and clamped to [min, max]
+	on commit. Exposes the small slice of the QSpinBox API the page relies on
+	(:meth:`value` / :meth:`setValue`).
+
+	The widget keeps a fixed width so a larger value can never stretch the
+	surrounding layout — and therefore the 조사 결과 progress bar.
 	"""
 
 	valueChanged = Signal(int)
@@ -118,20 +147,33 @@ class DocCountStepper(QFrame):
 		self._min = minimum
 		self._max = maximum
 		self._value = max(minimum, min(maximum, value))
+		# Fixed footprint: the stepper must never grow with the value.
+		self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
 		layout = QHBoxLayout(self)
 		layout.setContentsMargins(6, 6, 6, 6)
-		layout.setSpacing(8)
+		layout.setSpacing(6)
 
 		self._minus = CircleGlyphButton("minus", "#4F46E5", "#4338CA", 32)
 		self._minus.setObjectName("StepperButton")
 		self._minus.setToolTip("문서 수 줄이기")
 		self._minus.clicked.connect(lambda: self._step(-1))
 
-		self._value_label = QLabel()
-		self._value_label.setObjectName("StepperValue")
-		self._value_label.setAlignment(Qt.AlignCenter)
-		self._value_label.setMinimumWidth(58)
+		# Editable value field: type a number directly. The validator blocks
+		# out-of-range keystrokes; editingFinished clamps whatever remains.
+		self._value_edit = QLineEdit()
+		self._value_edit.setObjectName("StepperValue")
+		self._value_edit.setAlignment(Qt.AlignCenter)
+		self._value_edit.setFixedWidth(40)
+		self._value_edit.setValidator(QIntValidator(self._min, self._max, self))
+		self._value_edit.setToolTip(
+			f"{self._min}~{self._max} 사이의 값을 직접 입력할 수 있습니다."
+		)
+		self._value_edit.editingFinished.connect(self._commit_typed_value)
+
+		self._unit_label = QLabel("개")
+		self._unit_label.setObjectName("StepperUnit")
+		self._unit_label.setAlignment(Qt.AlignCenter)
 
 		self._plus = CircleGlyphButton("plus", "#4F46E5", "#4338CA", 32)
 		self._plus.setObjectName("StepperButton")
@@ -139,7 +181,8 @@ class DocCountStepper(QFrame):
 		self._plus.clicked.connect(lambda: self._step(1))
 
 		layout.addWidget(self._minus)
-		layout.addWidget(self._value_label, 1)
+		layout.addWidget(self._value_edit)
+		layout.addWidget(self._unit_label)
 		layout.addWidget(self._plus)
 
 		self._sync()
@@ -158,8 +201,24 @@ class DocCountStepper(QFrame):
 	def _step(self, delta: int) -> None:
 		self.setValue(self._value + delta)
 
+	def _commit_typed_value(self) -> None:
+		"""Apply a directly-typed value, clamped to [min, max].
+
+		The validator already rejects clearly out-of-range keystrokes; this
+		catches the rest (empty field, an intermediate value like ``0``) and
+		snaps the field back to the canonical value via ``setValue``.
+		"""
+		text = self._value_edit.text().strip()
+		try:
+			typed = int(text)
+		except ValueError:
+			typed = self._value
+		self.setValue(typed)
+
 	def _sync(self) -> None:
-		self._value_label.setText(f"{self._value} 개")
+		text = str(self._value)
+		if self._value_edit.text() != text:
+			self._value_edit.setText(text)
 		self._minus.setEnabled(self._value > self._min)
 		self._plus.setEnabled(self._value < self._max)
 
@@ -188,7 +247,9 @@ class InfoTile(QFrame):
 		layout.addWidget(self._value)
 
 	def set_value(self, value: str) -> None:
-		self._value.setText(value if value else "-")
+		# Break long unbreakable values (e.g. a workspace path) so the tile can
+		# shrink with the layout instead of stretching the result pane.
+		self._value.setText(_soft_break_long_tokens(value) if value else "-")
 		self._value.setToolTip(value if value else "")
 
 
@@ -205,7 +266,10 @@ class LinkLabel(QLabel):
 	def __init__(self, url: str, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self._url = (url or "").strip()
-		display = html.escape(self._url, quote=False)
+		# Break the URL into wrappable chunks: a word-wrap QLabel cannot break a
+		# spaceless URL, so without this its minimum width is the full string
+		# and it stretches the document row (and the result pane) horizontally.
+		display = html.escape(_soft_break_long_tokens(self._url), quote=False)
 		# Rich text is only used for the underline + color; the click handler
 		# does not rely on Qt parsing an <a> tag.
 		self.setText(
@@ -271,7 +335,7 @@ class DocumentBar(QFrame):
 		text_column.setSpacing(2)
 
 		safe_title = title if title else "Untitled"
-		title_text = f"{index}. {safe_title}"
+		title_text = _soft_break_long_tokens(f"{index}. {safe_title}")
 		title_label = QLabel(title_text)
 		title_label.setWordWrap(True)
 		title_label.setTextInteractionFlags(Qt.TextSelectableByMouse)

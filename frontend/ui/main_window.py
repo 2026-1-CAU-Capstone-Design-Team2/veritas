@@ -1413,10 +1413,24 @@ class MainWindow(QMainWindow):
 			border-color: #E2E8F0;
 		}
 
-		QLabel#StepperValue {
+		QLineEdit#StepperValue {
 			font-size: 15px;
 			font-weight: 800;
 			color: #0F172A;
+			background: transparent;
+			border: none;
+			padding: 0px;
+		}
+
+		QLineEdit#StepperValue:focus {
+			background: #EEF2FF;
+			border-radius: 6px;
+		}
+
+		QLabel#StepperUnit {
+			font-size: 13px;
+			font-weight: 700;
+			color: #64748B;
 		}
 
 		QLabel#ResearchCountTitle {
