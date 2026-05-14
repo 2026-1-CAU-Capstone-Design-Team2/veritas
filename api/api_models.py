@@ -72,6 +72,14 @@ class SettingsDocumentToolsRequest(BaseModel):
     customTools: list[DocumentToolItem] = Field(default_factory=list)
 
 
+class SettingsResearchMethodRequest(BaseModel):
+    # 최초 샘플링 개수 (scout_docs) / 각 플랜당 조사 개수 (collect_batch_size).
+    # Bounds are lenient — the settings UI enforces the practical range; this
+    # only guards against garbage input.
+    sampleCount: int = Field(default=3, ge=1, le=50)
+    planCount: int = Field(default=5, ge=1, le=9999)
+
+
 class TypingContextRequest(BaseModel):
     sessionId: str
     workspaceId: str

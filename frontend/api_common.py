@@ -35,6 +35,14 @@ STATE: dict[str, object] = {
         "documentTools": {
             "custom": [],
         },
+        # AutoSurvey pacing (설정 > 고급 설정 > 조사 진행 방식). The real values
+        # come from the backend via /fe/bootstrap — load_bootstrap_state()
+        # replaces STATE["settings"] wholesale, so this default only seeds the
+        # pre-bootstrap window.
+        "research": {
+            "sampleCount": 3,
+            "planCount": 5,
+        },
     },
 }
 

@@ -104,6 +104,12 @@ class AgentController:
 			{"customTools": custom_tools},
 		)
 
+	def update_research_method(self, sample_count: int, plan_count: int) -> dict[str, Any]:
+		return api_client.put(
+			"/api/v1/settings/research-method",
+			{"sampleCount": int(sample_count), "planCount": int(plan_count)},
+		)
+
 	def get_document_summary(self, workspace_id: str) -> str:
 		response = api_client.get(f"/api/v1/documents/{workspace_id}/summary")
 		return str(response.get("summary") or "")
