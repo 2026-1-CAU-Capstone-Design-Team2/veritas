@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
-from ...api_common import current_workspace_id, load_bootstrap_state
+from ...api_common import STATE, current_workspace_id, load_bootstrap_state
 from ...components.buttons import AppButton
 from ...components.cards import CardWidget
 from ...components.progress import ResearchProgressBar
@@ -724,6 +724,13 @@ class ResearchPage(QWidget):
 		self._workspace_id = current_workspace_id()
 		reference_urls = self.get_reference_urls()
 		self._max_docs = self.doc_count_stepper.value()
+		# AutoSurvey pacing from 설정 > 고급 설정 > 조사 진행 방식. The settings
+		# page writes these into the shared in-process STATE; read them fresh at
+		# run time so the workflow honors the user's configured values. When
+		# unset, None is sent and the backend falls back to its env defaults.
+		research_settings = STATE.get("settings", {}).get("research", {})
+		scout_docs = research_settings.get("sampleCount")
+		collect_batch_size = research_settings.get("planCount")
 		started = get_job_manager().submit(
 			JobCategory.RESEARCH,
 			AgentController().run_research,
@@ -731,6 +738,8 @@ class ResearchPage(QWidget):
 			instruction,
 			reference_urls,
 			self._max_docs,
+			scout_docs,
+			collect_batch_size,
 			on_success=self._on_research_finished,
 			on_error=self._on_research_failed,
 		)
@@ -1054,17 +1063,23 @@ class ResearchPage(QWidget):
 		failed_documents = [d for d in failed_documents if isinstance(d, dict)]
 		self._research_failed_documents = failed_documents
 
+		# Backend-reported total run duration. It is persisted in the workspace
+		# (summary/timing.json), so it is present both for a just-finished live
+		# run and for a job restored from disk — letting the elapsed time keep
+		# showing after completion instead of vanishing on reload.
+		elapsed_seconds = response.get("elapsedSeconds")
+
 		if status == "completed":
 			self._research_error_message = ""
-			self.progress_bar.mark_completed(animate=from_live)
+			self.progress_bar.mark_completed(animate=from_live, elapsed_seconds=elapsed_seconds)
 		elif status == "partial":
 			# Some documents failed to summarize but the run as a whole
 			# finished — a partial success, not an outright failure.
 			self._research_error_message = ""
-			self.progress_bar.mark_partial(animate=from_live)
+			self.progress_bar.mark_partial(animate=from_live, elapsed_seconds=elapsed_seconds)
 		elif status == "failed":
 			self._research_error_message = error_message or "조사 작업이 실패했습니다."
-			self.progress_bar.mark_failed(self._research_error_message)
+			self.progress_bar.mark_failed(self._research_error_message, elapsed_seconds=elapsed_seconds)
 		elif status == "running":
 			self._research_error_message = ""
 			self.progress_bar.restore_running(self._progress_estimate)

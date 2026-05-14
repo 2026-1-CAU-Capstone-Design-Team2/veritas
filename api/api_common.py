@@ -55,5 +55,12 @@ STATE: dict[str, Any] = {
         "documentTools": {
             "custom": [],
         },
+        # AutoSurvey pacing (설정 > 고급 설정 > 조사 진행 방식). Persisted here so
+        # it rides the /fe/bootstrap response into the frontend STATE and is
+        # honored by every research run, not just the in-memory UI session.
+        "research": {
+            "sampleCount": 3,
+            "planCount": 5,
+        },
     },
 }

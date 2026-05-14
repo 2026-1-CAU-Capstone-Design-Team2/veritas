@@ -50,6 +50,10 @@ class RunStoreService:
         return self.paths.index_path
 
     @property
+    def timing_path(self):
+        return self.paths.timing_path
+
+    @property
     def query_state_path(self):
         return self.paths.query_state_path
 
@@ -74,6 +78,9 @@ class RunStoreService:
         if not self.paths.request_path.exists():
             raise FileNotFoundError(f"Missing request file: {self.paths.request_path}")
         return self.read_text_file(str(self.paths.request_path)).strip()
+
+    def save_timing(self, payload: dict[str, Any]) -> None:
+        self.save_json(self.paths.timing_path, payload)
 
     def save_grounding(self, payload: dict[str, Any]) -> None:
         self.save_json(self.paths.grounding_path, payload)

@@ -35,6 +35,14 @@ STATE: dict[str, object] = {
         "documentTools": {
             "custom": [],
         },
+        # AutoSurvey pacing (설정 > 고급 설정 > 조사 진행 방식). The real values
+        # come from the backend via /fe/bootstrap — load_bootstrap_state()
+        # replaces STATE["settings"] wholesale, so this default only seeds the
+        # pre-bootstrap window.
+        "research": {
+            "sampleCount": 3,
+            "planCount": 5,
+        },
     },
 }
 
@@ -163,12 +171,20 @@ class ApiClient:
         return self._send_json(request)
 
     def _url(self, path: str, query: dict[str, Any] | None = None) -> str:
+        from urllib.parse import quote, urlencode
+
         normalized = path if path.startswith("/") else f"/{path}"
+        # Percent-encode the path so non-ASCII segments survive http.client's
+        # ASCII-only request line. Workspace ids come from term-grounding and
+        # are typically Korean (e.g. /api/v1/workspaces/<한글 id>); passing the
+        # raw string through raised "'ascii' codec can't encode characters".
+        # `safe="/"` keeps the path separators intact, and FastAPI/Starlette
+        # percent-decodes path params on the way in, so the route still sees
+        # the original id. Plain-ASCII paths are unaffected (quote is a no-op).
+        normalized = quote(normalized, safe="/")
         url = f"{self.base_url}{normalized}"
         if not query:
             return url
-        from urllib.parse import urlencode
-
         cleaned = {k: v for k, v in query.items() if v is not None}
         return f"{url}?{urlencode(cleaned)}" if cleaned else url
 

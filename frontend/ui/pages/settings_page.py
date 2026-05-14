@@ -732,10 +732,20 @@ class SettingsPage(QWidget):
 		self._save_research_method_settings()
 
 	def _save_research_method_settings(self) -> None:
+		sample_count = self.research_sample_input.value()
+		plan_count = self.research_plan_input.value()
 		self._settings["research"] = {
-			"sampleCount": self.research_sample_input.value(),
-			"planCount": self.research_plan_input.value(),
+			"sampleCount": sample_count,
+			"planCount": plan_count,
 		}
+		# Persist to the backend so the value survives load_bootstrap_state()
+		# (which replaces STATE["settings"] wholesale) and is actually applied
+		# when a research run reads STATE["settings"]["research"].
+		try:
+			AgentController().update_research_method(sample_count, plan_count)
+		except Exception as e:
+			self._update_research_method_status(f"저장 중 오류가 발생했습니다: {e}")
+			return
 		self._update_research_method_status("조사 진행 방식 설정이 저장되었습니다.")
 
 	def _update_research_method_status(self, prefix: str | None = None) -> None:
