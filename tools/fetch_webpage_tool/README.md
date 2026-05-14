@@ -69,7 +69,7 @@ fetch 결과는 매번 CLI 로그에 출력됩니다.
 ```
 
 - `content_type`의 `extraction=` 값으로 `fit_markdown` / `raw_markdown` 중 무엇이 쓰였는지 알 수 있습니다.
-- `corpus/raw_text/<doc_id>.txt`는 Crawl4AI Markdown(`#` 헤딩, `-` 리스트, `|` 표), `corpus/raw_html/<doc_id>.html`은 원본 HTML 전체입니다.
+- `clean_md/<doc_id>.md`는 Crawl4AI 정제 Markdown(`#` 헤딩, `-` 리스트, `|` 표 — RAG 답변 근거이자 요약 입력), `corpus/raw_html/<doc_id>.html`은 원본 HTML 전체입니다.
 
 ---
 

@@ -68,11 +68,11 @@ class AutoSurveyTool(BaseTool):
 
             indexed_chunks = None
             if self.rag_service is not None and self.run_store_service is not None:
-                summary_dir = getattr(self.run_store_service, "summary_dir", None)
+                clean_md_dir = getattr(self.run_store_service, "clean_md_dir", None)
                 index_path = getattr(self.run_store_service, "index_path", None)
-                if summary_dir is not None:
+                if clean_md_dir is not None:
                     indexed_chunks = self.rag_service.index_autosurvey_output(
-                        summary_dir=Path(summary_dir),
+                        clean_md_dir=Path(clean_md_dir),
                         index_path=Path(index_path) if index_path is not None else None,
                         clear_first=True,
                     )

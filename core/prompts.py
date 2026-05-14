@@ -155,7 +155,7 @@ Rules:
 - Preserve technical terms, model names, product names, APIs, filenames, and citations in their original form when appropriate.
 """
 
-BATCH_SUMMARY_PROMPT = """You are given an original user request and multiple document summaries.
+BATCH_SUMMARY_PROMPT = """You are given an original user request and the clean Markdown of multiple collected documents.
 Create a markdown batch note with these sections:
 # Batch Summary
 ## Repeated Findings

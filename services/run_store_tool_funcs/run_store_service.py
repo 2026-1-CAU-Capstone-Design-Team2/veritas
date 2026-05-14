@@ -42,6 +42,10 @@ class RunStoreService:
         return self.paths.summary_dir
 
     @property
+    def clean_md_dir(self):
+        return self.paths.clean_md_dir
+
+    @property
     def index_path(self):
         return self.paths.index_path
 
@@ -222,12 +226,6 @@ class RunStoreService:
 
     def list_duplicate_records(self) -> list[DocRecord]:
         return [r for r in self.load_records() if r.duplicate_of is not None]
-
-    def list_summarized_non_duplicate_records(self) -> list[DocRecord]:
-        return [
-            r for r in self.list_non_duplicate_records()
-            if Path(r.summary_path).exists() and Path(r.summary_path).stat().st_size > 0
-        ]
 
     def sanitize_text(self, content: Any) -> str:
         text = str(content or "")
@@ -493,7 +491,9 @@ class RunStoreService:
     ) -> None:
         records = self.load_records()
         html_path = self.paths.raw_html_dir / f"{doc_id}.html"
-        text_path = self.paths.raw_text_dir / f"{doc_id}.txt"
+        # Crawl4AI clean Markdown — stored as .md so every text artifact in the
+        # workspace is Markdown (raw HTML is the only non-.md document file).
+        text_path = self.paths.clean_md_dir / f"{doc_id}.md"
         summary_path = self.paths.summary_path_for(len(records))
 
         self.save_text(html_path, html)

@@ -6,12 +6,14 @@ class RunPathManager:
         self.root = Path(root)
         self.corpus_dir = self.root / "corpus"
         self.raw_html_dir = self.corpus_dir / "raw_html"
-        self.raw_text_dir = self.corpus_dir / "raw_text"
+        # Crawl4AI-extracted clean Markdown for each fetched document. This is
+        # the RAG answer source and the input to both per-doc and batch summary.
+        self.clean_md_dir = self.root / "clean_md"
         self.summary_dir = self.root / "summary"
         self.vector_dir = self.root / "chromadb"
 
         self.index_path = self.summary_dir / "index.json"
-        self.request_path = self.summary_dir / "request.txt"
+        self.request_path = self.summary_dir / "request.md"
         self.grounding_path = self.summary_dir / "grounding.json"
         self.plan_path = self.summary_dir / "plan.json"
         self.query_state_path = self.summary_dir / "query_state.json"
@@ -20,7 +22,7 @@ class RunPathManager:
 
     def prepare_dirs(self) -> None:
         self.raw_html_dir.mkdir(parents=True, exist_ok=True)
-        self.raw_text_dir.mkdir(parents=True, exist_ok=True)
+        self.clean_md_dir.mkdir(parents=True, exist_ok=True)
         self.summary_dir.mkdir(parents=True, exist_ok=True)
         self.vector_dir.mkdir(parents=True, exist_ok=True)
 

@@ -21,7 +21,8 @@
       "Bash(sed -n '100,160p' db/workspace_sync.py)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('frontend/ui/pages/research_page.py',encoding='utf-8'\\).read\\(\\)\\); print\\('research_page.py syntax OK'\\)\")",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('frontend/ui/pages/research_page.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
     ]
   }
 }

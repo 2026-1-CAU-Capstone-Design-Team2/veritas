@@ -55,7 +55,15 @@ class DocumentSummarizeTool(BaseTool):
         overwrite: bool = False,
         doc_ids: list[str] | None = None,
         rebuild_batches: bool = True,
+        summarize_docs: bool = True,
     ) -> ToolResult:
+        """Summarize collected documents.
+
+        ``summarize_docs`` controls per-document summaries (``summary/doc_*.md``);
+        ``rebuild_batches`` controls batch summaries. Both read the same source —
+        each document's clean Markdown (``clean_md/<doc_id>.md``) — so per-doc and
+        batch summary are independent consumers of clean_md, not a chain.
+        """
         try:
             target_doc_ids = {
                 str(doc_id).strip()
@@ -105,13 +113,15 @@ class DocumentSummarizeTool(BaseTool):
             failed_documents: list[dict[str, str]] = []
 
             single_pass_budget = self._single_pass_budget()
-            print(
-                f"[summarize] single-pass budget={single_pass_budget} chars "
-                f"(n_ctx={getattr(self._llm, 'n_ctx', 'unknown')}); "
-                "documents above this size use chunked map-reduce"
-            )
+            records_to_summarize = valid_records if summarize_docs else []
+            if records_to_summarize:
+                print(
+                    f"[summarize] single-pass budget={single_pass_budget} chars "
+                    f"(n_ctx={getattr(self._llm, 'n_ctx', 'unknown')}); "
+                    "documents above this size use chunked map-reduce"
+                )
 
-            for record in valid_records:
+            for record in records_to_summarize:
                 if has_cycle_scope and record.doc_id not in target_doc_ids:
                     skipped_not_in_cycle_doc_ids.append(record.doc_id)
                     continue
@@ -387,29 +397,50 @@ class DocumentSummarizeTool(BaseTool):
 
         return "\n".join(lines).strip() + "\n"
 
+    def _batch_candidate_records(self):
+        """Non-duplicate records that have usable clean Markdown on disk."""
+        return [
+            record
+            for record in self._run_store_service.list_non_duplicate_records()
+            if not self._run_store_service.is_invalid_document_record(record)
+        ]
+
+    def _read_batch_documents(self, batch_records) -> list[str]:
+        """Read each batch document's clean Markdown, capped so the whole batch
+        fits the model context.
+
+        The batch summary is built directly from clean_md (not from per-document
+        summaries), so the per-document slice is the context budget divided
+        across the batch.
+        """
+        per_doc_cap = max(
+            2000, self._single_pass_budget() // max(1, self._batch_size)
+        )
+        documents: list[str] = []
+        for record in batch_records:
+            content = self._run_store_service.read_text_file(record.text_path)
+            documents.append((content or "")[:per_doc_cap])
+        return documents
+
     def _rebuild_batch_summaries(self) -> dict[str, Any]:
-        summarized_records = self._run_store_service.list_summarized_non_duplicate_records()
-        summarized_records = sorted(summarized_records, key=lambda r: r.doc_id)
+        records = sorted(self._batch_candidate_records(), key=lambda r: r.doc_id)
 
         self._run_store_service.clear_batch_summaries()
 
-        if not summarized_records:
+        if not records:
             return {"batch_files": [], "count": 0}
 
         batch_files: list[str] = []
 
-        for start in range(0, len(summarized_records), self._batch_size):
-            batch_records = summarized_records[start : start + self._batch_size]
+        for start in range(0, len(records), self._batch_size):
+            batch_records = records[start : start + self._batch_size]
             batch_number = (start // self._batch_size) + 1
             batch_path = self._run_store_service.get_batch_summary_path(batch_number)
 
-            summaries = [
-                self._run_store_service.read_text_file(record.summary_path)
-                for record in batch_records
-            ]
+            documents = self._read_batch_documents(batch_records)
             batch_markdown = self._llm.ask(
                 BATCH_SUMMARY_PROMPT,
-                self._build_batch_prompt_input(summaries),
+                self._build_batch_prompt_input(documents),
                 reasoning=False,
                 stream=getattr(self._llm, "stream_summary", False),
                 stream_label=f"batch:{batch_number:03d}",
@@ -424,9 +455,14 @@ class DocumentSummarizeTool(BaseTool):
         if not cycle_doc_ids:
             return {"batch_files": [], "count": 0}
 
-        summarized_records = self._run_store_service.list_summarized_non_duplicate_records()
-        summarized_records = sorted(summarized_records, key=lambda r: r.doc_id)
-        cycle_records = [record for record in summarized_records if record.doc_id in cycle_doc_ids]
+        cycle_records = sorted(
+            (
+                record
+                for record in self._batch_candidate_records()
+                if record.doc_id in cycle_doc_ids
+            ),
+            key=lambda r: r.doc_id,
+        )
 
         if not cycle_records:
             return {"batch_files": [], "count": 0}
@@ -439,13 +475,10 @@ class DocumentSummarizeTool(BaseTool):
             next_batch_number += 1
             batch_path = self._run_store_service.get_batch_summary_path(next_batch_number)
 
-            summaries = [
-                self._run_store_service.read_text_file(record.summary_path)
-                for record in batch_records
-            ]
+            documents = self._read_batch_documents(batch_records)
             batch_markdown = self._llm.ask(
                 BATCH_SUMMARY_PROMPT,
-                self._build_batch_prompt_input(summaries),
+                self._build_batch_prompt_input(documents),
                 reasoning=False,
                 stream=getattr(self._llm, "stream_summary", False),
                 stream_label=f"batch:{next_batch_number:03d}",
@@ -456,7 +489,7 @@ class DocumentSummarizeTool(BaseTool):
 
         return {"batch_files": batch_files, "count": len(batch_files)}
 
-    def _build_batch_prompt_input(self, summaries: list[str]) -> str:
+    def _build_batch_prompt_input(self, documents: list[str]) -> str:
         try:
             user_request = self._run_store_service.load_request()
         except Exception:
@@ -466,7 +499,7 @@ class DocumentSummarizeTool(BaseTool):
             "Original User Request:",
             user_request or "(missing)",
             "",
-            "Document Summaries:",
-            "\n\n---\n\n".join(summaries),
+            "Document Contents (clean Markdown):",
+            "\n\n---\n\n".join(documents),
         ]
         return "\n".join(sections).strip() + "\n"
