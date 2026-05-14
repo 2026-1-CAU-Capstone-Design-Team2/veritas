@@ -66,6 +66,11 @@ class LLMClient:
             raise RuntimeError("No models available from llama-server.")
         self.model = models[0].id
 
+        # Detect the server's context window so downstream tools can size their
+        # input budgets to the model instead of guessing with a fixed default.
+        self.n_ctx = self._detect_n_ctx(host, port)
+        print(f"[llm] model={self.model} n_ctx={self.n_ctx}")
+
         # Embedding client. If only one embedding endpoint arg is provided,
         # inherit the missing value from chat endpoint.
         resolved_embed_host = embed_host or host
@@ -89,6 +94,29 @@ class LLMClient:
         self.stream_summary = stream_summary
         self.stream_reasoning = stream_reasoning
         self.trace_latency = trace_latency
+
+    def _detect_n_ctx(self, host: str, port: int, *, default: int = 8192) -> int:
+        """Query llama-server /props for the context window size, in tokens.
+
+        Falls back to a conservative default when the endpoint is unavailable
+        (e.g. a non-llama-server OpenAI-compatible backend).
+        """
+        try:
+            response = httpx.get(f"http://{host}:{port}/props", timeout=5.0)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            return default
+
+        generation_settings = payload.get("default_generation_settings") or {}
+        for value in (payload.get("n_ctx"), generation_settings.get("n_ctx")):
+            try:
+                n_ctx = int(value)
+            except (TypeError, ValueError):
+                continue
+            if n_ctx > 0:
+                return n_ctx
+        return default
 
     def ask(
         self,

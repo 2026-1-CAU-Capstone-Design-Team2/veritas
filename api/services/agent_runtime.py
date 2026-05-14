@@ -72,6 +72,16 @@ class AgentRuntime:
         self._configure_workspace_runtime(self.output_dir)
 
     def _configure_workspace_runtime(self, output_dir: Path) -> None:
+        # Release the previous workspace's ChromaDB handles before swapping in a
+        # new registry. On Windows an open SQLite handle would otherwise keep the
+        # old workspace directory locked and undeletable.
+        previous_rag_service = getattr(self, "rag_service", None)
+        if previous_rag_service is not None:
+            try:
+                previous_rag_service.close()
+            except Exception as e:
+                print(f"[workspace][warn] failed to release previous RAG store: {e}")
+
         output_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir = output_dir
         self.registry, self.run_store_service, self.rag_service = build_registry(
@@ -262,6 +272,13 @@ class AgentRuntime:
         self._emit_research_progress("term_grounding", "주제어 추출 중...")
         workspace_name, grounding = self._grounding_workspace_from_request(request)
         workspace_dir = self._reserve_workspace_dir(workspace_name)
+        # Make the new workspace visible to the rest of the system *immediately*.
+        # The frontend's Research page, sidebar, and chat panels can switch to
+        # this workspace mid-run instead of waiting for the workflow to complete.
+        try:
+            self._publish_new_workspace(workspace_dir, request)
+        except Exception as e:
+            print(f"[workspace][publish][warn] {e}")
         registry, run_store_service, rag_service = build_registry(
             llm=self.llm,
             run_root=workspace_dir,
@@ -360,6 +377,68 @@ class AgentRuntime:
         text = re.sub(r"[^\w가-힣.-]+", "_", str(name or "").strip(), flags=re.UNICODE)
         text = text.strip("._-")
         return text[:80] or "research"
+
+    def _publish_new_workspace(self, workspace_dir: Path, user_request: str) -> None:
+        """Surface a freshly-reserved workspace before the workflow runs.
+
+        Without this, the new workspace exists on disk but is hidden from
+        `_scan_run_workspaces` (no `final.md` / `summary/index.json` / docs
+        yet), so the sidebar and chat panels still show the previous
+        workspace until AutoSurvey completes minutes later.
+
+        Steps:
+        1. Write `summary/request.txt` so the workspace passes the
+           "has any research evidence" filter in `_scan_run_workspaces`.
+        2. Update the in-memory workspace catalog and the persisted
+           `app_state.current_workspace_id` so `/api/v1/fe/bootstrap`
+           returns the new workspace as current.
+        3. Emit a `workspace_created` progress event with the new id,
+           display name, and absolute path so the frontend can update
+           info tiles, sidebar, and chat panels live.
+        """
+        workspace_id = workspace_dir.name
+        # 1. Make the workspace dir visible to _scan_run_workspaces.
+        try:
+            summary_dir = workspace_dir / "summary"
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            (summary_dir / "request.txt").write_text(
+                str(user_request or "").strip(),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            print(f"[workspace][publish][warn] request.txt: {e}")
+
+        # 2. Promote in-memory + persisted state.
+        try:
+            from ..api_common import utc_now_iso
+            from ..repositories import state_repository as repo
+            from . import workspaces_service
+
+            repo.upsert_workspace(
+                {
+                    "workspaceId": workspace_id,
+                    "name": workspace_id,
+                    "detail": "조사 진행 중",
+                    "status": "running",
+                    "lastWorkedAt": utc_now_iso(),
+                    "path": str(workspace_dir.resolve()),
+                }
+            )
+            repo.set_current_workspace(workspace_id)
+            workspaces_service.remember_current_workspace(workspace_id)
+        except Exception as e:
+            print(f"[workspace][publish][warn] catalog: {e}")
+
+        # 3. Tell the frontend.
+        self._emit_research_progress(
+            "workspace_created",
+            f"새 워크스페이스 생성: {workspace_id}",
+            detail={
+                "workspaceId": workspace_id,
+                "name": workspace_id,
+                "path": str(workspace_dir.resolve()),
+            },
+        )
 
     def _cleanup_pending_dirs(self) -> None:
         try:

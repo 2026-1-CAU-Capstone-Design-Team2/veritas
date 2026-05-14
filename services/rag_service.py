@@ -51,6 +51,19 @@ class RAGService:
     def get_document_count(self) -> int:
         return self.vector_store.get_document_count()
 
+    def close(self) -> None:
+        """Release the underlying ChromaDB vector store handles.
+
+        Called when a workspace is switched away from or deleted so its
+        SQLite file handle does not keep the workspace directory locked.
+        """
+        vector_store = getattr(self, "vector_store", None)
+        if vector_store is not None:
+            try:
+                vector_store.close()
+            except Exception:
+                pass
+
     def _format_recent_history(self) -> str:
         if not self.chat_history:
             return "(No previous conversation)"

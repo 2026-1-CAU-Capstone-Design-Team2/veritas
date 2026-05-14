@@ -64,6 +64,24 @@ RAG over generated markdown outputs, and schema-driven chat tool use.
   URL hyperlink (uses `QDesktopServices.openUrl`, auto-prepends `https://`
   when the URL has no scheme), and a `doc_NNN.md ↗` button that opens the
   corresponding `summary/doc_<docId>.md` in the OS default viewer.
+- AutoSurvey runs now publish the new workspace **immediately after
+  term-grounding** instead of at completion. `AgentRuntime.run_autosurvey`
+  calls a new `_publish_new_workspace` step right after
+  `_reserve_workspace_dir`: it writes `summary/request.txt` (so the
+  directory passes `_scan_run_workspaces`' "has any research evidence"
+  filter even before the first document lands), upserts the workspace
+  row + `current_workspace_id` into the in-memory catalog and the
+  SQLite `app_state`, and emits a new `workspace_created` progress
+  event with `{ workspaceId, name, path }`. The Research page picks up
+  the event and updates the info tiles (작업 이름 / 저장 경로) plus
+  emits a light `workspaceCreated` signal that `MainWindow` routes to
+  `sidebar.set_current_workspace(name)` and, crucially, to clearing
+  the chat panels — `WritePage.chat_panel.clear_messages()` and
+  `DocumentAssistWindow.hydrate_history([])` — so the previous
+  workspace's chat history doesn't bleed into the new workspace's
+  context. This signal intentionally does *not* trigger the heavy
+  `_on_workspace_changed` cascade so the live `DocumentBar` timeline
+  in the Research page survives the workspace adoption.
 - Workspace lifecycle is now consistent across the on-disk `runs/`
   directory and the local SQLite DB at `%LOCALAPPDATA%/VERITAS/veritas.db`.
   `db/workspace_sync.py` exposes two helpers:

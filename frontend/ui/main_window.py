@@ -192,6 +192,10 @@ class MainWindow(QMainWindow):
 		self.research_page = ResearchPage()
 		self.research_page.workspaceChanged.connect(self.sidebar.set_current_workspace)
 		self.research_page.workspaceChanged.connect(self._on_workspace_changed)
+		# Mid-research workspace switch: light reset so the user sees the
+		# new workspace name in the sidebar and a clean chat panel without
+		# tearing down the active research display.
+		self.research_page.workspaceCreated.connect(self._on_research_workspace_created)
 		self._add_page("research", self.research_page)
 		self._add_page("verify", VerifyPage())
 		self.draft_page = DraftPage()
@@ -373,6 +377,41 @@ class MainWindow(QMainWindow):
 		self.research_page.set_workspace_by_name(workspace_name)
 		self.write_page.set_workspace_by_name(workspace_name)
 		self.document_page.refresh()
+
+	def _on_research_workspace_created(self, workspace_id: str, workspace_name: str) -> None:
+		"""Mid-research workspace adoption.
+
+		Unlike :meth:`_on_workspace_changed`, this does NOT call
+		`research_page.set_workspace_by_name` (which would reload the
+		page state from disk and wipe the live DocumentBar timeline). It
+		only touches the surfaces that should reflect the new workspace
+		immediately:
+
+		- bootstrap state cache (so `current_workspace_id()` resolves to
+		  the new id everywhere)
+		- sidebar footer + dropdown
+		- write_page chat panel (cleared because the new workspace has
+		  no chat history yet — and chat is JobManager-blocked during
+		  research so there's no in-flight stream to interrupt)
+		- document_assist window chat panel (same reason)
+		"""
+		try:
+			from ..api_common import load_bootstrap_state
+
+			load_bootstrap_state()
+		except Exception:
+			pass
+		self.sidebar.set_current_workspace(workspace_name)
+
+		self.write_page._workspace_id = workspace_id
+		self.write_page.chat_panel.clear_messages()
+		self.write_page.chat_panel.add_message(
+			"VERITAS",
+			"새 워크스페이스가 준비되었습니다. 조사가 완료되면 대화를 시작할 수 있습니다.",
+			False,
+		)
+
+		self.document_assist_window.hydrate_history([])
 
 	def _toggle_sidebar(self) -> None:
 		start = self.sidebar.width()

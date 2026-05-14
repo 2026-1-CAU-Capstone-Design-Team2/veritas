@@ -162,10 +162,22 @@ class DashboardPage(QWidget):
 			return
 
 		try:
-			self._controller.delete_workspace(workspace_id)
+			result = self._controller.delete_workspace(workspace_id)
 		except ApiError as e:
 			QMessageBox.critical(self, "삭제 실패", f"워크스페이스 삭제에 실패했습니다.\n\n{e}")
 			return
+
+		# The API clears the DB rows even when the on-disk folder could not be
+		# removed (e.g. a lingering file lock). Surface that case so the user
+		# isn't left thinking the runs/ folder is gone when it isn't.
+		if isinstance(result, dict) and result.get("diskError"):
+			QMessageBox.warning(
+				self,
+				"폴더 삭제 실패",
+				"워크스페이스 항목은 제거되었지만 디스크 폴더를 삭제하지 못했습니다.\n"
+				"수동으로 삭제해야 할 수 있습니다.\n\n"
+				f"{result.get('diskError')}",
+			)
 
 		# Refresh the bootstrap state so the sidebar workspace dropdown
 		# also reflects the removal on the next render.

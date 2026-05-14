@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(python -c \"import crawl4ai; print\\('crawl4ai', crawl4ai.__version__\\)\")",
+      "Bash(python -m pip show crawl4ai)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/unclecode/crawl4ai/main/crawl4ai/async_crawler_strategy.py\" -o c4_strat.py)",
+      "Bash(sed -n '/class AsyncWebCrawler/,/def __init__/p' c4_async_webcrawler.py)",
+      "Bash(grep -nA40 \"    def __init__\" c4_async_webcrawler.py)",
+      "Bash(grep -nA50 \"class CrawlResult\" c4_models.py)",
+      "Bash(grep -nA15 \"class MarkdownGenerationResult\" c4_models.py)",
+      "Bash(grep -nA12 \"async def __aenter__\\\\|async def start\\\\|async def __aexit__\\\\|async def close\" c4_async_webcrawler.py)",
+      "Bash(grep -nA55 \"async def _handle_http\" c4_strat.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('services/fetch_webpage_tool_funcs/crawl4ai_fetch.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('services/fetch_webpage_tool_funcs/__init__.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('tools/fetch_webpage_tool/fetch_webpage_tool.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('tools/document_summarize_tool/document_summarize_tool.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('core/prompts.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(curl -s -m 4 http://127.0.0.1:8080/props)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('PROPS KEYS:', list\\(d.keys\\(\\)\\)\\); print\\('n_ctx:', d.get\\('n_ctx'\\) or \\(d.get\\('default_generation_settings'\\) or {}\\).get\\('n_ctx'\\)\\); print\\('default_generation_settings keys:', list\\(\\(d.get\\('default_generation_settings'\\) or {}\\).keys\\(\\)\\)\\)\")",
+      "PowerShell(head -15)",
+      "Bash(sed -n '100,160p' db/workspace_sync.py)"
+    ]
+  }
+}
