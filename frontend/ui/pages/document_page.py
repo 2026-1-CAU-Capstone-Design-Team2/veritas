@@ -6,6 +6,7 @@ from ...api_common import ApiError, current_workspace_id
 from ...components.badges import Badge
 from ...components.cards import CardWidget
 from ...controllers import AgentController
+from ..markdown_view import apply_markdown
 
 
 class DocumentPage(QWidget):
@@ -58,7 +59,7 @@ class DocumentPage(QWidget):
 			return
 
 		if summary.strip():
-			self.summary_text.setMarkdown(summary)
+			apply_markdown(self.summary_text, summary)
 		else:
 			self.summary_text.setPlainText("아직 표시할 final.md가 없습니다. 조사 섹션에서 AutoSurvey를 먼저 실행하세요.")
 		self.merged_text.setPlainText(merged or "아직 수집 문서 목록이 없습니다.")

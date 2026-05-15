@@ -20,6 +20,135 @@ RAG over generated markdown outputs, and schema-driven chat tool use.
 - Runs subdirectories are treated as UI workspaces. The sidebar workspace
   dropdown refreshes from `/api/v1/workspaces`, which scans `runs/`.
 
+### 2026-05-13 Proactive assistance + streaming UX
+
+- Proactive screen-monitoring is now reachable from the API/UI. `AgentRuntime`
+  exposes `start_screen_monitoring`, `stop_screen_monitoring`,
+  `screen_monitoring_status`, and `get_screen_events_since`; these are wired to
+  `POST /api/v1/screen-monitoring/start`, `POST /api/v1/screen-monitoring/stop`,
+  `GET /api/v1/screen-monitoring/status`, and
+  `GET /api/v1/screen-monitoring/events?since=<seq>&limit=<n>`.
+- The proactive intervention loop is started automatically when the floating
+  "AI 보조창" (DocumentAssistWindow) is shown and stopped when it is hidden.
+  Generated screen-assist answers land in a runtime-side ring buffer; the
+  frontend `ScreenEventPollWorker` (QThread) polls every ~3s and renders new
+  answers as cards in the assist window's `SuggestionList`.
+- Chat is fully asynchronous. The OpenAI streaming path is exposed via
+  `LLMClient.iter_ask`, threaded through `ChatAgent.ask_auto_iter` /
+  `ask_explicit_tool_iter` / `ask_rag_iter`, and surfaced over Server-Sent
+  Events at `POST /api/v1/chat/messages/stream` and
+  `POST /api/v1/document-assist/chat/messages/stream`. The events are
+  `start` / `delta` / `done` / `error`.
+- `frontend/controllers/chat_bus.py` introduces a `ChatBus` singleton plus a
+  `ChatStreamWorker(QThread)`. Sending a chat message from any panel goes
+  through the bus; the main thread returns immediately (no UI freeze) and the
+  bus broadcasts `userMessageQueued`, `assistantStreamStarted`, `assistantChunk`,
+  `assistantCompleted`, and `assistantFailed`.
+- The main chat page (`WritePage`) and the floating assist window
+  (`DocumentAssistWindow`) both subscribe to the bus and stay in sync — the
+  same user/assistant bubbles appear in both views and chunk-by-chunk streaming
+  updates happen simultaneously. Backend-side, `document_assist_service` was
+  unified to route through `draft_chat_service`, so both panels share the same
+  `chat_history.json` per workspace.
+- AutoSurvey emits live progress events. `AutoSurveyWorkflow` accepts a
+  `progress_callback` and emits at term grounding, query plan (initial/replan),
+  per-query web search, per-URL fetch, batch summarize, and final report. The
+  runtime keeps a `_research_progress` ring buffer exposed at
+  `GET /api/v1/research/progress?since=<seq>&limit=<n>`. The Research page runs
+  `ResearchProgressPoller(QThread)` and displays the latest single line in
+  gray, replaced live as the agent acts (ChatGPT/Claude style).
+- The Research result card was redesigned: a colored status pill (green
+  `● 완료`, red `● 오류` with a click-to-open `QMessageBox`, blue `● 진행 중`),
+  three info tiles (`작업 이름` / `저장 경로` / `수집된 문서 수`), and one
+  `DocumentBar` per collected document. Each bar shows the title, a clickable
+  URL hyperlink (uses `QDesktopServices.openUrl`, auto-prepends `https://`
+  when the URL has no scheme), and a `doc_NNN.md ↗` button that opens the
+  corresponding `summary/doc_<docId>.md` in the OS default viewer.
+- Workspace lifecycle is now consistent across the on-disk `runs/`
+  directory and the local SQLite DB at `%LOCALAPPDATA%/VERITAS/veritas.db`.
+  `db/workspace_sync.py` exposes two helpers:
+  `reconcile_workspaces_with_disk(runs_root)` runs at both app launches
+  (PySide `frontend/ui/main.py` and `AgentRuntime.__init__`) and prunes DB
+  rows whose backing folder is gone — so workspaces a user manually
+  removed from `runs/` while the app was offline no longer linger in the
+  dashboard's "최근 작업". `delete_workspace(workspace_id, runs_root)`
+  performs the user-initiated delete: it switches the runtime off the
+  target workspace if it was active, removes `runs/<id>/`, and drops
+  rows from `workspaces` / `documents` / `activity_logs` / `app_state`
+  in one transaction. Demo seed rows (whose recorded `path` is outside
+  `runs_root`) are deliberately preserved by both helpers.
+- The dashboard "최근 작업 워크스페이스" panel now renders a red 삭제
+  button on each row. Clicking it opens a confirmation popup
+  ("{workspace_name} 워크스페이스가 삭제됩니다. 계속 하시겠습니까?" with
+  예 / 아니오), and on confirmation calls
+  `DELETE /api/v1/workspaces/{workspaceId}` which delegates to
+  `db.workspace_sync.delete_workspace` and reloads the bootstrap state so
+  the sidebar dropdown also drops the workspace.
+- `AgentRuntime` no longer materializes a `runs/api/` directory when a real
+  workspace already exists. At boot it scans `runs/` for the most-recently
+  modified directory that contains real research evidence (a `final.md`, a
+  `summary/index.json`, or any `doc_*.md`) and attaches to that workspace
+  directly. The `runs/api/` slot is only used as a one-time scratch home
+  for the very first session before any research has been produced; it is
+  also removed on boot, and again whenever `set_workspace` transitions off
+  of it, when it has no meaningful content. `set_workspace("default")` is
+  resolved to the same most-recent workspace, so a stale "default" id
+  coming from the frontend doesn't accidentally recreate the directory.
+- The Research result card clears its in-memory `_doc_bars` map at the
+  start of `_load_existing_result` so that switching workspaces does not
+  reconcile workspace B's documents on top of workspace A's leftover bars.
+  Bar identity is by `doc_id`, which is workspace-relative ("001" in
+  workspace A is a different document from "001" in workspace B), so the
+  reconciliation pass — which is correct for live updates within a single
+  run — has to be reset across workspace boundaries.
+- Frontend async dispatch and operation mutex go through a single
+  `frontend/controllers/job_manager.py` `JobManager` singleton. Every
+  long-running call to the backend (AutoSurvey, chat, draft, feedback
+  analyze, workspace switch, ...) is tagged with a
+  `JobCategory` constant and submitted via `JobManager.submit(category, fn,
+  ...)` which runs `fn` on a worker `QThread` and emits `busy_changed` on
+  state transitions. A central block matrix (`_BLOCKS_THIS` in `job_manager.py`)
+  encodes which categories block which: e.g. `RESEARCH` blocks `CHAT`,
+  `DRAFT`, `FEEDBACK`, `DOC_ANALYZE`, and `WORKSPACE_SWITCH`. Views connect
+  to `JobManager.busy_changed` once and disable their inputs via
+  `is_blocked(category)` — so while AutoSurvey is running the chat input
+  bars (in `WritePage` and the floating `DocumentAssistWindow`), the
+  workspace-switch button in the sidebar, the draft "초안 생성" button, and
+  the feedback upload button are all greyed out automatically and cannot
+  be invoked. The existing `ChatStreamWorker` reuses the same mutex via
+  `JobManager.register/unregister(CHAT)`, so chat streams and JobManager-
+  submitted operations participate in the same exclusion model. Adding a
+  new heavy operation is now a single-place change: pick a `JobCategory`,
+  call `submit(...)`, and the UI gating falls out automatically from
+  `_BLOCKS_THIS`.
+- FastAPI handlers that perform synchronous blocking work (`POST /research/jobs`,
+  `POST /workspaces/switch`, `POST /chat/messages`, `POST /draft/generate`,
+  `POST /draft/{id}/regenerate`, `POST /document-assist/analyze`,
+  `POST /document-assist/chat/messages`, `POST /feedback/analyze`,
+  `POST /screen-monitoring/{start,stop}`) are declared as plain `def`, not
+  `async def`. FastAPI dispatches `def` handlers to its thread pool instead of
+  running them on the event loop, so a long-running call (AutoSurvey, LLM
+  inference, registry rebuild) cannot freeze every other request. Without
+  this, the progress poller, workspace switch, and page-refresh calls all
+  queued behind the in-flight research job and the UI appeared frozen.
+- Collected-document bars stream in live as `AutoSurveyWorkflow` runs.
+  `_fetch_one` emits a `doc_fetched` progress event after a non-duplicate
+  record is committed, carrying `{doc_id, title, url, final_url, domain}`;
+  `run_summarize` emits one `doc_summarized` event per successfully summarized
+  doc with the absolute `summary_path`. The Research page (controller) owns a
+  `_doc_bars: dict[doc_id → DocumentBar]` model: `doc_fetched` creates the bar
+  in pending state (greyed-out "요약 대기 중" button) and `doc_summarized`
+  flips it to ready via the single mutation method `DocumentBar.set_summary_ready`.
+  The final job response is then reconciled in `_reconcile_documents` so any
+  bars that polling missed are appended and any pending bars get their summary
+  path filled in.
+- The Document page now renders `final.md` through Python's `markdown` library
+  (`tables` / `fenced_code` / `sane_lists` / `nl2br` extensions) and calls
+  `QTextEdit.setHtml`, because Qt's built-in `setMarkdown` has known GFM-table
+  rendering bugs (alignment row mis-parsed, tables breaking when adjacent to
+  other blocks). `frontend/ui/markdown_view.py` falls back to `setMarkdown` if
+  the optional `markdown` package is missing.
+
 The project is built around one principle:
 
 ```text
@@ -83,13 +212,28 @@ tools/
   query_plan_tool/
   document_summarize_tool/
   final_report_tool/
+  screen_context_tool/
 
 services/
   rag_service.py: indexing, retrieval, document-grounded answers
   run_store_tool_funcs/: output/state persistence
+  screen_tool_funcs/: foreground-window OCR/UIA capture, intervention detector
 
 storage/
   vector_store.py: ChromaDB vector store wrapper
+
+api/
+  api.py, main.py: FastAPI app + uvicorn entrypoint
+  api_routes/: per-feature routers (research, chat, document-assist,
+    documents, workspaces, write, feedback, screen-monitoring, ...)
+  services/: agent_runtime (shared LLM/registry/chat agent), draft_chat,
+    document_assist, research, screen_monitoring, ...
+
+frontend/
+  main.py, ui/: PySide6 desktop UI
+  controllers/agent_controller.py: HTTP client wrapper
+  controllers/chat_bus.py: ChatBus singleton + ChatStreamWorker(QThread)
+  ui/markdown_view.py: markdown -> HTML renderer with table support
 ```
 
 ## Run Modes
@@ -277,6 +421,9 @@ Explicit slash commands bypass LLM tool selection:
 /autosurvey <fresh research request>
 /rag <question against indexed local documents>
 ```
+
+The frontend chat mode selector uses the same forced paths: `자료조사` maps to
+`/autosurvey`, and `RAG` maps to `/rag`.
 
 Use these commands when you want deterministic tool selection and want to avoid
 the LLM deciding whether a tool should be called.

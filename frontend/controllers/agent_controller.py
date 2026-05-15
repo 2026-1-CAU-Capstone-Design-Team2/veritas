@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from ..api_common import api_client
 
@@ -15,6 +15,31 @@ class AgentController:
 			{"workspaceId": workspace_id, "message": message, "mode": mode},
 		)
 		return str(response.get("assistant") or "")
+
+	def stream_chat_message(
+		self,
+		workspace_id: str,
+		message: str,
+		mode: str,
+	) -> Iterator[tuple[str, dict[str, Any]]]:
+		return api_client.stream_post_sse(
+			"/api/v1/chat/messages/stream",
+			{"workspaceId": workspace_id, "message": message, "mode": mode},
+		)
+
+	def get_research_progress(self, since: int = 0, limit: int = 50) -> dict[str, Any]:
+		return api_client.get(
+			"/api/v1/research/progress",
+			{"since": since, "limit": limit},
+		)
+
+	def delete_workspace(self, workspace_id: str) -> dict[str, Any]:
+		return api_client.delete(f"/api/v1/workspaces/{workspace_id}")
+
+	def get_chat_history(self, workspace_id: str) -> list[dict[str, Any]]:
+		response = api_client.get(f"/api/v1/chat/sessions/session_{workspace_id}/messages")
+		items = response.get("items", [])
+		return items if isinstance(items, list) else []
 
 	def generate_draft(self, workspace_id: str, prompt: str) -> dict[str, Any]:
 		return api_client.post(
@@ -36,6 +61,11 @@ class AgentController:
 				"referenceUrls": reference_urls,
 			},
 		)
+
+	def list_research_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
+		response = api_client.get("/api/v1/research/jobs", {"limit": limit})
+		items = response.get("items", [])
+		return items if isinstance(items, list) else []
 
 	def upload_feedback_files(self, files: list[Path]) -> list[dict[str, str]]:
 		response = api_client.upload_files("/api/v1/feedback/files", files)
@@ -68,3 +98,21 @@ class AgentController:
 			{"workspaceId": workspace_id, "message": message, "mode": mode},
 		)
 		return str(response.get("reply") or "")
+
+	def start_screen_monitoring(self, workspace_id: str | None = None) -> dict[str, Any]:
+		payload: dict[str, Any] = {}
+		if workspace_id:
+			payload["workspaceId"] = workspace_id
+		return api_client.post("/api/v1/screen-monitoring/start", payload)
+
+	def stop_screen_monitoring(self) -> dict[str, Any]:
+		return api_client.post("/api/v1/screen-monitoring/stop", {})
+
+	def get_screen_monitoring_status(self) -> dict[str, Any]:
+		return api_client.get("/api/v1/screen-monitoring/status")
+
+	def get_screen_monitoring_events(self, since: int = 0, limit: int = 20) -> dict[str, Any]:
+		return api_client.get(
+			"/api/v1/screen-monitoring/events",
+			{"since": since, "limit": limit},
+		)

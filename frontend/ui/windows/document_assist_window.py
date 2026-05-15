@@ -359,7 +359,7 @@ class ChatPanel(QFrame):
 		root.addWidget(self.scroll, 1)
 		self._bubbles: list[ChatMessageBubble] = []
 
-	def add_message(self, sender: str, message: str, is_user: bool) -> None:
+	def add_message(self, sender: str, message: str, is_user: bool) -> ChatMessageBubble:
 		self.empty.hide()
 		bubble = ChatMessageBubble(sender, message, is_user)
 		bubble.set_bubble_width(self._bubble_width())
@@ -377,6 +377,62 @@ class ChatPanel(QFrame):
 		insert_at = max(0, self.layout.count() - 1)
 		self.layout.insertLayout(insert_at, row)
 		self.schedule_scroll_to_bottom()
+		return bubble
+
+	def start_streaming_assistant(self, sender: str = "VERITAS") -> ChatMessageBubble:
+		bubble = self.add_message(sender, "…", False)
+		self._streaming_bubble = bubble
+		self._streaming_buffer = ""
+		return bubble
+
+	def append_streaming_chunk(self, chunk: str) -> None:
+		bubble = getattr(self, "_streaming_bubble", None)
+		if bubble is None:
+			return
+		self._streaming_buffer = (getattr(self, "_streaming_buffer", "") or "") + chunk
+		bubble.text.setText(add_text_breakpoints(self._streaming_buffer))
+		self.schedule_scroll_to_bottom()
+
+	def finalize_streaming_assistant(self, text: str | None = None) -> None:
+		bubble = getattr(self, "_streaming_bubble", None)
+		if bubble is None:
+			return
+		final_text = text if text is not None else getattr(self, "_streaming_buffer", "")
+		bubble.text.setText(add_text_breakpoints(final_text or ""))
+		self._streaming_bubble = None
+		self._streaming_buffer = ""
+		self.schedule_scroll_to_bottom()
+
+	def cancel_streaming_assistant(self, error_text: str) -> None:
+		bubble = getattr(self, "_streaming_bubble", None)
+		if bubble is None:
+			return
+		current = getattr(self, "_streaming_buffer", "")
+		display = f"{current}\n\n[오류] {error_text}" if current else f"[오류] {error_text}"
+		bubble.text.setText(add_text_breakpoints(display))
+		self._streaming_bubble = None
+		self._streaming_buffer = ""
+		self.schedule_scroll_to_bottom()
+
+	def clear_messages(self) -> None:
+		while self.layout.count():
+			item = self.layout.takeAt(0)
+			self._dispose_layout_item(item)
+		self._bubbles.clear()
+		self.layout.addWidget(self.empty)
+		self.layout.addStretch(1)
+		self.empty.show()
+
+	def _dispose_layout_item(self, item) -> None:
+		widget = item.widget()
+		if widget is not None and widget is not self.empty:
+			widget.setParent(None)
+			widget.deleteLater()
+			return
+		layout = item.layout()
+		if layout is not None:
+			while layout.count():
+				self._dispose_layout_item(layout.takeAt(0))
 
 	def schedule_scroll_to_bottom(self) -> None:
 		for delay in (0, 25, 80):
@@ -473,6 +529,7 @@ class ChatInputBar(QFrame):
 
 class DocumentAssistWindow(QWidget):
 	messageSubmitted = Signal(str)
+	visibilityChanged = Signal(bool)
 
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
@@ -486,6 +543,7 @@ class DocumentAssistWindow(QWidget):
 		self._resize_edges: set[str] = set()
 		self._resize_origin: QPoint | None = None
 		self._resize_geometry = None
+		self._history_hydrated = False
 
 		self._build_ui()
 		self._apply_stylesheet()
@@ -778,6 +836,30 @@ class DocumentAssistWindow(QWidget):
 		is_user = normalized_sender == "나"
 		self.chat_panel.add_message(normalized_sender, message, is_user)
 
+	def hydrate_history(self, history: list[dict[str, str]]) -> None:
+		"""Replace the chat panel with the canonical workspace history so the
+		assist window mirrors the main chat page.
+		"""
+		self.chat_panel.clear_messages()
+		if not history:
+			self.chat_panel.add_message(
+				"VERITAS",
+				"문서에 대해 질문하면 이 대화가 메인 채팅 창과 동기화됩니다.",
+				False,
+			)
+			self._history_hydrated = True
+			return
+		for item in history:
+			if not isinstance(item, dict):
+				continue
+			role = str(item.get("role") or "")
+			text = str(item.get("text") or "")
+			if not text:
+				continue
+			sender = "나" if role == "user" else "VERITAS"
+			self.chat_panel.add_message(sender, text, role == "user")
+		self._history_hydrated = True
+
 	def get_current_chat_input(self) -> str:
 		return self.input_bar.input.toPlainText().strip()
 
@@ -789,7 +871,8 @@ class DocumentAssistWindow(QWidget):
 		self.title_bar.status.setText(label)
 
 	def on_message_submitted(self, message: str) -> None:
-		self.add_chat_message("나", message)
+		# The user bubble is drawn by ChatBus subscribers (MainWindow + WritePage)
+		# so it appears in both views at the same time.
 		self.messageSubmitted.emit(message)
 
 	def on_send_clicked(self) -> None:
@@ -798,6 +881,14 @@ class DocumentAssistWindow(QWidget):
 	def closeEvent(self, event: QCloseEvent) -> None:
 		event.ignore()
 		self.hide()
+
+	def hideEvent(self, event) -> None:  # type: ignore[override]
+		super().hideEvent(event)
+		self.visibilityChanged.emit(False)
+
+	def showEvent(self, event) -> None:  # type: ignore[override]
+		super().showEvent(event)
+		self.visibilityChanged.emit(True)
 
 	def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
 		if event.button() == Qt.LeftButton:

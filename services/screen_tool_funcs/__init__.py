@@ -13,6 +13,17 @@ from .models import (
 )
 from .ocr_engine import OcrEngine
 from .powerpoint_com import PowerPointComReader
+from .scenario_scheduler import ScenarioScheduler, ScenarioSchedulerState, ScenarioWeights
+from .scenarios import (
+    BlankDocumentStartScenario,
+    IdleAfterWritingScenario,
+    LongStaticReviewScenario,
+    ParagraphChurnScenario,
+    ScenarioContext,
+    ScenarioEvaluation,
+    ScenarioType,
+    WholeDocumentReviewScenario,
+)
 from .screen_capture import ScreenCapture
 from .screen_context_service import ScreenContextService
 from .store import ScreenContextStore
@@ -21,21 +32,32 @@ from .window_context import WindowContextReader
 
 __all__ = [
     "AppTextResult",
+    "BlankDocumentStartScenario",
     "BoundingBox",
     "ContentFilter",
     "FilteredScreenContext",
+    "IdleAfterWritingScenario",
     "InterventionDecision",
     "InterventionDetector",
     "InterventionDispatcher",
+    "LongStaticReviewScenario",
     "OcrEngine",
     "OcrResult",
+    "ParagraphChurnScenario",
     "PowerPointComReader",
+    "ScenarioContext",
+    "ScenarioEvaluation",
+    "ScenarioScheduler",
+    "ScenarioSchedulerState",
+    "ScenarioType",
+    "ScenarioWeights",
     "ScreenCapture",
     "ScreenContextEvent",
     "ScreenContextService",
     "ScreenContextStore",
     "UiAutomationReader",
     "UiAutomationResult",
+    "WholeDocumentReviewScenario",
     "WindowContext",
     "WindowContextReader",
 ]

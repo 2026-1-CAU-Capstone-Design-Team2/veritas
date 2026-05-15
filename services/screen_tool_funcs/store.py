@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import threading
 import time
 from datetime import datetime
@@ -13,7 +15,15 @@ from .models import ScreenContextEvent
 class ScreenContextStore:
     """screen context event를 latest JSON과 append-only JSONL로 저장합니다."""
 
-    def __init__(self, root: str | Path) -> None:
+    EVENTS_ROTATE_MAX_BYTES = 5 * 1024 * 1024
+    EVENTS_ROTATE_KEEP = 5
+    INTERVENTION_LOG_ROTATE_MAX_BYTES = 5 * 1024 * 1024
+    INTERVENTION_LOG_ROTATE_KEEP = 5
+    CAPTURE_LOG_ROTATE_MAX_BYTES = 10 * 1024 * 1024
+    CAPTURE_LOG_ROTATE_KEEP = 3
+    CAPTURE_LOG_SESSION_RETENTION = 20
+
+    def __init__(self, root: str | Path, *, debug: bool = False) -> None:
         self.root = Path(root)
         self.screen_dir = self.root / "screen_context"
         self.events_path = self.screen_dir / "events.jsonl"
@@ -21,12 +31,16 @@ class ScreenContextStore:
         self.intervention_log_path = self.screen_dir / "interventions.jsonl"
         self.intervention_queue_path = self.screen_dir / "intervention_queue.json"
         self.latest_intervention_path = self.screen_dir / "latest_intervention.json"
-        self.capture_log_dir = self.screen_dir / "capture_logs"
+        # debug 모드면 capture log를 capture_logs/ 대신 debug/에 기록
+        self.capture_log_dir = self.screen_dir / ("debug" if debug else "capture_logs")
+        self.scheduler_dir = self.screen_dir / "scheduler_state"
         self.capture_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.capture_log_path = self.capture_log_dir / f"capture_{self.capture_session_id}.jsonl"
         self._lock = threading.RLock()
         self.screen_dir.mkdir(parents=True, exist_ok=True)
         self.capture_log_dir.mkdir(parents=True, exist_ok=True)
+        self.scheduler_dir.mkdir(parents=True, exist_ok=True)
+        self._prune_capture_log_sessions()
 
     def save_event(self, event: ScreenContextEvent) -> None:
         payload = event.to_dict()
@@ -34,11 +48,21 @@ class ScreenContextStore:
             self._write_json_atomic(self.latest_path, payload, indent=2)
             with self.events_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._maybe_rotate(
+                self.events_path,
+                max_bytes=self.EVENTS_ROTATE_MAX_BYTES,
+                keep=self.EVENTS_ROTATE_KEEP,
+            )
 
     def append_capture_log(self, payload: dict[str, Any]) -> None:
         with self._lock:
             with self.capture_log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._maybe_rotate(
+                self.capture_log_path,
+                max_bytes=self.CAPTURE_LOG_ROTATE_MAX_BYTES,
+                keep=self.CAPTURE_LOG_ROTATE_KEEP,
+            )
 
     def load_latest(self) -> dict[str, Any] | None:
         with self._lock:
@@ -50,46 +74,44 @@ class ScreenContextStore:
                 return None
 
     def load_recent(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Return the most recent `limit` events, scanning rotated files if needed.
+
+        Reads tail-first to avoid pulling the entire JSONL into memory on every
+        capture. Falls back into events.jsonl.1 when the live file does not yet
+        hold enough lines (e.g. immediately after rotation).
+        """
+        if limit <= 0:
+            return []
         with self._lock:
-            if not self.events_path.exists():
-                return []
-            lines = self.events_path.read_text(encoding="utf-8").splitlines()
-        recent_lines = lines[-max(limit, 0):]
+            lines = self._tail_lines(self.events_path, limit)
+            if len(lines) < limit:
+                rotated = self.events_path.with_name(f"{self.events_path.name}.1")
+                if rotated.exists():
+                    deficit = limit - len(lines)
+                    lines = self._tail_lines(rotated, deficit) + lines
         records: list[dict[str, Any]] = []
-        for line in recent_lines:
+        for line in lines:
             try:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-        return records
+        return records[-limit:]
 
     def enqueue_intervention(self, payload: dict[str, Any]) -> None:
-        """Append one approved intervention to the durable FIFO queue.
-
-        Earlier versions used latest_intervention.json as the effective queue and
-        rewrote intervention_queue.json with only the newest payload. That made
-        screen assists fragile: a newly approved event could overwrite an older
-        pending event, and consume_interventions could clear the whole queue even
-        when only one item was requested. The chat-side consumer now gets a real
-        FIFO queue while latest_intervention.json remains a diagnostic snapshot.
-        """
+        # 단일 슬롯 큐로 구현.
         with self._lock:
-            queue = self._load_pending_interventions_unlocked()
-            event_id = str(payload.get("event_id") or "").strip()
-            if event_id:
-                queue = [
-                    item
-                    for item in queue
-                    if str(item.get("event_id") or "").strip() != event_id
-                ]
-            queue.append(payload)
-            queue = queue[-50:]
+            queue = [payload]
 
             self._write_json_atomic(self.latest_intervention_path, payload, indent=2)
             self._write_pending_interventions_unlocked(queue)
 
             with self.intervention_log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._maybe_rotate(
+                self.intervention_log_path,
+                max_bytes=self.INTERVENTION_LOG_ROTATE_MAX_BYTES,
+                keep=self.INTERVENTION_LOG_ROTATE_KEEP,
+            )
 
     def load_pending_interventions(self, limit: int | None = None) -> list[dict[str, Any]]:
         with self._lock:
@@ -140,6 +162,116 @@ class ScreenContextStore:
 
     def _write_pending_interventions_unlocked(self, queue: list[dict[str, Any]]) -> None:
         self._write_json_atomic(self.intervention_queue_path, queue, indent=2)
+
+    def scheduler_state_path(self, document_key: str) -> Path:
+        safe = self._safe_document_filename(document_key)
+        return self.scheduler_dir / f"{safe}.json"
+
+    def load_scheduler_state(self, document_key: str) -> dict[str, Any] | None:
+        path = self.scheduler_state_path(document_key)
+        with self._lock:
+            if not path.exists():
+                return None
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+        return data if isinstance(data, dict) else None
+
+    def save_scheduler_state(self, document_key: str, payload: dict[str, Any]) -> None:
+        path = self.scheduler_state_path(document_key)
+        with self._lock:
+            self._write_json_atomic(path, payload, indent=2)
+
+    def _safe_document_filename(self, document_key: str) -> str:
+        normalized = (document_key or "unknown").strip() or "unknown"
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", normalized)[:48].strip("_") or "doc"
+        return f"{slug}_{digest}"
+
+    def _tail_lines(self, path: Path, n: int, *, block_size: int = 8192) -> list[str]:
+        """Return the last `n` lines of `path` without reading the whole file.
+
+        Reads backwards from EOF in `block_size` chunks until we've collected
+        enough newlines, then decodes the joined bytes once. Bytes that span a
+        UTF-8 boundary are tolerated via errors="replace" on the final decode.
+        """
+        if n <= 0:
+            return []
+        try:
+            with path.open("rb") as f:
+                f.seek(0, 2)
+                pos = f.tell()
+                if pos == 0:
+                    return []
+                chunks: list[bytes] = []
+                newline_count = 0
+                while pos > 0 and newline_count <= n:
+                    read_size = min(block_size, pos)
+                    pos -= read_size
+                    f.seek(pos)
+                    chunk = f.read(read_size)
+                    chunks.append(chunk)
+                    newline_count += chunk.count(b"\n")
+                data = b"".join(reversed(chunks))
+        except OSError:
+            return []
+        text = data.decode("utf-8", errors="replace")
+        lines = [line for line in text.splitlines() if line]
+        return lines[-n:]
+
+    def _maybe_rotate(self, path: Path, *, max_bytes: int, keep: int) -> None:
+        """Rotate `path` to `path.1` … `path.keep` when it grows past `max_bytes`.
+
+        Caller must hold self._lock. Best-effort: any individual rename/unlink
+        failure is swallowed so that the active append path stays unblocked.
+        """
+        if max_bytes <= 0 or keep <= 0:
+            return
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        if size < max_bytes:
+            return
+
+        oldest = path.with_name(f"{path.name}.{keep}")
+        try:
+            oldest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        for index in range(keep - 1, 0, -1):
+            src = path.with_name(f"{path.name}.{index}")
+            dst = path.with_name(f"{path.name}.{index + 1}")
+            if not src.exists():
+                continue
+            try:
+                src.replace(dst)
+            except OSError:
+                pass
+        try:
+            path.replace(path.with_name(f"{path.name}.1"))
+        except OSError:
+            pass
+
+    def _prune_capture_log_sessions(self) -> None:
+        """capture_log_dir의 capture 세션 파일을 mtime 기준 최근 RETENTION개만 남김."""
+        retention = max(self.CAPTURE_LOG_SESSION_RETENTION, 1)
+        try:
+            files = list(self.capture_log_dir.glob("capture_*.jsonl*"))
+        except OSError:
+            return
+        if len(files) <= retention:
+            return
+        try:
+            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            return
+        for path in files[retention:]:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                continue
 
     def _write_json_atomic(self, path: Path, payload: Any, *, indent: int | None = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

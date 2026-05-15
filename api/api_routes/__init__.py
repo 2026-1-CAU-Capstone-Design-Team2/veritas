@@ -5,6 +5,7 @@ from .draft_chat import router as draft_chat_router
 from .feedback import router as feedback_router
 from .frontend import router as frontend_router
 from .research import router as research_router
+from .screen_monitoring import router as screen_monitoring_router
 from .settings import router as settings_router
 from .system import router as system_router
 from .verify import router as verify_router
@@ -19,6 +20,7 @@ __all__ = [
     "feedback_router",
     "frontend_router",
     "research_router",
+    "screen_monitoring_router",
     "settings_router",
     "system_router",
     "verify_router",

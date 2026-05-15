@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from core.prompts import (
     SCREEN_INTERVENTION_SYSTEM_PROMPT,
@@ -104,6 +104,129 @@ class ChatAgent:
             )
             self._append_history(question, answer)
             return answer
+
+    def ask_explicit_tool(self, command: str, question: str, *, stream: bool = False) -> str:
+        """Run the same forced tool path used by CLI slash commands.
+
+        This is intended for UI controls that choose a tool mode without making
+        the user type `/autosurvey` or `/rag` into the prompt field.
+        """
+        normalized_command = str(command or "").strip().lower()
+        if normalized_command not in {"autosurvey", "rag"}:
+            raise ValueError(f"Unsupported explicit chat tool: {command}")
+
+        command_text = str(question or "").strip()
+        with self._conversation_lock:
+            tool_outputs = self._run_explicit_tool_command(
+                command=normalized_command,
+                command_text=command_text,
+            )
+            answer = self._answer_from_current_turn(
+                question=command_text,
+                tool_outputs=tool_outputs,
+                stream=stream,
+            )
+            self._append_history(command_text, answer)
+            return answer
+
+    def ask_auto_iter(self, question: str) -> Iterator[str]:
+        """Generator variant of ask_auto. Tool decision runs non-streaming,
+        the final answer is streamed as chunks, and history is updated when
+        the stream completes.
+        """
+        with self._conversation_lock:
+            explicit_command = self._parse_explicit_command(question)
+            if explicit_command:
+                command, command_text = explicit_command
+                if command == "screen" and command_text.lower() in {"debug", "raw"}:
+                    answer = self._run_screen_debug_command()
+                    self._append_history(question, answer)
+                    if answer:
+                        yield answer
+                    return
+                tool_outputs = self._run_explicit_tool_command(
+                    command=command,
+                    command_text=command_text,
+                )
+                question_text = command_text or question
+                yield from self._stream_final_answer(
+                    question=question_text,
+                    tool_outputs=tool_outputs,
+                    history_question=question,
+                )
+                return
+
+            tool_outputs = self._collect_tool_outputs(question)
+            yield from self._stream_final_answer(
+                question=question,
+                tool_outputs=tool_outputs,
+                history_question=question,
+            )
+
+    def ask_explicit_tool_iter(self, command: str, question: str) -> Iterator[str]:
+        normalized_command = str(command or "").strip().lower()
+        if normalized_command not in {"autosurvey", "rag"}:
+            raise ValueError(f"Unsupported explicit chat tool: {command}")
+
+        command_text = str(question or "").strip()
+        with self._conversation_lock:
+            tool_outputs = self._run_explicit_tool_command(
+                command=normalized_command,
+                command_text=command_text,
+            )
+            yield from self._stream_final_answer(
+                question=command_text,
+                tool_outputs=tool_outputs,
+                history_question=command_text,
+            )
+
+    def ask_rag_iter(self, question: str) -> Iterator[str]:
+        with self._conversation_lock:
+            collected: list[str] = []
+            try:
+                for chunk in self.rag_service.iter_answer(question, use_history=True):
+                    collected.append(chunk)
+                    yield chunk
+            except AttributeError:
+                # rag_service does not support iter_answer yet; fall back to one-shot.
+                answer = self.rag_service.answer(question, stream=False, use_history=True)
+                collected.append(answer)
+                yield answer
+            self._append_history(question, "".join(collected))
+
+    def _stream_final_answer(
+        self,
+        *,
+        question: str,
+        tool_outputs: list[dict[str, str]],
+        history_question: str,
+    ) -> Iterator[str]:
+        prompt = TOOL_CHAT_FINAL_PROMPT_TEMPLATE.format(
+            history=self._format_recent_history(),
+            question=question,
+            tool_results=self._format_tool_results(tool_outputs),
+        )
+        collected: list[str] = []
+        try:
+            for chunk in self.llm.iter_ask(
+                self._chat_system_prompt(),
+                prompt,
+                reasoning=False,
+                stream_label="chat:final" if tool_outputs else "chat",
+                timeout_sec=self.FINAL_ANSWER_TIMEOUT_SEC,
+            ):
+                if not chunk:
+                    continue
+                collected.append(chunk)
+                yield chunk
+        except Exception as e:
+            error_text = f"[chat][error] failed to generate answer: {e}"
+            print(error_text)
+            collected.append(error_text)
+            yield error_text
+
+        final_text = "".join(collected).strip()
+        self._append_history(history_question, final_text)
 
     def _append_history(self, question: str, answer: str) -> None:
         self.chat_history.append((question, answer))
@@ -407,6 +530,86 @@ class ChatAgent:
             self._append_history(history_question, answer)
             return answer.strip()
 
+    
+    #single queue version with peek + separate consume
+    def _screen_intervention_loop(self, *, stream: bool) -> None:
+        while not self._screen_stop_event.wait(self.SCREEN_INTERVENTION_POLL_SEC):
+            try:
+                pending = self._peek_screen_interventions(limit=1)
+                if not pending:
+                    continue
+                intervention = pending[0]
+                # peek만 — LLM 처리 동안 큐에 남겨 producer가 점유중으로 인식하게 함
+                try:
+                    if not self._fresh_screen_interventions([intervention]):
+                        continue  # dup/stale → finally에서 제거
+                    event_id = str(intervention.get("event_id") or "-")
+                    if self.screen_debug:
+                        query = self._screen_intervention_query(intervention)
+                        print(
+                            "[screen_context][assist] "
+                            f"event={event_id} generating query={query[:160]!r}"
+                        )
+                    answer = self.answer_screen_intervention(intervention, stream=stream)
+                    if self.screen_debug:
+                        print(
+                            "[screen_context][assist] "
+                            f"event={event_id} answer_chars={len(answer)}"
+                        )
+                    if self._screen_answer_callback is not None:
+                        self._screen_answer_callback(answer, intervention)
+                    else:
+                        print("\n[Screen Assist]")
+                        print(answer)
+                        print()
+                finally:
+                    # 처리·스킵 결과와 무관하게 큐에서 1개 제거 — producer 점유 해제용,
+                    # 실패해도 같은 항목 무한 재시도 방지
+                    self._remove_screen_intervention()
+            except Exception as e:
+                print(f"[screen_context][assist][error] {type(e).__name__}: {e}")
+
+
+    def _peek_screen_interventions(self, *, limit: int) -> list[dict[str, Any]]:
+        """큐에서 제거하지 않고 대기 개입을 읽기만 한다."""
+        if not self.has_screen_context():
+            return []
+        try:
+            result = self.tool_registry.call(
+                "screen_context", action="pending_interventions", limit=limit,
+            )
+        except Exception as e:
+            print(f"[screen_context][warn] failed to peek interventions: {e}")
+            return []
+        if not result.success:
+            print(f"[screen_context][warn] failed to peek interventions: {result.error}")
+            return []
+        data = result.data if isinstance(result.data, dict) else {}
+        return [item for item in data.get("interventions", []) if isinstance(item, dict)]
+
+    def _remove_screen_intervention(self) -> None:
+        """큐 맨 앞 1개를 제거한다 (peek 후 처리/스킵을 마친 항목)."""
+        if not self.has_screen_context():
+            return
+        try:
+            result = self.tool_registry.call(
+                "screen_context", action="consume_interventions", limit=1,
+            )
+        except Exception as e:
+            print(f"[screen_context][warn] failed to remove intervention: {e}")
+            return
+        if not result.success:
+            print(f"[screen_context][warn] failed to remove intervention: {result.error}")
+            return
+        if self.screen_debug:
+            data = result.data if isinstance(result.data, dict) else {}
+            ids = [str(i.get("event_id") or "-") for i in data.get("interventions", []) if isinstance(i, dict)]
+            if ids:
+                print(f"[screen_context][queue] removed event_ids={ids}")
+
+
+    """
+    "multiple size queue version" 
     def _screen_intervention_loop(self, *, stream: bool) -> None:
         while not self._screen_stop_event.wait(self.SCREEN_INTERVENTION_POLL_SEC):
             try:
@@ -458,6 +661,7 @@ class ChatAgent:
             ids = [str(item.get("event_id") or "-") for item in valid]
             print(f"[screen_context][queue] consumed={len(valid)} event_ids={ids}")
         return valid
+    """
 
     def _fresh_screen_interventions(
         self,

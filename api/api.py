@@ -16,6 +16,7 @@ from .api_routes import (
     feedback_router,
     frontend_router,
     research_router,
+    screen_monitoring_router,
     settings_router,
     system_router,
     verify_router,
@@ -77,4 +78,5 @@ app.include_router(documents_router)
 app.include_router(feedback_router)
 app.include_router(write_router)
 app.include_router(document_assist_router)
+app.include_router(screen_monitoring_router)
 app.include_router(frontend_router)
