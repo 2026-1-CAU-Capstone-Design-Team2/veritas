@@ -72,6 +72,16 @@ class AgentRuntime:
         self._configure_workspace_runtime(self.output_dir)
 
     def _configure_workspace_runtime(self, output_dir: Path) -> None:
+        # Release the previous workspace's ChromaDB handles before swapping in a
+        # new registry. On Windows an open SQLite handle would otherwise keep the
+        # old workspace directory locked and undeletable.
+        previous_rag_service = getattr(self, "rag_service", None)
+        if previous_rag_service is not None:
+            try:
+                previous_rag_service.close()
+            except Exception as e:
+                print(f"[workspace][warn] failed to release previous RAG store: {e}")
+
         output_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir = output_dir
         self.registry, self.run_store_service, self.rag_service = build_registry(
@@ -254,26 +264,59 @@ class AgentRuntime:
         instruction: str,
         reference_urls: list[str] | None = None,
         job_id: str | None = None,
+        max_docs: int | None = None,
+        scout_docs: int | None = None,
+        collect_batch_size: int | None = None,
     ) -> dict[str, Any]:
+        from datetime import datetime, timezone
+
         started_at = time.perf_counter()
+        started_wall = datetime.now(timezone.utc)
         request = self._append_reference_sites(instruction, reference_urls or [])
         self._reset_research_progress(job_id=job_id, instruction=instruction)
         self._emit_research_progress("term_grounding", "주제어 추출 중...")
         workspace_name, grounding = self._grounding_workspace_from_request(request)
         workspace_dir = self._reserve_workspace_dir(workspace_name)
+        # Make the new workspace visible to the rest of the system *immediately*.
+        # The frontend's Research page, sidebar, and chat panels can switch to
+        # this workspace mid-run instead of waiting for the workflow to complete.
+        try:
+            self._publish_new_workspace(workspace_dir, request)
+        except Exception as e:
+            print(f"[workspace][publish][warn] {e}")
+        # AutoSurvey pacing — per-request values from the research page
+        # (maxDocs) and 설정 > 고급 설정 > 조사 진행 방식 (scoutDocs /
+        # collectBatchSize) take precedence; otherwise the VERITAS_* env
+        # defaults apply. collectBatchSize doubles as the document_summarize
+        # batch size so one collect cycle maps to one batch summary.
+        resolved_max_docs = (
+            int(max_docs)
+            if max_docs is not None and int(max_docs) > 0
+            else int(os.getenv("VERITAS_MAX_DOCS", "15"))
+        )
+        resolved_collect_batch_size = (
+            int(collect_batch_size)
+            if collect_batch_size is not None and int(collect_batch_size) > 0
+            else int(os.getenv("VERITAS_BATCH_SIZE", "5"))
+        )
+        resolved_scout_docs = (
+            int(scout_docs)
+            if scout_docs is not None and int(scout_docs) > 0
+            else int(os.getenv("VERITAS_SCOUT_DOCS", "3"))
+        )
         registry, run_store_service, rag_service = build_registry(
             llm=self.llm,
             run_root=workspace_dir,
-            batch_size=int(os.getenv("VERITAS_BATCH_SIZE", "5")),
+            batch_size=resolved_collect_batch_size,
             max_context=int(os.getenv("VERITAS_MAX_CONTEXT", "16384")),
             enable_screen_context=False,
         )
         workflow = AutoSurveyWorkflow(
             registry=registry,
             run_store_service=run_store_service,
-            max_docs=int(os.getenv("VERITAS_MAX_DOCS", "15")),
-            collect_batch_size=int(os.getenv("VERITAS_BATCH_SIZE", "5")),
-            scout_docs=int(os.getenv("VERITAS_SCOUT_DOCS", "3")),
+            max_docs=resolved_max_docs,
+            collect_batch_size=resolved_collect_batch_size,
+            scout_docs=resolved_scout_docs,
             progress_callback=self._emit_research_progress,
         )
         result = workflow.run_all(
@@ -283,22 +326,56 @@ class AgentRuntime:
             grounding=grounding,
         )
         indexed_chunks = None
-        summary_dir = getattr(run_store_service, "summary_dir", None)
+        clean_md_dir = getattr(run_store_service, "clean_md_dir", None)
         index_path = getattr(run_store_service, "index_path", None)
-        if summary_dir is not None:
+        if clean_md_dir is not None:
             self._emit_research_progress("indexing", "검색 색인 생성 중...")
             indexed_chunks = rag_service.index_autosurvey_output(
-                summary_dir=Path(summary_dir),
+                clean_md_dir=Path(clean_md_dir),
                 index_path=Path(index_path) if index_path is not None else None,
                 clear_first=True,
             )
-        self._emit_research_progress("completed", "조사 완료", final=True)
+
+        failed_documents = (
+            result.get("failed_documents", []) if isinstance(result, dict) else []
+        )
+        if not isinstance(failed_documents, list):
+            failed_documents = []
+
+        if failed_documents:
+            self._emit_research_progress(
+                "completed",
+                f"조사 완료 · 요약 실패 {len(failed_documents)}건",
+                final=True,
+            )
+        else:
+            self._emit_research_progress("completed", "조사 완료", final=True)
 
         final_path = run_store_service.final_path
         records = self._read_index_records(index_path)
+        # `_document_summaries` already drops duplicates, so its length is the
+        # count of actually-collected documents — the value the UI shows as
+        # "수집된 문서 수". Duplicates in index.json must never inflate it.
+        document_summaries = self._document_summaries(records)
         final_report = self._read_excerpt(final_path, max_chars=1_000_000)
         if not isinstance(final_report, str):
             final_report = ""
+        elapsed_seconds = round(time.perf_counter() - started_at, 3)
+        # Persist run timing into the workspace (summary/timing.json) so the
+        # elapsed time survives completion and an API restart — the in-memory
+        # job dict is the only other place it lives, and that is lost on restart.
+        try:
+            run_store_service.save_timing(
+                {
+                    "startedAt": started_wall.isoformat().replace("+00:00", "Z"),
+                    "completedAt": datetime.now(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "elapsedSeconds": elapsed_seconds,
+                }
+            )
+        except Exception as e:
+            print(f"[timing][warn] failed to persist run timing: {e}")
         return {
             "request": request,
             "workspace_id": workspace_dir.name,
@@ -306,12 +383,11 @@ class AgentRuntime:
             "max_docs": getattr(workflow, "max_docs", None),
             "final_path": str(final_path) if final_path else None,
             "indexed_chunks": indexed_chunks,
-            "elapsed_seconds": round(time.perf_counter() - started_at, 3),
-            "documents": self._document_summaries(records),
-            "document_count": len(records),
-            "non_duplicate_document_count": len(
-                [record for record in records if not record.get("duplicate_of")]
-            ),
+            "elapsed_seconds": elapsed_seconds,
+            "documents": document_summaries,
+            "document_count": len(document_summaries),
+            "non_duplicate_document_count": len(document_summaries),
+            "failed_documents": failed_documents,
             "final_report": final_report,
             "final_report_excerpt": final_report[:6000].strip(),
             "workflow_result": self._compact_workflow_result(result),
@@ -352,6 +428,68 @@ class AgentRuntime:
         text = re.sub(r"[^\w가-힣.-]+", "_", str(name or "").strip(), flags=re.UNICODE)
         text = text.strip("._-")
         return text[:80] or "research"
+
+    def _publish_new_workspace(self, workspace_dir: Path, user_request: str) -> None:
+        """Surface a freshly-reserved workspace before the workflow runs.
+
+        Without this, the new workspace exists on disk but is hidden from
+        `_scan_run_workspaces` (no `final.md` / `summary/index.json` / docs
+        yet), so the sidebar and chat panels still show the previous
+        workspace until AutoSurvey completes minutes later.
+
+        Steps:
+        1. Write `summary/request.md` so the workspace passes the
+           "has any research evidence" filter in `_scan_run_workspaces`.
+        2. Update the in-memory workspace catalog and the persisted
+           `app_state.current_workspace_id` so `/api/v1/fe/bootstrap`
+           returns the new workspace as current.
+        3. Emit a `workspace_created` progress event with the new id,
+           display name, and absolute path so the frontend can update
+           info tiles, sidebar, and chat panels live.
+        """
+        workspace_id = workspace_dir.name
+        # 1. Make the workspace dir visible to _scan_run_workspaces.
+        try:
+            summary_dir = workspace_dir / "summary"
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            (summary_dir / "request.md").write_text(
+                str(user_request or "").strip(),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            print(f"[workspace][publish][warn] request.md: {e}")
+
+        # 2. Promote in-memory + persisted state.
+        try:
+            from ..api_common import utc_now_iso
+            from ..repositories import state_repository as repo
+            from . import workspaces_service
+
+            repo.upsert_workspace(
+                {
+                    "workspaceId": workspace_id,
+                    "name": workspace_id,
+                    "detail": "조사 진행 중",
+                    "status": "running",
+                    "lastWorkedAt": utc_now_iso(),
+                    "path": str(workspace_dir.resolve()),
+                }
+            )
+            repo.set_current_workspace(workspace_id)
+            workspaces_service.remember_current_workspace(workspace_id)
+        except Exception as e:
+            print(f"[workspace][publish][warn] catalog: {e}")
+
+        # 3. Tell the frontend.
+        self._emit_research_progress(
+            "workspace_created",
+            f"새 워크스페이스 생성: {workspace_id}",
+            detail={
+                "workspaceId": workspace_id,
+                "name": workspace_id,
+                "path": str(workspace_dir.resolve()),
+            },
+        )
 
     def _cleanup_pending_dirs(self) -> None:
         try:
@@ -428,12 +566,12 @@ class AgentRuntime:
         if self.rag_service.get_document_count() > 0:
             return
 
-        summary_dir = self.run_store_service.summary_dir
-        has_summary_docs = summary_dir.exists() and any(summary_dir.glob("doc_*.md"))
+        clean_md_dir = self.run_store_service.clean_md_dir
+        has_clean_md = clean_md_dir.exists() and any(clean_md_dir.glob("*.md"))
         indexed = 0
-        if has_summary_docs:
+        if has_clean_md:
             indexed = self.rag_service.index_autosurvey_output(
-                summary_dir=summary_dir,
+                clean_md_dir=clean_md_dir,
                 index_path=self.run_store_service.index_path,
                 clear_first=True,
             )
@@ -480,6 +618,12 @@ class AgentRuntime:
     def _document_summaries(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         documents: list[dict[str, Any]] = []
         for record in records:
+            # Duplicates are not collected documents — they carry no clean_md
+            # and no summary file, and hold a ``dup_*`` id. They stay in
+            # index.json only to short-circuit re-fetching the same URL, so
+            # they are excluded from every user-facing document list and count.
+            if record.get("duplicate_of"):
+                continue
             url = str(record.get("final_url") or record.get("url") or "").strip()
             title = str(record.get("title") or url or record.get("doc_id") or "Untitled").strip()
             documents.append(

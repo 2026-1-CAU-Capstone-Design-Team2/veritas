@@ -18,6 +18,9 @@ def create_research_job(
     workspace_id: str | None,
     instruction: str,
     reference_urls: list[str],
+    max_docs: int | None = None,
+    scout_docs: int | None = None,
+    collect_batch_size: int | None = None,
 ) -> dict[str, Any]:
     instruction_text = instruction.strip()
     if not instruction_text:
@@ -31,6 +34,7 @@ def create_research_job(
         "workspaceName": _workspace_name(selected_workspace_id),
         "instruction": instruction_text,
         "referenceUrls": [url.strip() for url in reference_urls if url.strip()],
+        "maxDocs": max_docs,
         "status": "running",
         "submittedAt": utc_now_iso(),
     }
@@ -42,11 +46,15 @@ def create_research_job(
             instruction=instruction_text,
             reference_urls=job["referenceUrls"],
             job_id=job_id,
+            max_docs=max_docs,
+            scout_docs=scout_docs,
+            collect_batch_size=collect_batch_size,
         )
     except Exception as e:
         job["status"] = "failed"
         job["error"] = str(e)
         job["completedAt"] = utc_now_iso()
+        job["elapsedSeconds"] = round(time.perf_counter() - started_at, 3)
         repo.save_research_job(job_id, job)
         raise HTTPException(status_code=502, detail=f"AutoSurvey workflow failed: {e}") from e
 
@@ -58,17 +66,27 @@ def create_research_job(
     documents = result.get("documents", [])
     if not isinstance(documents, list):
         documents = []
+    failed_documents = result.get("failed_documents", [])
+    if not isinstance(failed_documents, list):
+        failed_documents = []
+    failed_documents = [item for item in failed_documents if isinstance(item, dict)]
+    # A run where every other document summarized fine but some failed is a
+    # *partial* success, not an outright failure. "failed" is reserved for the
+    # whole workflow raising (handled in the except branch above).
+    job_status = "partial" if failed_documents else "completed"
     job.update(
         {
-            "status": "completed",
+            "status": job_status,
             "workspaceId": result_workspace_id,
             "workspaceName": result_workspace_name,
+            "maxDocs": result.get("max_docs") or max_docs,
             "completedAt": utc_now_iso(),
             "summary": final_excerpt,
             "finalPath": result.get("final_path"),
             "finalMarkdown": result.get("final_report", ""),
             "indexedChunks": result.get("indexed_chunks"),
             "documents": documents,
+            "failedDocuments": failed_documents,
             "documentCount": result.get("document_count", len(documents)),
             "nonDuplicateDocumentCount": result.get("non_duplicate_document_count"),
             "elapsedSeconds": elapsed_seconds,
@@ -141,29 +159,50 @@ def _sync_run_research_jobs() -> None:
 
         final_path = workspace_dir / "final.md"
         index_path = workspace_dir / "summary" / "index.json"
-        request_path = workspace_dir / "summary" / "request.txt"
+        request_path = workspace_dir / "summary" / "request.md"
+        timing_path = workspace_dir / "summary" / "timing.json"
         if not final_path.exists() and not index_path.exists():
             continue
 
         documents = _read_index_documents(index_path)
-        submitted_at = _mtime_iso(request_path if request_path.exists() else workspace_dir)
-        completed_at = _mtime_iso(final_path if final_path.exists() else workspace_dir)
+        # summary/timing.json is the authoritative run-duration record (written
+        # by run_autosurvey). When present, prefer its real timestamps over the
+        # filesystem mtimes, which are only a wall-clock approximation.
+        timing = _read_timing(timing_path)
+        submitted_at = timing.get("startedAt") or _mtime_iso(
+            request_path if request_path.exists() else workspace_dir
+        )
+        completed_at = timing.get("completedAt") or _mtime_iso(
+            final_path if final_path.exists() else workspace_dir
+        )
         final_markdown = _read_text(final_path, max_chars=1_000_000)
         instruction = _read_text(request_path, max_chars=4000) or workspace_id
+        # For finished runs, a document present in index.json with no summary
+        # file is a summarization failure -> the run as a whole is "partial".
+        if final_path.exists():
+            failed_documents = _failed_documents_from_disk(
+                workspace_dir / "summary", documents
+            )
+            status = "partial" if failed_documents else "completed"
+        else:
+            failed_documents = []
+            status = "running"
         job = {
             "jobId": f"rs_{workspace_id}",
             "workspaceId": workspace_id,
             "workspaceName": workspace_id,
             "instruction": instruction,
             "referenceUrls": [],
-            "status": "completed" if final_path.exists() else "running",
+            "status": status,
             "submittedAt": submitted_at,
             "completedAt": completed_at,
             "summary": final_markdown[:6000].strip(),
             "finalPath": str(final_path) if final_path.exists() else None,
             "finalMarkdown": final_markdown,
             "documents": documents,
+            "failedDocuments": failed_documents,
             "documentCount": len(documents),
+            "elapsedSeconds": timing.get("elapsedSeconds"),
             "collectedDocuments": documents,
             "workflowResult": {},
         }
@@ -215,6 +254,39 @@ def _format_document_list(documents: list[Any]) -> str:
     return "\n".join(lines)
 
 
+def _failed_documents_from_disk(
+    summary_dir: Path,
+    documents: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Documents present in index.json but with no summary file = failed.
+
+    Used when reconstructing a finished run from disk (the per-document failure
+    reasons are not persisted, so a generic reason is used). Duplicates are
+    skipped because they intentionally carry a duplicate-note summary file.
+    """
+    failed: list[dict[str, str]] = []
+    for doc in documents:
+        if not isinstance(doc, dict) or doc.get("duplicateOf"):
+            continue
+        doc_id = str(doc.get("docId") or "").strip()
+        if not doc_id:
+            continue
+        summary_file = summary_dir / f"doc_{doc_id}.md"
+        try:
+            has_summary = summary_file.exists() and summary_file.stat().st_size > 0
+        except Exception:
+            has_summary = False
+        if not has_summary:
+            failed.append(
+                {
+                    "docId": doc_id,
+                    "title": str(doc.get("title") or doc_id),
+                    "reason": "요약 파일이 생성되지 않았습니다 (요약 단계 실패).",
+                }
+            )
+    return failed
+
+
 def _read_index_documents(index_path: Path) -> list[dict[str, str]]:
     try:
         payload = json.loads(index_path.read_text(encoding="utf-8"))
@@ -227,6 +299,11 @@ def _read_index_documents(index_path: Path) -> list[dict[str, str]]:
     documents: list[dict[str, str]] = []
     for record in records:
         if not isinstance(record, dict):
+            continue
+        # Duplicates are not collected documents (see write_duplicate_record /
+        # agent_runtime._document_summaries); keep them out of the reloaded
+        # job's document list and count just like a freshly-finished run.
+        if record.get("duplicate_of"):
             continue
         url = str(record.get("final_url") or record.get("url") or "").strip()
         title = str(record.get("title") or url or record.get("doc_id") or "Untitled").strip()
@@ -241,6 +318,16 @@ def _read_index_documents(index_path: Path) -> list[dict[str, str]]:
             }
         )
     return documents
+
+
+def _read_timing(timing_path: Path) -> dict[str, Any]:
+    """Load summary/timing.json — the persisted run-duration record. Returns an
+    empty dict when the file is missing (older runs predate the timing file)."""
+    try:
+        payload = json.loads(timing_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _read_text(path: Path, *, max_chars: int) -> str:

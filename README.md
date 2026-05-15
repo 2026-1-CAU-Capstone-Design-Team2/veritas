@@ -64,6 +64,24 @@ RAG over generated markdown outputs, and schema-driven chat tool use.
   URL hyperlink (uses `QDesktopServices.openUrl`, auto-prepends `https://`
   when the URL has no scheme), and a `doc_NNN.md ↗` button that opens the
   corresponding `summary/doc_<docId>.md` in the OS default viewer.
+- AutoSurvey runs now publish the new workspace **immediately after
+  term-grounding** instead of at completion. `AgentRuntime.run_autosurvey`
+  calls a new `_publish_new_workspace` step right after
+  `_reserve_workspace_dir`: it writes `summary/request.txt` (so the
+  directory passes `_scan_run_workspaces`' "has any research evidence"
+  filter even before the first document lands), upserts the workspace
+  row + `current_workspace_id` into the in-memory catalog and the
+  SQLite `app_state`, and emits a new `workspace_created` progress
+  event with `{ workspaceId, name, path }`. The Research page picks up
+  the event and updates the info tiles (작업 이름 / 저장 경로) plus
+  emits a light `workspaceCreated` signal that `MainWindow` routes to
+  `sidebar.set_current_workspace(name)` and, crucially, to clearing
+  the chat panels — `WritePage.chat_panel.clear_messages()` and
+  `DocumentAssistWindow.hydrate_history([])` — so the previous
+  workspace's chat history doesn't bleed into the new workspace's
+  context. This signal intentionally does *not* trigger the heavy
+  `_on_workspace_changed` cascade so the live `DocumentBar` timeline
+  in the Research page survives the workspace adoption.
 - Workspace lifecycle is now consistent across the on-disk `runs/`
   directory and the local SQLite DB at `%LOCALAPPDATA%/VERITAS/veritas.db`.
   `db/workspace_sync.py` exposes two helpers:
@@ -272,15 +290,24 @@ The full workflow in `AutoSurveyWorkflow.run_all()` is:
 1. Save the user request and reset query state.
 2. Run term_grounding.
 3. Extract explicit `site:` reference-site constraints, if present.
-4. Fetch and summarize reference-site URLs directly when possible.
+4. Fetch and batch-summarize reference-site URLs directly when possible.
 5. Build the initial query plan from the request, grounded terms, and reference sites.
 6. Add site-scoped search queries for each reference site.
 7. Run a scout collection cycle.
-8. Summarize scout documents.
-9. Replan if summaries reveal relevant gaps.
-10. Continue collect -> summarize -> replan until max_docs or no queries remain.
-11. Write the final report.
+8. Batch-summarize scout documents.
+9. Replan if batch summaries reveal relevant gaps.
+10. Continue collect -> batch-summarize -> replan until max_docs or no queries remain.
+11. Per-document summaries: summarize every collected clean_md once (after the loop).
+12. Write the final report.
+13. Index clean_md into ChromaDB for RAG.
 ```
+
+Batch summary and per-document summary are independent consumers of each
+document's clean Markdown (`clean_md/<doc_id>.md`), not a chain. Batch summary
+runs inside the collect loop (it drives gap analysis / replan) and reads
+clean_md directly. Per-document summaries (`summary/doc_*.md`) are UX
+descriptors — source cards, citations, the verification view — so they do not
+feed replan and are generated once after the loop instead of every cycle.
 
 Internal AutoSurvey tools:
 
@@ -289,7 +316,7 @@ term_grounding      LLM extracts important literal terms only.
 query_plan          LLM builds search queries and coverage points.
 web_search          Searches the web for planned queries.
 fetch_webpage       Fetches and preprocesses web pages.
-document_summarize  Summarizes fetched documents and batches.
+document_summarize  Builds per-document and batch summaries from clean_md.
 final_report        Produces the final markdown report.
 ```
 
@@ -336,29 +363,36 @@ DuckDuckGo handles the submitted search syntax.
 
 ## Web Fetching
 
-`fetch_webpage_tool.py` uses the stable requests + BeautifulSoup extraction path only.
-Browser-based crawler integration has been removed to avoid Playwright / asyncio
-subprocess cleanup failures on Windows and to keep the fetch pipeline easy to debug.
+`fetch_webpage_tool.py` uses Crawl4AI's HTTP-only crawler strategy
+(`AsyncHTTPCrawlerStrategy`, backed by aiohttp — no Playwright browser) as its
+*only* fetch path. There is no fallback extractor: a URL Crawl4AI cannot fetch
+or extract is reported as a failure, so every document that *is* stored was
+fetched by Crawl4AI and can be persisted directly as clean Markdown.
 
 ```text
 1. DuckDuckGo returns result URLs.
-2. fetch_webpage fetches each URL with requests.
-3. BeautifulSoup removes noise tags and selects the likely main content node.
-4. Cleaned HTML is stored under corpus/raw_html/<doc_id>.html.
-5. Extracted plain text is stored under corpus/raw_text/<doc_id>.txt.
-6. document_summarize reads the plain text file directly.
+2. fetch_webpage fetches each URL via Crawl4AI's HTTP-only strategy.
+3. Crawl4AI (DefaultMarkdownGenerator + PruningContentFilter) converts the HTML
+   to clean, structure-preserving Markdown and strips boilerplate.
+4. The clean Markdown is stored under clean_md/<doc_id>.md.
+5. The original HTTP response HTML is archived (untruncated) under
+   corpus/raw_html/<doc_id>.html.
+6. A URL that fails is skipped; the collect loop moves on to the next result.
 ```
 
-Storage layout:
+Storage layout — document text artifacts are always Markdown:
 
 ```text
-corpus/raw_html/<doc_id>.html
-corpus/raw_text/<doc_id>.txt
-summary/doc_<n>.md
+clean_md/<doc_id>.md            # Crawl4AI clean Markdown — RAG source + summary input
+corpus/raw_html/<doc_id>.html   # original HTML archive (provenance only)
+summary/doc_<n>.md              # per-document summary (UX descriptor)
+summary/batch_<n>.md            # batch summary (gap analysis / final-report input)
 ```
 
 Fetched text is sanitized before writing, and file reads use UTF-8 with replacement
-so malformed page encodings do not stop summarization.
+so malformed page encodings do not stop summarization. `requests` /
+`beautifulsoup4` are still used by `web_search_tool.py` for DuckDuckGo HTML
+search, but no longer for page fetching.
 
 ## Term Grounding
 
@@ -475,8 +509,9 @@ recent history is context and should not override the current user message.
 Before `--phase rag` or `--phase chat`, `main.py` calls `ensure_rag_index()`.
 
 - If `--markdown-root` is omitted, `--output-dir` is used.
-- If AutoSurvey summaries exist and the markdown root is `--output-dir`, those
-  summaries are indexed.
+- If AutoSurvey `clean_md/` documents exist and the markdown root is
+  `--output-dir`, those clean Markdown documents are indexed. RAG answers are
+  grounded in the clean source text, not the lossy per-document summaries.
 - Otherwise markdown files under `--markdown-root` are indexed.
 - `--reindex` clears and rebuilds the vector index.
 - `--rag-results` controls `RAGService.n_results`.

@@ -2,7 +2,7 @@
   "type": "function",
   "function": {
     "name": "fetch_webpage",
-    "description": "Fetch a webpage from a URL, extract the main readable text content, and return the cleaned result along with metadata such as title and final URL.",
+    "description": "Fetch a webpage from a URL and extract its main content as clean Markdown using Crawl4AI's HTTP-only crawler (no browser) with structure-preserving HTML-to-Markdown conversion. Crawl4AI is the only fetch path: a URL it cannot fetch or extract is reported as a failure (the collect loop then moves on to another result). Returns the extracted Markdown text plus metadata such as title and final URL.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -12,13 +12,13 @@
         },
         "timeout_sec": {
           "type": "integer",
-          "description": "HTTP request timeout in seconds.",
+          "description": "HTTP request timeout in seconds. A hard outer bound of timeout_sec + 15s is also applied to the Crawl4AI path.",
           "default": 15
         },
         "max_chars": {
           "type": "integer",
-          "description": "Maximum number of characters to keep from the extracted text.",
-          "default": 12000
+          "description": "Maximum number of characters to keep from the extracted Markdown text. Raw HTML is archived separately for provenance and is not truncated.",
+          "default": 25000
         }
       },
       "required": ["url"]

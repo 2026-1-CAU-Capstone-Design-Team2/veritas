@@ -156,6 +156,41 @@ def set_local_access_settings(folder_paths: list[str]) -> dict[str, Any]:
     return STATE["settings"]["localAccess"]
 
 
+def set_document_tools_settings(custom_tools: list[dict[str, Any]]) -> dict[str, Any]:
+    """Persist the user-defined document editing tools.
+
+    Each tool is normalized to ``{"name", "identifier"}``; entries without a
+    name are dropped and exact duplicates are collapsed.
+    """
+    cleaned: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for tool in custom_tools:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name") or "").strip()
+        if not name:
+            continue
+        identifier = str(tool.get("identifier") or "").strip()
+        key = f"{name}|{identifier}".lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append({"name": name, "identifier": identifier})
+    STATE["settings"]["documentTools"] = {"custom": cleaned}
+    return STATE["settings"]["documentTools"]
+
+
+def set_research_method_settings(sample_count: int, plan_count: int) -> dict[str, Any]:
+    """Persist AutoSurvey pacing — initial scout sample size and per-plan
+    collect/batch-summary cycle size — so research runs honor the user's
+    설정 > 고급 설정 values."""
+    STATE["settings"]["research"] = {
+        "sampleCount": max(1, int(sample_count)),
+        "planCount": max(1, int(plan_count)),
+    }
+    return STATE["settings"]["research"]
+
+
 def get_current_workspace_id() -> str:
     return STATE["current_workspace_id"]
 

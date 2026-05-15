@@ -79,13 +79,13 @@ def ensure_rag_index(
             else output_dir
         )
 
-        summary_dir = run_store_service.summary_dir
-        has_summary_docs = summary_dir.exists() and any(summary_dir.glob("doc_*.md"))
+        clean_md_dir = run_store_service.clean_md_dir
+        has_clean_md = clean_md_dir.exists() and any(clean_md_dir.glob("*.md"))
 
-        if has_summary_docs and markdown_root == output_dir:
-            print("[info] Indexing AutoSurvey summaries for RAG...")
+        if has_clean_md and markdown_root == output_dir:
+            print("[info] Indexing AutoSurvey clean_md documents for RAG...")
             indexed = rag_service.index_autosurvey_output(
-                summary_dir=summary_dir,
+                clean_md_dir=clean_md_dir,
                 index_path=run_store_service.index_path,
                 clear_first=True,
             )

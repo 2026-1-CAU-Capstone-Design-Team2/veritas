@@ -2,7 +2,7 @@
   "type": "function",
   "function": {
     "name": "document_summarize",
-    "description": "Summarize collected documents into per-document markdown summaries and generate batch summaries.",
+    "description": "Summarize collected documents into per-document markdown summaries and generate batch summaries. Documents that fit the context budget are summarized in one pass; longer documents are chunked, noted per chunk, and reduced into one summary so no content is truncated away.",
     "parameters": {
       "type": "object",
       "properties": {

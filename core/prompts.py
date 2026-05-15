@@ -113,7 +113,49 @@ Rules:
 - Preserve technical terms, model names, product names, APIs, filenames, and citations in their original form when appropriate.
 """
 
-BATCH_SUMMARY_PROMPT = """You are given an original user request and multiple document summaries.
+# Map step of the long-document map-reduce path: notes are extracted from one
+# chunk at a time so that no part of an over-long document is truncated away.
+# Free-form text output (not JSON) is intentional — it is far more reliable for
+# small local models than strict JSON, and the strict schema is only required
+# once, at the reduce step below.
+DOC_CHUNK_NOTES_PROMPT = """Extract structured notes from ONE part of a longer document.
+You are given the document metadata, this part's index, the total number of parts, and the text of this part only. Later parts will be combined into a single document summary.
+Return plain text notes only — no JSON, no markdown headings, no preamble.
+Capture, when present in THIS part:
+- Concrete factual claims, definitions, methods, and conclusions
+- Numbers, dates, metrics, named entities, and model/product/API/file names
+- Specific statements worth quoting or verifying later
+Rules:
+- Use only content from the provided text part. Do not invent or infer beyond it.
+- Produce compact, atomic note lines (one claim per line). Do not write a narrative.
+- If this part has no substantive content, return exactly: (no substantive content)
+- Write notes in the original user request language when it is known. If it is Korean, write Korean notes even when the document text or technical terms are English.
+- Preserve technical terms, model/product/API names, filenames, numbers, and citations in their original form.
+"""
+
+# Reduce step of the long-document map-reduce path: ordered per-chunk notes are
+# synthesized into ONE document summary using the exact same schema as
+# DOC_SUMMARY_PROMPT, so downstream rendering is identical for both paths.
+DOC_SUMMARY_REDUCE_PROMPT = """Combine per-part notes from a long document into ONE document summary.
+You are given the document metadata and ordered notes extracted from every part of the document. The notes already cover the full document; treat them as the complete evidence.
+Return JSON only with this schema:
+{
+  "title": string,
+  "source_type": string,
+  "summary": string,
+  "key_points": [string, ...],
+  "reliability_notes": [string, ...],
+  "keywords": [string, ...]
+}
+Rules:
+- Synthesize across ALL parts. Merge duplicates and resolve overlap; do not just concatenate the notes.
+- Keep it concise. Prefer a 4-6 sentence summary and 3-6 key points.
+- Use only information present in the provided notes. Do not add outside knowledge.
+- Write the summary and notes in the original user request language when it is known. If it is Korean, write Korean even when titles, source metadata, or technical terms are English.
+- Preserve technical terms, model names, product names, APIs, filenames, and citations in their original form when appropriate.
+"""
+
+BATCH_SUMMARY_PROMPT = """You are given an original user request and the clean Markdown of multiple collected documents.
 Create a markdown batch note with these sections:
 # Batch Summary
 ## Repeated Findings

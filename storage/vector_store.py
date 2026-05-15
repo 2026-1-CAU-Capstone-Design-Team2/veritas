@@ -1,10 +1,68 @@
 """ChromaDB-based vector store for document embeddings."""
 
+import gc
 from pathlib import Path
 from typing import Any, Callable
 
 import chromadb
 from chromadb.config import Settings
+
+
+def _resolve_path(value: Any) -> Path | None:
+    if not value:
+        return None
+    try:
+        return Path(value).expanduser().resolve()
+    except Exception:
+        return None
+
+
+def release_chromadb_handles_for(target_dir: Any) -> None:
+    """Force-release ChromaDB SQLite handles for stores under ``target_dir``.
+
+    ChromaDB keeps a process-wide cache of "systems" keyed by persist directory,
+    each holding an open SQLite connection. On Windows that open handle prevents
+    the workspace directory from being deleted. Unlike ``Client.close()``, this
+    ignores client refcounts and stops the system outright -- it is meant for the
+    workspace-deletion path, where every client for that path is being discarded
+    anyway. Stores under other directories (other workspaces) are left untouched.
+    """
+    target = _resolve_path(target_dir)
+    if target is None:
+        gc.collect()
+        return
+
+    try:
+        from chromadb.api.shared_system_client import SharedSystemClient
+    except Exception:
+        gc.collect()
+        return
+
+    cache = getattr(SharedSystemClient, "_identifier_to_system", None)
+    refcounts = getattr(SharedSystemClient, "_identifier_to_refcount", None)
+    if not isinstance(cache, dict):
+        gc.collect()
+        return
+
+    for identifier, system in list(cache.items()):
+        try:
+            settings = getattr(system, "settings", None)
+            persist_dir = getattr(settings, "persist_directory", None) if settings else None
+        except Exception:
+            persist_dir = None
+        # For persistent clients the cache identifier IS the persist directory.
+        candidate = _resolve_path(persist_dir) or _resolve_path(identifier)
+        if candidate is None:
+            continue
+        if candidate == target or target in candidate.parents:
+            try:
+                system.stop()
+            except Exception:
+                pass
+            cache.pop(identifier, None)
+            if isinstance(refcounts, dict):
+                refcounts.pop(identifier, None)
+    gc.collect()
 
 
 class VectorStore:
@@ -42,6 +100,26 @@ class VectorStore:
             name=self.collection_name,
             metadata={"hnsw:space": "cosine"},
         )
+
+    def close(self) -> None:
+        """Release the ChromaDB client so its SQLite file handle is freed.
+
+        Idempotent. Must run before the workspace directory is deleted -- on
+        Windows an open ``chromadb/chroma.sqlite3`` handle makes the directory
+        undeletable. ``Client.close()`` decrements the shared-system refcount and
+        stops the system (closing SQLite) when the last client for that path is
+        closed; the targeted ``release_chromadb_handles_for`` is the force-release
+        fallback used by the workspace-deletion path.
+        """
+        client = getattr(self, "client", None)
+        self.collection = None
+        self.client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        gc.collect()
 
     def add_document(
         self,

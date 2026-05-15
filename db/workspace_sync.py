@@ -21,7 +21,9 @@ deliberately left alone — only rows whose recorded `path` is inside
 
 from __future__ import annotations
 
+import gc
 import shutil
+import time
 from pathlib import Path
 
 from .db import get_connection, init_db
@@ -100,10 +102,14 @@ def delete_workspace(workspace_id: str, runs_root: Path) -> dict[str, object]:
 
 		if _is_within(candidate, root) and candidate.exists() and candidate.is_dir():
 			try:
-				shutil.rmtree(candidate)
+				_force_remove_workspace_dir(candidate)
 				disk_removed = True
+				print(f"[workspace][delete] removed directory: {candidate}")
 			except Exception as e:
 				disk_error = f"{type(e).__name__}: {e}"
+				print(
+					f"[workspace][delete][error] could not remove {candidate}: {disk_error}"
+				)
 
 		_delete_workspace_rows(conn, workspace_id)
 		_clear_current_workspace_if_stale(conn, [workspace_id])
@@ -117,6 +123,44 @@ def delete_workspace(workspace_id: str, runs_root: Path) -> dict[str, object]:
 		"diskRemoved": disk_removed,
 		"diskError": disk_error,
 	}
+
+
+def _release_chromadb_handles(target_dir: Path) -> None:
+	"""Best-effort release of ChromaDB SQLite handles under ``target_dir``.
+
+	Each ``runs/<id>/`` workspace holds a ``chromadb/`` store, and ChromaDB keeps
+	the backing SQLite file open via a process-wide system cache. On Windows that
+	open handle blocks directory removal, so it must be released before rmtree.
+	"""
+	try:
+		from storage.vector_store import release_chromadb_handles_for
+
+		release_chromadb_handles_for(target_dir)
+	except Exception as e:
+		print(f"[workspace][delete][warn] could not release ChromaDB handles: {e}")
+
+
+def _force_remove_workspace_dir(path: Path, *, attempts: int = 4) -> None:
+	"""Remove a workspace directory, retrying around Windows file locks.
+
+	The usual blocker is a lingering ChromaDB SQLite handle in ``chromadb/``, so
+	each attempt first releases ChromaDB handles backing this directory, then
+	forces a GC pass before retrying.
+	"""
+	last_error: Exception | None = None
+	for attempt in range(attempts):
+		_release_chromadb_handles(path)
+		try:
+			shutil.rmtree(path)
+			return
+		except FileNotFoundError:
+			return
+		except Exception as e:
+			last_error = e
+			gc.collect()
+			time.sleep(0.3 * (attempt + 1))
+	if last_error is not None:
+		raise last_error
 
 
 def _delete_workspace_rows(conn, workspace_id: str) -> None:

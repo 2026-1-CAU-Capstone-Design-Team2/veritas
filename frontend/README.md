@@ -28,7 +28,7 @@
 Windows PowerShell:
 
 ```powershell
-cd C:\Users\chosw\VERITAS_CAPSTONE\veritas-core\frontend
+cd frontend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -50,28 +50,28 @@ pip install -r ../requirements.txt
 레포 루트에서 실행:
 
 ```powershell
-cd C:\Users\chosw\VERITAS_CAPSTONE\veritas-core
+cd 
 python -m frontend.main
 ```
 
 `frontend` 폴더 안에서 실행:
 
 ```powershell
-cd C:\Users\chosw\VERITAS_CAPSTONE\veritas-core\frontend
+cd frontend
 python main.py
 ```
 
 macOS/Linux에서 레포 루트 기준:
 
 ```bash
-cd /path/to/veritas-core
+cd /path/to/veritas
 python -m frontend.main
 ```
 
 macOS/Linux에서 `frontend` 폴더 기준:
 
 ```bash
-cd /path/to/veritas-core/frontend
+cd /path/to/veritas/frontend
 python main.py
 ```
 
