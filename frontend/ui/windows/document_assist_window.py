@@ -73,6 +73,36 @@ def _render_assistant_markdown(text: str) -> str:
 	return doc.toHtml()
 
 
+def render_history_html(history: list) -> list[dict]:
+	"""Pre-render a raw chat history into display-ready bubble specs.
+
+	Each spec is ``{"role", "text", "is_user", "html"}``. This is pure and
+	Qt-free (only :func:`render_markdown_html`), so it is safe to run on a
+	worker thread — that is the point: hydrating a long workspace history used
+	to parse every assistant message's markdown on the UI thread. ``html`` is an
+	empty string for user messages and whenever the optional ``markdown``
+	package is missing; the bubble then falls back to its own rendering.
+	"""
+	prepared: list[dict] = []
+	for item in history:
+		if not isinstance(item, dict):
+			continue
+		role = str(item.get("role") or "")
+		text = str(item.get("text") or "")
+		if not text:
+			continue
+		is_user = role == "user"
+		prepared.append(
+			{
+				"role": role,
+				"text": text,
+				"is_user": is_user,
+				"html": "" if is_user else render_markdown_html(text, font_size=None),
+			}
+		)
+	return prepared
+
+
 try:
 	from shiboken6 import isValid as _shiboken_is_valid
 except Exception:  # pragma: no cover - shiboken6 ships with PySide6
@@ -343,9 +373,34 @@ class SuggestionList(QFrame):
 			self.updateGeometry()
 
 	def add_suggestion(self, category: str, text: str, tone: str = "working") -> None:
-		items = [dict(item) for item in self._suggestions]
-		items.append({"category": category, "text": text, "tone": tone})
-		self.set_suggestions(items)
+		"""Append a single suggestion card.
+
+		Unlike :meth:`set_suggestions`, this does not tear down and rebuild every
+		existing card. The screen-monitoring poller feeds suggestions in one at a
+		time, so a full rebuild per event would be O(n²) as the list grows.
+		"""
+		item = {"category": category, "text": text, "tone": tone}
+		if not self._cards:
+			# Leaving the empty state: drop the placeholder + its trailing stretch.
+			self._clear()
+		else:
+			# The previous last card carried the fill stretch; hand it off so the
+			# new card is the one that grows to the bottom of the panel.
+			prev_index = self.layout.indexOf(self._cards[-1])
+			if prev_index >= 0:
+				self.layout.setStretch(prev_index, 0)
+
+		self._suggestions.append(item)
+		card = SuggestionCard(item["category"], item["text"], item["tone"])
+		card.set_card_width(self._content_width())
+		self._cards.append(card)
+		self.layout.addWidget(card, 1)
+
+		self.count_label.setText(f"{len(self._suggestions)}개")
+		self.schedule_width_update()
+		self.schedule_scroll_to_bottom()
+		if self._hug_content:
+			self.updateGeometry()
 
 	def schedule_scroll_to_bottom(self) -> None:
 		for delay in (0, 25, 80):
@@ -657,7 +712,15 @@ class _BubbleTextBrowser(QTextBrowser):
 
 
 class ChatMessageBubble(QFrame):
-	def __init__(self, sender: str, message: str, is_user: bool, parent: QWidget | None = None) -> None:
+	def __init__(
+		self,
+		sender: str,
+		message: str,
+		is_user: bool,
+		parent: QWidget | None = None,
+		*,
+		rendered_html: str | None = None,
+	) -> None:
 		super().__init__(parent)
 		self._is_user = is_user
 		# The original message text, kept so the copy button yields clean text
@@ -678,9 +741,13 @@ class ChatMessageBubble(QFrame):
 		# no markdown parse on the per-token path. A finished assistant answer is
 		# rendered from markdown to HTML once, via set_markdown(); an empty
 		# assistant bubble is a streaming turn about to begin, so it stays in
-		# raw-text mode until then.
+		# raw-text mode until then. `rendered_html` lets a caller supply HTML that
+		# was already parsed off the UI thread (history hydration) so the parse
+		# is never paid here.
 		if is_user:
 			self.text.set_plain(message or "")
+		elif rendered_html:
+			self.text.set_html(rendered_html)
 		elif message:
 			self.text.set_html(_render_assistant_markdown(message))
 		else:
@@ -824,6 +891,13 @@ class ChatPanel(QFrame):
 		self._scroll_timer.setSingleShot(True)
 		self._scroll_timer.setInterval(55)
 		self._scroll_timer.timeout.connect(self._scroll_to_bottom)
+		# Throttles bubble re-flow during a window drag-resize: re-measuring
+		# every bubble on every resize frame is wasted work, so a burst of
+		# resize events coalesces into one re-flow per tick.
+		self._resize_timer = QTimer(self)
+		self._resize_timer.setSingleShot(True)
+		self._resize_timer.setInterval(60)
+		self._resize_timer.timeout.connect(self._update_bubble_widths)
 		self._apply_bubble_font()
 
 	# -- chat answer text zoom (Ctrl +/-) --------------------------------
@@ -857,9 +931,16 @@ class ChatPanel(QFrame):
 		self._bubble_font_pt = self._BASE_FONT_PT
 		self._apply_bubble_font()
 
-	def add_message(self, sender: str, message: str, is_user: bool) -> ChatMessageBubble:
+	def add_message(
+		self,
+		sender: str,
+		message: str,
+		is_user: bool,
+		*,
+		rendered_html: str | None = None,
+	) -> ChatMessageBubble:
 		self.empty.hide()
-		bubble = ChatMessageBubble(sender, message, is_user)
+		bubble = ChatMessageBubble(sender, message, is_user, rendered_html=rendered_html)
 		bubble.set_bubble_width(self._bubble_width())
 		self._bubbles.append(bubble)
 
@@ -970,12 +1051,13 @@ class ChatPanel(QFrame):
 
 	def resizeEvent(self, event) -> None:  # type: ignore[override]
 		super().resizeEvent(event)
-		# Re-flow bubbles to the new width immediately, then once more on the
-		# next tick in case the scroll viewport size lagged this event by a
-		# frame — this is what keeps the answers sized proportionally to the
-		# window as the user drags its edge.
-		self._update_bubble_widths()
-		QTimer.singleShot(0, self._update_bubble_widths)
+		# Coalesce a drag-resize burst: re-measuring every bubble's wrapped
+		# height on every resize frame is wasted work. The throttle still
+		# re-flows roughly every 60ms during the drag and once when it settles,
+		# so the answers keep tracking the window width without the per-frame
+		# cost over the whole bubble list.
+		if not self._resize_timer.isActive():
+			self._resize_timer.start()
 
 	def _bubble_width(self) -> int:
 		viewport_width = max(280, self.scroll.viewport().width())
@@ -1404,9 +1486,13 @@ class DocumentAssistWindow(QWidget):
 		is_user = normalized_sender == "나"
 		self.chat_panel.add_message(normalized_sender, message, is_user)
 
-	def hydrate_history(self, history: list[dict[str, str]]) -> None:
+	def hydrate_history(self, history: list[dict]) -> None:
 		"""Replace the chat panel with the canonical workspace history so the
 		assist window mirrors the main chat page.
+
+		``history`` is a list of pre-rendered bubble specs from
+		:func:`render_history_html` — the per-message markdown parse already
+		happened on a worker thread, so this just builds bubbles.
 		"""
 		self.chat_panel.clear_messages()
 		if not history:
@@ -1417,15 +1503,17 @@ class DocumentAssistWindow(QWidget):
 			)
 			self._history_hydrated = True
 			return
-		for item in history:
-			if not isinstance(item, dict):
+		for spec in history:
+			if not isinstance(spec, dict):
 				continue
-			role = str(item.get("role") or "")
-			text = str(item.get("text") or "")
+			text = str(spec.get("text") or "")
 			if not text:
 				continue
-			sender = "나" if role == "user" else "VERITAS"
-			self.chat_panel.add_message(sender, text, role == "user")
+			is_user = bool(spec.get("is_user"))
+			sender = "나" if is_user else "VERITAS"
+			self.chat_panel.add_message(
+				sender, text, is_user, rendered_html=spec.get("html") or None
+			)
 		self._history_hydrated = True
 
 	def get_current_chat_input(self) -> str:

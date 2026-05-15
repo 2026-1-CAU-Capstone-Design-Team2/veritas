@@ -537,6 +537,10 @@ class ResearchPage(QWidget):
 		# `doc_fetched` events and activated on `doc_summarized`. The final
 		# response reconciles anything that polling may have missed.
 		self._doc_bars: dict[str, DocumentBar] = {}
+		# Monotonic guard for the background "load persisted result" fetch, so a
+		# slow `list_research_jobs` completion can't clobber a newer workspace
+		# load — or a research run the user started in the meantime.
+		self._result_load_token = 0
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
@@ -749,6 +753,9 @@ class ResearchPage(QWidget):
 			# we still bail out cleanly.
 			return
 
+		# Invalidate any in-flight "load persisted result" fetch so its late
+		# completion can't overwrite this run's live progress display.
+		self._result_load_token += 1
 		self._clear_documents()
 		self.info_row_widget.setVisible(False)
 		self.documents_header.setVisible(False)
@@ -1012,23 +1019,42 @@ class ResearchPage(QWidget):
 		# workspace-relative — workspace A's "001" and B's "001" are
 		# different documents) and only append B's tail end after A's bars.
 		self._clear_documents()
-		try:
-			jobs = AgentController().list_research_jobs(100)
-		except Exception:
+
+		# list_research_jobs is a blocking HTTP call — run it off the UI thread
+		# so app startup and workspace switches never freeze the window. The
+		# token guards against an out-of-order completion (a newer workspace
+		# load, or a research run the user started meanwhile) being clobbered.
+		self._result_load_token += 1
+		token = self._result_load_token
+		workspace_id = self._workspace_id
+
+		def _load() -> list:
+			return AgentController().list_research_jobs(100)
+
+		def _apply(jobs: object) -> None:
+			if token != self._result_load_token:
+				return
+			job_list = jobs if isinstance(jobs, list) else []
+			current_job = next(
+				(
+					job
+					for job in job_list
+					if isinstance(job, dict)
+					and str(job.get("workspaceId") or "") == workspace_id
+				),
+				None,
+			)
+			if current_job is None:
+				self._show_message("조사 실행 후 agent 결과가 여기에 표시됩니다.")
+				return
+			self._render_result(current_job)
+
+		def _failed(_message: str) -> None:
+			if token != self._result_load_token:
+				return
 			self._show_message("조사 실행 후 agent 결과가 여기에 표시됩니다.")
-			return
-		current_job = next(
-			(
-				job
-				for job in jobs
-				if isinstance(job, dict) and str(job.get("workspaceId") or "") == self._workspace_id
-			),
-			None,
-		)
-		if current_job is None:
-			self._show_message("조사 실행 후 agent 결과가 여기에 표시됩니다.")
-			return
-		self._render_result(current_job)
+
+		get_job_manager().run_detached(_load, on_success=_apply, on_error=_failed)
 
 	def _on_research_failed(self, message: str) -> None:
 		# Button re-enable is handled by JobManager.busy_changed → _sync_busy_state.
