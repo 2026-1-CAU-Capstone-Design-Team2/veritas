@@ -280,8 +280,8 @@ You are responding to an automatic screen-context intervention while the user is
 Rules:
 - Use the screen payload to understand what the user is currently writing or viewing.
 - Base writing suggestions on the latest 1-2 sentences in the screen writing context; do not restate or rework older document text unless it is explicitly included there.
-- Use the knowledge-base context when it is relevant, and cite document IDs in the form [Document <id>] when provided.
-- If the knowledge base does not support a factual claim, do not invent a source.
+- Cite document IDs in the form [Document <id>] ONLY when a matching entry literally appears in the KNOWLEDGE BASE CONTEXT section. The ID inside the brackets must match a literal entry shown there; do not invent IDs.
+- If KNOWLEDGE BASE CONTEXT is empty or contains only a parenthesized placeholder (for example "(No relevant knowledge-base documents found.)", "(The knowledge base is empty.)", "(no knowledge base context...)"), do NOT output any [Document ...] tokens in your reply at all.
 - Keep the response short and directly usable: suggest the next sentence, revision, supporting evidence, or a concise answer.
 - If the payload indicates no useful action, return a brief no-action explanation.
 - Do not mention implementation details such as OCR, UI Automation, polling, queues, or JSON unless needed to explain uncertainty.
@@ -305,8 +305,47 @@ SCREEN WRITING CONTEXT:
 INTERVENTION ROUTING HINT:
 {routing_hint}
 
+SCENARIO GUIDANCE:
+{scenario_guidance}
+
 KNOWLEDGE BASE CONTEXT:
 {knowledge_context}
 
 Write the assistant message that should appear in the chat for this screen context now.
 Language rule: answer in the dominant language of SCREEN WRITING CONTEXT. If SCREEN WRITING CONTEXT is Korean, answer in Korean."""
+
+
+SCREEN_SCENARIO_GUIDANCE_DEFAULT = (
+    "Respond helpfully to the on-screen situation, following the general rules above."
+)
+
+SCREEN_SCENARIO_GUIDANCE = {
+    "idle_after_writing": (
+        "The user just paused mid-paragraph; the writing flow is still warm. "
+        "Pick up from the last 1-2 sentences and propose either the next single sentence "
+        "to continue the thought, or one short supporting fact for what they just wrote. "
+        "If nothing useful comes to mind, return a brief no-action note rather than forcing content. "
+        "Keep it to roughly one sentence; do not break the user's momentum."
+    ),
+    "whole_document_review": (
+        "The user has built up a substantial document and it is a good moment for a holistic pass. "
+        "Comment on overall logical flow, section balance, and missing points - not individual sentence wording. "
+        "Deliver 2-3 focused observations as a short bulleted list."
+    ),
+    "long_static_review": (
+        "The document has been sitting open without edits for a long time; the user is likely re-reading and proofreading. "
+        "Scan the entire document and surface 2-3 distinct concrete issues - typos, awkward phrasing, factual slips - quoting the exact text and suggesting a fix for each. "
+        "Do not fixate on a single obvious problem; act as a copy editor making a pass through the whole text."
+    ),
+    "paragraph_churn": (
+        "The user has been writing and deleting within the same paragraph; they are stuck on phrasing. "
+        "Offer 1-2 concrete rewrites of the current paragraph (or the specific stuck sentence) as alternatives. "
+        "Stay strictly within the user's existing argument and concepts; do not introduce new ideas, terms, or supporting points they were not already trying to express. Rephrase only what is already there. "
+        "The goal is to unstick their phrasing, not to expand the argument."
+    ),
+    "blank_document_start": (
+        "The document is nearly empty; the user is at the very start. "
+        "Offer a low-pressure starting point - one suggested opening sentence or two, or a brief outline of how the piece could begin. "
+        "Present it as an option to take or leave, not as a fixed plan."
+    ),
+}
