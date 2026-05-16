@@ -396,7 +396,7 @@ SCREEN_SCENARIO_GUIDANCE = {
         "Stay within the structure the user has established; do not propose new top-level bullets or restructure the outline."
     ),
     "acronym_introduced": (
-        "The user's text contains an acronym (such as 'WTO', 'NATO', 'AI'). "
+        "The user's text contains an acronym (a multi-letter uppercase abbreviation). "
         "Check whether the surrounding text already defines it on first use. "
         "If undefined, propose one brief expansion in parentheses or as a short clarifying clause. "
         "Limit to a single suggestion for the most prominent acronym."
@@ -460,11 +460,6 @@ SCREEN_SCENARIO_GUIDANCE = {
         "The user's text relies on vague intensity modifiers ('매우', '정말', '아주' 등) repeatedly. "
         "Suggest a concrete substitute for one or two occurrences (a measurable detail or stronger verb). "
         "Stay within the same claim; do not amplify it."
-    ),
-    "jargon_dense_passage": (
-        "The user's current paragraph has a high density of technical jargon. "
-        "Pick one or two terms most likely to need clarification for a general reader and propose a brief gloss in parentheses or a one-line explanation. "
-        "Do not remove the technical terms; just make them accessible."
     ),
     "scattered_edits": (
         "The user has been making small edits scattered across the document rather than focused in one paragraph. "

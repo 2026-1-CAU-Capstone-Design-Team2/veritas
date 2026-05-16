@@ -14,7 +14,7 @@ from .models import (
 from .ocr_engine import OcrEngine
 from .powerpoint_com import PowerPointComReader
 from .scenario_scheduler import ScenarioScheduler, ScenarioSchedulerState, ScenarioWeights
-from .scenarios import (
+from .scenario import (
     AcronymIntroducedScenario,
     BlankDocumentStartScenario,
     CitationMissingScenario,
@@ -23,7 +23,6 @@ from .scenarios import (
     FactualClaimMadeScenario,
     HeadingAddedScenario,
     IdleAfterWritingScenario,
-    JargonDensePassageScenario,
     LargeDeletionScenario,
     LongParagraphWrittenScenario,
     LongStaticReviewScenario,
@@ -65,7 +64,6 @@ __all__ = [
     "InterventionDecision",
     "InterventionDetector",
     "InterventionDispatcher",
-    "JargonDensePassageScenario",
     "LargeDeletionScenario",
     "LongParagraphWrittenScenario",
     "LongStaticReviewScenario",

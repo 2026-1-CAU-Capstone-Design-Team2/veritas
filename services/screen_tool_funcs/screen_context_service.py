@@ -12,7 +12,7 @@ from .models import AppTextResult, OcrResult, ScreenContextEvent, UiAutomationRe
 from .ocr_engine import OcrEngine
 from .powerpoint_com import PowerPointComReader
 from .scenario_scheduler import ScenarioScheduler
-from .scenarios import (
+from .scenario import (
     AcronymIntroducedScenario,
     BlankDocumentStartScenario,
     CitationMissingScenario,
@@ -21,7 +21,6 @@ from .scenarios import (
     FactualClaimMadeScenario,
     HeadingAddedScenario,
     IdleAfterWritingScenario,
-    JargonDensePassageScenario,
     LargeDeletionScenario,
     LongParagraphWrittenScenario,
     LongStaticReviewScenario,
@@ -106,14 +105,13 @@ class ScreenContextService:
             TodoMarkerPresentScenario(),
             ManyQuestionMarksScenario(),
             CodeBlockPresentScenario(),
-            # Phase 4 — Tier 2-A (텍스트 패턴, 7개)
+            # Phase 4 — Tier 2-A (텍스트 패턴, 6개)
             QuoteInsertedScenario(),
             CitationMissingScenario(),
             FactualClaimMadeScenario(),
             RepeatedPhraseInParagraphScenario(),
             TransitionWordOveruseScenario(),
             WeakModifierOveruseScenario(),
-            JargonDensePassageScenario(),
             # Phase 4 — Tier 2-B (캡처간 diff, 4개)
             ScatteredEditsScenario(),
             LargeDeletionScenario(),

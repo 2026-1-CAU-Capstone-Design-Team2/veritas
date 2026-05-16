@@ -7,7 +7,7 @@ from typing import Any
 
 from .models import FilteredScreenContext, InterventionDecision, WindowContext
 from .scenario_scheduler import ScenarioScheduler, ScenarioWeights
-from .scenarios import (
+from .scenario import (
     IdleAfterWritingScenario,
     ScenarioContext,
     ScenarioEvaluation,
