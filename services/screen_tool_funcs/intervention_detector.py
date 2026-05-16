@@ -141,6 +141,7 @@ class InterventionDetector:
                     "blockers": common_blockers,
                     "selected": None,
                     "scheduler": None,
+                    "scheduler_trace": None,
                 },
             )
 
@@ -177,15 +178,18 @@ class InterventionDetector:
 
         ready_names = [name for name, ev in scenario_results.items() if ev.ready]
         scheduler_snapshot: dict[str, Any] | None = None
+        scheduler_trace: dict[str, Any] | None = None
         selected_name: str | None = None
         if schedule and ready_names and self.scheduler is not None:
             # 발동 시점의 정규화 문서 길이 — 글자수 기반 cooldown 판정용
             doc_chars = len(" ".join((filtered.active_editor_text or "").split()))
+            scheduler_trace = {}
             selected_name = self.scheduler.select_and_charge(
                 current_snapshot["document_key"],
                 ready_names,
                 now=now,
                 doc_chars=doc_chars,
+                trace_out=scheduler_trace,
             )
             scheduler_snapshot = self.scheduler.snapshot(
                 current_snapshot["document_key"], now=now
@@ -208,6 +212,9 @@ class InterventionDetector:
 
         if selected_name is None:
             blockers = [f"scenario:{name}:not_ready" for name in scenario_results if not scenario_results[name].ready]
+            # ready 후보가 있었는데 throttle로 막힌 경우, 전역 blocker도 함께 표시
+            if scheduler_trace and scheduler_trace.get("rejected_reason") == "global_throttle":
+                blockers.append("global_throttle_active")
             return InterventionDecision(
                 should_consider_llm=False,
                 intervention_type="none",
@@ -221,6 +228,7 @@ class InterventionDetector:
                     "blockers": blockers,
                     "selected": None,
                     "scheduler": scheduler_snapshot,
+                    "scheduler_trace": scheduler_trace,
                 },
             )
 
@@ -238,6 +246,7 @@ class InterventionDetector:
                 "blockers": [],
                 "selected": selected_name,
                 "scheduler": scheduler_snapshot,
+                "scheduler_trace": scheduler_trace,
             },
         )
 

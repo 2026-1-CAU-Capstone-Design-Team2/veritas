@@ -85,10 +85,27 @@ class ScenarioType(ABC):
     ScenarioEvaluation that the detector can compare against others.
     """
 
+    # priority → (initial_vruntime, vruntime_increment) 기본 매핑.
+    # 서브클래스가 클래스 attribute로 명시하지 않은 경우 __init__에서 적용.
+    _PRIORITY_VRUNTIME_DEFAULTS: dict[str, tuple[float, float]] = {
+        "high":   (-5.0, 3.0),
+        "medium": ( 0.0, 2.0),
+        "low":    ( 5.0, 2.0),
+    }
+
     name: str = ""
     priority: str = "medium"
     initial_vruntime: float = 0.0
     vruntime_increment: float = 1.0
+
+    @classmethod
+    def _default_vruntime_for_priority(cls, priority: str) -> tuple[float, float]:
+        """priority 문자열에서 (initial_vruntime, vruntime_increment) default를 반환.
+        모르는 priority면 medium 값으로 fallback.
+        """
+        return cls._PRIORITY_VRUNTIME_DEFAULTS.get(
+            priority, cls._PRIORITY_VRUNTIME_DEFAULTS["medium"]
+        )
 
     def __init__(
         self,
@@ -96,6 +113,15 @@ class ScenarioType(ABC):
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
+        # 서브클래스가 자체 클래스 namespace에 명시하지 않은 vruntime 값은 priority 기반 default로 채움.
+        # vars(cls)에 키가 없으면 명시 안 한 것 (베이스 ScenarioType에서 상속만 받은 상태).
+        cls_vars = vars(type(self))
+        derived_initial, derived_increment = self._default_vruntime_for_priority(self.priority)
+        if "initial_vruntime" not in cls_vars:
+            self.initial_vruntime = derived_initial
+        if "vruntime_increment" not in cls_vars:
+            self.vruntime_increment = derived_increment
+        # ctor 인자가 주어지면 instance-level override.
         if initial_vruntime is not None:
             self.initial_vruntime = initial_vruntime
         if vruntime_increment is not None:
@@ -158,6 +184,37 @@ class ScenarioType(ABC):
         paragraph = " ".join((filtered.current_paragraph_text or "").split())
         return len(paragraph) >= min_chars
 
+    def _time_cooldown_status(
+        self,
+        last_fired_at: dict[str, float],
+        *,
+        min_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """last_fired_at[self.name] 경과 시간이 min_seconds 이상이면 통과하는 시간 cooldown.
+        min_seconds=None이면 self.cooldown_min_seconds를 사용.
+        반환: {passed, reason, elapsed_seconds(있을 때), min_seconds}.
+        """
+        threshold = (
+            min_seconds
+            if min_seconds is not None
+            else float(getattr(self, "cooldown_min_seconds", 0.0))
+        )
+        last_at = last_fired_at.get(self.name)
+        if last_at is None:
+            return {
+                "passed": True,
+                "reason": "no_prior_fire",
+                "min_seconds": threshold,
+            }
+        elapsed_seconds = max(time.time() - last_at, 0.0)
+        passed = elapsed_seconds >= threshold
+        return {
+            "passed": passed,
+            "reason": "ok" if passed else "cooldown_active",
+            "elapsed_seconds": round(elapsed_seconds, 1),
+            "min_seconds": threshold,
+        }
+
 
 class IdleAfterWritingScenario(ScenarioType):
     """User wrote, then paused on the same paragraph -> request gentle continuation."""
@@ -175,6 +232,7 @@ class IdleAfterWritingScenario(ScenarioType):
         min_idle_captures: int = 2,
         idle_similarity_threshold: float = 0.985,
         cooldown_events: int = 3,
+        cooldown_min_seconds: float = 60.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -187,6 +245,7 @@ class IdleAfterWritingScenario(ScenarioType):
         self.min_idle_captures = min_idle_captures
         self.idle_similarity_threshold = idle_similarity_threshold
         self.cooldown_events = cooldown_events
+        self.cooldown_min_seconds = cooldown_min_seconds
 
     def evaluate(self, context: ScenarioContext) -> ScenarioEvaluation:
         evaluation = ScenarioEvaluation(name=self.name, priority=self.priority)
@@ -198,6 +257,8 @@ class IdleAfterWritingScenario(ScenarioType):
             document_key=context.document_key,
             paragraph_fingerprint=context.paragraph_fingerprint,
         )
+        time_cooldown = self._time_cooldown_status(context.last_fired_at)
+        time_cooldown_passed = bool(time_cooldown.get("passed"))
         # 현재 문단 길이 게이트 — 문단 단위 시나리오가 자기 책임으로 확인
         paragraph_chars = len(
             " ".join((context.filtered.current_paragraph_text or "").split())
@@ -221,6 +282,11 @@ class IdleAfterWritingScenario(ScenarioType):
                     "paragraph_fingerprint": context.paragraph_fingerprint,
                 },
             ),
+            "time_cooldown": self._gate_result(
+                time_cooldown_passed,
+                "time_cooldown_passed" if time_cooldown_passed else "time_cooldown_active",
+                time_cooldown,
+            ),
             "substantial_paragraph": self._gate_result(
                 substantial_paragraph_passed,
                 "substantial_paragraph" if substantial_paragraph_passed else "paragraph_too_short",
@@ -243,6 +309,12 @@ class IdleAfterWritingScenario(ScenarioType):
         else:
             evaluation.blockers.append("cooldown_or_duplicate")
 
+        # 시간 cooldown은 prereq: 점수 없이 blocker에만 기여
+        if time_cooldown_passed:
+            evaluation.reasons.append("time_cooldown_passed")
+        else:
+            evaluation.blockers.append("time_cooldown_active")
+
         # 점수 없는 순수 prerequisite: blocker에만 기여
         if substantial_paragraph_passed:
             evaluation.reasons.append("substantial_paragraph")
@@ -251,7 +323,7 @@ class IdleAfterWritingScenario(ScenarioType):
 
         evaluation.ready = not evaluation.blockers
         evaluation.priority = "high" if evaluation.ready and evaluation.score >= 0.7 else "medium"
-        evaluation.metadata = {"typing_pause": typing_pause}
+        evaluation.metadata = {"typing_pause": typing_pause, "time_cooldown": time_cooldown}
         return evaluation
 
     def writing_context_overrides(
@@ -707,7 +779,7 @@ class LongStaticReviewScenario(ScenarioType):
 
         static = self._prolonged_static_status(context.same_document_events)
         static_passed = bool(static.get("passed"))
-        cooldown = self._review_cooldown_status(context.last_fired_at)
+        cooldown = self._time_cooldown_status(context.last_fired_at)
         cooldown_passed = bool(cooldown.get("passed"))
 
         evaluation.gate_results = {
@@ -836,26 +908,6 @@ class LongStaticReviewScenario(ScenarioType):
             "min_document_chars": self.min_document_chars,
         }
 
-    def _review_cooldown_status(self, last_fired_at: dict[str, float]) -> dict[str, Any]:
-        """`last_fired_at[self.name]`(직전 발동 시각)과 현재 시각을 비교해,
-        경과가 `cooldown_min_seconds` 이상이면 통과시키는 시간 기반 cooldown.
-        """
-        last_at = last_fired_at.get(self.name)
-        if last_at is None:
-            return {
-                "passed": True,
-                "reason": "no_prior_review",
-                "min_seconds": self.cooldown_min_seconds,
-            }
-
-        elapsed_seconds = max(time.time() - last_at, 0.0)
-        passed = elapsed_seconds >= self.cooldown_min_seconds
-        return {
-            "passed": passed,
-            "reason": "ok" if passed else "cooldown_active",
-            "elapsed_seconds": round(elapsed_seconds, 1),
-            "min_seconds": self.cooldown_min_seconds,
-        }
 
     def _normalized_active_text(self, event: dict[str, Any]) -> str:
         filtered = event.get("filtered") or {}
@@ -917,7 +969,7 @@ class ParagraphChurnScenario(ScenarioType):
 
         churn = self._small_churn_status(context.same_document_events)
         churn_passed = bool(churn.get("passed"))
-        cooldown = self._churn_cooldown_status(context.last_fired_at)
+        cooldown = self._time_cooldown_status(context.last_fired_at)
         cooldown_passed = bool(cooldown.get("passed"))
         # 문단 단위 시나리오의 공유 prereq — 현재 문단이 개입할 만큼 충분한 길이인지
         substantial_passed = self._has_substantial_paragraph(
@@ -1035,24 +1087,6 @@ class ParagraphChurnScenario(ScenarioType):
             "max_net_change": self.max_net_change,
         }
 
-    def _churn_cooldown_status(self, last_fired_at: dict[str, float]) -> dict[str, Any]:
-        """`last_fired_at[self.name]`과 현재 시각을 비교하는 시간 기반 cooldown."""
-        last_at = last_fired_at.get(self.name)
-        if last_at is None:
-            return {
-                "passed": True,
-                "reason": "no_prior_fire",
-                "min_seconds": self.cooldown_min_seconds,
-            }
-        elapsed_seconds = max(time.time() - last_at, 0.0)
-        passed = elapsed_seconds >= self.cooldown_min_seconds
-        return {
-            "passed": passed,
-            "reason": "ok" if passed else "cooldown_active",
-            "elapsed_seconds": round(elapsed_seconds, 1),
-            "min_seconds": self.cooldown_min_seconds,
-        }
-
     def _normalized_active_text(self, event: dict[str, Any]) -> str:
         filtered = event.get("filtered") or {}
         text = str(filtered.get("active_editor_text") or "")
@@ -1094,7 +1128,7 @@ class BlankDocumentStartScenario(ScenarioType):
 
         blank = self._near_empty_status(context.same_document_events)
         blank_passed = bool(blank.get("passed"))
-        cooldown = self._start_cooldown_status(context.last_fired_at)
+        cooldown = self._time_cooldown_status(context.last_fired_at)
         cooldown_passed = bool(cooldown.get("passed"))
 
         evaluation.gate_results = {
@@ -1178,24 +1212,6 @@ class BlankDocumentStartScenario(ScenarioType):
             "min_blank_captures": self.min_blank_captures,
             "current_text_chars": last_chars,
             "max_document_chars": self.max_document_chars,
-        }
-
-    def _start_cooldown_status(self, last_fired_at: dict[str, float]) -> dict[str, Any]:
-        """`last_fired_at[self.name]`과 현재 시각을 비교하는 시간 기반 cooldown."""
-        last_at = last_fired_at.get(self.name)
-        if last_at is None:
-            return {
-                "passed": True,
-                "reason": "no_prior_fire",
-                "min_seconds": self.cooldown_min_seconds,
-            }
-        elapsed_seconds = max(time.time() - last_at, 0.0)
-        passed = elapsed_seconds >= self.cooldown_min_seconds
-        return {
-            "passed": passed,
-            "reason": "ok" if passed else "cooldown_active",
-            "elapsed_seconds": round(elapsed_seconds, 1),
-            "min_seconds": self.cooldown_min_seconds,
         }
 
     def _normalized_active_text(self, event: dict[str, Any]) -> str:
