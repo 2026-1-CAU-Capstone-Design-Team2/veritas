@@ -13,10 +13,29 @@ from .ocr_engine import OcrEngine
 from .powerpoint_com import PowerPointComReader
 from .scenario_scheduler import ScenarioScheduler
 from .scenarios import (
+    AcronymIntroducedScenario,
     BlankDocumentStartScenario,
+    CitationMissingScenario,
+    CodeBlockPresentScenario,
+    CopyPasteGrowthScenario,
+    FactualClaimMadeScenario,
+    HeadingAddedScenario,
     IdleAfterWritingScenario,
+    JargonDensePassageScenario,
+    LargeDeletionScenario,
+    LongParagraphWrittenScenario,
     LongStaticReviewScenario,
+    ManyQuestionMarksScenario,
+    NumberedListGrowthScenario,
+    OutlinePhaseScenario,
     ParagraphChurnScenario,
+    QuoteInsertedScenario,
+    RepeatedPhraseInParagraphScenario,
+    ScatteredEditsScenario,
+    TodoMarkerPresentScenario,
+    TransitionWordOveruseScenario,
+    UndoCycleDetectedScenario,
+    WeakModifierOveruseScenario,
     WholeDocumentReviewScenario,
 )
 from .screen_capture import ScreenCapture
@@ -72,11 +91,34 @@ class ScreenContextService:
         # to the detector via a post-construction setter — which would silently
         # drift if anyone replaced detector.scenarios at runtime.
         scenarios = [
+            # Phase 1-3 (기존 5개)
             IdleAfterWritingScenario(),
             WholeDocumentReviewScenario(),
             LongStaticReviewScenario(),
             ParagraphChurnScenario(),
             BlankDocumentStartScenario(),
+            # Phase 4 — Tier 1 (현재 캡처 payload 기반, 8개)
+            OutlinePhaseScenario(),
+            AcronymIntroducedScenario(),
+            HeadingAddedScenario(),
+            LongParagraphWrittenScenario(),
+            NumberedListGrowthScenario(),
+            TodoMarkerPresentScenario(),
+            ManyQuestionMarksScenario(),
+            CodeBlockPresentScenario(),
+            # Phase 4 — Tier 2-A (텍스트 패턴, 7개)
+            QuoteInsertedScenario(),
+            CitationMissingScenario(),
+            FactualClaimMadeScenario(),
+            RepeatedPhraseInParagraphScenario(),
+            TransitionWordOveruseScenario(),
+            WeakModifierOveruseScenario(),
+            JargonDensePassageScenario(),
+            # Phase 4 — Tier 2-B (캡처간 diff, 4개)
+            ScatteredEditsScenario(),
+            LargeDeletionScenario(),
+            CopyPasteGrowthScenario(),
+            UndoCycleDetectedScenario(),
         ]
         self.scenario_scheduler = ScenarioScheduler(
             self.store,
