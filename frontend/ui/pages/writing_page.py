@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QFrame, QVBoxLayout, QWidget
 
+from ...controllers import format_screen_event, get_screen_event_store
 from ..windows.document_assist_window import SuggestionList
 
 
@@ -10,7 +11,12 @@ class DocumentAssistPage(QWidget):
 		super().__init__(parent)
 		self.setObjectName("DocumentAssistPage")
 		self._build_ui()
-		self._load_demo_data()
+		# screen-monitoring 이벤트 broker 연결 — floating 보조창과 같은 데이터 공유.
+		self._screen_store = get_screen_event_store()
+		self._screen_store.eventsAppended.connect(self._on_screen_events_appended)
+		# 워크스페이스 전환 시 store.clear() → cleared emit → hydrate로 위젯 reset.
+		self._screen_store.cleared.connect(self._hydrate_screen_suggestions)
+		self._hydrate_screen_suggestions()
 
 	def _build_ui(self) -> None:
 		root = QVBoxLayout(self)
@@ -29,21 +35,33 @@ class DocumentAssistPage(QWidget):
 
 		root.addWidget(panel, 1)
 
-	def _load_demo_data(self) -> None:
-		self.suggestion_list.set_suggestions(
-			[
-				{
-					"category": "수정",
-					"text": "본 보고서는 2026년 AI 규제 변화가 기업 운영에 미치는 영향을 분석하고, 우선 대응이 필요한 리스크를 정리합니다.",
-					"tone": "working",
-				},
-				{
-					"category": "근거 보강",
-					"text": "효율성 개선 효과는 내부 처리 시간 비교 데이터 또는 외부 벤치마크 수치를 함께 제시하면 더 설득력 있습니다.",
-					"tone": "warning",
-				},
-			]
-		)
+	def _hydrate_screen_suggestions(self) -> None:
+		"""store history 전체로 suggestion_list 재구성. show 시점마다 호출되어 양쪽 위젯 동기화 보장."""
+		history = self._screen_store.get_history()
+		suggestions: list[dict[str, str]] = []
+		for item in history:
+			formatted = format_screen_event(item)
+			if formatted is None:
+				continue
+			category, text, tone = formatted
+			suggestions.append({"category": category, "text": text, "tone": tone})
+		self.suggestion_list.set_suggestions(suggestions)
+
+	def _on_screen_events_appended(self, items: list) -> None:
+		"""실시간 append — 보이는 동안만 add_suggestion, 숨김 동안은 다음 hydrate에서 일괄 보충."""
+		if not self.isVisible():
+			return
+		for item in items:
+			if not isinstance(item, dict):
+				continue
+			formatted = format_screen_event(item)
+			if formatted is None:
+				continue
+			self.suggestion_list.add_suggestion(*formatted)
+
+	def showEvent(self, event) -> None:  # type: ignore[override]
+		super().showEvent(event)
+		self._hydrate_screen_suggestions()
 
 	def update_assist_text(self, text: str) -> None:
 		self.suggestion_list.set_suggestions([{"category": "수정", "text": text, "tone": "working"}])
