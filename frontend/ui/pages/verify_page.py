@@ -118,13 +118,32 @@ class VerifyProgressPoller(QThread):
 				elapsed += 100
 
 
-class _SummaryStripe(QFrame):
-	"""Headline counts: 평균 일치율 · 신뢰도 분포 · 미해결 항목.
+class _ClickableLabel(QLabel):
+	"""QLabel that emits ``clicked`` on left-click and uses a pointer cursor."""
 
-	Stays compact so the run button and progress bar remain the page's visual
-	focus. Numbers default to dashes so the empty state reads "검증 결과 없음"
-	rather than a row of zeros.
+	clicked = Signal()
+
+	def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+		super().__init__(text, parent)
+		self.setCursor(Qt.PointingHandCursor)
+
+	def mousePressEvent(self, event) -> None:  # type: ignore[override]
+		if event.button() == Qt.LeftButton:
+			self.clicked.emit()
+			event.accept()
+			return
+		super().mousePressEvent(event)
+
+
+class _SummaryStripe(QFrame):
+	"""Headline counts: 평균 일치율 · 신뢰도 분포 · 점검 필요 항목.
+
+	The "점검 필요 항목" stat is clickable: clicking it asks the page to open
+	the issues dialog. When no issues exist (or no verification has run yet)
+	the click is a no-op and the styling stays subdued.
 	"""
+
+	issuesClicked = Signal()
 
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
@@ -134,7 +153,9 @@ class _SummaryStripe(QFrame):
 			"border: 1px solid #E2E8F0; border-radius: 12px; }"
 			"QLabel#SummaryCaption { color: #64748B; font-size: 11px; font-weight: 700; }"
 			"QLabel#SummaryValue { color: #0F172A; font-size: 20px; font-weight: 800; }"
+			"QLabel#SummaryValueClickable { color: #4F46E5; font-size: 20px; font-weight: 800; text-decoration: underline; }"
 			"QLabel#SummaryHint { color: #64748B; font-size: 12px; font-weight: 600; }"
+			"QLabel#SummaryActionHint { color: #4F46E5; font-size: 10px; font-weight: 700; }"
 		)
 		row = QHBoxLayout(self)
 		row.setContentsMargins(16, 12, 16, 12)
@@ -144,7 +165,8 @@ class _SummaryStripe(QFrame):
 		self._high = self._stat("높음", "—")
 		self._medium = self._stat("중간", "—")
 		self._low = self._stat("낮음", "—")
-		self._issues = self._stat("점검 필요 항목", "—")
+		self._issues = self._stat("점검 필요 항목", "—", clickable=True, action_hint="자세히 보기")
+		self._issues["value"].clicked.connect(self.issuesClicked)
 
 		for stat in (self._average, self._high, self._medium, self._low, self._issues):
 			row.addLayout(stat["layout"])
@@ -156,40 +178,79 @@ class _SummaryStripe(QFrame):
 		self._hint.setWordWrap(True)
 		row.addWidget(self._hint, 0, Qt.AlignRight | Qt.AlignVCenter)
 
-	def _stat(self, caption: str, value: str) -> dict[str, Any]:
+		self._issue_count = 0
+
+	def _stat(
+		self,
+		caption: str,
+		value: str,
+		*,
+		clickable: bool = False,
+		action_hint: str = "",
+	) -> dict[str, Any]:
 		layout = QVBoxLayout()
 		layout.setContentsMargins(0, 0, 0, 0)
 		layout.setSpacing(2)
 		caption_label = QLabel(caption)
 		caption_label.setObjectName("SummaryCaption")
-		value_label = QLabel(value)
-		value_label.setObjectName("SummaryValue")
+		if clickable:
+			value_label: QLabel = _ClickableLabel(value)
+			value_label.setObjectName("SummaryValueClickable")
+		else:
+			value_label = QLabel(value)
+			value_label.setObjectName("SummaryValue")
 		layout.addWidget(caption_label)
 		layout.addWidget(value_label)
-		return {"layout": layout, "caption": caption_label, "value": value_label}
+		action_label: QLabel | None = None
+		if clickable and action_hint:
+			action_label = QLabel(action_hint)
+			action_label.setObjectName("SummaryActionHint")
+			layout.addWidget(action_label)
+		return {
+			"layout": layout,
+			"caption": caption_label,
+			"value": value_label,
+			"action": action_label,
+		}
 
 	def apply(self, summary: dict[str, Any] | None) -> None:
 		if not summary or not summary.get("available"):
 			for stat in (self._average, self._high, self._medium, self._low, self._issues):
 				stat["value"].setText("—")
 			self._hint.setText("")
+			self._issue_count = 0
+			self._update_issues_affordance()
 			return
 		avg = int(summary.get("averageMatchPercent") or 0)
 		self._average["value"].setText(f"{avg}%")
 		self._high["value"].setText(str(int(summary.get("highCount") or 0)))
 		self._medium["value"].setText(str(int(summary.get("mediumCount") or 0)))
 		self._low["value"].setText(str(int(summary.get("lowCount") or 0)))
-		issue_total = (
+		self._issue_count = (
 			int(summary.get("unmetMustCoverCount") or 0)
 			+ int(summary.get("intentGapCount") or 0)
 			+ int(summary.get("conflictCount") or 0)
 		)
-		self._issues["value"].setText(str(issue_total))
+		self._issues["value"].setText(str(self._issue_count))
 		updated = summary.get("updatedAt")
 		if updated:
 			self._hint.setText(f"마지막 검증: {str(updated).replace('T', ' ').split('.')[0]} UTC")
 		else:
 			self._hint.setText("")
+		self._update_issues_affordance()
+
+	def _update_issues_affordance(self) -> None:
+		"""Show the '자세히 보기' hint only when there is something to drill into."""
+		action = self._issues.get("action")
+		if action is None:
+			return
+		if self._issue_count > 0:
+			action.setText("자세히 보기")
+			action.setVisible(True)
+			self._issues["value"].setCursor(Qt.PointingHandCursor)
+		else:
+			action.setVisible(False)
+			self._issues["value"].setCursor(Qt.ArrowCursor)
 
 
 class VerifyDetailDialog(QDialog):
@@ -402,6 +463,406 @@ def _normalize_score(value: float, hi: float) -> float:
 	return max(0.0, min(1.0, value / hi))
 
 
+# Per-issue palette: header chip + body tint. Tuned to match the badge tones
+# used elsewhere on the verify page so the user reads the kind at a glance.
+_ISSUE_PALETTE = {
+	"unmet_must_cover": ("#FEF3C7", "#B45309", "#FDE68A", "근거 부족"),
+	"conflict": ("#FEE2E2", "#B91C1C", "#FCA5A5", "출처 충돌"),
+	"intent_gap": ("#E0E7FF", "#3730A3", "#C7D2FE", "의도 미커버"),
+}
+
+
+class VerifyIssuesDialog(QDialog):
+	"""Modal listing every workspace-level "점검 필요 항목" in plain Korean.
+
+	Three kinds are mixed in one ordered list (unmet must_cover → conflict →
+	intent gap, per ``verify_view.issues_overview``). A leading chip tells the
+	user what kind each row is without needing a legend.
+	"""
+
+	def __init__(self, issues: list[dict[str, Any]], parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self.setObjectName("VerifyIssuesDialog")
+		self.setWindowTitle("점검 필요 항목")
+		self.setModal(True)
+		self.resize(620, 540)
+		self.setStyleSheet(
+			"""
+			QDialog#VerifyIssuesDialog { background-color: #F8FAFC; }
+			QFrame#IssuesHeader {
+				background-color: #FFFFFF; border: 1px solid #E2E8F0;
+				border-radius: 12px;
+			}
+			QFrame#IssueCard {
+				background-color: #FFFFFF; border: 1px solid #E5E7EB;
+				border-radius: 10px;
+			}
+			QLabel#IssueKindChip {
+				font-size: 11px; font-weight: 800;
+				padding: 3px 10px; border-radius: 11px;
+			}
+			QLabel#IssueTitle   { color: #0F172A; font-size: 13px; font-weight: 800; }
+			QLabel#IssueDetail  { color: #1F2937; font-size: 12px; font-weight: 600; }
+			QLabel#IssueHint    { color: #64748B; font-size: 11px; font-weight: 600; }
+			QLabel#IssueMetric  { color: #94A3B8; font-size: 11px; font-weight: 700; }
+			"""
+		)
+
+		layout = QVBoxLayout(self)
+		layout.setContentsMargins(18, 18, 18, 18)
+		layout.setSpacing(12)
+
+		header = QFrame()
+		header.setObjectName("IssuesHeader")
+		header_layout = QVBoxLayout(header)
+		header_layout.setContentsMargins(16, 14, 16, 14)
+		header_layout.setSpacing(6)
+		title = QLabel("점검 필요 항목")
+		title.setObjectName("CardTitle")
+		caption = QLabel(
+			"조사 결과에서 자동으로 감지된 점검 항목입니다. 각 항목은 자료 보강이"
+			" 필요한 부분(근거 부족), 출처 간 입장 차이(출처 충돌), 또는 사용자 의도가"
+			" 충분히 받쳐지지 않은 영역(의도 미커버)을 의미합니다."
+		)
+		caption.setObjectName("CardSecondary")
+		caption.setWordWrap(True)
+		header_layout.addWidget(title)
+		header_layout.addWidget(caption)
+		layout.addWidget(header)
+
+		scroll = QScrollArea()
+		scroll.setWidgetResizable(True)
+		scroll.setFrameShape(QFrame.NoFrame)
+		scroll.setObjectName("PageScroll")
+		container = QWidget()
+		container_layout = QVBoxLayout(container)
+		container_layout.setContentsMargins(0, 0, 0, 0)
+		container_layout.setSpacing(10)
+
+		if not issues:
+			empty = QLabel("점검이 필요한 항목이 발견되지 않았습니다.")
+			empty.setObjectName("CardSecondary")
+			empty.setAlignment(Qt.AlignCenter)
+			empty.setWordWrap(True)
+			container_layout.addWidget(empty)
+		else:
+			for issue in issues:
+				container_layout.addWidget(self._issue_card(issue))
+		container_layout.addStretch(1)
+
+		scroll.setWidget(container)
+		layout.addWidget(scroll, 1)
+
+		buttons = QDialogButtonBox(QDialogButtonBox.Close)
+		buttons.rejected.connect(self.reject)
+		buttons.accepted.connect(self.accept)
+		layout.addWidget(buttons)
+
+	def _issue_card(self, issue: dict[str, Any]) -> QFrame:
+		kind = str(issue.get("kind") or "")
+		bg, fg, border, kind_label = _ISSUE_PALETTE.get(
+			kind, ("#F1F5F9", "#475569", "#CBD5E1", "기타")
+		)
+
+		card = QFrame()
+		card.setObjectName("IssueCard")
+		layout = QVBoxLayout(card)
+		layout.setContentsMargins(14, 12, 14, 12)
+		layout.setSpacing(6)
+
+		head = QHBoxLayout()
+		head.setContentsMargins(0, 0, 0, 0)
+		head.setSpacing(8)
+		chip = QLabel(kind_label)
+		chip.setObjectName("IssueKindChip")
+		chip.setStyleSheet(
+			f"QLabel#IssueKindChip {{ background-color: {bg}; color: {fg};"
+			f" border: 1px solid {border}; }}"
+		)
+		head.addWidget(chip, 0, Qt.AlignLeft)
+		metric = QLabel(str(issue.get("metric") or ""))
+		metric.setObjectName("IssueMetric")
+		head.addStretch(1)
+		head.addWidget(metric, 0, Qt.AlignRight)
+		layout.addLayout(head)
+
+		title = QLabel(str(issue.get("title") or ""))
+		title.setObjectName("IssueTitle")
+		title.setWordWrap(True)
+		layout.addWidget(title)
+
+		detail = QLabel(str(issue.get("detail") or ""))
+		detail.setObjectName("IssueDetail")
+		detail.setWordWrap(True)
+		detail.setTextInteractionFlags(
+			Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+		)
+		layout.addWidget(detail)
+
+		hint = str(issue.get("hint") or "")
+		if hint:
+			hint_label = QLabel(hint)
+			hint_label.setObjectName("IssueHint")
+			hint_label.setWordWrap(True)
+			layout.addWidget(hint_label)
+		return card
+
+
+class _SectionCard(QFrame):
+	"""One auto-identified report section, surfaced as a clickable card.
+
+	Click → emits ``clicked`` with the section's id. The page uses that to
+	open the section detail dialog (label list + top doc names + match
+	signals). The card itself only shows the headline labels, counts, and an
+	"점검 필요" marker when the section has uncovered must_cover items.
+	"""
+
+	clicked = Signal(int)
+
+	def __init__(
+		self,
+		section: dict[str, Any],
+		has_unmet: bool,
+		parent: QWidget | None = None,
+	) -> None:
+		super().__init__(parent)
+		self._section_id = int(section.get("sectionId") or 0)
+		self.setObjectName("SectionCard")
+		self.setCursor(Qt.PointingHandCursor)
+		self.setStyleSheet(
+			"QFrame#SectionCard { background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px; }"
+			"QFrame#SectionCard:hover { border-color: #6366F1; }"
+			"QLabel#SectionLabels { color: #0F172A; font-size: 13px; font-weight: 800; }"
+			"QLabel#SectionMeta { color: #64748B; font-size: 11px; font-weight: 700; }"
+			"QLabel#SectionAlert { color: #B45309; font-size: 11px; font-weight: 800; }"
+		)
+		layout = QVBoxLayout(self)
+		layout.setContentsMargins(14, 12, 14, 12)
+		layout.setSpacing(4)
+
+		labels = ", ".join(str(t) for t in (section.get("labels") or []) if str(t).strip())
+		if not labels:
+			labels = f"섹션 {self._section_id}"
+		label_widget = QLabel(labels)
+		label_widget.setObjectName("SectionLabels")
+		label_widget.setWordWrap(True)
+		layout.addWidget(label_widget)
+
+		meta = QLabel(
+			f"근거 chunk {int(section.get('evidenceCount') or 0)}건"
+			f" · 관련 자료 {int(section.get('documentCount') or 0)}건"
+			f" · must_cover {int(section.get('mustCoverCount') or 0)}개"
+		)
+		meta.setObjectName("SectionMeta")
+		layout.addWidget(meta)
+
+		if has_unmet:
+			alert = QLabel("● 자료에서 충분히 확인되지 않은 must_cover 항목이 있습니다.")
+			alert.setObjectName("SectionAlert")
+			alert.setWordWrap(True)
+			layout.addWidget(alert)
+
+	def mousePressEvent(self, event) -> None:  # type: ignore[override]
+		if event.button() == Qt.LeftButton:
+			self.clicked.emit(self._section_id)
+			event.accept()
+			return
+		super().mousePressEvent(event)
+
+
+class _SectionsPanel(CardWidget):
+	"""'보고서 섹션 구조' 패널 — surfaces Task 1 (sections) results inline.
+
+	Sits between the summary stripe and the per-doc results so the user sees
+	the *report structure* the verification found before scrolling through
+	per-doc ratings.
+	"""
+
+	sectionClicked = Signal(int)
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(title="보고서 섹션 구조", parent=parent)
+		caption = QLabel(
+			"조사 자료가 자동으로 묶인 보고서 섹션입니다. 각 섹션을 클릭하면 어떤"
+			" 자료가 그 섹션을 가장 잘 받쳐주는지 확인할 수 있습니다."
+		)
+		caption.setObjectName("CardSecondary")
+		caption.setWordWrap(True)
+		self.layout.addWidget(caption)
+
+		self._cards_layout = QVBoxLayout()
+		self._cards_layout.setContentsMargins(0, 0, 0, 0)
+		self._cards_layout.setSpacing(8)
+		self.layout.addLayout(self._cards_layout)
+
+		self._empty_label: QLabel | None = None
+
+	def apply(self, sections: list[dict[str, Any]], unmet_count: int) -> None:
+		"""Rebuild the card grid from the latest sections overview payload."""
+		while self._cards_layout.count():
+			item = self._cards_layout.takeAt(0)
+			widget = item.widget() if item else None
+			if widget is not None:
+				widget.setParent(None)
+				widget.deleteLater()
+		self._empty_label = None
+
+		if not sections:
+			empty = QLabel("섹션 구조가 아직 분석되지 않았습니다.")
+			empty.setObjectName("CardSecondary")
+			empty.setAlignment(Qt.AlignCenter)
+			empty.setWordWrap(True)
+			self._cards_layout.addWidget(empty)
+			self._empty_label = empty
+			return
+
+		# We don't know per-section unmet without the raw artifact; surface the
+		# workspace-level unmet count on the first card as a soft alert when
+		# any unmet items exist. Keeps the panel honest without lying about
+		# which exact section is affected.
+		for index, section in enumerate(sections):
+			card = _SectionCard(section, has_unmet=(index == 0 and unmet_count > 0))
+			card.clicked.connect(self.sectionClicked)
+			self._cards_layout.addWidget(card)
+
+
+class VerifySectionDetailDialog(QDialog):
+	"""Modal showing one section's labels + top supporting documents."""
+
+	def __init__(
+		self,
+		section: dict[str, Any],
+		doc_titles: dict[str, str],
+		parent: QWidget | None = None,
+	) -> None:
+		super().__init__(parent)
+		self.setObjectName("VerifySectionDialog")
+		self.setWindowTitle("보고서 섹션 상세")
+		self.setModal(True)
+		self.resize(560, 460)
+		self.setStyleSheet(
+			"""
+			QDialog#VerifySectionDialog { background-color: #F8FAFC; }
+			QFrame#SectionDialogHeader {
+				background-color: #FFFFFF; border: 1px solid #E2E8F0;
+				border-radius: 12px;
+			}
+			QFrame#TopDocRow {
+				background-color: #FFFFFF; border: 1px solid #E5E7EB;
+				border-radius: 10px;
+			}
+			QLabel#SectionDialogTitle { color: #0F172A; font-size: 15px; font-weight: 800; }
+			QLabel#SectionDialogMeta  { color: #64748B; font-size: 12px; font-weight: 600; }
+			QLabel#TopDocTitle { color: #1F2937; font-size: 12px; font-weight: 700; }
+			"""
+		)
+		layout = QVBoxLayout(self)
+		layout.setContentsMargins(18, 18, 18, 18)
+		layout.setSpacing(12)
+
+		header = QFrame()
+		header.setObjectName("SectionDialogHeader")
+		header_layout = QVBoxLayout(header)
+		header_layout.setContentsMargins(16, 14, 16, 14)
+		header_layout.setSpacing(6)
+		labels = ", ".join(str(t) for t in (section.get("labels") or []) if str(t).strip())
+		title = QLabel(labels or f"섹션 {section.get('sectionId')}")
+		title.setObjectName("SectionDialogTitle")
+		title.setWordWrap(True)
+		meta = QLabel(
+			f"근거 chunk {int(section.get('evidenceCount') or 0)}건"
+			f" · 관련 자료 {int(section.get('documentCount') or 0)}건"
+			f" · must_cover {int(section.get('mustCoverCount') or 0)}개"
+		)
+		meta.setObjectName("SectionDialogMeta")
+		header_layout.addWidget(title)
+		header_layout.addWidget(meta)
+		layout.addWidget(header)
+
+		top_title = QLabel("이 섹션을 가장 잘 받쳐주는 자료")
+		top_title.setObjectName("CardTitle")
+		layout.addWidget(top_title)
+
+		scroll = QScrollArea()
+		scroll.setWidgetResizable(True)
+		scroll.setFrameShape(QFrame.NoFrame)
+		scroll.setObjectName("PageScroll")
+		container = QWidget()
+		container_layout = QVBoxLayout(container)
+		container_layout.setContentsMargins(0, 0, 0, 0)
+		container_layout.setSpacing(8)
+
+		top_docs = section.get("topDocs") or []
+		if not top_docs:
+			empty = QLabel("이 섹션에 대한 doc-level 근거가 아직 부족합니다.")
+			empty.setObjectName("CardSecondary")
+			empty.setWordWrap(True)
+			container_layout.addWidget(empty)
+		else:
+			for index, doc_id in enumerate(top_docs, start=1):
+				row = QFrame()
+				row.setObjectName("TopDocRow")
+				row_layout = QHBoxLayout(row)
+				row_layout.setContentsMargins(12, 10, 12, 10)
+				row_layout.setSpacing(10)
+				number = QLabel(str(index))
+				number.setObjectName("IssueNumber")
+				row_layout.addWidget(number, 0, Qt.AlignTop)
+				body = QLabel(doc_titles.get(str(doc_id), f"문서 {doc_id}"))
+				body.setObjectName("TopDocTitle")
+				body.setWordWrap(True)
+				row_layout.addWidget(body, 1)
+				container_layout.addWidget(row)
+		container_layout.addStretch(1)
+		scroll.setWidget(container)
+		layout.addWidget(scroll, 1)
+
+		buttons = QDialogButtonBox(QDialogButtonBox.Close)
+		buttons.rejected.connect(self.reject)
+		buttons.accepted.connect(self.accept)
+		layout.addWidget(buttons)
+
+
+class _EmptyStateCard(CardWidget):
+	"""Large, obvious 'no verification yet' card.
+
+	Replaces the previous tiny PageSubtitle label so a user landing on the page
+	for the first time immediately sees what to do (and why nothing else is
+	rendered). Shown only when the workspace has no saved verification — once
+	the run completes the card is dropped and the real results render.
+	"""
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(title=None, parent=parent)
+		self.setObjectName("VerifyEmptyState")
+		self.setStyleSheet(
+			"QFrame#VerifyEmptyState { background-color: #F1F5F9; "
+			"border: 1px dashed #94A3B8; border-radius: 12px; }"
+			"QLabel#VerifyEmptyTitle { color: #0F172A; font-size: 16px; font-weight: 800; }"
+			"QLabel#VerifyEmptyBody  { color: #475569; font-size: 13px; font-weight: 500; }"
+			"QLabel#VerifyEmptyHint  { color: #64748B; font-size: 12px; font-weight: 600; }"
+		)
+		title = QLabel("이 워크스페이스에는 아직 검증 결과가 없습니다.")
+		title.setObjectName("VerifyEmptyTitle")
+		title.setWordWrap(True)
+		body = QLabel(
+			"상단 ‘검증 시작’ 버튼을 누르면 조사 결과를 자동으로 분석합니다.\n"
+			"분석은 보통 15초~1분 정도 걸리며, 그동안 다른 페이지를 자유롭게 사용할 수 있습니다."
+		)
+		body.setObjectName("VerifyEmptyBody")
+		body.setWordWrap(True)
+		hint = QLabel(
+			"검증을 위해서는 조사가 이미 완료되어 ‘summary/’ 와 ‘chromadb/’ 가 만들어진"
+			" 워크스페이스여야 합니다. 막 만든 워크스페이스에서 조사가 진행 중이라면"
+			" 완료된 후 다시 시도해 주세요."
+		)
+		hint.setObjectName("VerifyEmptyHint")
+		hint.setWordWrap(True)
+		self.layout.addWidget(title)
+		self.layout.addWidget(body)
+		self.layout.addWidget(hint)
+
+
 def _tone_for_level(level: str) -> str:
 	if level == "높음":
 		return "success"
@@ -487,11 +948,34 @@ class VerifyPage(QWidget):
 		self._progress_bar.set_idle()
 		root.addWidget(self._progress_bar)
 
-		# Summary stripe (counts + averages).
+		# Summary stripe (counts + averages). The "점검 필요 항목" stat is
+		# clickable — :class:`VerifyIssuesDialog` opens with the full list.
 		self._summary_stripe = _SummaryStripe()
+		self._summary_stripe.issuesClicked.connect(self._on_issues_clicked)
 		root.addWidget(self._summary_stripe)
 
-		# Filter chip row + content area (results list or empty-state message).
+		# Large empty-state card — only visible when this workspace has no
+		# saved verification yet. Hidden once results render.
+		self._empty_state_card = _EmptyStateCard()
+		root.addWidget(self._empty_state_card)
+
+		# Auto-identified report sections (Task 1) — surfaced *between* the
+		# summary stripe and per-doc cards so the user reads the structure
+		# before scrolling through individual ratings.
+		self._sections_panel = _SectionsPanel()
+		self._sections_panel.sectionClicked.connect(self._on_section_clicked)
+		root.addWidget(self._sections_panel)
+
+		# Per-doc results header + filter chips.
+		results_header = CardWidget("자료별 검증 결과")
+		results_header_caption = QLabel(
+			"각 자료가 사용자 의도와 얼마나 잘 맞물리는지를 0~100% 의 일치율로 보여줍니다."
+			" ‘상세 보기’ 버튼으로 자료가 약하게 다룬 보고서 섹션·의도 주제를 확인할 수 있습니다."
+		)
+		results_header_caption.setObjectName("CardSecondary")
+		results_header_caption.setWordWrap(True)
+		results_header.layout.addWidget(results_header_caption)
+
 		filter_row = QHBoxLayout()
 		filter_row.setSpacing(8)
 		self._filter_buttons: dict[str, AppButton] = {}
@@ -501,17 +985,16 @@ class VerifyPage(QWidget):
 			filter_row.addWidget(chip)
 			self._filter_buttons[label] = chip
 		filter_row.addStretch(1)
-		root.addLayout(filter_row)
+		results_header.layout.addLayout(filter_row)
+		root.addWidget(results_header)
+		self._results_header = results_header
 
 		self._content_layout = QVBoxLayout()
 		self._content_layout.setContentsMargins(0, 0, 0, 0)
 		self._content_layout.setSpacing(10)
 		root.addLayout(self._content_layout)
 
-		self._empty_label = QLabel(
-			"아직 검증을 실행하지 않았습니다.\n"
-			"위 ‘검증 시작’ 버튼을 누르면 조사 결과에 대한 자동 검증을 진행합니다."
-		)
+		self._empty_label = QLabel("결과를 불러오는 중...")
 		self._empty_label.setObjectName("PageSubtitle")
 		self._empty_label.setAlignment(Qt.AlignCenter)
 		self._empty_label.setWordWrap(True)
@@ -668,6 +1151,29 @@ class VerifyPage(QWidget):
 		if isinstance(response, dict) and response.get("workspaceId"):
 			self._workspace_id = str(response["workspaceId"])
 			self._update_workspace_label()
+
+		# Toggle the empty-state card + sections panel + results header against
+		# whatever the summary reports — one source of truth (``available``).
+		available = bool(self._summary and self._summary.get("available"))
+		self._empty_state_card.setVisible(not available)
+		sections_overview = (
+			list(self._summary.get("sectionsOverview") or [])
+			if isinstance(self._summary, dict)
+			else []
+		)
+		unmet_count = (
+			int(self._summary.get("unmetMustCoverCount") or 0)
+			if isinstance(self._summary, dict)
+			else 0
+		)
+		self._sections_panel.setVisible(available)
+		if available:
+			self._sections_panel.apply(sections_overview, unmet_count)
+		self._results_header.setVisible(available)
+		self._prev_btn.setVisible(available)
+		self._next_btn.setVisible(available)
+		self._page_label.setVisible(available)
+
 		self._render_results()
 
 	# -- rendering ------------------------------------------------------------
@@ -687,19 +1193,20 @@ class VerifyPage(QWidget):
 		]
 
 		if not self._items:
-			# No verified data yet — show one of two contextual empty states.
+			# The top-level _EmptyStateCard already explains the no-verification
+			# case loudly, so the in-content message only fires when verification
+			# *did* run but produced no items (rare — usually means no docs or no
+			# intent queries).
 			summary_available = bool(self._summary and self._summary.get("available"))
-			text = (
-				"검증 결과가 비어 있습니다."
-				if summary_available
-				else "아직 검증을 실행하지 않았습니다.\n"
-				     "위 ‘검증 시작’ 버튼을 누르면 조사 결과에 대한 자동 검증을 진행합니다."
-			)
-			empty = QLabel(text)
-			empty.setObjectName("PageSubtitle")
-			empty.setAlignment(Qt.AlignCenter)
-			empty.setWordWrap(True)
-			self._content_layout.addWidget(empty)
+			if summary_available:
+				empty = QLabel(
+					"검증은 실행되었지만 표시할 자료가 없습니다. 조사 결과에"
+					" plan.must_cover 또는 grounded_terms 가 비어 있는지 확인해 주세요."
+				)
+				empty.setObjectName("PageSubtitle")
+				empty.setAlignment(Qt.AlignCenter)
+				empty.setWordWrap(True)
+				self._content_layout.addWidget(empty)
 			self._page_label.setText("0 / 0")
 			self._prev_btn.setEnabled(False)
 			self._next_btn.setEnabled(False)
@@ -766,6 +1273,35 @@ class VerifyPage(QWidget):
 			)
 		)
 		return wrapper
+
+	def _on_issues_clicked(self) -> None:
+		"""Open the issues dialog with whatever the summary already carries."""
+		if not isinstance(self._summary, dict) or not self._summary.get("available"):
+			return
+		issues = self._summary.get("issues") or []
+		if not isinstance(issues, list):
+			return
+		dialog = VerifyIssuesDialog(issues, parent=self)
+		dialog.exec()
+
+	def _on_section_clicked(self, section_id: int) -> None:
+		"""Open the section detail dialog for the clicked section card."""
+		if not isinstance(self._summary, dict):
+			return
+		sections = self._summary.get("sectionsOverview") or []
+		section = next(
+			(s for s in sections if isinstance(s, dict) and int(s.get("sectionId") or -1) == section_id),
+			None,
+		)
+		if section is None:
+			return
+		titles = {
+			str(item.get("docId") or ""): str(item.get("title") or item.get("docId") or "")
+			for item in self._items
+			if isinstance(item, dict)
+		}
+		dialog = VerifySectionDetailDialog(section, titles, parent=self)
+		dialog.exec()
 
 	def _show_detail(self, summary_item: dict[str, Any]) -> None:
 		"""Pull the full detail payload from the API and open the dialog."""

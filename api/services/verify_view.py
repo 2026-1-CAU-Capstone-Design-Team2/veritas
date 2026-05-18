@@ -48,7 +48,7 @@ def build_doc_items(
     consensus: ConsensusResult | None = artifacts.consensus
 
     intent_scores = dict(intent.doc_intent_score) if intent else {}
-    rank_pct = rank_normalize_percent(intent_scores)
+    rank_pct = ratio_normalize_percent(intent_scores)
     doc_ids = sorted(set(rank_pct) | set(doc_titles))
 
     items: list[dict[str, Any]] = []
@@ -78,33 +78,38 @@ def build_doc_items(
     return items
 
 
-def rank_normalize_percent(scores: dict[str, float]) -> dict[str, int]:
-    """Workspace-internal rank percentile (0-100). Ties share a percentile.
+def ratio_normalize_percent(scores: dict[str, float]) -> dict[str, int]:
+    """Workspace-internal proportion of the best raw score, 0-100.
 
-    Used because raw RRF scores are tiny (max ~0.017) and don't read well as a
-    "match rate"; rank-normalizing inside the same workspace gives a 0-100
-    scale that preserves order without faking absolute precision.
+    The doc with the highest raw intent score lands at 100; every other doc
+    scales linearly as ``raw / max * 100``. Unlike a rank percentile, this
+    preserves the raw score *distribution* — a workspace where docs cluster
+    tightly reads as a tight band near the top (and a meaningful average),
+    while a workspace with a clear standout shows it as a wide spread.
+
+    Why not the raw RRF score itself: RRF scores are tiny (≲ 0.02), so
+    showing them as a "match rate" reads as 1% to a user. Scaling against the
+    workspace's own max keeps the relative order *and* makes the unit
+    intuitive ("% of the best doc in this workspace").
     """
     if not scores:
         return {}
-    if len(scores) == 1:
-        only = next(iter(scores))
-        return {only: 100}
+    max_score = max(scores.values())
+    if max_score <= 0.0:
+        # Every doc has zero intent signal — surface them all as 0% rather
+        # than dividing by zero. The caller will mark them "낮음".
+        return {doc: 0 for doc in scores}
+    return {
+        doc: max(0, min(100, int(round(score / max_score * 100))))
+        for doc, score in scores.items()
+    }
 
-    ordered = sorted(scores.items(), key=lambda kv: kv[1])
-    span = len(ordered) - 1
-    out: dict[str, int] = {}
-    last_score: float | None = None
-    last_percent = 0
-    for rank, (doc_id, score) in enumerate(ordered):
-        if last_score is not None and abs(score - last_score) < 1e-9:
-            percent = last_percent
-        else:
-            percent = int(round(rank / span * 100))
-            last_percent = percent
-            last_score = float(score)
-        out[doc_id] = percent
-    return out
+
+# Backwards-compatible alias for any caller that imported the old name.
+# The rank-percentile semantics it used to carry (forced uniform distribution,
+# constant ~50% workspace average) hid genuine quality differences between
+# workspaces, so the implementation now delegates to the ratio normalizer.
+rank_normalize_percent = ratio_normalize_percent
 
 
 def level_for(percent: int) -> str:
@@ -310,11 +315,125 @@ def concept_participation_for(consensus: ConsensusResult | None) -> list[dict[st
     return rows[:12]
 
 
+def sections_overview(artifacts: VerificationArtifacts) -> list[dict[str, Any]]:
+    """One row per auto-identified report section — what the section panel renders.
+
+    Surfaces the *structure* the verification found in the corpus: each section's
+    label terms, how many ``must_cover`` items mapped into it, how many chunks
+    of evidence it pulled, and which docs scored above the section median (i.e.
+    the docs the user can rely on for that section).
+    """
+    sections = artifacts.sections
+    if sections is None or not sections.sections:
+        return []
+    rows: list[dict[str, Any]] = []
+    for section in sections.sections:
+        doc_scores = section.doc_scores or {}
+        if doc_scores:
+            ordered = sorted(doc_scores.items(), key=lambda kv: -kv[1])
+            top_docs = [doc_id for doc_id, _ in ordered[:5]]
+        else:
+            top_docs = []
+        rows.append(
+            {
+                "sectionId": section.id,
+                "labels": list(section.label_terms[:8]),
+                "mustCoverCount": len(section.origin_must_cover_indices),
+                "evidenceCount": len(section.chunk_evidence),
+                "documentCount": len(doc_scores),
+                "topDocs": top_docs,
+            }
+        )
+    return rows
+
+
+def issues_overview(
+    artifacts: VerificationArtifacts,
+    doc_titles: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Flatten every detected issue into one user-readable list.
+
+    Three kinds, each with a short non-technical message:
+
+    * ``unmet_must_cover`` — a topic the plan wanted covered but the corpus
+      does not actually support.
+    * ``intent_gap``       — a user-intent facet no document covers well.
+    * ``conflict``         — a concept cluster where sources disagree.
+
+    Ordered so the most actionable items (unmet must_cover, then conflicts,
+    then gaps) appear first.
+    """
+    rows: list[dict[str, Any]] = []
+
+    if artifacts.sections is not None:
+        for item in artifacts.sections.unmet_must_cover:
+            rows.append(
+                {
+                    "kind": "unmet_must_cover",
+                    "title": "조사 계획이 다룬다고 했지만 자료에서 충분히 확인되지 않은 주제",
+                    "detail": item.text,
+                    "hint": "추가 검색 또는 별도 자료 보강이 필요할 수 있습니다.",
+                    "metric": f"근거 점수 {item.top_rrf:.3f}",
+                }
+            )
+
+    if artifacts.consensus is not None:
+        cluster_by_id = {
+            cluster.id: cluster
+            for cluster in artifacts.consensus.concept_clusters
+        }
+        for flag in artifacts.consensus.conflicts:
+            cluster = cluster_by_id.get(flag.cluster_id)
+            label = _format_label_list(cluster.label_terms[:4]) if cluster else ""
+            if flag.type == "semantic_split":
+                title = "한 개념이 자료들에서 두 갈래로 갈리는 부분"
+                hint = "두 해석을 모두 확인하고, 어떤 입장을 채택할지 결정하세요."
+            elif flag.type == "cross_domain":
+                title = "출처마다 입장이 다를 수 있는 주제"
+                hint = "다양한 출처를 비교해 교차 검증한 뒤 인용하세요."
+            else:
+                title = "출처 간 입장 차이가 있을 수 있는 주제"
+                hint = "추가 확인이 필요합니다."
+            rows.append(
+                {
+                    "kind": "conflict",
+                    "title": title,
+                    "detail": label or "(개념 라벨이 비어 있는 클러스터)",
+                    "hint": hint,
+                    "metric": f"차이 점수 {flag.score:.3f}",
+                }
+            )
+
+    if artifacts.intent is not None:
+        for gap in artifacts.intent.coverage_gap:
+            label = _format_label_list(gap.label_terms[:4]) or "(라벨이 비어 있는 의도)"
+            rows.append(
+                {
+                    "kind": "intent_gap",
+                    "title": "사용자 의도 중 자료가 충분히 받쳐주지 못한 주제",
+                    "detail": label,
+                    "hint": "이 주제를 잘 다룬 자료가 거의 없어 보강이 필요합니다.",
+                    "metric": f"최고 자료 점수 {gap.top_doc_score:.3f}",
+                }
+            )
+
+    order = {"unmet_must_cover": 0, "conflict": 1, "intent_gap": 2}
+    rows.sort(key=lambda row: order.get(row["kind"], 99))
+
+    # ``doc_titles`` is accepted for future per-doc surfacing; the three issue
+    # kinds are workspace-level today, not individual docs.
+    _ = doc_titles
+    return rows
+
+
 __all__ = [
     "build_doc_items",
-    "rank_normalize_percent",
+    "ratio_normalize_percent",
+    "rank_normalize_percent",  # alias — kept for the existing smoke test
     "level_for",
     "section_breakdown_for",
     "facet_breakdown_for",
     "concept_participation_for",
+    "sections_overview",
+    "issues_overview",
 ]

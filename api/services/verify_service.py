@@ -158,7 +158,8 @@ def get_summary(workspace_id: str | None) -> dict[str, Any]:
         return _empty_summary(resolved)
     artifacts, meta = loaded
 
-    items = verify_view.build_doc_items(artifacts, _load_doc_titles(resolved))
+    titles = _load_doc_titles(resolved)
+    items = verify_view.build_doc_items(artifacts, titles)
     high = sum(1 for item in items if item["level"] == "높음")
     medium = sum(1 for item in items if item["level"] == "중간")
     low = sum(1 for item in items if item["level"] == "낮음")
@@ -187,6 +188,10 @@ def get_summary(workspace_id: str | None) -> dict[str, Any]:
         "conflictCount": (
             len(artifacts.consensus.conflicts) if artifacts.consensus else 0
         ),
+        # Drill-down payloads — kept inline so the issues dialog and the
+        # sections panel render without a second round-trip.
+        "sectionsOverview": verify_view.sections_overview(artifacts),
+        "issues": verify_view.issues_overview(artifacts, titles),
     }
 
 
@@ -283,4 +288,6 @@ def _empty_summary(workspace_id: str | None) -> dict[str, Any]:
         "unmetMustCoverCount": 0,
         "intentGapCount": 0,
         "conflictCount": 0,
+        "sectionsOverview": [],
+        "issues": [],
     }
