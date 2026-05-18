@@ -87,6 +87,6 @@ s = FooScenario(initial_vruntime=-3.0, vruntime_increment=4.0)
 vruntime/cooldown 외에 다음 두 가지가 발화율을 추가로 조정:
 
 1. **각 시나리오의 `cooldown_min_seconds`** — 같은 시나리오 발화 간 최소 시간. base의 `_time_cooldown_status(last_fired_at)` 헬퍼 사용.
-2. **`ScenarioScheduler.min_global_fire_interval_sec`** (default 30.0) — 시나리오 무관 전역 throttle. 어떤 시나리오든 마지막 발화로부터 N초 내엔 또 안 뜸.
+2. **`ScenarioScheduler.min_global_fire_interval_sec`** (default 10.0) — 시나리오 무관 전역 throttle. 어떤 시나리오든 마지막 발화로부터 N초 내엔 또 안 뜸.
 
 vruntime은 "**누가** 다음에 뜨나"를 결정하고, cooldown/throttle은 "**언제** 뜰 수 있나"를 결정. 두 레이어 독립.

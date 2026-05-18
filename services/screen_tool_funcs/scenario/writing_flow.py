@@ -57,11 +57,11 @@ class IdleAfterWritingScenario(ScenarioType):
 
         typing_pause = self._typing_pause_status(context.same_document_events)
         typing_pause_passed = bool(typing_pause.get("ready"))
-        cooldown_passed = self._passes_paragraph_cooldown(
-            history_events=context.history_events,
-            document_key=context.document_key,
-            paragraph_fingerprint=context.paragraph_fingerprint,
-        )
+        # paragraph_cooldown(`_passes_paragraph_cooldown`) 게이트는 의도적으로
+        # 평가에서 제외 — `time_cooldown`(60s)이 같은 시나리오의 재발화를 이미
+        # 막아주고, paragraph fingerprint 기반 윈도우(`cooldown_events`)는 같은
+        # 문단에 머무는 동안 사실상 영구 차단으로 동작해 "최빈도 2번 후 침묵"
+        # 증상의 원인이었다. 메서드/필드는 보존하므로 필요 시 재활성화 가능.
         time_cooldown = self._time_cooldown_status(context.last_fired_at)
         time_cooldown_passed = bool(time_cooldown.get("passed"))
         # 현재 문단 길이 게이트 — 문단 단위 시나리오가 자기 책임으로 확인
@@ -78,15 +78,6 @@ class IdleAfterWritingScenario(ScenarioType):
                 "typing_pause_satisfied" if typing_pause_passed else "not_paused_after_typing",
                 typing_pause,
             ),
-            "paragraph_cooldown": self._gate_result(
-                cooldown_passed,
-                "cooldown_dedupe_passed" if cooldown_passed else "cooldown_or_duplicate",
-                {
-                    "cooldown_events": self.cooldown_events,
-                    "document_key": context.document_key,
-                    "paragraph_fingerprint": context.paragraph_fingerprint,
-                },
-            ),
             "time_cooldown": self._gate_result(
                 time_cooldown_passed,
                 "time_cooldown_passed" if time_cooldown_passed else "time_cooldown_active",
@@ -102,17 +93,14 @@ class IdleAfterWritingScenario(ScenarioType):
             ),
         }
 
+        # typing_pause 점수 0.8 = 기존 0.5(typing_pause) + 0.3(paragraph_cooldown 흡수).
+        # priority="high" 임계 0.7 을 그대로 유지하면서 paragraph_cooldown 게이트
+        # 제거로 인한 점수 회귀를 방지.
         if typing_pause_passed:
-            evaluation.score += 0.5
+            evaluation.score += 0.8
             evaluation.reasons.append("typing_pause_satisfied")
         else:
             evaluation.blockers.append("not_paused_after_typing")
-
-        if cooldown_passed:
-            evaluation.score += 0.3
-            evaluation.reasons.append("cooldown_dedupe_passed")
-        else:
-            evaluation.blockers.append("cooldown_or_duplicate")
 
         # 시간 cooldown은 prereq: 점수 없이 blocker에만 기여
         if time_cooldown_passed:
@@ -217,6 +205,9 @@ class IdleAfterWritingScenario(ScenarioType):
         document_key: str,
         paragraph_fingerprint: str,
     ) -> bool:
+        """[Deprecated] paragraph fingerprint 기반 dedupe. `evaluate()` 에서 호출
+        하지 않는다 — `time_cooldown`(60s) 으로 통합됨. 같은 문단 윈도우 안에서
+        영구 차단으로 작동하는 부작용 때문에 비활성. 필요 시 재활성화 가능."""
         if not paragraph_fingerprint:
             return False
         for event in reversed(history_events[-self.cooldown_events:]):

@@ -14,7 +14,7 @@ def is_api_available(base_url: str, *, timeout: float = 0.5) -> bool:
 		return False
 
 
-def ensure_api_server(base_url: str, *, host: str = "127.0.0.1", port: int = 8000) -> None:
+def ensure_api_server(base_url: str, *, host: str = "127.0.0.1", port: int = 8001) -> None:
 	if is_api_available(base_url):
 		return
 

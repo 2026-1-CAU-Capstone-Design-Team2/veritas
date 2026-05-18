@@ -181,7 +181,7 @@
 이전엔 시나리오마다 동일 로직의 cooldown 메서드(`_review_cooldown_status`, `_churn_cooldown_status`, `_start_cooldown_status`, idle의 `_time_cooldown_status`)를 각자 보유했음. T1-1에서 4개를 베이스의 `_time_cooldown_status`로 통합. 자체 메서드 0개, 모든 시간 cooldown은 `self._time_cooldown_status(context.last_fired_at)` 호출. `WholeDocumentReviewScenario`만 시간+글자수 결합 cooldown(`_document_cooldown_status`)이라 자체 메서드 유지.
 
 ### T1-4 전역 throttle (시나리오 무관 rate limit)
-`ScenarioScheduler.min_global_fire_interval_sec` (default `30.0`초)이 시나리오 무관 전역 throttle을 제공. `select_and_charge` 진입부에서 `now - state.last_global_fire_at < min_global_fire_interval_sec`이면 발화 거부(반환값 `None`). 즉 시나리오별 cooldown과 별개로, 어떤 시나리오든 마지막 발화로부터 N초 안에는 또 안 뜸. 20+ 시나리오 환경에서 LLM 호출 폭주 방지의 안전망 역할. `0`으로 설정하면 비활성.
+`ScenarioScheduler.min_global_fire_interval_sec` (default `10.0`초)이 시나리오 무관 전역 throttle을 제공. `select_and_charge` 진입부에서 `now - state.last_global_fire_at < min_global_fire_interval_sec`이면 발화 거부(반환값 `None`). 즉 시나리오별 cooldown과 별개로, 어떤 시나리오든 마지막 발화로부터 N초 안에는 또 안 뜸. 20+ 시나리오 환경에서 LLM 호출 폭주 방지의 안전망 역할. `0`으로 설정하면 비활성.
 
 ### vruntime 컨벤션
 새 시나리오는 `priority`("high"/"medium"/"low")만 선언하면 `_PRIORITY_VRUNTIME_DEFAULTS`에서 `(initial_vruntime, vruntime_increment)`를 자동 도출. 자세한 컨벤션·사용 패턴은 `vruntime_convention.md` 참조.
