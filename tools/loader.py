@@ -41,6 +41,7 @@ def build_registry(
     from .rag_tool import RAGSearchTool
     from .screen_context_tool import ScreenContextTool
     from .term_grounding_tool import TermGroundingTool
+    from .verify_flow_planner_tool import VerifyFlowPlannerTool
     from .web_search_tool import WebSearchTool
 
     registry = ToolRegistry()
@@ -96,6 +97,16 @@ def build_registry(
             schema=load_schema(TOOLS_DIR / "final_report_tool" / "tool_schema.json"),
             llm=llm,
             run_store_service=run_store_service,
+        )
+    )
+
+    # Verify flow planner — used by services/verification/sections, also
+    # exposed in the chat registry so a future "/verify-flow" command (or
+    # tool-using agent) can reach the same outline capability.
+    registry.register(
+        VerifyFlowPlannerTool(
+            schema=load_schema(TOOLS_DIR / "verify_flow_planner_tool" / "tool_schema.json"),
+            llm=llm,
         )
     )
 

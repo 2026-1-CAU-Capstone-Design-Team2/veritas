@@ -169,6 +169,20 @@ def get_summary(workspace_id: str | None) -> dict[str, Any]:
         else 0
     )
 
+    # Sections that the LLM-planned outline asked for but the corpus does not
+    # really support — fewer than 3 sentences assigned. The verify_view's
+    # ``issues_overview`` enforces the same cutoff, so the count and the
+    # drill-down list stay consistent.
+    underweighted_sections = (
+        sum(
+            1
+            for section in artifacts.sections.sections
+            if len(section.sentence_assignments) < 3
+        )
+        if artifacts.sections
+        else 0
+    )
+
     return {
         "workspaceId": resolved,
         "available": True,
@@ -179,14 +193,19 @@ def get_summary(workspace_id: str | None) -> dict[str, Any]:
         "highCount": high,
         "mediumCount": medium,
         "lowCount": low,
-        "unmetMustCoverCount": (
-            len(artifacts.sections.unmet_must_cover) if artifacts.sections else 0
-        ),
+        "underweightedSectionCount": underweighted_sections,
         "intentGapCount": (
             len(artifacts.intent.coverage_gap) if artifacts.intent else 0
         ),
         "conflictCount": (
             len(artifacts.consensus.conflicts) if artifacts.consensus else 0
+        ),
+        # Flow outline summary — the section panel reads this directly.
+        "flowSource": (
+            artifacts.sections.flow_source if artifacts.sections else "empty"
+        ),
+        "sentenceCount": (
+            artifacts.sections.sentence_count if artifacts.sections else 0
         ),
         # Drill-down payloads — kept inline so the issues dialog and the
         # sections panel render without a second round-trip.
@@ -285,9 +304,11 @@ def _empty_summary(workspace_id: str | None) -> dict[str, Any]:
         "highCount": 0,
         "mediumCount": 0,
         "lowCount": 0,
-        "unmetMustCoverCount": 0,
+        "underweightedSectionCount": 0,
         "intentGapCount": 0,
         "conflictCount": 0,
+        "flowSource": "empty",
+        "sentenceCount": 0,
         "sectionsOverview": [],
         "issues": [],
     }

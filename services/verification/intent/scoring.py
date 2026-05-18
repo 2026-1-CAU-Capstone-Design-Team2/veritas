@@ -124,14 +124,30 @@ def detect_coverage_gaps(
     facet_doc_matrix: np.ndarray,
     cfg: VerificationConfig,
 ) -> list[CoverageGap]:
-    """Facets whose best doc still falls below ``intent_coverage_gap_threshold``.
+    """Facets whose best doc sits below ``intent_coverage_gap_threshold`` of
+    the workspace's strongest facet-doc match.
 
-    A gap means *no* corpus document covers the facet well enough; it is the
-    intent-side analogue of Task 1's unmet-must_cover check.
+    The threshold is interpreted as a *ratio of the workspace max*, not as a
+    raw RRF score. Raw RRF tops out near ``1/cfg.rrf_k`` (~0.017) so an
+    absolute threshold of e.g. 0.3 would always fire and every facet would
+    be reported as a gap — the signal would be useless. A ratio of the
+    workspace max instead asks "does this facet have at least X% as much
+    support as the best-covered facet?", which is invariant to absolute RRF
+    scale (§1.5: thresholds tunable, not raw).
     """
     if not facets or facet_doc_matrix.size == 0:
         return []
-    threshold = cfg.intent_coverage_gap_threshold
+    workspace_max = float(facet_doc_matrix.max())
+    if workspace_max <= 0.0:
+        return [
+            CoverageGap(
+                facet_id=facet.id,
+                label_terms=list(facet.label_terms),
+                top_doc_score=0.0,
+            )
+            for facet in facets
+        ]
+    threshold = cfg.intent_coverage_gap_threshold * workspace_max
     gaps: list[CoverageGap] = []
     for row, facet in enumerate(facets):
         top = float(facet_doc_matrix[row].max()) if facet_doc_matrix.shape[1] else 0.0

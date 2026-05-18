@@ -19,6 +19,7 @@ from services.verification.models import (
     ConsensusResult,
     IntentResult,
     SectionResult,
+    SentenceAssignment,
     VerificationArtifacts,
 )
 
@@ -192,30 +193,27 @@ def _section_notes(
     doc_id: str,
     sections: SectionResult | None,
 ) -> list[str]:
+    """Tell the user which flow sections actually use sentences from this doc.
+
+    Rewritten for the sentence-flow model: a doc "contributes" to a section
+    when at least one of its sentences was assigned there. Surfacing the
+    contribution makes the per-doc card immediately useful to the writer
+    ("이 자료는 *서론* / *본론* 의 어디에 쓸 수 있다").
+    """
     if sections is None or not sections.sections:
         return []
 
-    weak_labels: list[str] = []
+    contributed: list[str] = []
     for section in sections.sections:
-        if doc_id not in section.doc_scores:
-            continue
-        scores = sorted(section.doc_scores.values())
-        if not scores:
-            continue
-        # Bottom-third cutoff inside the section; below that the doc is a
-        # weak contributor to that report section's evidence.
-        cutoff = scores[max(0, len(scores) // 3 - 1)]
-        if section.doc_scores[doc_id] <= cutoff:
-            label = _format_label_list(section.label_terms[:4])
-            if label:
-                weak_labels.append(label)
-    if weak_labels:
-        return [
-            "다음 보고서 섹션에서는 이 자료의 근거가 약합니다: "
-            + " · ".join(weak_labels[:2])
-            + "."
-        ]
-    return []
+        if any(a.doc_id == doc_id for a in section.sentence_assignments):
+            title = (section.title or f"섹션 {section.id}").strip()
+            if title:
+                contributed.append(title)
+    if not contributed:
+        return ["이 자료의 문장은 어느 보고서 섹션에도 할당되지 않았습니다."]
+    return [
+        "이 자료가 받쳐주는 섹션: " + " · ".join(contributed[:3]) + "."
+    ]
 
 
 def _consensus_notes(
@@ -256,16 +254,29 @@ def _format_label_list(terms: list[str]) -> str:
 
 
 def section_breakdown_for(doc_id: str, sections: SectionResult | None) -> list[dict[str, Any]]:
+    """For one doc, which flow sections include sentences from it, and how many.
+
+    Score = the sum of ``fit_score`` of this doc's sentences in each section.
+    Sections with zero contribution are still listed (with score 0) so the
+    user sees a complete map of the report's flow even when this doc only
+    helps with part of it.
+    """
     if sections is None:
         return []
-    rows = [
-        {
-            "sectionId": section.id,
-            "labels": list(section.label_terms[:6]),
-            "score": round(float(section.doc_scores.get(doc_id, 0.0)), 6),
-        }
-        for section in sections.sections
-    ]
+    rows: list[dict[str, Any]] = []
+    for section in sections.sections:
+        contributions = [
+            a for a in section.sentence_assignments if a.doc_id == doc_id
+        ]
+        total = sum(float(a.fit_score) for a in contributions)
+        rows.append(
+            {
+                "sectionId": section.id,
+                "labels": [section.title] + list(section.keywords[:5]),
+                "score": round(total, 6),
+                "sentenceCount": len(contributions),
+            }
+        )
     rows.sort(key=lambda item: -item["score"])
     return rows
 
@@ -316,32 +327,55 @@ def concept_participation_for(consensus: ConsensusResult | None) -> list[dict[st
 
 
 def sections_overview(artifacts: VerificationArtifacts) -> list[dict[str, Any]]:
-    """One row per auto-identified report section — what the section panel renders.
+    """One row per *ordered* flow section — what the section panel renders.
 
-    Surfaces the *structure* the verification found in the corpus: each section's
-    label terms, how many ``must_cover`` items mapped into it, how many chunks
-    of evidence it pulled, and which docs scored above the section median (i.e.
-    the docs the user can rely on for that section).
+    The new sentence-flow model carries:
+      * an ``order`` (writer-readable left-to-right narrative)
+      * a ``role`` (intro / body / conclusion) the UI chips up
+      * a list of ``SentenceAssignment`` per section
+
+    Per-section ``topDocs`` are the documents that contributed the most
+    sentence weight to *this* section (i.e. the writer can grab their text
+    first). ``sentenceCount`` and ``documentCount`` are the section's
+    quick-glance scope.
     """
     sections = artifacts.sections
     if sections is None or not sections.sections:
         return []
+    ordered = sorted(sections.sections, key=lambda s: (s.order, s.id))
     rows: list[dict[str, Any]] = []
-    for section in sections.sections:
-        doc_scores = section.doc_scores or {}
-        if doc_scores:
-            ordered = sorted(doc_scores.items(), key=lambda kv: -kv[1])
-            top_docs = [doc_id for doc_id, _ in ordered[:5]]
-        else:
-            top_docs = []
+    for section in ordered:
+        # Aggregate per-doc weight inside this section.
+        doc_weight: dict[str, float] = {}
+        for assignment in section.sentence_assignments:
+            doc_weight[assignment.doc_id] = (
+                doc_weight.get(assignment.doc_id, 0.0) + float(assignment.fit_score)
+            )
+        top_docs = [
+            doc_id
+            for doc_id, _ in sorted(doc_weight.items(), key=lambda kv: -kv[1])[:5]
+        ]
         rows.append(
             {
                 "sectionId": section.id,
-                "labels": list(section.label_terms[:8]),
-                "mustCoverCount": len(section.origin_must_cover_indices),
-                "evidenceCount": len(section.chunk_evidence),
-                "documentCount": len(doc_scores),
+                "order": section.order,
+                "title": section.title,
+                "description": section.description,
+                "role": section.role,
+                "labels": list(section.keywords[:8]),
+                "sentenceCount": len(section.sentence_assignments),
+                "documentCount": len(doc_weight),
                 "topDocs": top_docs,
+                "sentenceAssignments": [
+                    {
+                        "docId": a.doc_id,
+                        "paragraphIndex": a.paragraph_index,
+                        "sentenceIndex": a.sentence_index,
+                        "text": a.text,
+                        "fitScore": round(float(a.fit_score), 6),
+                    }
+                    for a in section.sentence_assignments
+                ],
             }
         )
     return rows
@@ -365,15 +399,22 @@ def issues_overview(
     """
     rows: list[dict[str, Any]] = []
 
+    # New "근거 부족 섹션" signal: an LLM-planned section the corpus cannot
+    # actually support (too few sentences assigned to it). Threshold is small
+    # by design — we only want to flag the truly underweighted sections.
+    _UNDERWEIGHTED_MIN_SENTENCES = 3
     if artifacts.sections is not None:
-        for item in artifacts.sections.unmet_must_cover:
+        for section in artifacts.sections.sections:
+            if len(section.sentence_assignments) >= _UNDERWEIGHTED_MIN_SENTENCES:
+                continue
+            title = (section.title or f"섹션 {section.id}").strip()
             rows.append(
                 {
-                    "kind": "unmet_must_cover",
-                    "title": "조사 계획이 다룬다고 했지만 자료에서 충분히 확인되지 않은 주제",
-                    "detail": item.text,
-                    "hint": "추가 검색 또는 별도 자료 보강이 필요할 수 있습니다.",
-                    "metric": f"근거 점수 {item.top_rrf:.3f}",
+                    "kind": "underweighted_section",
+                    "title": "보고서 흐름에 필요하지만 자료에서 충분히 받쳐주지 못한 섹션",
+                    "detail": title,
+                    "hint": "이 섹션을 다룬 자료를 추가로 확보하거나, 흐름을 재설계할 수 있습니다.",
+                    "metric": f"배치된 문장 {len(section.sentence_assignments)}개",
                 }
             )
 
@@ -417,7 +458,7 @@ def issues_overview(
                 }
             )
 
-    order = {"unmet_must_cover": 0, "conflict": 1, "intent_gap": 2}
+    order = {"underweighted_section": 0, "conflict": 1, "intent_gap": 2}
     rows.sort(key=lambda row: order.get(row["kind"], 99))
 
     # ``doc_titles`` is accepted for future per-doc surfacing; the three issue

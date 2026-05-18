@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 	QLabel,
 	QScrollArea,
 	QSizePolicy,
+	QToolButton,
 	QVBoxLayout,
 	QWidget,
 )
@@ -227,7 +228,7 @@ class _SummaryStripe(QFrame):
 		self._medium["value"].setText(str(int(summary.get("mediumCount") or 0)))
 		self._low["value"].setText(str(int(summary.get("lowCount") or 0)))
 		self._issue_count = (
-			int(summary.get("unmetMustCoverCount") or 0)
+			int(summary.get("underweightedSectionCount") or 0)
 			+ int(summary.get("intentGapCount") or 0)
 			+ int(summary.get("conflictCount") or 0)
 		)
@@ -466,9 +467,17 @@ def _normalize_score(value: float, hi: float) -> float:
 # Per-issue palette: header chip + body tint. Tuned to match the badge tones
 # used elsewhere on the verify page so the user reads the kind at a glance.
 _ISSUE_PALETTE = {
-	"unmet_must_cover": ("#FEF3C7", "#B45309", "#FDE68A", "근거 부족"),
+	"underweighted_section": ("#FEF3C7", "#B45309", "#FDE68A", "근거 부족"),
 	"conflict": ("#FEE2E2", "#B91C1C", "#FCA5A5", "출처 충돌"),
 	"intent_gap": ("#E0E7FF", "#3730A3", "#C7D2FE", "의도 미커버"),
+}
+
+# Role chip palette for ordered flow sections (intro / body / conclusion).
+# Body sits in neutral indigo, intro/conclusion get the warm/cool accents.
+_ROLE_CHIP = {
+	"intro": ("도입", "#DBEAFE", "#1D4ED8", "#BFDBFE"),
+	"body": ("본문", "#EEF2FF", "#3730A3", "#C7D2FE"),
+	"conclusion": ("마무리", "#DCFCE7", "#15803D", "#86EFAC"),
 }
 
 
@@ -609,103 +618,161 @@ class VerifyIssuesDialog(QDialog):
 
 
 class _SectionCard(QFrame):
-	"""One auto-identified report section, surfaced as a clickable card.
+	"""One ordered report-flow section, with a dedicated "자세히 보기" button.
 
-	Click → emits ``clicked`` with the section's id. The page uses that to
-	open the section detail dialog (label list + top doc names + match
-	signals). The card itself only shows the headline labels, counts, and an
-	"점검 필요" marker when the section has uncovered must_cover items.
+	Renders:
+	  * a left margin index chip (``1·2·…``) so the visual reading order
+	    matches the report order;
+	  * a role chip (``도입 / 본문 / 마무리``);
+	  * the LLM-authored title + description (the labels the writer reads);
+	  * a meta line with sentence and contributing-doc counts;
+	  * an amber alert when too few sentences support this section.
 	"""
 
 	clicked = Signal(int)
 
+	# A section under this many assigned sentences is flagged "근거 부족" so
+	# the writer knows the outline asks for more than the corpus has.
+	_UNDERWEIGHTED_MIN = 3
+
 	def __init__(
 		self,
 		section: dict[str, Any],
-		has_unmet: bool,
 		parent: QWidget | None = None,
 	) -> None:
 		super().__init__(parent)
 		self._section_id = int(section.get("sectionId") or 0)
 		self.setObjectName("SectionCard")
-		self.setCursor(Qt.PointingHandCursor)
 		self.setStyleSheet(
 			"QFrame#SectionCard { background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px; }"
 			"QFrame#SectionCard:hover { border-color: #6366F1; }"
-			"QLabel#SectionLabels { color: #0F172A; font-size: 13px; font-weight: 800; }"
+			"QLabel#SectionOrderChip {"
+			"  background-color: #F1F5F9; color: #1F2937;"
+			"  border: 1px solid #CBD5E1; border-radius: 13px;"
+			"  font-size: 12px; font-weight: 800; padding: 3px 10px;"
+			"}"
+			"QLabel#SectionRoleChip { font-size: 11px; font-weight: 800; padding: 3px 10px; border-radius: 11px; }"
+			"QLabel#SectionTitle { color: #0F172A; font-size: 14px; font-weight: 800; }"
+			"QLabel#SectionDescription { color: #475569; font-size: 12px; font-weight: 500; }"
 			"QLabel#SectionMeta { color: #64748B; font-size: 11px; font-weight: 700; }"
 			"QLabel#SectionAlert { color: #B45309; font-size: 11px; font-weight: 800; }"
 		)
-		layout = QVBoxLayout(self)
-		layout.setContentsMargins(14, 12, 14, 12)
-		layout.setSpacing(4)
+		outer = QHBoxLayout(self)
+		outer.setContentsMargins(14, 12, 14, 12)
+		outer.setSpacing(12)
 
-		labels = ", ".join(str(t) for t in (section.get("labels") or []) if str(t).strip())
-		if not labels:
-			labels = f"섹션 {self._section_id}"
-		label_widget = QLabel(labels)
-		label_widget.setObjectName("SectionLabels")
-		label_widget.setWordWrap(True)
-		layout.addWidget(label_widget)
+		# Order number — visible reading order for the writer.
+		order_chip = QLabel(str(int(section.get("order") or self._section_id) + 1))
+		order_chip.setObjectName("SectionOrderChip")
+		order_chip.setAlignment(Qt.AlignCenter)
+		order_chip.setFixedWidth(36)
+		outer.addWidget(order_chip, 0, Qt.AlignTop)
 
-		meta = QLabel(
-			f"근거 chunk {int(section.get('evidenceCount') or 0)}건"
-			f" · 관련 자료 {int(section.get('documentCount') or 0)}건"
-			f" · must_cover {int(section.get('mustCoverCount') or 0)}개"
+		body = QVBoxLayout()
+		body.setContentsMargins(0, 0, 0, 0)
+		body.setSpacing(4)
+
+		# Title + role chip on one line.
+		head = QHBoxLayout()
+		head.setContentsMargins(0, 0, 0, 0)
+		head.setSpacing(8)
+		title = QLabel(str(section.get("title") or f"섹션 {self._section_id}").strip())
+		title.setObjectName("SectionTitle")
+		title.setWordWrap(True)
+		head.addWidget(title, 1)
+		role = str(section.get("role") or "body").lower()
+		role_label_text, bg, fg, border = _ROLE_CHIP.get(role, _ROLE_CHIP["body"])
+		role_chip = QLabel(role_label_text)
+		role_chip.setObjectName("SectionRoleChip")
+		role_chip.setStyleSheet(
+			f"QLabel#SectionRoleChip {{ background-color: {bg}; color: {fg};"
+			f" border: 1px solid {border}; }}"
 		)
-		meta.setObjectName("SectionMeta")
-		layout.addWidget(meta)
+		head.addWidget(role_chip, 0, Qt.AlignTop)
+		body.addLayout(head)
 
-		if has_unmet:
-			alert = QLabel("● 자료에서 충분히 확인되지 않은 must_cover 항목이 있습니다.")
+		desc_text = str(section.get("description") or "").strip()
+		if desc_text:
+			desc = QLabel(desc_text)
+			desc.setObjectName("SectionDescription")
+			desc.setWordWrap(True)
+			body.addWidget(desc)
+
+		sentence_count = int(section.get("sentenceCount") or 0)
+		document_count = int(section.get("documentCount") or 0)
+		meta = QLabel(f"배치된 문장 {sentence_count}개 · 관련 자료 {document_count}건")
+		meta.setObjectName("SectionMeta")
+		body.addWidget(meta)
+
+		if sentence_count < self._UNDERWEIGHTED_MIN:
+			alert = QLabel(
+				"● 자료에서 충분히 확인되지 않은 섹션입니다 — 보강이 필요합니다."
+			)
 			alert.setObjectName("SectionAlert")
 			alert.setWordWrap(True)
-			layout.addWidget(alert)
+			body.addWidget(alert)
 
-	def mousePressEvent(self, event) -> None:  # type: ignore[override]
-		if event.button() == Qt.LeftButton:
-			self.clicked.emit(self._section_id)
-			event.accept()
-			return
-		super().mousePressEvent(event)
+		outer.addLayout(body, 1)
+
+		detail_btn = AppButton("자세히 보기", variant="ghost")
+		detail_btn.setObjectName("VerifyDetailButton")
+		detail_btn.setFixedHeight(28)
+		detail_btn.setFixedWidth(92)
+		detail_btn.clicked.connect(lambda: self.clicked.emit(self._section_id))
+		outer.addWidget(detail_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
 
 
 class _SectionsPanel(CardWidget):
-	"""'보고서 섹션 구조' 패널 — surfaces Task 1 (sections) results inline.
+	"""'보고서 흐름 구조' 패널 — ordered report-flow outline from Task 1.
 
-	Sits between the summary stripe and the per-doc results so the user sees
-	the *report structure* the verification found before scrolling through
-	per-doc ratings.
+	Sits between the summary stripe and the per-doc results so the writer
+	first reads the *report structure* (introduction → body → conclusion)
+	before scrolling through per-doc ratings.
 	"""
 
 	sectionClicked = Signal(int)
 
 	def __init__(self, parent: QWidget | None = None) -> None:
-		super().__init__(title="보고서 섹션 구조", parent=parent)
-		caption = QLabel(
-			"조사 자료가 자동으로 묶인 보고서 섹션입니다. 각 섹션을 클릭하면 어떤"
-			" 자료가 그 섹션을 가장 잘 받쳐주는지 확인할 수 있습니다."
+		super().__init__(title="보고서 흐름 구조", parent=parent)
+		self._caption = QLabel(
+			"LLM 이 조사 의도·계획·자료 메타를 보고 정한 보고서 작성 순서입니다."
+			" 각 섹션을 클릭하면 어느 자료의 어느 문장이 그 섹션에 배치되는지"
+			" 확인할 수 있습니다."
 		)
-		caption.setObjectName("CardSecondary")
-		caption.setWordWrap(True)
-		self.layout.addWidget(caption)
+		self._caption.setObjectName("CardSecondary")
+		self._caption.setWordWrap(True)
+		self.layout.addWidget(self._caption)
+
+		# Tiny fallback notice — switches on when ``flow_source != 'llm'``.
+		self._fallback_notice = QLabel("")
+		self._fallback_notice.setObjectName("CardSecondary")
+		self._fallback_notice.setStyleSheet("color: #B45309; font-weight: 700;")
+		self._fallback_notice.setWordWrap(True)
+		self._fallback_notice.setVisible(False)
+		self.layout.addWidget(self._fallback_notice)
 
 		self._cards_layout = QVBoxLayout()
 		self._cards_layout.setContentsMargins(0, 0, 0, 0)
 		self._cards_layout.setSpacing(8)
 		self.layout.addLayout(self._cards_layout)
 
-		self._empty_label: QLabel | None = None
-
-	def apply(self, sections: list[dict[str, Any]], unmet_count: int) -> None:
-		"""Rebuild the card grid from the latest sections overview payload."""
+	def apply(self, sections: list[dict[str, Any]], flow_source: str) -> None:
+		"""Rebuild the card stack from the latest sections overview payload."""
 		while self._cards_layout.count():
 			item = self._cards_layout.takeAt(0)
 			widget = item.widget() if item else None
 			if widget is not None:
 				widget.setParent(None)
 				widget.deleteLater()
-		self._empty_label = None
+
+		if flow_source == "fallback":
+			self._fallback_notice.setText(
+				"⚠ LLM 흐름 계획에 실패하여 must_cover 기반 임시 구조로 대체되었습니다."
+				" LLM 서버 상태를 확인 후 ‘재검증’ 을 눌러주세요."
+			)
+			self._fallback_notice.setVisible(True)
+		else:
+			self._fallback_notice.setVisible(False)
 
 		if not sections:
 			empty = QLabel("섹션 구조가 아직 분석되지 않았습니다.")
@@ -713,21 +780,21 @@ class _SectionsPanel(CardWidget):
 			empty.setAlignment(Qt.AlignCenter)
 			empty.setWordWrap(True)
 			self._cards_layout.addWidget(empty)
-			self._empty_label = empty
 			return
 
-		# We don't know per-section unmet without the raw artifact; surface the
-		# workspace-level unmet count on the first card as a soft alert when
-		# any unmet items exist. Keeps the panel honest without lying about
-		# which exact section is affected.
-		for index, section in enumerate(sections):
-			card = _SectionCard(section, has_unmet=(index == 0 and unmet_count > 0))
+		for section in sections:
+			card = _SectionCard(section)
 			card.clicked.connect(self.sectionClicked)
 			self._cards_layout.addWidget(card)
 
 
 class VerifySectionDetailDialog(QDialog):
-	"""Modal showing one section's labels + top supporting documents."""
+	"""Modal showing one flow section's sentence-level evidence.
+
+	Each row is a sentence assigned to this section — source title + the
+	sentence text itself — so the writer can read the actual quote and
+	decide whether to cite it directly.
+	"""
 
 	def __init__(
 		self,
@@ -739,7 +806,7 @@ class VerifySectionDetailDialog(QDialog):
 		self.setObjectName("VerifySectionDialog")
 		self.setWindowTitle("보고서 섹션 상세")
 		self.setModal(True)
-		self.resize(560, 460)
+		self.resize(720, 600)
 		self.setStyleSheet(
 			"""
 			QDialog#VerifySectionDialog { background-color: #F8FAFC; }
@@ -747,41 +814,36 @@ class VerifySectionDetailDialog(QDialog):
 				background-color: #FFFFFF; border: 1px solid #E2E8F0;
 				border-radius: 12px;
 			}
-			QFrame#TopDocRow {
+			QFrame#SentenceRow {
 				background-color: #FFFFFF; border: 1px solid #E5E7EB;
 				border-radius: 10px;
 			}
 			QLabel#SectionDialogTitle { color: #0F172A; font-size: 15px; font-weight: 800; }
-			QLabel#SectionDialogMeta  { color: #64748B; font-size: 12px; font-weight: 600; }
-			QLabel#TopDocTitle { color: #1F2937; font-size: 12px; font-weight: 700; }
+			QLabel#SectionDialogDesc  { color: #475569; font-size: 12px; font-weight: 500; }
+			QLabel#SectionDialogMeta  { color: #64748B; font-size: 11px; font-weight: 600; }
+			QLabel#SentenceSource { color: #4F46E5; font-size: 11px; font-weight: 800; }
+			QLabel#SentenceLocator { color: #94A3B8; font-size: 10px; font-weight: 700; }
+			QLabel#SentenceBody { color: #1F2937; font-size: 13px; font-weight: 500; }
+			QLabel#SectionDialogRoleChip { font-size: 11px; font-weight: 800; padding: 3px 10px; border-radius: 11px; }
 			"""
 		)
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(18, 18, 18, 18)
 		layout.setSpacing(12)
 
-		header = QFrame()
-		header.setObjectName("SectionDialogHeader")
-		header_layout = QVBoxLayout(header)
-		header_layout.setContentsMargins(16, 14, 16, 14)
-		header_layout.setSpacing(6)
-		labels = ", ".join(str(t) for t in (section.get("labels") or []) if str(t).strip())
-		title = QLabel(labels or f"섹션 {section.get('sectionId')}")
-		title.setObjectName("SectionDialogTitle")
-		title.setWordWrap(True)
-		meta = QLabel(
-			f"근거 chunk {int(section.get('evidenceCount') or 0)}건"
-			f" · 관련 자료 {int(section.get('documentCount') or 0)}건"
-			f" · must_cover {int(section.get('mustCoverCount') or 0)}개"
-		)
-		meta.setObjectName("SectionDialogMeta")
-		header_layout.addWidget(title)
-		header_layout.addWidget(meta)
-		layout.addWidget(header)
+		layout.addWidget(self._header(section))
 
-		top_title = QLabel("이 섹션을 가장 잘 받쳐주는 자료")
-		top_title.setObjectName("CardTitle")
-		layout.addWidget(top_title)
+		body_title = QLabel("이 섹션에 배치된 문장들")
+		body_title.setObjectName("CardTitle")
+		layout.addWidget(body_title)
+
+		caption = QLabel(
+			"각 문장은 ‘출처 자료 → 문장 위치 → 본문’ 형태로 표시됩니다."
+			" 보고서 작성 시 그대로 인용하거나 paraphrase 의 근거로 사용할 수 있습니다."
+		)
+		caption.setObjectName("CardSecondary")
+		caption.setWordWrap(True)
+		layout.addWidget(caption)
 
 		scroll = QScrollArea()
 		scroll.setWidgetResizable(True)
@@ -792,27 +854,17 @@ class VerifySectionDetailDialog(QDialog):
 		container_layout.setContentsMargins(0, 0, 0, 0)
 		container_layout.setSpacing(8)
 
-		top_docs = section.get("topDocs") or []
-		if not top_docs:
-			empty = QLabel("이 섹션에 대한 doc-level 근거가 아직 부족합니다.")
+		assignments = section.get("sentenceAssignments") or []
+		if not assignments:
+			empty = QLabel("이 섹션에 배치된 문장이 없습니다. 자료 보강이 필요합니다.")
 			empty.setObjectName("CardSecondary")
 			empty.setWordWrap(True)
 			container_layout.addWidget(empty)
 		else:
-			for index, doc_id in enumerate(top_docs, start=1):
-				row = QFrame()
-				row.setObjectName("TopDocRow")
-				row_layout = QHBoxLayout(row)
-				row_layout.setContentsMargins(12, 10, 12, 10)
-				row_layout.setSpacing(10)
-				number = QLabel(str(index))
-				number.setObjectName("IssueNumber")
-				row_layout.addWidget(number, 0, Qt.AlignTop)
-				body = QLabel(doc_titles.get(str(doc_id), f"문서 {doc_id}"))
-				body.setObjectName("TopDocTitle")
-				body.setWordWrap(True)
-				row_layout.addWidget(body, 1)
-				container_layout.addWidget(row)
+			for index, assignment in enumerate(assignments, start=1):
+				container_layout.addWidget(
+					self._sentence_row(index, assignment, doc_titles)
+				)
 		container_layout.addStretch(1)
 		scroll.setWidget(container)
 		layout.addWidget(scroll, 1)
@@ -821,6 +873,87 @@ class VerifySectionDetailDialog(QDialog):
 		buttons.rejected.connect(self.reject)
 		buttons.accepted.connect(self.accept)
 		layout.addWidget(buttons)
+
+	def _header(self, section: dict[str, Any]) -> QFrame:
+		header = QFrame()
+		header.setObjectName("SectionDialogHeader")
+		header_layout = QVBoxLayout(header)
+		header_layout.setContentsMargins(16, 14, 16, 14)
+		header_layout.setSpacing(6)
+
+		title_row = QHBoxLayout()
+		title_row.setContentsMargins(0, 0, 0, 0)
+		title_row.setSpacing(8)
+		title = QLabel(str(section.get("title") or f"섹션 {section.get('sectionId')}"))
+		title.setObjectName("SectionDialogTitle")
+		title.setWordWrap(True)
+		title_row.addWidget(title, 1)
+		role = str(section.get("role") or "body").lower()
+		role_label_text, bg, fg, border = _ROLE_CHIP.get(role, _ROLE_CHIP["body"])
+		role_chip = QLabel(role_label_text)
+		role_chip.setObjectName("SectionDialogRoleChip")
+		role_chip.setStyleSheet(
+			f"QLabel#SectionDialogRoleChip {{ background-color: {bg}; color: {fg};"
+			f" border: 1px solid {border}; }}"
+		)
+		title_row.addWidget(role_chip, 0, Qt.AlignTop)
+		header_layout.addLayout(title_row)
+
+		desc_text = str(section.get("description") or "").strip()
+		if desc_text:
+			desc = QLabel(desc_text)
+			desc.setObjectName("SectionDialogDesc")
+			desc.setWordWrap(True)
+			header_layout.addWidget(desc)
+
+		meta = QLabel(
+			f"순서 {int(section.get('order') or 0) + 1}"
+			f" · 배치 문장 {int(section.get('sentenceCount') or 0)}개"
+			f" · 관련 자료 {int(section.get('documentCount') or 0)}건"
+		)
+		meta.setObjectName("SectionDialogMeta")
+		header_layout.addWidget(meta)
+		return header
+
+	def _sentence_row(
+		self,
+		index: int,
+		assignment: dict[str, Any],
+		doc_titles: dict[str, str],
+	) -> QFrame:
+		row = QFrame()
+		row.setObjectName("SentenceRow")
+		layout = QVBoxLayout(row)
+		layout.setContentsMargins(12, 10, 12, 10)
+		layout.setSpacing(4)
+
+		head = QHBoxLayout()
+		head.setContentsMargins(0, 0, 0, 0)
+		head.setSpacing(8)
+		number = QLabel(str(index))
+		number.setObjectName("IssueNumber")
+		head.addWidget(number, 0, Qt.AlignTop)
+		doc_id = str(assignment.get("docId") or "")
+		source = QLabel(doc_titles.get(doc_id, f"문서 {doc_id}"))
+		source.setObjectName("SentenceSource")
+		source.setWordWrap(True)
+		head.addWidget(source, 1)
+		locator = QLabel(
+			f"문단 {int(assignment.get('paragraphIndex') or 0) + 1}"
+			f" · 문장 {int(assignment.get('sentenceIndex') or 0) + 1}"
+		)
+		locator.setObjectName("SentenceLocator")
+		head.addWidget(locator, 0, Qt.AlignRight | Qt.AlignTop)
+		layout.addLayout(head)
+
+		body = QLabel(str(assignment.get("text") or ""))
+		body.setObjectName("SentenceBody")
+		body.setWordWrap(True)
+		body.setTextInteractionFlags(
+			Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+		)
+		layout.addWidget(body)
+		return row
 
 
 class _EmptyStateCard(CardWidget):
@@ -950,6 +1083,16 @@ class VerifyPage(QWidget):
 
 		# Summary stripe (counts + averages). The "점검 필요 항목" stat is
 		# clickable — :class:`VerifyIssuesDialog` opens with the full list.
+		summary_caption = QLabel(
+			"‘평균 일치율’ 은 이 워크스페이스의 가장 잘 매칭된 자료를 100% 로 두고"
+			" 각 자료가 그 대비 얼마나 매칭되는지를 평균낸 값입니다 — 워크스페이스"
+			" 자료들의 평균 품질에 비례합니다 (모든 자료가 균등하게 잘 매칭되면 100% 에"
+			" 가깝고, 한두 자료만 강하게 매칭되면 낮아집니다)."
+		)
+		summary_caption.setObjectName("CardSecondary")
+		summary_caption.setWordWrap(True)
+		root.addWidget(summary_caption)
+
 		self._summary_stripe = _SummaryStripe()
 		self._summary_stripe.issuesClicked.connect(self._on_issues_clicked)
 		root.addWidget(self._summary_stripe)
@@ -969,8 +1112,10 @@ class VerifyPage(QWidget):
 		# Per-doc results header + filter chips.
 		results_header = CardWidget("자료별 검증 결과")
 		results_header_caption = QLabel(
-			"각 자료가 사용자 의도와 얼마나 잘 맞물리는지를 0~100% 의 일치율로 보여줍니다."
-			" ‘상세 보기’ 버튼으로 자료가 약하게 다룬 보고서 섹션·의도 주제를 확인할 수 있습니다."
+			"각 자료의 ‘일치율 %’는 이 워크스페이스에서 가장 잘 매칭된 자료를 100% 로 두고"
+			" 그 대비 비율을 보여줍니다.  ≥ 70% → 높음, 40 ~ 70% → 중간, < 40% → 낮음."
+			" 아래 칩을 누르면 해당 단계의 자료만 추려서 볼 수 있고, ‘상세 보기’ 로"
+			" 그 자료가 약하게 다룬 섹션·의도 주제를 확인할 수 있습니다."
 		)
 		results_header_caption.setObjectName("CardSecondary")
 		results_header_caption.setWordWrap(True)
@@ -978,13 +1123,33 @@ class VerifyPage(QWidget):
 
 		filter_row = QHBoxLayout()
 		filter_row.setSpacing(8)
-		self._filter_buttons: dict[str, AppButton] = {}
+		self._filter_buttons: dict[str, QToolButton] = {}
 		for label in _FILTERS:
-			chip = AppButton(label, variant="filter")
+			chip = QToolButton()
+			chip.setObjectName("VerifyFilterChip")
+			chip.setText(label)
+			chip.setCheckable(True)
+			chip.setCursor(Qt.PointingHandCursor)
+			chip.setFocusPolicy(Qt.NoFocus)
 			chip.clicked.connect(partial(self._set_filter, label))
 			filter_row.addWidget(chip)
 			self._filter_buttons[label] = chip
 		filter_row.addStretch(1)
+		# Chip stylesheet — checked = brand color, unchecked = subdued. Applied
+		# on the filter row so chip count widgets inherit the same palette.
+		results_header.setStyleSheet(
+			"QToolButton#VerifyFilterChip {"
+			"  background-color: #F1F5F9; color: #475569;"
+			"  border: 1px solid #E2E8F0; border-radius: 14px;"
+			"  padding: 5px 12px; font-size: 12px; font-weight: 700;"
+			"}"
+			"QToolButton#VerifyFilterChip:hover { border-color: #CBD5E1; }"
+			"QToolButton#VerifyFilterChip:checked {"
+			"  background-color: #4F46E5; color: #FFFFFF;"
+			"  border: 1px solid #4338CA;"
+			"}"
+		)
+		self._filter_buttons[self._active_filter].setChecked(True)
 		results_header.layout.addLayout(filter_row)
 		root.addWidget(results_header)
 		self._results_header = results_header
@@ -1161,14 +1326,14 @@ class VerifyPage(QWidget):
 			if isinstance(self._summary, dict)
 			else []
 		)
-		unmet_count = (
-			int(self._summary.get("unmetMustCoverCount") or 0)
+		flow_source = (
+			str(self._summary.get("flowSource") or "")
 			if isinstance(self._summary, dict)
-			else 0
+			else ""
 		)
 		self._sections_panel.setVisible(available)
 		if available:
-			self._sections_panel.apply(sections_overview, unmet_count)
+			self._sections_panel.apply(sections_overview, flow_source)
 		self._results_header.setVisible(available)
 		self._prev_btn.setVisible(available)
 		self._next_btn.setVisible(available)
@@ -1186,6 +1351,17 @@ class VerifyPage(QWidget):
 			if widget is not None:
 				widget.setParent(None)
 				widget.deleteLater()
+
+		# Update every chip's label so the user sees per-level counts even
+		# before clicking — answers "어떤 문서가 각 항목으로 평가되었는지".
+		counts = {
+			"전체": len(self._items),
+			"높음": sum(1 for it in self._items if it.get("level") == "높음"),
+			"중간": sum(1 for it in self._items if it.get("level") == "중간"),
+			"낮음": sum(1 for it in self._items if it.get("level") == "낮음"),
+		}
+		for name, chip in self._filter_buttons.items():
+			chip.setText(f"{name} ({counts.get(name, 0)})")
 
 		filtered = [
 			item for item in self._items
@@ -1362,7 +1538,12 @@ class VerifyPage(QWidget):
 	# -- helpers --------------------------------------------------------------
 
 	def _set_filter(self, label: str) -> None:
+		# A QToolButton in a non-exclusive group can stay un-checked when
+		# clicked again. Force-check the active one (and un-check the others)
+		# so the chip row always shows exactly one selected level.
 		self._active_filter = label
+		for name, chip in self._filter_buttons.items():
+			chip.setChecked(name == label)
 		self._current_page = 0
 		self._render_results()
 

@@ -863,6 +863,9 @@ class AgentRuntime:
             dense=DenseIndex(self.llm),
             config=config,
             persistence=VerificationPersistence(self.output_root),
+            # Task 1's flow planner needs a chat-completion LLM; the same
+            # llama-server backs the embed channel via DenseIndex above.
+            llm=self.llm,
         )
 
         try:

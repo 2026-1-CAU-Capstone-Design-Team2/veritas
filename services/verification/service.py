@@ -19,6 +19,11 @@ from typing import Callable, Sequence
 
 import numpy as np
 
+from pathlib import Path
+
+from tools.loader import load_schema
+from tools.verify_flow_planner_tool import VerifyFlowPlannerTool
+
 from .artifact_loader import ArtifactLoader, key_points_from_docs
 from .consensus.consensus_pipeline import run_consensus_pipeline
 from .indexing.bm25_index import BM25Index
@@ -35,6 +40,15 @@ from .persistence import VerificationPersistence
 from .retrieval import stack_chunk_embeddings
 from .sections.section_pipeline import run_section_pipeline
 from .tokenization import HybridTokenizer
+
+# The flow-planner tool's schema lives next to its implementation. Resolved
+# once at import time so per-run service construction stays cheap.
+_FLOW_PLANNER_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "tools"
+    / "verify_flow_planner_tool"
+    / "tool_schema.json"
+)
 
 # Task names accepted by :meth:`VerificationService.run`. The order here is the
 # order pipelines execute when ``tasks`` is left at the default.
@@ -77,12 +91,30 @@ class VerificationService:
         config: VerificationConfig,
         persistence: VerificationPersistence,
         *,
+        llm=None,
+        flow_planner_tool: VerifyFlowPlannerTool | None = None,
         bm25_factory: Bm25Factory | None = None,
         tokenizer: HybridTokenizer | None = None,
     ) -> None:
         self._workspace = workspace
         self._loader = artifact_loader
         self._dense = dense
+        # ``flow_planner_tool`` is required for Task 1 (sections). Callers may
+        # pass a pre-built instance — e.g. one already registered in the
+        # chat ToolRegistry — or omit it and pass ``llm`` to let the service
+        # spin up its own tool against the schema next to the implementation.
+        # Tasks 2/3 don't need it; ``run`` raises a clear error if Task 1
+        # is requested with neither supplied.
+        self._llm = llm
+        if flow_planner_tool is not None:
+            self._flow_planner_tool: VerifyFlowPlannerTool | None = flow_planner_tool
+        elif llm is not None:
+            self._flow_planner_tool = VerifyFlowPlannerTool(
+                schema=load_schema(_FLOW_PLANNER_SCHEMA_PATH),
+                llm=llm,
+            )
+        else:
+            self._flow_planner_tool = None
         self._cfg = config
         self._persistence = persistence
         self._tokenizer = tokenizer or HybridTokenizer()
@@ -156,22 +188,37 @@ class VerificationService:
         )
 
         if "sections" in requested:
-            cb("sections", "섹션 클러스터링 분석 중...")
+            if self._flow_planner_tool is None:
+                raise RuntimeError(
+                    "Task 1 (sections) needs the verify_flow_planner tool; "
+                    "construct VerificationService with llm=... (auto-builds the tool) "
+                    "or pass flow_planner_tool=... directly, or omit 'sections' from tasks."
+                )
+            cb("sections", "보고서 흐름 구성 중 (LLM)...")
             artifacts.sections = run_section_pipeline(
-                chunks=self.chunks,
-                chunk_bm25=self.chunk_bm25,
+                docs=self.docs,
                 dense=self._dense,
+                flow_planner_tool=self._flow_planner_tool,
+                request_text=self.request_text,
                 plan=self.plan,
+                grounding=self.grounding,
                 cfg=self._cfg,
-                chunk_embeddings=self.chunk_embeddings,
                 tokenizer=self._tokenizer,
             )
             section_count = len(artifacts.sections.sections)
-            unmet_count = len(artifacts.sections.unmet_must_cover)
+            assigned_sentences = sum(
+                len(section.sentence_assignments)
+                for section in artifacts.sections.sections
+            )
             cb(
                 "sections",
-                f"섹션 분석 완료 · 섹션 {section_count}개 · 미충족 {unmet_count}개",
-                detail={"sections": section_count, "unmet": unmet_count},
+                f"흐름 구성 완료 · 섹션 {section_count}개 · 배치된 문장 {assigned_sentences}개"
+                f" ({artifacts.sections.flow_source})",
+                detail={
+                    "sections": section_count,
+                    "sentenceAssignments": assigned_sentences,
+                    "flowSource": artifacts.sections.flow_source,
+                },
             )
             completed.append("sections")
 

@@ -352,3 +352,41 @@ KNOWLEDGE BASE CONTEXT:
 
 Write the assistant message that should appear in the chat for this screen context now.
 Language rule: answer in the dominant language of SCREEN WRITING CONTEXT. If SCREEN WRITING CONTEXT is Korean, answer in Korean."""
+
+
+VERIFY_FLOW_PLANNER_PROMPT = """You are an editor planning the outline of a research report.
+
+Given the user's request, the planner's topic / goal / must_cover items, the
+grounded terms, and a few document titles & summary snippets, decide the
+ordered list of report sections the writer will need.
+
+Output JSON only, matching exactly this schema:
+
+{
+  "sections": [
+    {
+      "title": "섹션 제목 (자연어 명사구, 한 문장)",
+      "description": "이 섹션에서 다룰 내용을 1~2문장으로 설명",
+      "role": "intro" | "body" | "conclusion",
+      "keywords": ["섹션 내부 검색에 도움될 키워드 3~6개"]
+    }
+  ]
+}
+
+Rules:
+- ``sections`` length must be between min_sections and max_sections (inclusive),
+  values are provided in the user payload.
+- The very first section's role must be ``intro``; the very last section's
+  role must be ``conclusion``; everything in between is ``role=body``.
+- Order the sections by the actual reading flow of the report
+  (e.g. 정의/배경 → 핵심 메커니즘 → 응용/한계 → 마무리).
+- ``title`` is a natural-language noun phrase, NOT a keyword dump
+  ("MCP 개요" OK, "mcp ai docs" NOT OK).
+- ``description`` must read like a one-sentence editorial brief so the
+  writer immediately knows why the section exists.
+- Do not invent sections the source documents could not plausibly support —
+  stay inside the topic + must_cover + grounded_terms space.
+- Use the language of the user's request (Korean if Korean; English otherwise)
+  for ``title``/``description``/``keywords``. Preserve domain proper nouns
+  in their original form even when answering in Korean.
+- Output JSON only. No prose, no markdown fences."""

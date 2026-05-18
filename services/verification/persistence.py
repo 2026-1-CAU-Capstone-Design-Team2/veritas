@@ -32,10 +32,10 @@ from .models import (
     ConsensusResult,
     CoverageGap,
     Facet,
+    FlowSection,
     IntentResult,
-    Section,
     SectionResult,
-    UnmetMustCover,
+    SentenceAssignment,
     VerificationArtifacts,
     VerificationConfig,
 )
@@ -193,38 +193,37 @@ def _serialize_section_result(result: SectionResult) -> dict:
 
 
 def _deserialize_section_result(payload: dict) -> SectionResult:
-    sections = [
-        Section(
-            id=int(item.get("id", 0)),
-            origin_must_cover_indices=[int(i) for i in item.get("origin_must_cover_indices", [])],
-            label_terms=[str(t) for t in item.get("label_terms", [])],
-            chunk_evidence=[
-                _deserialize_chunk_evidence(c) for c in item.get("chunk_evidence", [])
-            ],
-            doc_scores={str(k): float(v) for k, v in (item.get("doc_scores") or {}).items()},
+    sections: list[FlowSection] = []
+    for item in payload.get("sections", []):
+        if not isinstance(item, dict):
+            continue
+        assignments = [
+            SentenceAssignment(
+                doc_id=str(a.get("doc_id", "")),
+                paragraph_index=int(a.get("paragraph_index", 0)),
+                sentence_index=int(a.get("sentence_index", 0)),
+                text=str(a.get("text", "")),
+                fit_score=float(a.get("fit_score", 0.0)),
+            )
+            for a in item.get("sentence_assignments", [])
+            if isinstance(a, dict)
+        ]
+        sections.append(
+            FlowSection(
+                id=int(item.get("id", 0)),
+                order=int(item.get("order", item.get("id", 0))),
+                title=str(item.get("title", "")),
+                description=str(item.get("description", "")),
+                role=str(item.get("role", "body")),
+                keywords=[str(k) for k in item.get("keywords", [])],
+                sentence_assignments=assignments,
+            )
         )
-        for item in payload.get("sections", [])
-        if isinstance(item, dict)
-    ]
-    unmet = [
-        UnmetMustCover(
-            index=int(item.get("index", 0)),
-            text=str(item.get("text", "")),
-            top_rrf=float(item.get("top_rrf", 0.0)),
-        )
-        for item in payload.get("unmet_must_cover", [])
-        if isinstance(item, dict)
-    ]
-    return SectionResult(sections=sections, unmet_must_cover=unmet)
-
-
-def _deserialize_chunk_evidence(item: dict):
-    from .models import ChunkEvidence
-
-    return ChunkEvidence(
-        doc_id=str(item.get("doc_id", "")),
-        chunk_id=str(item.get("chunk_id", "")),
-        rrf_score=float(item.get("rrf_score", 0.0)),
+    return SectionResult(
+        sections=sections,
+        flow_source=str(payload.get("flow_source") or "llm"),
+        sentence_count=int(payload.get("sentence_count") or 0),
+        document_count=int(payload.get("document_count") or 0),
     )
 
 

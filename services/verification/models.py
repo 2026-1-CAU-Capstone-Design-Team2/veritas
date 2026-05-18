@@ -43,17 +43,24 @@ class VerificationConfig:
     # --- Reciprocal Rank Fusion (indexing/rrf.py) ---
     rrf_k: int = 60
 
-    # --- Task 1: section clustering ---
-    section_query_edge_threshold: float = 0.55  # cosine edge in must_cover graph
-    community_resolution: float = 1.0           # Louvain resolution (shared T1/T2)
-    section_top_chunk: int = 10                 # chunk evidence kept per section
-    section_candidate_multiplier: int = 5       # per-query candidate pool = top_chunk * this
-    unmet_must_cover_threshold: float = 0.01    # RRF score below this => unmet must_cover
-    doc_score_top_chunk: int = 5                # topK chunks averaged into a doc-level score
-    label_top_n: int = 8                        # c-TF-IDF terms kept per auto label
+    # --- Task 1: section flow (LLM-planned outline + sentence-level retrieval) ---
+    community_resolution: float = 1.0           # Louvain resolution (shared T2; legacy T1 retained)
+    section_candidate_multiplier: int = 5       # per-section sentence candidate pool size
+    section_top_chunk: int = 10                 # (retained for Task 2 retrieval helper)
+    doc_score_top_chunk: int = 5                # (retained for Task 2 doc-level aggregation)
+    section_sentence_top_k: int = 12            # sentences kept per flow section
+    section_sentence_min_chars: int = 12        # sentences shorter than this are dropped at split time
+    section_sentence_max_chars: int = 320       # sentences longer than this get clause-split
+    label_top_n: int = 8                        # c-TF-IDF terms kept per auto label (Task 2/3)
     label_ngram_min: int = 1
     label_ngram_max: int = 3
     label_max_features: int = 5000
+    # LLM flow planner — runs once per verify call. Caps keep the prompt /
+    # output bounded so cost stays predictable.
+    flow_planner_max_sections: int = 6
+    flow_planner_min_sections: int = 3
+    flow_planner_doc_hints: int = 12            # how many doc titles+summary first lines to show LLM
+    flow_planner_timeout_sec: float = 90.0
 
     # --- Task 2: intent coverage ---
     intent_query_edge_threshold: float = 0.55   # cosine edge in intent-query graph
@@ -168,38 +175,68 @@ class Query:
 
 
 @dataclass
-class ChunkEvidence:
-    """One chunk supporting a section, with its fused retrieval score."""
+class SentenceUnit:
+    """One sentence pulled out of a doc's clean_md, with its embedding cached.
+
+    ``doc_id`` / ``paragraph_index`` / ``sentence_index`` together form a stable
+    cross-doc address so the writing stage can later re-locate the same span
+    inside its original paragraph for context. ``order`` is a corpus-wide rank
+    used as the (sole) deterministic position for retrieval rankings.
+    """
 
     doc_id: str
-    chunk_id: str
-    rrf_score: float
+    paragraph_index: int
+    sentence_index: int
+    text: str
+    order: int = 0
+    embedding: np.ndarray | None = None
 
 
 @dataclass
-class Section:
-    """An auto-identified report section (Task 1)."""
+class SentenceAssignment:
+    """One sentence assigned to one flow section, with its retrieval score."""
+
+    doc_id: str
+    paragraph_index: int
+    sentence_index: int
+    text: str
+    fit_score: float
+
+
+@dataclass
+class FlowSection:
+    """One ordered section of the planned report-flow outline.
+
+    ``role`` is one of ``"intro" | "body" | "conclusion"`` — the LLM-decided
+    narrative role, used by the UI to render an ordered timeline with role
+    chips. ``keywords`` are the LLM's own keyword hints retained for
+    transparency (and as a sparse-retrieval boost on top of the title /
+    description embedding).
+    """
 
     id: int
-    origin_must_cover_indices: list[int]
-    label_terms: list[str]
-    chunk_evidence: list[ChunkEvidence] = field(default_factory=list)
-    doc_scores: dict[str, float] = field(default_factory=dict)
-
-
-@dataclass
-class UnmetMustCover:
-    """A ``must_cover`` item the corpus does not actually support (Task 1 §3.5)."""
-
-    index: int
-    text: str
-    top_rrf: float
+    order: int
+    title: str
+    description: str
+    role: str
+    keywords: list[str] = field(default_factory=list)
+    sentence_assignments: list[SentenceAssignment] = field(default_factory=list)
 
 
 @dataclass
 class SectionResult:
-    sections: list[Section] = field(default_factory=list)
-    unmet_must_cover: list[UnmetMustCover] = field(default_factory=list)
+    """Task 1 output — the ordered report-flow outline."""
+
+    sections: list[FlowSection] = field(default_factory=list)
+    # How the flow was authored. ``"llm"`` = via flow_planner; ``"fallback"`` =
+    # plan.must_cover deduplication when the LLM call failed or was disabled.
+    # Surfaced so the UI can warn that an LLM hiccup left the user looking at
+    # a degraded outline rather than a successful one.
+    flow_source: str = "llm"
+    # Sentence-level units this run analysed — kept so callers can introspect
+    # the corpus the assignments were drawn from without reloading.
+    sentence_count: int = 0
+    document_count: int = 0
 
 
 @dataclass
@@ -301,9 +338,9 @@ __all__ = [
     "DocRecord",
     "KeyPointRecord",
     "Query",
-    "ChunkEvidence",
-    "Section",
-    "UnmetMustCover",
+    "SentenceUnit",
+    "SentenceAssignment",
+    "FlowSection",
     "SectionResult",
     "Facet",
     "CoverageGap",
