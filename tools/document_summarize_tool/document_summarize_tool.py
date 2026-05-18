@@ -451,19 +451,27 @@ class DocumentSummarizeTool(BaseTool):
         ]
 
     def _read_batch_documents(self, batch_records) -> list[str]:
-        """Read each batch document's clean Markdown, capped so the whole batch
-        fits the model context.
+        """Read each batch document's *post-cleanup* clean Markdown, capped so
+        the whole batch fits the model context.
 
-        The batch summary is built directly from clean_md (not from per-document
-        summaries), so the per-document slice is the context budget divided
-        across the batch.
+        ``record.text_path`` points at the raw_md/ file Crawl4AI wrote — that
+        was the only Markdown back when ``clean_md`` was the Crawl4AI output.
+        Now the document_cleanup tool runs after fetch and writes the real
+        cleaned body to ``clean_md/<doc_id>.md``, so the batch summary should
+        prefer that path. Falling back to ``text_path`` lets a workspace that
+        has not run cleanup yet still produce a (degraded) batch summary
+        instead of failing the loop.
         """
         per_doc_cap = max(
             2000, self._single_pass_budget() // max(1, self._batch_size)
         )
         documents: list[str] = []
         for record in batch_records:
-            content = self._run_store_service.read_text_file(record.text_path)
+            clean_path = self._run_store_service.clean_md_dir / f"{record.doc_id}.md"
+            if clean_path.exists():
+                content = self._run_store_service.read_text_file(str(clean_path))
+            else:
+                content = self._run_store_service.read_text_file(record.text_path)
             documents.append((content or "")[:per_doc_cap])
         return documents
 

@@ -34,6 +34,7 @@ def build_registry(
     from services.screen_tool_funcs import ScreenContextService
 
     from .current_time_tool import CurrentTimeTool
+    from .document_cleanup_tool import DocumentCleanupTool
     from .document_summarize_tool import DocumentSummarizeTool
     from .fetch_webpage_tool import FetchWebpageTool
     from .final_report_tool import FinalReportTool
@@ -89,6 +90,18 @@ def build_registry(
             run_store_service=run_store_service,
             batch_size=batch_size,
             max_context=max_context,
+        )
+    )
+
+    # Per-doc cleanup — strips boilerplate paragraphs the LLM flags in raw_md
+    # and persists the cleaned body to clean_md/<id>.md plus a meta-only
+    # summary/doc_<id>.md. Runs after fetch in AutoSurvey, replacing the
+    # previous per-doc LLM summarize pass on the workflow's critical path.
+    registry.register(
+        DocumentCleanupTool(
+            schema=load_schema(TOOLS_DIR / "document_cleanup_tool" / "tool_schema.json"),
+            llm=llm,
+            run_store_service=run_store_service,
         )
     )
 

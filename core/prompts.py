@@ -354,6 +354,81 @@ Write the assistant message that should appear in the chat for this screen conte
 Language rule: answer in the dominant language of SCREEN WRITING CONTEXT. If SCREEN WRITING CONTEXT is Korean, answer in Korean."""
 
 
+DOCUMENT_CLEANUP_PROMPT = """You are cleaning a research document for downstream analysis.
+
+The input is the Markdown body of one web page, with every paragraph prefixed
+by a stable index of the form ``[P0]``, ``[P1]``, ``[P2]`` …. Web Markdown
+typically carries non-body chrome (site navigation, footer, share/cookie
+strips, breadcrumbs, theme-switcher logos, "on this page" sidebars, repeated
+menu blocks). Your job is to *identify the paragraph indices that are NOT
+body content*, and to extract the body's keywords + key points.
+
+Output format — plain text only, exactly three sections separated by ``===``
+lines. Do NOT output JSON; the body language often contains quotes / commas
+that break JSON escaping. The sections in order:
+
+BOILERPLATE_PARAGRAPHS
+<comma-separated paragraph indices, e.g. "3, 7, 12, 21" — empty if none>
+
+===
+
+KEYWORDS
+- <keyword 1>
+- <keyword 2>
+(5 to 10 items, one per line, prefixed by "- ")
+
+===
+
+KEY_POINTS
+- <key point 1>
+- <key point 2>
+(5 to 7 items, one per line, prefixed by "- ")
+
+Rules:
+
+A. ``BOILERPLATE_PARAGRAPHS``
+   - List the P-indices of paragraphs that are NOT body content.
+   - Include: navigation / menu lines, breadcrumbs, "Skip to content", "Edit
+     this page", "Share on …", cookie banners, footer text, repeated logo
+     captions, raw nav-link rows, sidebar-of-contents.
+   - Do NOT include: real prose, definitions, examples, code blocks that
+     illustrate concepts, tables that carry data, lists that contain
+     content (not menu items).
+   - When uncertain, KEEP the paragraph (do not list it). The downstream
+     pipeline tolerates leftover noise far better than missing body text.
+
+B. ``KEYWORDS`` — 5 ~ 10 short content terms that identify what the document
+   is about. Use the language of the body. Proper nouns / technical terms
+   stay in their original form. No stop words, no nav phrases.
+
+C. ``KEY_POINTS`` — 5 ~ 7 short, citation-shaped sentences pulled FROM the
+   body (paraphrase allowed) that capture the document's main claims or
+   findings. Each sentence < 200 chars. Use the body's language. These feed
+   the verification layer's cross-source consensus task.
+
+If the document is mostly empty / mostly chrome, return three empty sections:
+
+BOILERPLATE_PARAGRAPHS
+
+
+===
+
+KEYWORDS
+
+
+===
+
+KEY_POINTS
+
+
+— and the caller will treat the doc as unusable.
+
+Language policy: respond in the body's dominant language (Korean if the body
+is Korean, otherwise English). Preserve URLs, code identifiers, model names,
+file paths, and citations in their original form. Output the three sections
+exactly as shown — no surrounding prose, no markdown headers, no JSON."""
+
+
 VERIFY_FLOW_PLANNER_PROMPT = """You are an editor planning the outline of a research report.
 
 Given the user's request, the planner's topic / goal / must_cover items, the

@@ -334,6 +334,81 @@ class AutoSurveyWorkflow:
             "target_new_docs": target_new_docs,
         }
 
+    def _on_cleanup_progress(self, kind: str, **info: Any) -> None:
+        """Translate per-document cleanup events into research-progress emissions.
+
+        Cleanup runs after fetch and before batch summarize, once per document
+        (LLM index-only call). Each ``doc_cleanup_started`` / ``doc_cleanup_done``
+        event drives the progress bar exactly the way ``_on_summarize_progress``
+        used to for the old per-doc summarize loop.
+        """
+        record = info.get("record") if isinstance(info.get("record"), dict) else {}
+        doc_id = str(info.get("doc_id") or "")
+        title = str(record.get("title") or doc_id)
+        if kind == "doc_cleanup_started":
+            self._emit_progress(
+                "doc_cleanup",
+                f"정제 중: {title}",
+                detail={"docId": doc_id, "title": title},
+            )
+        elif kind == "doc_cleanup_done":
+            self._emit_progress(
+                "doc_cleaned",
+                f"정제 완료: {title}",
+                detail={
+                    "docId": doc_id,
+                    "title": title,
+                    "paragraphs": info.get("paragraphs"),
+                    "dropped": info.get("dropped"),
+                    "keywords": info.get("keywords") or [],
+                },
+            )
+        elif kind == "doc_cleanup_failed":
+            self._emit_progress(
+                "doc_cleanup_failed",
+                f"정제 실패: {title}",
+                detail={
+                    "docId": doc_id,
+                    "title": title,
+                    "error": str(info.get("error") or ""),
+                },
+            )
+
+    def run_cleanup(
+        self,
+        *,
+        doc_ids: list[str] | None = None,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Per-document cleanup: raw_md → clean_md + summary/doc_<id>.md.
+
+        Called after every collect cycle and *before* the batch summarize so
+        downstream batch / RAG / verify all see post-cleanup bodies. Replaces
+        the previous end-of-run per-doc summarize phase entirely.
+        """
+        if doc_ids is not None and not doc_ids:
+            print("[cleanup][skip:no-new-docs] empty doc id list")
+            return {
+                "cleaned_doc_ids": [],
+                "skipped_existing_doc_ids": [],
+                "failed_documents": [],
+            }
+        count = len(doc_ids) if doc_ids is not None else 0
+        message = f"문서 정제 중: {count}건" if count > 0 else "문서 정제 중..."
+        self._emit_progress(
+            "document_cleanup",
+            message,
+            detail={"doc_ids": doc_ids or []},
+        )
+        result = self.registry.get("document_cleanup").run(
+            doc_ids=doc_ids,
+            overwrite=overwrite,
+            progress_callback=self._on_cleanup_progress,
+        )
+        if not result.success:
+            raise RuntimeError(result.error)
+        return result.data or {}
+
     def run_summarize(
         self,
         *,
@@ -431,12 +506,21 @@ class AutoSurveyWorkflow:
 
         reference_collect_result = self._collect_reference_sites(reference_sites)
         if reference_collect_result.get("new_doc_count", 0) > 0:
+            reference_cleanup_result = self.run_cleanup(
+                doc_ids=reference_collect_result.get("new_doc_ids", []),
+                overwrite=overwrite_summaries,
+            )
             reference_summarize_result = self.run_summarize(
                 overwrite=overwrite_summaries,
                 doc_ids=reference_collect_result.get("new_doc_ids", []),
                 phase="batch",
             )
         else:
+            reference_cleanup_result = {
+                "cleaned_doc_ids": [],
+                "skipped_existing_doc_ids": [],
+                "failed_documents": [],
+            }
             reference_summarize_result = {
                 "summarized_doc_ids": [],
                 "skipped_reason": "no_reference_docs",
@@ -460,6 +544,10 @@ class AutoSurveyWorkflow:
         )
 
         if scout_collect_result.get("new_doc_count", 0) > 0:
+            scout_cleanup_result = self.run_cleanup(
+                doc_ids=scout_collect_result.get("new_doc_ids", []),
+                overwrite=overwrite_summaries,
+            )
             scout_summarize_result = self.run_summarize(
                 overwrite=overwrite_summaries,
                 doc_ids=scout_collect_result.get("new_doc_ids", []),
@@ -467,6 +555,11 @@ class AutoSurveyWorkflow:
             )
         else:
             print("[summarize][skip:no-new-docs] scout cycle produced no new documents")
+            scout_cleanup_result = {
+                "cleaned_doc_ids": [],
+                "skipped_existing_doc_ids": [],
+                "failed_documents": [],
+            }
             scout_summarize_result = {
                 "summarized_doc_ids": [],
                 "skipped_reason": "no_new_docs",
@@ -494,6 +587,10 @@ class AutoSurveyWorkflow:
         loop_index = 0
         empty_collect_replans = 0
         max_empty_collect_replans = 2
+        # Collect failures across the main-loop cleanup calls so the return
+        # value's ``failed_documents`` reflects every cycle, not only the
+        # last iteration.
+        loop_cleanup_failed: list[dict[str, str]] = []
 
         while self._kept_record_count() < self.max_docs:
             loop_index += 1
@@ -546,6 +643,15 @@ class AutoSurveyWorkflow:
                 break
 
             empty_collect_replans = 0
+            cleanup_result = self.run_cleanup(
+                doc_ids=collect_result.get("new_doc_ids", []),
+                overwrite=overwrite_summaries,
+            )
+            loop_cleanup_failed.extend(
+                item
+                for item in (cleanup_result.get("failed_documents") or [])
+                if isinstance(item, dict)
+            )
             summarize_result = self.run_summarize(
                 overwrite=overwrite_summaries,
                 doc_ids=collect_result.get("new_doc_ids", []),
@@ -634,32 +740,37 @@ class AutoSurveyWorkflow:
                 print("[workflow] stopping loop: no remaining search queries after replan")
                 break
 
-        # Per-document summaries run once here, after the collect/replan loop.
-        # They are UX descriptors (source cards / citations / verification) and
-        # do not feed gap analysis, so keeping them off the loop's critical path
-        # speeds convergence. This is the sole source of failed_documents.
-        per_doc_summarize_result = self.run_summarize(
-            overwrite=overwrite_summaries,
-            phase="per_doc",
-        )
-        failed_documents = [
-            failed
-            for failed in (per_doc_summarize_result.get("failed_documents") or [])
-            if isinstance(failed, dict)
-        ]
+        # Per-doc summarize no longer runs at the end of the survey. The
+        # document_cleanup tool — called after every collect cycle, on the
+        # workflow's critical path — already wrote ``summary/doc_<id>.md`` for
+        # every kept doc directly from index.json + the cleanup output (no
+        # extra LLM call). ``failed_documents`` is now the union of every
+        # cleanup cycle's failures.
+        failed_documents: list[dict[str, str]] = []
+        for cleanup_payload in (
+            reference_cleanup_result,
+            scout_cleanup_result,
+        ):
+            failed_documents.extend(
+                item
+                for item in (cleanup_payload.get("failed_documents") or [])
+                if isinstance(item, dict)
+            )
+        failed_documents.extend(loop_cleanup_failed)
 
         final_result = self.run_final(user_request=user_request)
 
         return {
             "grounding": grounding,
             "reference_collect_result": reference_collect_result,
+            "reference_cleanup_result": reference_cleanup_result,
             "reference_summarize_result": reference_summarize_result,
             "initial_plan": initial_plan,
             "scout_collect_result": scout_collect_result,
+            "scout_cleanup_result": scout_cleanup_result,
             "scout_summarize_result": scout_summarize_result,
             "active_plan": active_plan,
             "iterations": iterations,
-            "per_doc_summarize_result": per_doc_summarize_result,
             "final_result": final_result,
             "failed_documents": failed_documents,
         }
