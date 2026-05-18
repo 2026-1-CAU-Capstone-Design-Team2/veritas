@@ -399,10 +399,12 @@ def issues_overview(
     """
     rows: list[dict[str, Any]] = []
 
-    # New "근거 부족 섹션" signal: an LLM-planned section the corpus cannot
-    # actually support (too few sentences assigned to it). Threshold is small
-    # by design — we only want to flag the truly underweighted sections.
-    _UNDERWEIGHTED_MIN_SENTENCES = 3
+    # "근거 부족 섹션": an LLM-planned section the corpus cannot fully support.
+    # Cutoff is ~ 1/3 of ``section_sentence_top_k`` so this fires when the
+    # writer can read it as "the outline asked for more than the corpus has",
+    # not on the trivial case of a few-doc workspace where 5-7 sentences may
+    # still be reasonable.
+    _UNDERWEIGHTED_MIN_SENTENCES = 8
     if artifacts.sections is not None:
         for section in artifacts.sections.sections:
             if len(section.sentence_assignments) >= _UNDERWEIGHTED_MIN_SENTENCES:
@@ -417,6 +419,34 @@ def issues_overview(
                     "metric": f"배치된 문장 {len(section.sentence_assignments)}개",
                 }
             )
+
+    # New "전반적 자료 품질 약함" signal: when most documents in the workspace
+    # match the intent very weakly, the writer should know the *corpus*, not
+    # any single doc, is the bottleneck. Triggered when ≥ 60% of docs end up
+    # in the "낮음" band (< 40% match rate by ratio).
+    if artifacts.intent is not None and artifacts.intent.doc_intent_score:
+        scores = list(artifacts.intent.doc_intent_score.values())
+        if scores:
+            max_score = max(scores)
+            if max_score > 0.0:
+                weak = sum(1 for s in scores if (s / max_score) < 0.4)
+                weak_ratio = weak / len(scores)
+                if weak_ratio >= 0.6:
+                    rows.append(
+                        {
+                            "kind": "corpus_weakness",
+                            "title": "대부분의 자료가 사용자 의도와 약하게 매칭됩니다",
+                            "detail": (
+                                f"전체 {len(scores)}개 자료 중 {weak}개가 워크스페이스 최고"
+                                f" 매칭 자료의 40% 미만으로 매칭됩니다."
+                            ),
+                            "hint": (
+                                "조사 주제를 더 좁히거나, 의도와 직접 맞물리는 자료를"
+                                " 추가로 수집한 뒤 재검증해 보세요."
+                            ),
+                            "metric": f"약한 매칭 비율 {weak_ratio * 100:.0f}%",
+                        }
+                    )
 
     if artifacts.consensus is not None:
         cluster_by_id = {
@@ -458,7 +488,12 @@ def issues_overview(
                 }
             )
 
-    order = {"underweighted_section": 0, "conflict": 1, "intent_gap": 2}
+    order = {
+        "corpus_weakness": 0,
+        "underweighted_section": 1,
+        "conflict": 2,
+        "intent_gap": 3,
+    }
     rows.sort(key=lambda row: order.get(row["kind"], 99))
 
     # ``doc_titles`` is accepted for future per-doc surfacing; the three issue

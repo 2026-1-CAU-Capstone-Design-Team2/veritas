@@ -48,9 +48,10 @@ class VerificationConfig:
     section_candidate_multiplier: int = 5       # per-section sentence candidate pool size
     section_top_chunk: int = 10                 # (retained for Task 2 retrieval helper)
     doc_score_top_chunk: int = 5                # (retained for Task 2 doc-level aggregation)
-    section_sentence_top_k: int = 12            # sentences kept per flow section
-    section_sentence_min_chars: int = 12        # sentences shorter than this are dropped at split time
+    section_sentence_top_k: int = 24            # sentences kept per flow section
+    section_sentence_min_chars: int = 24        # sentences shorter than this are dropped at split time
     section_sentence_max_chars: int = 320       # sentences longer than this get clause-split
+    section_sentence_min_word_diversity: float = 0.45  # unique/total token ratio cutoff
     label_top_n: int = 8                        # c-TF-IDF terms kept per auto label (Task 2/3)
     label_ngram_min: int = 1
     label_ngram_max: int = 3
@@ -67,14 +68,26 @@ class VerificationConfig:
     intent_weight_max: float = 0.4              # doc_intent_score = max/mean/breadth blend
     intent_weight_mean: float = 0.3
     intent_weight_breadth: float = 0.3
-    intent_coverage_gap_threshold: float = 0.3  # facet whose best doc score < this => gap
+    # Ratio of the workspace's strongest facet-doc score. A facet under this
+    # ratio is flagged as a coverage gap. Was 0.3 (way under the workspace
+    # peak), but a single dominant facet in the workspace stayed at 100% of
+    # its own peak and never tripped the gap; 0.5 means "below half of the
+    # best-covered facet" and surfaces genuinely weak coverage.
+    intent_coverage_gap_threshold: float = 0.5
 
     # --- Task 3: cross-source consensus ---
     concept_edge_threshold_rrf: float = 0.012   # min fused RRF weight kept as a graph edge
     min_cluster_size: int = 2                   # clusters smaller than this are dropped
     conflict_min_cluster_size: int = 4          # conflict detection needs at least this many KPs
-    silhouette_split_threshold: float = 0.45    # sub-cluster silhouette above => semantic split
-    cross_domain_disagreement_threshold: float = 0.15
+    # KMeans(k=2) silhouette above this => semantic split. 0.45 is the
+    # classical "strong cluster" cutoff but it rarely fires inside a single
+    # concept cluster because the embeddings are already similar; relaxing to
+    # 0.30 surfaces the real bimodal splits we want the user to inspect.
+    silhouette_split_threshold: float = 0.30
+    # within-domain mean − between-domain mean. 0.15 was strict enough that
+    # only highly polarized topics tripped it; 0.08 catches softer divergence
+    # which is what the writer actually needs to know about.
+    cross_domain_disagreement_threshold: float = 0.08
     hits_max_iter: int = 200
 
     # --- shared ---

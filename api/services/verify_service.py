@@ -170,14 +170,14 @@ def get_summary(workspace_id: str | None) -> dict[str, Any]:
     )
 
     # Sections that the LLM-planned outline asked for but the corpus does not
-    # really support — fewer than 3 sentences assigned. The verify_view's
-    # ``issues_overview`` enforces the same cutoff, so the count and the
-    # drill-down list stay consistent.
+    # really support — fewer than 8 sentences assigned (~1/3 of the default
+    # top_k=24). ``verify_view.issues_overview`` enforces the same cutoff so
+    # the headline count and the drill-down list stay consistent.
     underweighted_sections = (
         sum(
             1
             for section in artifacts.sections.sections
-            if len(section.sentence_assignments) < 3
+            if len(section.sentence_assignments) < 8
         )
         if artifacts.sections
         else 0

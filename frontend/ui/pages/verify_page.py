@@ -467,6 +467,7 @@ def _normalize_score(value: float, hi: float) -> float:
 # Per-issue palette: header chip + body tint. Tuned to match the badge tones
 # used elsewhere on the verify page so the user reads the kind at a glance.
 _ISSUE_PALETTE = {
+	"corpus_weakness": ("#FEE2E2", "#B91C1C", "#FCA5A5", "자료 품질 약함"),
 	"underweighted_section": ("#FEF3C7", "#B45309", "#FDE68A", "근거 부족"),
 	"conflict": ("#FEE2E2", "#B91C1C", "#FCA5A5", "출처 충돌"),
 	"intent_gap": ("#E0E7FF", "#3730A3", "#C7D2FE", "의도 미커버"),
@@ -1109,8 +1110,23 @@ class VerifyPage(QWidget):
 		self._sections_panel.sectionClicked.connect(self._on_section_clicked)
 		root.addWidget(self._sections_panel)
 
-		# Per-doc results header + filter chips.
+		# Per-doc results header + filter chips. The page can grow long once
+		# the sections panel is populated, so we surface a prominent doc-count
+		# badge right under the title — the writer immediately sees how many
+		# items the filter chips control even before scrolling to the cards.
 		results_header = CardWidget("자료별 검증 결과")
+
+		self._results_count_badge = QLabel("총 0개 자료")
+		self._results_count_badge.setObjectName("ResultsCountBadge")
+		self._results_count_badge.setStyleSheet(
+			"QLabel#ResultsCountBadge {"
+			"  background-color: #EEF2FF; color: #3730A3;"
+			"  border: 1px solid #C7D2FE; border-radius: 12px;"
+			"  padding: 4px 12px; font-size: 12px; font-weight: 800;"
+			"}"
+		)
+		results_header.layout.addWidget(self._results_count_badge, 0, Qt.AlignLeft)
+
 		results_header_caption = QLabel(
 			"각 자료의 ‘일치율 %’는 이 워크스페이스에서 가장 잘 매칭된 자료를 100% 로 두고"
 			" 그 대비 비율을 보여줍니다.  ≥ 70% → 높음, 40 ~ 70% → 중간, < 40% → 낮음."
@@ -1362,6 +1378,12 @@ class VerifyPage(QWidget):
 		}
 		for name, chip in self._filter_buttons.items():
 			chip.setText(f"{name} ({counts.get(name, 0)})")
+		# Visible badge under the section title so the count survives even
+		# when the page is too long for the user to scroll to the chips.
+		self._results_count_badge.setText(
+			f"총 {counts['전체']}개 자료 ·"
+			f" 높음 {counts['높음']} · 중간 {counts['중간']} · 낮음 {counts['낮음']}"
+		)
 
 		filtered = [
 			item for item in self._items
@@ -1375,14 +1397,26 @@ class VerifyPage(QWidget):
 			# intent queries).
 			summary_available = bool(self._summary and self._summary.get("available"))
 			if summary_available:
-				empty = QLabel(
-					"검증은 실행되었지만 표시할 자료가 없습니다. 조사 결과에"
-					" plan.must_cover 또는 grounded_terms 가 비어 있는지 확인해 주세요."
+				empty_card = CardWidget(title=None)
+				empty_card.setObjectName("VerifyEmptyResults")
+				empty_card.setStyleSheet(
+					"QFrame#VerifyEmptyResults { background-color: #F1F5F9;"
+					" border: 1px dashed #94A3B8; border-radius: 12px; }"
 				)
-				empty.setObjectName("PageSubtitle")
-				empty.setAlignment(Qt.AlignCenter)
-				empty.setWordWrap(True)
-				self._content_layout.addWidget(empty)
+				empty_title = QLabel("표시할 자료별 결과가 없습니다")
+				empty_title.setObjectName("CardTitle")
+				empty_title.setAlignment(Qt.AlignCenter)
+				empty_body = QLabel(
+					"검증은 실행되었지만 자료별 점수가 비어 있습니다. 조사 결과의"
+					" plan.must_cover 또는 grounded_terms 가 비어 있거나, 조사된 자료가"
+					" 한 건도 인덱싱되지 않은 워크스페이스일 수 있습니다."
+				)
+				empty_body.setObjectName("CardSecondary")
+				empty_body.setAlignment(Qt.AlignCenter)
+				empty_body.setWordWrap(True)
+				empty_card.layout.addWidget(empty_title)
+				empty_card.layout.addWidget(empty_body)
+				self._content_layout.addWidget(empty_card)
 			self._page_label.setText("0 / 0")
 			self._prev_btn.setEnabled(False)
 			self._next_btn.setEnabled(False)
@@ -1465,8 +1499,15 @@ class VerifyPage(QWidget):
 		if not isinstance(self._summary, dict):
 			return
 		sections = self._summary.get("sectionsOverview") or []
+		# Note: ``s.get("sectionId") or -1`` would coerce a legitimate
+		# sectionId=0 (the intro card) into -1 and silently fail to match.
+		# Use the default-argument form so 0 stays 0.
 		section = next(
-			(s for s in sections if isinstance(s, dict) and int(s.get("sectionId") or -1) == section_id),
+			(
+				s
+				for s in sections
+				if isinstance(s, dict) and int(s.get("sectionId", -1)) == section_id
+			),
 			None,
 		)
 		if section is None:

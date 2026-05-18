@@ -46,11 +46,47 @@ _PARA_RE = re.compile(r"\n{2,}")
 # boundaries, not perfect ones.
 _EN_SENT_RE = re.compile(r"(?<=[\.!?])\s+(?=[A-Z0-9가-힣])")
 
+# Phrases that are virtually always page navigation chrome, not body text.
+# Case-insensitive; matched anywhere in the line and the *whole* line is
+# dropped when one fires.
+_NAV_PHRASE_RE = re.compile(
+    r"\b(?:skip to (?:main )?content|table of contents|view all|read more|"
+    r"sign in|log in|sign up|subscribe(?: now)?|share this(?: page)?|"
+    r"copy(?: link|right)|edit this page|view source|on this page|back to top|"
+    r"share on (?:twitter|x|facebook|linkedin|reddit|hacker news)|"
+    r"home page|menu|cookie (?:settings|policy|preferences))\b",
+    re.IGNORECASE,
+)
+# Single-word "logo" / "dark logo" / "light logo" patterns from theme switches.
+_LOGO_TOKEN_RE = re.compile(r"^(?:light|dark)?\s*logo$", re.IGNORECASE)
+# Repeating-shape sentences that turned out to be a flattened nav menu:
+# "Building MCP clients-Python Building MCP clients-Node.js Writing Effective ...".
+# Detected by *low word diversity*: when the same handful of tokens dominate
+# a long sentence, it is almost always menu repetition rather than prose.
+_TOKEN_SPLIT_RE = re.compile(r"\W+", re.UNICODE)
+
+
+def _word_diversity(text: str) -> float:
+    """Unique-token / total-token ratio for one sentence.
+
+    A normal English / Korean sentence sits at 0.7~1.0. A flattened
+    navigation strip ("Building MCP clients-Python Building MCP clients-Node.js
+    Writing …") falls under 0.5 because the same anchor words repeat. Used as
+    a soft filter so we never drop legitimate prose that happens to repeat a
+    keyword.
+    """
+    tokens = [t for t in _TOKEN_SPLIT_RE.split(text.lower()) if t]
+    if len(tokens) < 6:
+        # Too short to judge by diversity — let length/min_chars handle it.
+        return 1.0
+    return len(set(tokens)) / float(len(tokens))
+
 
 @dataclass(frozen=True)
 class _SplitContext:
     min_chars: int
     max_chars: int
+    min_word_diversity: float = 0.45
 
 
 def _strip_markdown(line: str) -> str:
@@ -88,6 +124,22 @@ def _paragraph_blocks(text: str) -> list[str]:
     return blocks
 
 
+def _is_navigation_noise(text: str) -> bool:
+    """True when this sentence-ish blob is almost certainly chrome, not prose.
+
+    Catches three common cases the markdown clean-up misses:
+    * ``Skip to main content`` and friends — explicit nav phrases.
+    * Pure ``light logo`` / ``dark logo`` from theme-switcher captions.
+    * Flattened nav menus disguised as a long sentence ("Building MCP …
+      Building MCP … Writing …") — detected via low word diversity.
+    """
+    if _NAV_PHRASE_RE.search(text):
+        return True
+    if _LOGO_TOKEN_RE.match(text.strip()):
+        return True
+    return False
+
+
 def _split_paragraph(paragraph: str, kiwi: Kiwi, ctx: _SplitContext) -> list[str]:
     """Sentence-ish units from one paragraph. Kiwi first, regex as fallback."""
     try:
@@ -123,7 +175,17 @@ def _split_paragraph(paragraph: str, kiwi: Kiwi, ctx: _SplitContext) -> list[str
                     break
             if piece:
                 expanded.append(piece)
-    return [s for s in expanded if len(s) >= ctx.min_chars]
+
+    out: list[str] = []
+    for sent in expanded:
+        if len(sent) < ctx.min_chars:
+            continue
+        if _is_navigation_noise(sent):
+            continue
+        if _word_diversity(sent) < ctx.min_word_diversity:
+            continue
+        out.append(sent)
+    return out
 
 
 def split_docs_to_sentences(
@@ -141,6 +203,7 @@ def split_docs_to_sentences(
     ctx = _SplitContext(
         min_chars=int(cfg.section_sentence_min_chars),
         max_chars=int(cfg.section_sentence_max_chars),
+        min_word_diversity=float(cfg.section_sentence_min_word_diversity),
     )
     out: list[SentenceUnit] = []
     order = 0
