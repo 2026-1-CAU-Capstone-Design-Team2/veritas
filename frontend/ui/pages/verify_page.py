@@ -1,9 +1,27 @@
+"""Verification page — drives the verification pipeline and shows its output.
+
+Architecturally mirrors :mod:`research_page` so the two long-running operations
+behave the same from a user perspective:
+
+* a single **검증 시작 / 재검증** button submits the job through :class:`JobManager`
+  (so the UI thread never blocks and other pages stay interactive);
+* a background :class:`VerifyProgressPoller` (``QThread``) reads
+  ``/api/v1/verify/progress`` with cursor semantics and pushes events to the
+  shared :class:`ResearchProgressBar`;
+* result rendering is split out of the page (:class:`VerifyResultsView`,
+  :class:`VerifyDetailDialog`) so each piece has one job (§1.1 spirit).
+
+The three view states — *no results yet*, *in flight*, *results loaded* —
+swap a single content area so the header / progress bar stay continuous.
+"""
+
 from __future__ import annotations
 
 from functools import partial
 from math import ceil
+from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, QThread, Qt, Signal
 from PySide6.QtWidgets import (
 	QDialog,
 	QDialogButtonBox,
@@ -16,207 +34,235 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
+from ...api_common import current_workspace_id
 from ...components.badges import Badge
 from ...components.buttons import AppButton
 from ...components.cards import CardWidget, DocumentCard
+from ...components.progress import ResearchProgressBar
+from ...controllers import AgentController, JobCategory, get_job_manager
+
+_FILTERS = ("전체", "높음", "중간", "낮음")
+# Verification has three task pipelines; reaching "검증 완료" maps to 100%.
+# Stages emitted in order: queued → start → sections → intent → consensus →
+# persisting → completed. Hold a small floor for the prep stages so the bar
+# is not pinned at 0 while we wait for the first task to finish.
+_STAGE_PROGRESS = {
+	"queued": 4.0,
+	"start": 8.0,
+	"sections": 35.0,
+	"intent": 65.0,
+	"consensus": 90.0,
+	"persisting": 96.0,
+	"completed": 100.0,
+}
 
 
-class VerifyPage(QWidget):
+class VerifyProgressPoller(QThread):
+	"""Polls ``/api/v1/verify/progress`` on a background thread.
+
+	Same shape as :class:`ResearchProgressPoller`: cursor-based, primes on the
+	first response (skipping whatever the previous run left in the buffer),
+	and emits a ``reset_detected`` signal when the backend sequence rewinds
+	(a new run starting).
+	"""
+
+	events = Signal(list)
+	reset_detected = Signal()
+
+	def __init__(self, parent: QObject | None = None) -> None:
+		super().__init__(parent)
+		self._cursor = 0
+		self._stop = False
+		self._sleep_ms = 800
+		self._primed = False
+
+	def request_stop(self) -> None:
+		self._stop = True
+
+	def reset(self) -> None:
+		self._cursor = 0
+		self._primed = False
+
+	def run(self) -> None:  # type: ignore[override]
+		while not self._stop:
+			try:
+				response = AgentController().get_verify_progress(
+					since=self._cursor, limit=100
+				)
+				if isinstance(response, dict):
+					latest_seq = int(response.get("latestSeq") or 0)
+					if not self._primed:
+						self._primed = True
+						self._cursor = latest_seq
+					else:
+						if latest_seq < self._cursor:
+							self._cursor = 0
+							self.reset_detected.emit()
+							response = AgentController().get_verify_progress(
+								since=0, limit=100
+							)
+						items = response.get("items", []) if isinstance(response, dict) else []
+						if isinstance(items, list) and items:
+							self._cursor = int(
+								response.get("nextCursor") or self._cursor
+							)
+							valid = [it for it in items if isinstance(it, dict)]
+							if valid:
+								self.events.emit(valid)
+			except Exception:
+				# Network blips are non-fatal — the next tick retries.
+				pass
+			elapsed = 0
+			while not self._stop and elapsed < self._sleep_ms:
+				self.msleep(100)
+				elapsed += 100
+
+
+class _SummaryStripe(QFrame):
+	"""Headline counts: 평균 일치율 · 신뢰도 분포 · 미해결 항목.
+
+	Stays compact so the run button and progress bar remain the page's visual
+	focus. Numbers default to dashes so the empty state reads "검증 결과 없음"
+	rather than a row of zeros.
+	"""
+
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
-		self._cards: list[dict[str, str | QWidget]] = []
-		self._active_filter = "전체"
-		self._page_size = 5
-		self._current_page = 0
+		self.setObjectName("VerifySummaryStripe")
+		self.setStyleSheet(
+			"QFrame#VerifySummaryStripe { background-color: #F8FAFC; "
+			"border: 1px solid #E2E8F0; border-radius: 12px; }"
+			"QLabel#SummaryCaption { color: #64748B; font-size: 11px; font-weight: 700; }"
+			"QLabel#SummaryValue { color: #0F172A; font-size: 20px; font-weight: 800; }"
+			"QLabel#SummaryHint { color: #64748B; font-size: 12px; font-weight: 600; }"
+		)
+		row = QHBoxLayout(self)
+		row.setContentsMargins(16, 12, 16, 12)
+		row.setSpacing(18)
 
-		root = QVBoxLayout(self)
-		root.setContentsMargins(0, 0, 0, 0)
-		root.setSpacing(12)
+		self._average = self._stat("평균 일치율", "—")
+		self._high = self._stat("높음", "—")
+		self._medium = self._stat("중간", "—")
+		self._low = self._stat("낮음", "—")
+		self._issues = self._stat("점검 필요 항목", "—")
 
-		header = CardWidget("검증")
-		subtitle = QLabel("정합성 결과와 출처 일치성을 확인합니다.")
-		subtitle.setObjectName("PageSubtitle")
-		header.layout.addWidget(subtitle)
+		for stat in (self._average, self._high, self._medium, self._low, self._issues):
+			row.addLayout(stat["layout"])
+			row.addStretch(0)
+		row.addStretch(1)
 
-		filter_row = QHBoxLayout()
-		filter_row.setSpacing(8)
-		for label in ["전체", "높음", "중간", "낮음"]:
-			chip = AppButton(label, variant="filter")
-			chip.clicked.connect(partial(self._set_filter, label))
-			filter_row.addWidget(chip)
+		self._hint = QLabel("")
+		self._hint.setObjectName("SummaryHint")
+		self._hint.setWordWrap(True)
+		row.addWidget(self._hint, 0, Qt.AlignRight | Qt.AlignVCenter)
 
-		filter_row.addStretch(1)
+	def _stat(self, caption: str, value: str) -> dict[str, Any]:
+		layout = QVBoxLayout()
+		layout.setContentsMargins(0, 0, 0, 0)
+		layout.setSpacing(2)
+		caption_label = QLabel(caption)
+		caption_label.setObjectName("SummaryCaption")
+		value_label = QLabel(value)
+		value_label.setObjectName("SummaryValue")
+		layout.addWidget(caption_label)
+		layout.addWidget(value_label)
+		return {"layout": layout, "caption": caption_label, "value": value_label}
 
-		header.layout.addLayout(filter_row)
-		root.addWidget(header)
-
-		docs = [
-			(
-				"AI 안전성 백서",
-				"교차 출처 일치율: 92%",
-				"높음",
-				[
-					"핵심 주장과 수치 근거가 일치하지만, 3장 결론의 출처 표기 형식이 혼재되어 있습니다.",
-					"표 2-1의 기준 연도가 본문 표현과 다를 수 있으니 최종본에서 통일이 필요합니다.",
-				],
-			),
-			(
-				"오픈모델 리스크 노트",
-				"교차 출처 일치율: 71%",
-				"중간",
-				[
-					"리스크 레벨 분류 기준이 본문 중간에서 바뀌어 해석 혼선이 발생합니다.",
-					"외부 인용 2건이 최신 버전 문서와 문구 차이가 있어 재검증이 필요합니다.",
-				],
-			),
-			(
-				"포럼 스냅샷",
-				"교차 출처 일치율: 39%",
-				"낮음",
-				[
-					"주요 주장에 대한 신뢰 가능한 1차 출처가 확인되지 않았습니다.",
-					"수치 인용이 캡처 기반이라 원문 링크를 통한 사실 검증이 필요합니다.",
-					"결론 문단의 표현이 단정적이므로 조건부 표현으로 완화가 필요합니다.",
-				],
-			),
-		]
-
-		for title_text, detail, level, issues in docs:
-			tone = self._tone_for_level(level)
-
-			right_panel = QWidget()
-			right_panel.setAttribute(Qt.WA_StyledBackground, False)
-			right_panel.setStyleSheet("background: transparent;")
-			right_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-			right_panel.setFixedWidth(104)
-			right_layout = QVBoxLayout(right_panel)
-			right_layout.setContentsMargins(0, 0, 0, 0)
-			right_layout.setSpacing(6)
-
-			badge = Badge(level, tone)
-			action = AppButton("상세 보기", variant="ghost")
-			action.setObjectName("VerifyDetailButton")
-			action.setFixedHeight(28)
-			action.setFixedWidth(92)
-			action.clicked.connect(partial(self._show_issue_dialog, title_text, detail, level, issues))
-
-			right_layout.addWidget(badge, 0, Qt.AlignRight)
-			right_layout.addWidget(action, 0, Qt.AlignRight)
-			right_layout.addStretch(1)
-
-			wrapper = QWidget()
-			wrapper_layout = QVBoxLayout(wrapper)
-			wrapper_layout.setContentsMargins(0, 0, 0, 0)
-			wrapper_layout.setSpacing(0)
-			wrapper_layout.addWidget(DocumentCard(title=title_text, subtitle=detail, right_widget=right_panel))
-
-			self._cards.append({"level": level, "widget": wrapper})
-			root.addWidget(wrapper)
-
-		pagination_row = QHBoxLayout()
-		pagination_row.setContentsMargins(0, 0, 0, 0)
-		pagination_row.setSpacing(8)
-
-		self._prev_btn = AppButton("이전", variant="ghost")
-		self._prev_btn.clicked.connect(self._go_prev_page)
-
-		self._page_label = QLabel("0 / 0")
-		self._page_label.setObjectName("PageSubtitle")
-
-		self._next_btn = AppButton("다음", variant="ghost")
-		self._next_btn.clicked.connect(self._go_next_page)
-
-		pagination_row.addStretch(1)
-		pagination_row.addWidget(self._prev_btn)
-		pagination_row.addWidget(self._page_label)
-		pagination_row.addWidget(self._next_btn)
-		root.addLayout(pagination_row)
-
-		root.addStretch(1)
-		self._refresh_cards()
-
-	def _set_filter(self, label: str) -> None:
-		self._active_filter = label
-		self._current_page = 0
-		self._refresh_cards()
-
-	def _refresh_cards(self) -> None:
-		matched_indices = [
-			i
-			for i, item in enumerate(self._cards)
-			if self._active_filter == "전체" or item["level"] == self._active_filter
-		]
-
-		if not matched_indices:
-			for item in self._cards:
-				item["widget"].setVisible(False)  # type: ignore[union-attr]
-			self._page_label.setText("0 / 0")
-			self._prev_btn.setEnabled(False)
-			self._next_btn.setEnabled(False)
+	def apply(self, summary: dict[str, Any] | None) -> None:
+		if not summary or not summary.get("available"):
+			for stat in (self._average, self._high, self._medium, self._low, self._issues):
+				stat["value"].setText("—")
+			self._hint.setText("")
 			return
+		avg = int(summary.get("averageMatchPercent") or 0)
+		self._average["value"].setText(f"{avg}%")
+		self._high["value"].setText(str(int(summary.get("highCount") or 0)))
+		self._medium["value"].setText(str(int(summary.get("mediumCount") or 0)))
+		self._low["value"].setText(str(int(summary.get("lowCount") or 0)))
+		issue_total = (
+			int(summary.get("unmetMustCoverCount") or 0)
+			+ int(summary.get("intentGapCount") or 0)
+			+ int(summary.get("conflictCount") or 0)
+		)
+		self._issues["value"].setText(str(issue_total))
+		updated = summary.get("updatedAt")
+		if updated:
+			self._hint.setText(f"마지막 검증: {str(updated).replace('T', ' ').split('.')[0]} UTC")
+		else:
+			self._hint.setText("")
 
-		total_pages = ceil(len(matched_indices) / self._page_size)
-		if self._current_page >= total_pages:
-			self._current_page = total_pages - 1
 
-		start = self._current_page * self._page_size
-		end = start + self._page_size
-		visible_set = set(matched_indices[start:end])
+class VerifyDetailDialog(QDialog):
+	"""Modal drill-down for one document.
 
-		for i, item in enumerate(self._cards):
-			item["widget"].setVisible(i in visible_set)  # type: ignore[union-attr]
+	Splits the per-doc detail into three sections — overall · 섹션별 · 의도 facet
+	— so the user can quickly see *which* report sections are weak and *which*
+	intent facets are uncovered, without needing to read percentages on the card.
+	"""
 
-		self._page_label.setText(f"{self._current_page + 1} / {total_pages}")
-		self._prev_btn.setEnabled(self._current_page > 0)
-		self._next_btn.setEnabled(self._current_page < total_pages - 1)
-
-	def _go_prev_page(self) -> None:
-		if self._current_page <= 0:
-			return
-		self._current_page -= 1
-		self._refresh_cards()
-
-	def _go_next_page(self) -> None:
-		self._current_page += 1
-		self._refresh_cards()
-
-	def _show_issue_dialog(self, title: str, detail: str, level: str, issues: list[str]) -> None:
-		dialog = QDialog(self)
-		dialog.setObjectName("VerifyDetailDialog")
-		dialog.setWindowTitle("검증 상세")
-		dialog.setModal(True)
-		dialog.resize(620, 520)
-		dialog.setStyleSheet(
+	def __init__(self, payload: dict[str, Any], parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self.setObjectName("VerifyDetailDialog")
+		self.setWindowTitle("검증 상세")
+		self.setModal(True)
+		self.resize(680, 600)
+		self.setStyleSheet(
 			"""
-			QDialog#VerifyDetailDialog {
-				background-color: #F8FAFC;
-			}
+			QDialog#VerifyDetailDialog { background-color: #F8FAFC; }
 			QFrame#VerifyDialogHeader {
-				background-color: #FFFFFF;
-				border: 1px solid #E2E8F0;
+				background-color: #FFFFFF; border: 1px solid #E2E8F0;
 				border-radius: 12px;
 			}
-			QFrame#IssueItem {
-				background-color: #FFFFFF;
-				border: 1px solid #E5E7EB;
+			QFrame#DetailSection {
+				background-color: #FFFFFF; border: 1px solid #E5E7EB;
 				border-radius: 10px;
 			}
+			QLabel#DetailSectionTitle {
+				color: #0F172A; font-size: 13px; font-weight: 800;
+			}
+			QLabel#DetailRowTitle { color: #1F2937; font-size: 12px; font-weight: 700; }
+			QLabel#DetailRowMeta  { color: #64748B; font-size: 11px; font-weight: 600; }
+			QLabel#DetailScore    { color: #4F46E5; font-size: 12px; font-weight: 800; }
 			QLabel#IssueNumber {
-				background-color: #EEF2FF;
-				border: 1px solid #C7D2FE;
-				border-radius: 12px;
-				color: #3730A3;
-				font-size: 11px;
-				font-weight: 800;
-				padding: 3px 8px;
+				background-color: #EEF2FF; border: 1px solid #C7D2FE;
+				border-radius: 12px; color: #3730A3; font-size: 11px;
+				font-weight: 800; padding: 3px 8px;
 			}
 			"""
 		)
-
-		layout = QVBoxLayout(dialog)
+		layout = QVBoxLayout(self)
 		layout.setContentsMargins(18, 18, 18, 18)
 		layout.setSpacing(12)
 
+		layout.addWidget(self._header(payload))
+
+		scroll = QScrollArea()
+		scroll.setWidgetResizable(True)
+		scroll.setFrameShape(QFrame.NoFrame)
+		scroll.setObjectName("PageScroll")
+		container = QWidget()
+		container_layout = QVBoxLayout(container)
+		container_layout.setContentsMargins(0, 0, 0, 0)
+		container_layout.setSpacing(10)
+
+		container_layout.addWidget(self._issue_block(payload))
+		container_layout.addWidget(
+			self._breakdown_block("보고서 섹션별 근거 강도", payload.get("sectionBreakdown") or [])
+		)
+		container_layout.addWidget(
+			self._breakdown_block("의도 주제별 커버", payload.get("facetBreakdown") or [])
+		)
+		container_layout.addStretch(1)
+
+		scroll.setWidget(container)
+		layout.addWidget(scroll, 1)
+
+		buttons = QDialogButtonBox(QDialogButtonBox.Close)
+		buttons.rejected.connect(self.reject)
+		buttons.accepted.connect(self.accept)
+		layout.addWidget(buttons)
+
+	def _header(self, payload: dict[str, Any]) -> QFrame:
 		header = QFrame()
 		header.setObjectName("VerifyDialogHeader")
 		header_layout = QVBoxLayout(header)
@@ -225,93 +271,587 @@ class VerifyPage(QWidget):
 
 		title_row = QHBoxLayout()
 		title_row.setSpacing(8)
-
-		title_label = QLabel(title)
+		title_label = QLabel(str(payload.get("title") or payload.get("docId") or "문서"))
 		title_label.setObjectName("CardTitle")
 		title_label.setWordWrap(True)
-
-		badge = Badge(level, self._tone_for_level(level))
-
 		title_row.addWidget(title_label, 1)
-		title_row.addWidget(badge, 0, Qt.AlignTop)
+		level = str(payload.get("level") or "")
+		title_row.addWidget(Badge(level, _tone_for_level(level)), 0, Qt.AlignTop)
+		header_layout.addLayout(title_row)
 
-		meta = QLabel(detail)
+		meta_text = str(payload.get("matchRate") or "")
+		meta = QLabel(meta_text)
 		meta.setObjectName("CardSecondary")
 		meta.setWordWrap(True)
+		header_layout.addWidget(meta)
 
-		summary = QLabel(self._summary_for_level(level))
+		summary = QLabel(_summary_for_level(level))
 		summary.setObjectName("CardPrimary")
 		summary.setWordWrap(True)
-
-		header_layout.addLayout(title_row)
-		header_layout.addWidget(meta)
 		header_layout.addWidget(summary)
+		return header
 
-		issue_title = QLabel("확인해야 할 항목")
-		issue_title.setObjectName("CardTitle")
+	def _issue_block(self, payload: dict[str, Any]) -> QFrame:
+		frame = QFrame()
+		frame.setObjectName("DetailSection")
+		layout = QVBoxLayout(frame)
+		layout.setContentsMargins(14, 12, 14, 12)
+		layout.setSpacing(8)
+		title = QLabel("자동 점검 의견")
+		title.setObjectName("DetailSectionTitle")
+		layout.addWidget(title)
 
-		scroll = QScrollArea()
-		scroll.setWidgetResizable(True)
-		scroll.setFrameShape(QFrame.NoFrame)
-		scroll.setObjectName("PageScroll")
+		issues = payload.get("issues") or []
+		if not issues:
+			empty = QLabel("특이사항 없이 통과되었습니다.")
+			empty.setObjectName("CardSecondary")
+			empty.setWordWrap(True)
+			layout.addWidget(empty)
+			return frame
+		for index, text in enumerate(issues, start=1):
+			row = QFrame()
+			row_layout = QHBoxLayout(row)
+			row_layout.setContentsMargins(0, 0, 0, 0)
+			row_layout.setSpacing(10)
+			number = QLabel(str(index))
+			number.setObjectName("IssueNumber")
+			body = QLabel(str(text))
+			body.setObjectName("CardSecondary")
+			body.setWordWrap(True)
+			body.setTextInteractionFlags(
+				Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+			)
+			row_layout.addWidget(number, 0, Qt.AlignTop)
+			row_layout.addWidget(body, 1)
+			layout.addWidget(row)
+		return frame
 
-		issue_container = QWidget()
-		issue_layout = QVBoxLayout(issue_container)
-		issue_layout.setContentsMargins(0, 0, 0, 0)
-		issue_layout.setSpacing(8)
+	def _breakdown_block(self, title_text: str, rows: list[dict[str, Any]]) -> QFrame:
+		frame = QFrame()
+		frame.setObjectName("DetailSection")
+		layout = QVBoxLayout(frame)
+		layout.setContentsMargins(14, 12, 14, 12)
+		layout.setSpacing(8)
+		title = QLabel(title_text)
+		title.setObjectName("DetailSectionTitle")
+		layout.addWidget(title)
 
-		for index, issue in enumerate(issues, start=1):
-			issue_layout.addWidget(self._issue_item(index, issue))
+		if not rows:
+			empty = QLabel("분석 결과가 없습니다.")
+			empty.setObjectName("CardSecondary")
+			layout.addWidget(empty)
+			return frame
 
-		recommendation = QLabel("권장 조치: 출처 표기 형식과 기준 연도를 먼저 통일한 뒤, 재검증이 필요한 인용을 우선 확인하세요.")
-		recommendation.setObjectName("WarningSummary")
-		recommendation.setWordWrap(True)
-		issue_layout.addWidget(recommendation)
-		issue_layout.addStretch(1)
+		# Workspace-internal min/max for the small inline bar — visualizes
+		# this row's score against the doc's own range so the user can spot
+		# strong/weak rows without reading floats.
+		scores = [float(row.get("score") or 0.0) for row in rows]
+		hi = max(scores) if scores else 0.0
+		for row in rows[:8]:
+			layout.addWidget(self._breakdown_row(row, hi))
+		return frame
 
-		scroll.setWidget(issue_container)
+	def _breakdown_row(self, row: dict[str, Any], hi: float) -> QFrame:
+		frame = QFrame()
+		row_layout = QVBoxLayout(frame)
+		row_layout.setContentsMargins(0, 4, 0, 4)
+		row_layout.setSpacing(4)
+		labels = ", ".join(str(t) for t in (row.get("labels") or []) if str(t).strip())
+		if not labels:
+			labels = "—"
+		head = QHBoxLayout()
+		head.setContentsMargins(0, 0, 0, 0)
+		head.setSpacing(8)
+		title_label = QLabel(labels)
+		title_label.setObjectName("DetailRowTitle")
+		title_label.setWordWrap(True)
+		head.addWidget(title_label, 1)
+		score_value = float(row.get("score") or 0.0)
+		score_label = QLabel(f"{int(round(_normalize_score(score_value, hi) * 100))}%")
+		score_label.setObjectName("DetailScore")
+		head.addWidget(score_label, 0, Qt.AlignRight)
+		row_layout.addLayout(head)
+		bar = _MiniBar(_normalize_score(score_value, hi))
+		row_layout.addWidget(bar)
+		return frame
 
-		buttons = QDialogButtonBox(QDialogButtonBox.Close)
-		buttons.rejected.connect(dialog.reject)
-		buttons.accepted.connect(dialog.accept)
 
-		layout.addWidget(header)
-		layout.addWidget(issue_title)
-		layout.addWidget(scroll, 1)
-		layout.addWidget(buttons)
+class _MiniBar(QWidget):
+	"""Tiny horizontal score bar (used inside the detail dialog)."""
 
+	def __init__(self, ratio: float, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self._ratio = max(0.0, min(1.0, float(ratio)))
+		self.setFixedHeight(6)
+		self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+	def paintEvent(self, event) -> None:  # type: ignore[override]
+		from PySide6.QtGui import QColor, QPainter
+
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.Antialiasing, True)
+		painter.fillRect(self.rect(), QColor("#E2E8F0"))
+		if self._ratio > 0.0:
+			fill_width = max(2, int(self.width() * self._ratio))
+			painter.fillRect(0, 0, fill_width, self.height(), QColor("#6366F1"))
+
+
+def _normalize_score(value: float, hi: float) -> float:
+	if hi <= 0.0:
+		return 0.0
+	return max(0.0, min(1.0, value / hi))
+
+
+def _tone_for_level(level: str) -> str:
+	if level == "높음":
+		return "success"
+	if level == "중간":
+		return "warning"
+	if level == "낮음":
+		return "danger"
+	return "default"
+
+
+def _summary_for_level(level: str) -> str:
+	if level == "높음":
+		return "이 자료는 조사 의도와 맞물려 잘 활용할 수 있습니다."
+	if level == "중간":
+		return "일부 주제 커버가 약하므로 활용 시 추가 자료와 함께 확인하세요."
+	if level == "낮음":
+		return "신뢰도 보강이 필요합니다. 인용 전 추가 출처로 교차 확인을 권장합니다."
+	return "검증 결과를 확인해 주세요."
+
+
+class VerifyPage(QWidget):
+	"""검증 페이지 — runs verification asynchronously, renders the saved results.
+
+	Page life-cycle:
+	1. ``showEvent`` (or :meth:`set_workspace`) loads the saved summary +
+	   results for the current workspace; if none exist the empty-state hint
+	   is shown.
+	2. *"검증 시작 / 재검증"* dispatches the run through :class:`JobManager`
+	   and starts the progress poller. The progress bar updates from the live
+	   events.
+	3. On success the page reloads from the persisted JSON — i.e. the final
+	   render comes from the same code path as a workspace already verified.
+	"""
+
+	# Mirror of ResearchPage.workspaceChanged: emitted when the user switches
+	# workspace from this page (none yet, but keeps the signature uniform if
+	# we add it later).
+	workspaceChanged = Signal(str)
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self._controller = AgentController()
+		self._workspace_id = current_workspace_id()
+		self._active_filter = "전체"
+		self._page_size = 5
+		self._current_page = 0
+		self._items: list[dict[str, Any]] = []
+		self._summary: dict[str, Any] | None = None
+		self._progress_poller: VerifyProgressPoller | None = None
+		# True between job submission and the controller's success/error callback.
+		# Drives the run button label / availability.
+		self._busy = False
+
+		root = QVBoxLayout(self)
+		root.setContentsMargins(0, 0, 0, 0)
+		root.setSpacing(12)
+
+		# Header card with the run/re-run button + workspace label.
+		header_card = CardWidget("검증")
+		subtitle = QLabel(
+			"조사 결과를 자동 분석하여 자료별 의도 일치율, 보고서 섹션 커버리지,"
+			" 그리고 출처 간 합의/충돌을 확인합니다."
+		)
+		subtitle.setObjectName("PageSubtitle")
+		subtitle.setWordWrap(True)
+		header_card.layout.addWidget(subtitle)
+
+		action_row = QHBoxLayout()
+		action_row.setContentsMargins(0, 0, 0, 0)
+		action_row.setSpacing(10)
+		self._workspace_label = QLabel("")
+		self._workspace_label.setObjectName("CardSecondary")
+		action_row.addWidget(self._workspace_label, 1)
+		self._run_button = AppButton("검증 시작", variant="primary")
+		self._run_button.setObjectName("VerifyRunButton")
+		self._run_button.clicked.connect(self._on_run_clicked)
+		action_row.addWidget(self._run_button, 0, Qt.AlignRight)
+		header_card.layout.addLayout(action_row)
+		root.addWidget(header_card)
+
+		# Live progress bar (reused from research) — invisible until a run starts.
+		self._progress_bar = ResearchProgressBar()
+		self._progress_bar.set_idle()
+		root.addWidget(self._progress_bar)
+
+		# Summary stripe (counts + averages).
+		self._summary_stripe = _SummaryStripe()
+		root.addWidget(self._summary_stripe)
+
+		# Filter chip row + content area (results list or empty-state message).
+		filter_row = QHBoxLayout()
+		filter_row.setSpacing(8)
+		self._filter_buttons: dict[str, AppButton] = {}
+		for label in _FILTERS:
+			chip = AppButton(label, variant="filter")
+			chip.clicked.connect(partial(self._set_filter, label))
+			filter_row.addWidget(chip)
+			self._filter_buttons[label] = chip
+		filter_row.addStretch(1)
+		root.addLayout(filter_row)
+
+		self._content_layout = QVBoxLayout()
+		self._content_layout.setContentsMargins(0, 0, 0, 0)
+		self._content_layout.setSpacing(10)
+		root.addLayout(self._content_layout)
+
+		self._empty_label = QLabel(
+			"아직 검증을 실행하지 않았습니다.\n"
+			"위 ‘검증 시작’ 버튼을 누르면 조사 결과에 대한 자동 검증을 진행합니다."
+		)
+		self._empty_label.setObjectName("PageSubtitle")
+		self._empty_label.setAlignment(Qt.AlignCenter)
+		self._empty_label.setWordWrap(True)
+		self._content_layout.addWidget(self._empty_label)
+
+		# Pagination row.
+		pagination_row = QHBoxLayout()
+		pagination_row.setContentsMargins(0, 0, 0, 0)
+		pagination_row.setSpacing(8)
+		self._prev_btn = AppButton("이전", variant="ghost")
+		self._prev_btn.clicked.connect(self._go_prev_page)
+		self._page_label = QLabel("0 / 0")
+		self._page_label.setObjectName("PageSubtitle")
+		self._next_btn = AppButton("다음", variant="ghost")
+		self._next_btn.clicked.connect(self._go_next_page)
+		pagination_row.addStretch(1)
+		pagination_row.addWidget(self._prev_btn)
+		pagination_row.addWidget(self._page_label)
+		pagination_row.addWidget(self._next_btn)
+		root.addLayout(pagination_row)
+
+		root.addStretch(1)
+
+		# Job-manager-driven enabled state so a research run elsewhere disables
+		# this page's run button automatically.
+		get_job_manager().busy_changed.connect(self._sync_run_button)
+		self._sync_run_button()
+		self._update_workspace_label()
+		self._refresh_data()
+
+	# -- public API ----------------------------------------------------------
+
+	def set_workspace_by_name(self, name: str) -> None:
+		"""Alias matching the other pages' ``set_workspace_by_name`` surface.
+
+		Workspace name and id are interchangeable in this app (the sidebar
+		uses the workspace directory name as the displayed label), so this is
+		a thin pass-through.
+		"""
+		self.set_workspace(name)
+
+	def set_workspace(self, workspace_id: str) -> None:
+		"""External hook (main_window) called when the user switches workspace."""
+		workspace_id = (workspace_id or "").strip()
+		if workspace_id and workspace_id != self._workspace_id:
+			self._workspace_id = workspace_id
+			self._stop_poller()
+			self._items = []
+			self._summary = None
+			self._current_page = 0
+			self._progress_bar.set_idle()
+			self._update_workspace_label()
+			self._refresh_data()
+		else:
+			# Same workspace: still refresh in case external code persisted new results.
+			self._refresh_data()
+
+	def showEvent(self, event) -> None:  # type: ignore[override]
+		super().showEvent(event)
+		latest_workspace = current_workspace_id()
+		if latest_workspace and latest_workspace != self._workspace_id:
+			self.set_workspace(latest_workspace)
+		else:
+			self._refresh_data()
+
+	def hideEvent(self, event) -> None:  # type: ignore[override]
+		# Stop polling when the page is hidden so a long-running verify in
+		# another workspace doesn't keep emitting on a stale view.
+		super().hideEvent(event)
+		self._stop_poller()
+
+	# -- run lifecycle --------------------------------------------------------
+
+	def _on_run_clicked(self) -> None:
+		manager = get_job_manager()
+		if manager.is_blocked(JobCategory.VERIFY):
+			return
+		workspace_id = (self._workspace_id or "").strip() or current_workspace_id()
+		if not workspace_id or workspace_id == "default":
+			self._progress_bar.start("검증할 워크스페이스가 없습니다.")
+			self._progress_bar.mark_failed("먼저 조사 페이지에서 조사를 진행해 주세요.")
+			return
+
+		self._busy = True
+		self._sync_run_button()
+		self._progress_bar.start("검증 준비 중...")
+		self._start_poller()
+
+		submitted = manager.submit(
+			JobCategory.VERIFY,
+			self._controller.run_verification,
+			workspace_id,
+			None,
+			on_success=self._on_run_success,
+			on_error=self._on_run_error,
+			on_done=self._on_run_done,
+		)
+		if not submitted:
+			self._busy = False
+			self._sync_run_button()
+			self._stop_poller()
+			self._progress_bar.mark_failed("다른 작업이 진행 중입니다. 잠시 후 다시 시도해 주세요.")
+
+	def _on_run_success(self, result: Any) -> None:
+		# The progress poller will deliver a `completed` event; mark the bar
+		# completed here too in case the poller missed the very last tick.
+		self._progress_bar.mark_completed(animate=True)
+		self._refresh_data()
+
+	def _on_run_error(self, message: str) -> None:
+		clean = " ".join(str(message or "").split()).strip() or "알 수 없는 오류"
+		self._progress_bar.mark_failed(clean)
+
+	def _on_run_done(self) -> None:
+		self._busy = False
+		self._sync_run_button()
+		self._stop_poller()
+
+	# -- data loading ---------------------------------------------------------
+
+	def _refresh_data(self) -> None:
+		"""Reload summary + results for the active workspace.
+
+		Runs synchronously on the UI thread because both endpoints are
+		filesystem reads (no LLM, no embeddings) — they return in O(ms) once
+		the artifacts are written.
+		"""
+		workspace_id = (self._workspace_id or "").strip() or current_workspace_id()
+		if not workspace_id or workspace_id == "default":
+			self._summary = None
+			self._items = []
+			self._summary_stripe.apply(None)
+			self._render_results()
+			return
+
+		try:
+			self._summary = self._controller.get_verify_summary(workspace_id)
+		except Exception:
+			self._summary = None
+		try:
+			response = self._controller.list_verify_results(
+				workspace_id=workspace_id,
+				page=1,
+				page_size=200,
+			)
+		except Exception:
+			response = {"items": [], "available": False}
+
+		items = response.get("items") if isinstance(response, dict) else []
+		self._items = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+		self._summary_stripe.apply(self._summary)
+		# Updating the workspace_id from the API response is the source of truth
+		# (the runtime may have resolved "default" → most-recent workspace).
+		if isinstance(response, dict) and response.get("workspaceId"):
+			self._workspace_id = str(response["workspaceId"])
+			self._update_workspace_label()
+		self._render_results()
+
+	# -- rendering ------------------------------------------------------------
+
+	def _render_results(self) -> None:
+		# Tear down old widgets and rebuild from current state.
+		while self._content_layout.count():
+			item = self._content_layout.takeAt(0)
+			widget = item.widget() if item else None
+			if widget is not None:
+				widget.setParent(None)
+				widget.deleteLater()
+
+		filtered = [
+			item for item in self._items
+			if self._active_filter == "전체" or item.get("level") == self._active_filter
+		]
+
+		if not self._items:
+			# No verified data yet — show one of two contextual empty states.
+			summary_available = bool(self._summary and self._summary.get("available"))
+			text = (
+				"검증 결과가 비어 있습니다."
+				if summary_available
+				else "아직 검증을 실행하지 않았습니다.\n"
+				     "위 ‘검증 시작’ 버튼을 누르면 조사 결과에 대한 자동 검증을 진행합니다."
+			)
+			empty = QLabel(text)
+			empty.setObjectName("PageSubtitle")
+			empty.setAlignment(Qt.AlignCenter)
+			empty.setWordWrap(True)
+			self._content_layout.addWidget(empty)
+			self._page_label.setText("0 / 0")
+			self._prev_btn.setEnabled(False)
+			self._next_btn.setEnabled(False)
+			return
+
+		if not filtered:
+			empty = QLabel(f"‘{self._active_filter}’ 단계의 자료가 없습니다.")
+			empty.setObjectName("PageSubtitle")
+			empty.setAlignment(Qt.AlignCenter)
+			empty.setWordWrap(True)
+			self._content_layout.addWidget(empty)
+			self._page_label.setText("0 / 0")
+			self._prev_btn.setEnabled(False)
+			self._next_btn.setEnabled(False)
+			return
+
+		total_pages = max(1, ceil(len(filtered) / self._page_size))
+		if self._current_page >= total_pages:
+			self._current_page = total_pages - 1
+		self._current_page = max(0, self._current_page)
+		start = self._current_page * self._page_size
+		end = start + self._page_size
+		for item in filtered[start:end]:
+			self._content_layout.addWidget(self._build_card(item))
+
+		self._page_label.setText(f"{self._current_page + 1} / {total_pages}")
+		self._prev_btn.setEnabled(self._current_page > 0)
+		self._next_btn.setEnabled(self._current_page < total_pages - 1)
+
+	def _build_card(self, item: dict[str, Any]) -> QWidget:
+		level = str(item.get("level") or "")
+		tone = _tone_for_level(level)
+
+		right_panel = QWidget()
+		right_panel.setAttribute(Qt.WA_StyledBackground, False)
+		right_panel.setStyleSheet("background: transparent;")
+		right_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+		right_panel.setFixedWidth(104)
+		right_layout = QVBoxLayout(right_panel)
+		right_layout.setContentsMargins(0, 0, 0, 0)
+		right_layout.setSpacing(6)
+		right_layout.addWidget(Badge(level or "—", tone), 0, Qt.AlignRight)
+
+		action = AppButton("상세 보기", variant="ghost")
+		action.setObjectName("VerifyDetailButton")
+		action.setFixedHeight(28)
+		action.setFixedWidth(92)
+		action.clicked.connect(partial(self._show_detail, item))
+		right_layout.addWidget(action, 0, Qt.AlignRight)
+		right_layout.addStretch(1)
+
+		wrapper = QWidget()
+		wrapper_layout = QVBoxLayout(wrapper)
+		wrapper_layout.setContentsMargins(0, 0, 0, 0)
+		wrapper_layout.setSpacing(0)
+		issues = item.get("issues") or []
+		footer = issues[0] if issues else "특이사항이 발견되지 않았습니다."
+		wrapper_layout.addWidget(
+			DocumentCard(
+				title=str(item.get("title") or item.get("docId") or "문서"),
+				subtitle=str(item.get("matchRate") or ""),
+				right_widget=right_panel,
+				footer=str(footer),
+			)
+		)
+		return wrapper
+
+	def _show_detail(self, summary_item: dict[str, Any]) -> None:
+		"""Pull the full detail payload from the API and open the dialog."""
+		doc_id = str(summary_item.get("docId") or "").strip()
+		if not doc_id:
+			return
+		try:
+			payload = self._controller.get_verify_detail(doc_id, self._workspace_id)
+		except Exception as exc:
+			# Fall back to the list-row data so the dialog still opens with
+			# whatever we already have rather than failing silently.
+			payload = dict(summary_item)
+			payload["_error"] = str(exc)
+		if not isinstance(payload, dict):
+			payload = dict(summary_item)
+		dialog = VerifyDetailDialog(payload, parent=self)
 		dialog.exec()
 
-	def _issue_item(self, index: int, text: str) -> QFrame:
-		item = QFrame()
-		item.setObjectName("IssueItem")
+	# -- progress poller ------------------------------------------------------
 
-		layout = QHBoxLayout(item)
-		layout.setContentsMargins(12, 10, 12, 10)
-		layout.setSpacing(10)
+	def _start_poller(self) -> None:
+		if self._progress_poller is not None and self._progress_poller.isRunning():
+			return
+		poller = VerifyProgressPoller(self)
+		poller.events.connect(self._on_progress_events)
+		poller.reset_detected.connect(self._on_progress_reset)
+		poller.start()
+		self._progress_poller = poller
 
-		number = QLabel(str(index))
-		number.setObjectName("IssueNumber")
+	def _stop_poller(self) -> None:
+		poller = self._progress_poller
+		if poller is None:
+			return
+		poller.request_stop()
+		poller.wait(2000)
+		self._progress_poller = None
 
-		body = QLabel(text)
-		body.setObjectName("CardSecondary")
-		body.setWordWrap(True)
-		body.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+	def _on_progress_reset(self) -> None:
+		self._progress_bar.start("검증 준비 중...")
 
-		layout.addWidget(number, 0, Qt.AlignTop)
-		layout.addWidget(body, 1)
-		return item
+	def _on_progress_events(self, events: list[dict[str, Any]]) -> None:
+		# Use the latest event to drive the bar; earlier events are folded
+		# into the same animation step naturally.
+		if not events:
+			return
+		latest = events[-1]
+		stage = str(latest.get("stage") or "")
+		message = str(latest.get("message") or "")
+		if stage == "failed":
+			self._progress_bar.mark_failed(message or "검증에 실패했습니다.")
+			return
+		if stage == "completed":
+			self._progress_bar.mark_completed(animate=True)
+			return
+		percent = _STAGE_PROGRESS.get(stage, 50.0)
+		self._progress_bar.set_progress(percent, message or None)
 
-	def _tone_for_level(self, level: str) -> str:
-		if level == "높음":
-			return "success"
-		if level == "중간":
-			return "warning"
-		return "danger"
+	# -- helpers --------------------------------------------------------------
 
-	def _summary_for_level(self, level: str) -> str:
-		if level == "높음":
-			return "대부분의 근거가 일치합니다. 최종본 품질을 위해 표기와 기준만 정리하면 됩니다."
-		if level == "중간":
-			return "핵심 흐름은 유지되지만 일부 인용과 분류 기준은 재확인이 필요합니다."
-		return "신뢰도 보강이 필요합니다. 원문 링크와 1차 출처를 먼저 확보하세요."
+	def _set_filter(self, label: str) -> None:
+		self._active_filter = label
+		self._current_page = 0
+		self._render_results()
+
+	def _go_prev_page(self) -> None:
+		if self._current_page <= 0:
+			return
+		self._current_page -= 1
+		self._render_results()
+
+	def _go_next_page(self) -> None:
+		self._current_page += 1
+		self._render_results()
+
+	def _update_workspace_label(self) -> None:
+		name = (self._workspace_id or "").strip() or "(미선택)"
+		self._workspace_label.setText(f"워크스페이스: {name}")
+
+	def _sync_run_button(self) -> None:
+		manager = get_job_manager()
+		blocked_externally = manager.is_blocked(JobCategory.VERIFY) and not self._busy
+		if self._busy:
+			self._run_button.setText("검증 진행 중...")
+			self._run_button.setEnabled(False)
+			return
+		# Has any saved verification result -> show "재검증", else "검증 시작".
+		has_results = bool(self._summary and self._summary.get("available"))
+		self._run_button.setText("재검증" if has_results else "검증 시작")
+		self._run_button.setEnabled(not blocked_externally)
