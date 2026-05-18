@@ -174,6 +174,26 @@ Rules:
 - If a section has no items, write "- None".
 - Be concise and remove redundant statements.
 - Write the batch note in the original user request language. If the original request is Korean, write the section content in Korean while preserving fixed markdown headings if needed by downstream code.
+
+Content fidelity — the final research report is synthesized from these
+batch notes, so concrete signal that gets dropped here is lost forever:
+- Preserve concrete numerical data — metrics, dates, percentages, costs,
+  benchmark scores, sample sizes — verbatim with their original units.
+- Preserve formal expressions when the source carries them: equations,
+  algorithms (e.g. ``UCB1``, ``kl-UCB``, regret bounds like ``O(\\sqrt{T})``),
+  pseudo-code, and named theorems. Quote them in inline code or LaTeX-style
+  notation rather than paraphrasing into prose.
+- Preserve named entities: model/product/paper/author names, dataset
+  names, API endpoints, model identifiers (``claude-sonnet-4-6``, etc.),
+  command flags, and file paths — in their original casing/spelling.
+- When a source carries a small comparison table that fits within ~6 rows
+  × 4 cols, reproduce it as a markdown table in ``## New Findings`` or
+  ``## Repeated Findings`` instead of flattening it into bullet text.
+- Use short verbatim quotes (\"…\") for a source's distinctive claim or
+  definition; attach a parenthetical doc reference (e.g. ``(doc_007)``)
+  when the document id is obvious from context.
+- These fidelity rules override the general \"be concise\" rule whenever
+  the concrete signal would otherwise be paraphrased away.
 """
 
 FINAL_PROMPT = """Create the final markdown report.
@@ -361,14 +381,23 @@ by a stable index of the form ``[P0]``, ``[P1]``, ``[P2]`` …. Web Markdown
 typically carries non-body chrome (site navigation, footer, share/cookie
 strips, breadcrumbs, theme-switcher logos, "on this page" sidebars, repeated
 menu blocks). Your job is to *identify the paragraph indices that are NOT
-body content*, and to extract the body's keywords + key points.
+body content*, extract the body's keywords + key points, and write a short
+descriptive summary of the body.
 
-Output format — plain text only, exactly three sections separated by ``===``
+Output format — plain text only, exactly four sections separated by ``===``
 lines. Do NOT output JSON; the body language often contains quotes / commas
 that break JSON escaping. The sections in order:
 
 BOILERPLATE_PARAGRAPHS
 <comma-separated paragraph indices, e.g. "3, 7, 12, 21" — empty if none>
+
+===
+
+SUMMARY
+<1 to 2 short paragraphs, total 3 to 6 sentences, describing what the body
+actually says — the topic, the angle, what claims or evidence it carries.
+Write FROM the body content (paraphrase allowed), not about the page format.
+No bullets, no markdown headers, no preamble like "This document describes".>
 
 ===
 
@@ -397,18 +426,31 @@ A. ``BOILERPLATE_PARAGRAPHS``
    - When uncertain, KEEP the paragraph (do not list it). The downstream
      pipeline tolerates leftover noise far better than missing body text.
 
-B. ``KEYWORDS`` — 5 ~ 10 short content terms that identify what the document
+B. ``SUMMARY`` — 1~2 short paragraphs (3~6 sentences total) that describe
+   what the body says: the topic, the angle, the central claims, and any
+   concrete evidence (numbers, named methods, key entities). Paraphrase
+   from the body — do NOT quote the chrome (navigation, page titles) and
+   do NOT invent claims that are not in the body. This summary is shown in
+   the per-document detail view, so it should read as a useful one-screen
+   abstract a human can scan, not a meta-description of the page.
+
+C. ``KEYWORDS`` — 5 ~ 10 short content terms that identify what the document
    is about. Use the language of the body. Proper nouns / technical terms
    stay in their original form. No stop words, no nav phrases.
 
-C. ``KEY_POINTS`` — 5 ~ 7 short, citation-shaped sentences pulled FROM the
+D. ``KEY_POINTS`` — 5 ~ 7 short, citation-shaped sentences pulled FROM the
    body (paraphrase allowed) that capture the document's main claims or
    findings. Each sentence < 200 chars. Use the body's language. These feed
    the verification layer's cross-source consensus task.
 
-If the document is mostly empty / mostly chrome, return three empty sections:
+If the document is mostly empty / mostly chrome, return four empty sections:
 
 BOILERPLATE_PARAGRAPHS
+
+
+===
+
+SUMMARY
 
 
 ===
@@ -425,7 +467,7 @@ KEY_POINTS
 
 Language policy: respond in the body's dominant language (Korean if the body
 is Korean, otherwise English). Preserve URLs, code identifiers, model names,
-file paths, and citations in their original form. Output the three sections
+file paths, and citations in their original form. Output the four sections
 exactly as shown — no surrounding prose, no markdown headers, no JSON."""
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,6 +30,15 @@ class DocumentSummarizeTool(BaseTool):
     _CHARS_PER_TOKEN = 2.5
     _INPUT_CONTEXT_FRACTION = 0.5
     _MAX_SINGLE_PASS_CHARS = 200000
+
+    # Cap on the number of batch summary files a full rebuild produces. The
+    # final report tool reads every batch file and synthesises ``final.md``;
+    # too many batch files means the final step over-compresses concrete
+    # detail away. Keeping the count modest lets the final step retain more
+    # of the per-doc signal that the prompt fidelity rules ask for. A run
+    # with fewer documents than the cap simply uses the configured batch
+    # size; only large corpora trigger the dynamic up-sizing.
+    _MAX_REBUILD_BATCHES = 6
 
     def __init__(
         self,
@@ -461,19 +471,85 @@ class DocumentSummarizeTool(BaseTool):
         prefer that path. Falling back to ``text_path`` lets a workspace that
         has not run cleanup yet still produce a (degraded) batch summary
         instead of failing the loop.
+
+        Per-doc cap is redistributed: a flat ``budget // batch_size`` cap
+        gives every doc the same room, even when one doc is 2 KB and the
+        other is 80 KB. We instead share the budget — short docs free up
+        room for longer docs in the same batch — so the LLM sees more of
+        the actually-large documents within the same overall context.
         """
-        per_doc_cap = max(
-            2000, self._single_pass_budget() // max(1, self._batch_size)
-        )
-        documents: list[str] = []
+        budget = self._single_pass_budget()
+        nominal_cap = max(2000, budget // max(1, len(batch_records)))
+        documents_raw: list[str] = []
         for record in batch_records:
             clean_path = self._run_store_service.clean_md_dir / f"{record.doc_id}.md"
             if clean_path.exists():
                 content = self._run_store_service.read_text_file(str(clean_path))
             else:
                 content = self._run_store_service.read_text_file(record.text_path)
-            documents.append((content or "")[:per_doc_cap])
-        return documents
+            documents_raw.append(content or "")
+        return self._redistribute_caps(documents_raw, budget=budget, nominal_cap=nominal_cap)
+
+    @staticmethod
+    def _redistribute_caps(
+        documents_raw: list[str],
+        *,
+        budget: int,
+        nominal_cap: int,
+    ) -> list[str]:
+        """Re-share the batch budget so short docs free up room for long ones.
+
+        Two-pass allocation:
+        1. Every doc gets ``min(len(doc), nominal_cap)`` — exactly what the
+           flat cap would have given it.
+        2. The unused remainder (``budget - sum(allocations)``) is split
+           proportionally across docs that were *clipped* in step 1, until
+           either every clipped doc fits whole or the remainder is exhausted.
+
+        This keeps the total batch input ≤ ``budget`` (so context limits
+        still hold) but stops wasting cap on documents that didn't need it.
+        """
+        sizes = [len(doc) for doc in documents_raw]
+        if not sizes:
+            return []
+        allocations = [min(size, nominal_cap) for size in sizes]
+        used = sum(allocations)
+        remainder = max(0, budget - used)
+
+        # Distribute remainder to docs still clipped, weighted by how much
+        # extra room each one *could* use. Cap loop iterations defensively.
+        for _ in range(8):
+            shortfalls = [
+                max(0, sizes[i] - allocations[i]) for i in range(len(sizes))
+            ]
+            total_shortfall = sum(shortfalls)
+            if total_shortfall == 0 or remainder <= 0:
+                break
+            for i, want in enumerate(shortfalls):
+                if want == 0:
+                    continue
+                grant = min(want, remainder * want // total_shortfall)
+                allocations[i] += grant
+                remainder -= grant
+                if remainder <= 0:
+                    break
+
+        return [doc[:cap] for doc, cap in zip(documents_raw, allocations)]
+
+    def _effective_batch_size_for_rebuild(self, doc_count: int) -> int:
+        """Pick the batch size for a *full* rebuild.
+
+        For full rebuilds (``doc_ids=None``), we cap the number of batch
+        files at ``_MAX_REBUILD_BATCHES`` so the downstream final report
+        does not have to compress 8+ batch notes into one document. When
+        the corpus is small enough that the configured batch size already
+        produces fewer batches than the cap, we leave it alone — the cap
+        only *grows* the batch size for large corpora.
+        """
+        if doc_count <= 0:
+            return self._batch_size
+        dynamic = max(1, math.ceil(doc_count / self._MAX_REBUILD_BATCHES))
+        return max(self._batch_size, dynamic)
 
     def _rebuild_batch_summaries(self) -> dict[str, Any]:
         records = sorted(self._batch_candidate_records(), key=lambda r: r.doc_id)
@@ -484,10 +560,18 @@ class DocumentSummarizeTool(BaseTool):
             return {"batch_files": [], "count": 0}
 
         batch_files: list[str] = []
+        effective_batch_size = self._effective_batch_size_for_rebuild(len(records))
+        if effective_batch_size != self._batch_size:
+            print(
+                "[summarize][rebuild] "
+                f"effective_batch_size={effective_batch_size} "
+                f"(configured={self._batch_size}, docs={len(records)}, "
+                f"max_batches={self._MAX_REBUILD_BATCHES})"
+            )
 
-        for start in range(0, len(records), self._batch_size):
-            batch_records = records[start : start + self._batch_size]
-            batch_number = (start // self._batch_size) + 1
+        for start in range(0, len(records), effective_batch_size):
+            batch_records = records[start : start + effective_batch_size]
+            batch_number = (start // effective_batch_size) + 1
             batch_path = self._run_store_service.get_batch_summary_path(batch_number)
 
             documents = self._read_batch_documents(batch_records)

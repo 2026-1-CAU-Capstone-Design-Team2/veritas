@@ -340,7 +340,11 @@ class AutoSurveyWorkflow:
         Cleanup runs after fetch and before batch summarize, once per document
         (LLM index-only call). Each ``doc_cleanup_started`` / ``doc_cleanup_done``
         event drives the progress bar exactly the way ``_on_summarize_progress``
-        used to for the old per-doc summarize loop.
+        used to for the old per-doc summarize loop — and because cleanup is
+        the step that writes ``summary/doc_<id>.md`` now, ``doc_cleanup_done``
+        emits a ``doc_summarized`` event (carrying ``summary_path``) so the
+        frontend can flip the document card to its ready state immediately,
+        without waiting for the downstream batch summary to finish.
         """
         record = info.get("record") if isinstance(info.get("record"), dict) else {}
         doc_id = str(info.get("doc_id") or "")
@@ -349,18 +353,23 @@ class AutoSurveyWorkflow:
             self._emit_progress(
                 "doc_cleanup",
                 f"정제 중: {title}",
-                detail={"docId": doc_id, "title": title},
+                detail={"docId": doc_id, "title": title, "doc_id": doc_id},
             )
         elif kind == "doc_cleanup_done":
+            summary_path = str(info.get("summary_path") or "")
             self._emit_progress(
-                "doc_cleaned",
+                "doc_summarized",
                 f"정제 완료: {title}",
                 detail={
+                    "doc_id": doc_id,
                     "docId": doc_id,
                     "title": title,
+                    "summary_path": summary_path,
                     "paragraphs": info.get("paragraphs"),
                     "dropped": info.get("dropped"),
                     "keywords": info.get("keywords") or [],
+                    "key_points": info.get("key_points") or [],
+                    "used_fallback": bool(info.get("used_fallback")),
                 },
             )
         elif kind == "doc_cleanup_failed":
@@ -369,6 +378,7 @@ class AutoSurveyWorkflow:
                 f"정제 실패: {title}",
                 detail={
                     "docId": doc_id,
+                    "doc_id": doc_id,
                     "title": title,
                     "error": str(info.get("error") or ""),
                 },

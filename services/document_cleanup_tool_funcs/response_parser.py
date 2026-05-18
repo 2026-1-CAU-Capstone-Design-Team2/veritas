@@ -2,10 +2,10 @@
 
 JSON output proved fragile across languages — a single un-escaped quote
 inside a Korean key-point breaks the whole document. We switched to a
-plain-text three-section response (``BOILERPLATE_PARAGRAPHS`` / ``KEYWORDS``
-/ ``KEY_POINTS``) so the LLM never has to escape body text. This module
-parses that response into the same in-memory shape the previous JSON path
-produced, so the rest of the tool is unaffected.
+plain-text four-section response (``BOILERPLATE_PARAGRAPHS`` / ``SUMMARY``
+/ ``KEYWORDS`` / ``KEY_POINTS``) so the LLM never has to escape body text.
+This module parses that response into a canonical dict the rest of the tool
+consumes.
 
 The parser is intentionally tolerant:
 
@@ -17,9 +17,12 @@ The parser is intentionally tolerant:
   whitespace; lines without a bullet marker are still kept as items.
 * ``BOILERPLATE_PARAGRAPHS`` accepts comma-separated, bracketed, or
   whitespace-separated digit lists. Any integer in the body is picked up.
+* ``SUMMARY`` is collected as free-form prose: bullets are stripped, lines
+  joined with single newlines, and runs of blank lines collapse to a
+  paragraph break.
 
-If the LLM only produced one or two of the three sections, the missing
-sections come back as empty lists — the tool then treats those as "no
+If the LLM only produced some of the four sections, the missing sections
+come back as empty (list or string) — the tool then treats those as "no
 signal" rather than failing the whole document.
 """
 
@@ -36,14 +39,18 @@ _INT_TOKEN_RE = re.compile(r"\d+")
 
 # Header keyword fragments mapped to canonical section names. Case-folded
 # before matching so ``Key Points`` / ``KEY POINTS`` / ``KEY_POINTS`` all
-# resolve to the same canonical key.
+# resolve to the same canonical key. ``key point`` is checked BEFORE
+# ``keyword`` because ``keypoint`` would otherwise match the ``keyword``
+# fragment by substring rule (``keyword``? no — but the iteration order is
+# safer when key_points hints are listed first).
 _HEADER_HINTS: dict[str, str] = {
-    "boilerplate": "boilerplate_paragraphs",
-    "keyword": "keywords",
     "key point": "key_points",
     "key_point": "key_points",
     "key-point": "key_points",
     "keypoint": "key_points",
+    "boilerplate": "boilerplate_paragraphs",
+    "keyword": "keywords",
+    "summary": "summary",
 }
 
 
@@ -103,16 +110,42 @@ def _parse_int_list(body: str) -> list[int]:
     return [int(token) for token in _INT_TOKEN_RE.findall(body)]
 
 
-def parse_cleanup_response(text: str) -> dict[str, list]:
+def _parse_prose(body: str) -> str:
+    """Collect free-form prose from a section body.
+
+    Used by the ``SUMMARY`` section. Strips leading bullet markers (the LLM
+    sometimes wraps the summary as a single bullet by habit), keeps each
+    non-blank line, and collapses runs of blank lines to a single paragraph
+    break so the rendered ``doc_<id>.md`` keeps the LLM's paragraphing.
+    """
+    paragraphs: list[list[str]] = []
+    current: list[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                paragraphs.append(current)
+                current = []
+            continue
+        cleaned = _strip_bullet(stripped)
+        if cleaned:
+            current.append(cleaned)
+    if current:
+        paragraphs.append(current)
+    return "\n\n".join(" ".join(lines) for lines in paragraphs).strip()
+
+
+def parse_cleanup_response(text: str) -> dict[str, list | str]:
     """Parse the cleanup tool's plain-text response into the canonical dict.
 
-    Returns ``{"boilerplate_paragraphs": [int], "keywords": [str],
-    "key_points": [str]}`` with every missing section coming back as an
-    empty list — the tool's caller treats those as 'no signal' rather than
-    failing the document.
+    Returns ``{"boilerplate_paragraphs": [int], "summary": str,
+    "keywords": [str], "key_points": [str]}`` with every missing section
+    coming back as an empty list/string — the tool's caller treats those as
+    'no signal' rather than failing the document.
     """
-    canonical: dict[str, list] = {
+    canonical: dict[str, list | str] = {
         "boilerplate_paragraphs": [],
+        "summary": "",
         "keywords": [],
         "key_points": [],
     }
@@ -121,9 +154,9 @@ def parse_cleanup_response(text: str) -> dict[str, list]:
 
     # Split on ``===``/``---`` boundary lines first. Sections then start with
     # a header line + a body. When the boundary is missing the LLM often
-    # still emits the three headers in order — so we *also* sweep through
-    # the whole text line-by-line and reattach orphan lines to the most
-    # recently seen header.
+    # still emits the headers in order — so we *also* sweep through the
+    # whole text line-by-line and reattach orphan lines to the most recently
+    # seen header.
     sections = _SECTION_BOUNDARY_RE.split(text)
 
     for section in sections:
@@ -147,11 +180,13 @@ def parse_cleanup_response(text: str) -> dict[str, list]:
         body = "\n".join(lines[header_index + 1 :])
         if canonical_key == "boilerplate_paragraphs":
             canonical[canonical_key] = _parse_int_list(body)
+        elif canonical_key == "summary":
+            canonical[canonical_key] = _parse_prose(body)
         else:
             canonical[canonical_key] = _parse_bullet_list(body)
 
     # Line-by-line fallback for responses without boundary markers.
-    if not any(canonical[key] for key in canonical):
+    if not _has_any_signal(canonical):
         current_key: str | None = None
         buffer: list[str] = []
 
@@ -163,6 +198,8 @@ def parse_cleanup_response(text: str) -> dict[str, list]:
             body = "\n".join(buffer)
             if current_key == "boilerplate_paragraphs":
                 canonical[current_key] = _parse_int_list(body)
+            elif current_key == "summary":
+                canonical[current_key] = _parse_prose(body)
             else:
                 canonical[current_key] = _parse_bullet_list(body)
             buffer = []
@@ -177,6 +214,17 @@ def parse_cleanup_response(text: str) -> dict[str, list]:
         _flush()
 
     return canonical
+
+
+def _has_any_signal(canonical: dict[str, list | str]) -> bool:
+    """True iff any parsed section ended up non-empty."""
+    for value in canonical.values():
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif value:
+            return True
+    return False
 
 
 __all__ = ["parse_cleanup_response"]

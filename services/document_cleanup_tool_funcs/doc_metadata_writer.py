@@ -3,17 +3,21 @@
 Replaces the previous per-doc LLM summarize pass: the meta header
 (Title / URL / Final URL / Domain / Search Query / Source type) is now built
 deterministically from the workspace's ``summary/index.json`` record, and
-``Keywords`` + ``Key Points`` come from the document_cleanup tool's JSON
-output. No LLM call is needed for this writer — it is pure I/O + formatting.
+``Summary`` + ``Keywords`` + ``Key Points`` come from the document_cleanup
+tool's plain-text output. No extra LLM call is needed for this writer — it
+is pure I/O + formatting; the cleanup tool already produces the summary in
+the same single LLM call that picks the boilerplate paragraphs.
 
 The on-disk shape stays compatible with what the verification layer already
 parses (``Summary`` / ``Key Points`` / ``Reliability Notes`` / ``Keywords``
-section headings), with two changes:
+section headings), with two changes vs. the legacy per-doc summarize path:
 
-* ``Summary`` becomes a short one-line caption built from the meta header
-  (so callers that *only* read summary's first line — the verify flow
-  planner doc_hints — still see something meaningful).
-* ``Reliability Notes`` is omitted: the new cleanup step does not produce it
+* ``Summary`` is now a 1~2 paragraph descriptive abstract written by the
+  cleanup pass from the body — not a one-line ``title — domain`` caption.
+  When the cleanup pass produced no summary (empty section), the writer
+  falls back to the one-line caption so the verify flow planner's
+  doc_hints still see something meaningful.
+* ``Reliability Notes`` is omitted: the cleanup step does not produce it
   (per the user-confirmed reduction in LLM output tokens).
 """
 
@@ -90,20 +94,24 @@ def _format_bullet_list(items: list[str]) -> str:
 def render_doc_md(
     record: dict[str, Any],
     *,
+    summary: str,
     keywords: list[str],
     key_points: list[str],
 ) -> str:
-    """Render the full ``doc_<id>.md`` body for the given workspace record."""
+    """Render the full ``doc_<id>.md`` body for the given workspace record.
+
+    ``summary`` is the cleanup-pass abstract (1~2 paragraphs). When empty,
+    the writer falls back to a one-line ``title — domain`` caption so the
+    verify flow planner's doc_hints still see something meaningful.
+    """
     title = str(record.get("title") or "").strip() or f"Document {record.get('doc_id')}"
     domain = str(record.get("domain") or "").strip()
 
     meta_block = _format_meta_block(record)
 
-    # The verify flow planner only reads ``Summary``'s first line, so we give
-    # it a one-sentence descriptor synthesised from meta — no LLM needed.
-    summary_line = (
-        f"{title} — {domain}" if domain else title
-    )
+    summary_text = (summary or "").strip()
+    if not summary_text:
+        summary_text = f"{title} — {domain}" if domain else title
 
     sections = [
         f"# Document {record.get('doc_id')}",
@@ -111,7 +119,7 @@ def render_doc_md(
         *meta_block,
         "",
         "## Summary",
-        summary_line,
+        summary_text,
         "",
         "## Key Points",
         _format_bullet_list(key_points),
@@ -127,11 +135,17 @@ def write_doc_metadata(
     summary_path: Path,
     record: dict[str, Any],
     *,
+    summary: str,
     keywords: list[str],
     key_points: list[str],
 ) -> Path:
     """Persist a freshly built ``doc_<id>.md`` to disk and return its path."""
-    body = render_doc_md(record, keywords=keywords, key_points=key_points)
+    body = render_doc_md(
+        record,
+        summary=summary,
+        keywords=keywords,
+        key_points=key_points,
+    )
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(body, encoding="utf-8")
     return summary_path
