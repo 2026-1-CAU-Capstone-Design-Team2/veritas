@@ -18,9 +18,11 @@ from tools.autosurvey_tool import AutoSurveyTool
 from tools.loader import build_registry, load_schema
 from workflows import AutoSurveyConfig, AutoSurveyWorkflow
 
+from .progress_buffer import BUFFER_DEFAULT_MAX, ProgressBuffer
+
 
 SCREEN_EVENT_BUFFER_MAX = 100
-RESEARCH_PROGRESS_BUFFER_MAX = 500
+RESEARCH_PROGRESS_BUFFER_MAX = BUFFER_DEFAULT_MAX
 
 
 class AgentRuntime:
@@ -55,18 +57,13 @@ class AgentRuntime:
         self._screen_event_seq = 0
         self._screen_event_lock = threading.Lock()
         self._screen_monitoring_started_at: str | None = None
-        self._research_progress: deque[dict[str, Any]] = deque(maxlen=RESEARCH_PROGRESS_BUFFER_MAX)
-        self._research_progress_seq = 0
-        self._research_progress_lock = threading.Lock()
-        self._research_active_job: dict[str, Any] | None = None
-        # Verification (services/verification) reuses the same ring-buffer +
-        # cursor pattern as research progress so the frontend can poll
-        # /api/v1/verify/progress with the same `since` semantics, without two
-        # streams of events colliding inside one buffer.
-        self._verify_progress: deque[dict[str, Any]] = deque(maxlen=RESEARCH_PROGRESS_BUFFER_MAX)
-        self._verify_progress_seq = 0
-        self._verify_progress_lock = threading.Lock()
-        self._verify_active_job: dict[str, Any] | None = None
+        # Two parallel progress streams. Same buffer class, two instances —
+        # so a research run and a verify run can be in flight at the same
+        # time without their events colliding. The verify task pollers
+        # already enforce ``Query(..., le=500)`` for the cursor read so the
+        # ``BUFFER_DEFAULT_MAX`` ceiling matches.
+        self._research_progress = ProgressBuffer(maxlen=RESEARCH_PROGRESS_BUFFER_MAX)
+        self._verify_progress = ProgressBuffer(maxlen=RESEARCH_PROGRESS_BUFFER_MAX)
 
         # Boot-time workspace selection: prefer the most recently-used real
         # workspace so we never create `runs/api/` when one already exists.
@@ -279,8 +276,12 @@ class AgentRuntime:
         started_at = time.perf_counter()
         started_wall = datetime.now(timezone.utc)
         request = self._append_reference_sites(instruction, reference_urls or [])
-        self._reset_research_progress(job_id=job_id, instruction=instruction)
-        self._emit_research_progress("term_grounding", "주제어 추출 중...")
+        self._research_progress.reset(
+            jobId=job_id,
+            workspaceId=self.workspace_id,
+            instruction=instruction,
+        )
+        self._research_progress.emit("term_grounding", "주제어 추출 중...")
         workspace_name, grounding = self._grounding_workspace_from_request(request)
         workspace_dir = self._reserve_workspace_dir(workspace_name)
         # Make the new workspace visible to the rest of the system *immediately*.
@@ -314,7 +315,7 @@ class AgentRuntime:
             registry=registry,
             run_store_service=run_store_service,
             config=autosurvey_config,
-            progress_callback=self._emit_research_progress,
+            progress_callback=self._research_progress.emit,
         )
         result = workflow.run_all(
             user_request=request,
@@ -326,7 +327,7 @@ class AgentRuntime:
         clean_md_dir = getattr(run_store_service, "clean_md_dir", None)
         index_path = getattr(run_store_service, "index_path", None)
         if clean_md_dir is not None:
-            self._emit_research_progress("indexing", "검색 색인 생성 중...")
+            self._research_progress.emit("indexing", "검색 색인 생성 중...")
             indexed_chunks = rag_service.index_autosurvey_output(
                 clean_md_dir=Path(clean_md_dir),
                 index_path=Path(index_path) if index_path is not None else None,
@@ -340,13 +341,13 @@ class AgentRuntime:
             failed_documents = []
 
         if failed_documents:
-            self._emit_research_progress(
+            self._research_progress.emit(
                 "completed",
                 f"조사 완료 · 요약 실패 {len(failed_documents)}건",
                 final=True,
             )
         else:
-            self._emit_research_progress("completed", "조사 완료", final=True)
+            self._research_progress.emit("completed", "조사 완료", final=True)
 
         final_path = run_store_service.final_path
         records = self._read_index_records(index_path)
@@ -478,7 +479,7 @@ class AgentRuntime:
             print(f"[workspace][publish][warn] catalog: {e}")
 
         # 3. Tell the frontend.
-        self._emit_research_progress(
+        self._research_progress.emit(
             "workspace_created",
             f"새 워크스페이스 생성: {workspace_id}",
             detail={
@@ -635,154 +636,24 @@ class AgentRuntime:
             )
         return documents
 
-    def _reset_research_progress(
-        self,
-        *,
-        job_id: str | None,
-        instruction: str,
-    ) -> None:
-        from datetime import datetime, timezone
-
-        with self._research_progress_lock:
-            self._research_progress.clear()
-            self._research_progress_seq = 0
-            self._research_active_job = {
-                "jobId": job_id,
-                "workspaceId": self.workspace_id,
-                "instruction": instruction,
-                "startedAt": datetime.now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-                "status": "running",
-            }
-
-    def _emit_research_progress(
-        self,
-        stage: str,
-        message: str,
-        *,
-        detail: dict[str, Any] | None = None,
-        final: bool = False,
-    ) -> None:
-        from datetime import datetime, timezone
-
-        message_text = " ".join(str(message or "").split()).strip()[:280]
-        with self._research_progress_lock:
-            self._research_progress_seq += 1
-            seq = self._research_progress_seq
-            event = {
-                "seq": seq,
-                "stage": str(stage or "").strip() or "info",
-                "message": message_text,
-                "detail": detail or {},
-                "timestamp": datetime.now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-            }
-            self._research_progress.append(event)
-            if self._research_active_job is not None and final:
-                self._research_active_job["status"] = "completed"
-
     def get_research_progress(self, since: int, limit: int) -> dict[str, Any]:
-        if limit <= 0:
-            limit = 50
-        limit = min(limit, RESEARCH_PROGRESS_BUFFER_MAX)
-        with self._research_progress_lock:
-            latest_seq = self._research_progress_seq
-            events = [
-                event
-                for event in self._research_progress
-                if int(event.get("seq", 0)) > since
-            ]
-            job_snapshot = dict(self._research_active_job or {})
-        events.sort(key=lambda item: int(item.get("seq", 0)))
-        events = events[:limit]
-        next_cursor = events[-1]["seq"] if events else since
-        return {
-            "items": events,
-            "nextCursor": next_cursor,
-            "latestSeq": latest_seq,
-            "activeJob": job_snapshot or None,
-        }
+        """Public read API for the research progress stream.
+
+        Thin facade over :class:`ProgressBuffer.get_since`; kept on the
+        runtime so route handlers (``api/api_routes/research.py``) have one
+        well-known callable instead of digging into ``_research_progress``.
+        """
+        return self._research_progress.get_since(since=since, limit=limit)
 
     # ------------------------------------------------------------------ verify
-    # The verification layer (services/verification) reuses the research-style
-    # progress pattern: ring buffer + cursor + lock + active-job snapshot. Two
-    # parallel streams (one for research, one for verify) so the frontend can
-    # show the two pages live without their events colliding in one buffer.
-
-    def _reset_verify_progress(
-        self,
-        *,
-        job_id: str | None,
-        workspace_id: str,
-    ) -> None:
-        from datetime import datetime, timezone
-
-        with self._verify_progress_lock:
-            self._verify_progress.clear()
-            self._verify_progress_seq = 0
-            self._verify_active_job = {
-                "jobId": job_id,
-                "workspaceId": workspace_id,
-                "startedAt": datetime.now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-                "status": "running",
-            }
-
-    def _emit_verify_progress(
-        self,
-        stage: str,
-        message: str,
-        *,
-        detail: dict[str, Any] | None = None,
-        final: bool = False,
-    ) -> None:
-        from datetime import datetime, timezone
-
-        message_text = " ".join(str(message or "").split()).strip()[:280]
-        with self._verify_progress_lock:
-            self._verify_progress_seq += 1
-            seq = self._verify_progress_seq
-            event = {
-                "seq": seq,
-                "stage": str(stage or "").strip() or "info",
-                "message": message_text,
-                "detail": detail or {},
-                "timestamp": datetime.now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-            }
-            self._verify_progress.append(event)
-            if self._verify_active_job is not None and final:
-                # ``stage=='failed'`` lets the frontend distinguish a graceful
-                # completion from a thrown failure that emitted a final event.
-                self._verify_active_job["status"] = (
-                    "failed" if str(stage) == "failed" else "completed"
-                )
+    # Verify reuses the same :class:`ProgressBuffer` class as research — two
+    # instances so the frontend's two pages can poll their own streams
+    # without events colliding.
 
     def get_verify_progress(self, *, since: int, limit: int) -> dict[str, Any]:
-        if limit <= 0:
-            limit = 50
-        limit = min(limit, RESEARCH_PROGRESS_BUFFER_MAX)
-        with self._verify_progress_lock:
-            latest_seq = self._verify_progress_seq
-            events = [
-                event
-                for event in self._verify_progress
-                if int(event.get("seq", 0)) > since
-            ]
-            job_snapshot = dict(self._verify_active_job or {})
-        events.sort(key=lambda item: int(item.get("seq", 0)))
-        events = events[:limit]
-        next_cursor = events[-1]["seq"] if events else since
-        return {
-            "items": events,
-            "nextCursor": next_cursor,
-            "latestSeq": latest_seq,
-            "activeJob": job_snapshot or None,
-        }
+        """Public read API for the verify progress stream — facade like
+        :meth:`get_research_progress`."""
+        return self._verify_progress.get_since(since=since, limit=limit)
 
     def run_verification(
         self,
@@ -838,8 +709,11 @@ class AgentRuntime:
         if not selected_tasks:
             selected_tasks = list(ALL_TASKS)
 
-        self._reset_verify_progress(job_id=job_id, workspace_id=resolved_workspace)
-        self._emit_verify_progress(
+        self._verify_progress.reset(
+            jobId=job_id,
+            workspaceId=resolved_workspace,
+        )
+        self._verify_progress.emit(
             "queued",
             f"검증 시작 · 워크스페이스 {resolved_workspace}",
             detail={"tasks": list(selected_tasks)},
@@ -860,12 +734,12 @@ class AgentRuntime:
         try:
             artifacts = service.run(
                 tasks=selected_tasks,
-                progress_callback=self._emit_verify_progress,
+                progress_callback=self._verify_progress.emit,
             )
         except HTTPException:
             raise
         except Exception as exc:
-            self._emit_verify_progress("failed", f"검증 실패: {exc}", final=True)
+            self._verify_progress.emit("failed", f"검증 실패: {exc}", final=True)
             raise HTTPException(
                 status_code=502,
                 detail=f"verification pipeline failed: {exc}",
