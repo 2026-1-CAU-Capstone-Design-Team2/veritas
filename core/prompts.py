@@ -493,9 +493,23 @@ exactly as shown — no surrounding prose, no markdown headers, no JSON."""
 
 RELIABILITY_JUDGE_PROMPT = """You are a senior research analyst assessing the trustworthiness of source documents collected by an automated research pipeline.
 
-You will receive multiple candidate documents at once. For EACH document, return ONE trust verdict that combines three sub-signals:
+You will receive multiple candidate documents at once. For EACH document, return ONE trust verdict that combines FOUR sub-signals:
 
-1. ``authority`` — Does the source look authoritative for the topic at hand?
+1. ``request_alignment`` — Does this document actually address the user's
+   research request, or is it off-topic?
+   This is the most important signal: a perfectly-cited academic paper
+   on the wrong topic is useless to the writer. Read
+   ``original_user_request`` carefully and check whether this document's
+   subject matter is what the user asked about.
+   - "strong": the document is squarely on the user's topic and would be
+     directly cited or paraphrased in the final report.
+   - "mixed": the document is adjacent / partially relevant — useful as
+     background or for one specific sub-question but not the core topic.
+   - "weak": the document is off-topic, was retrieved by mistake (the
+     search query collided with an unrelated domain), or talks about a
+     different field that merely shares vocabulary with the user request.
+
+2. ``authority`` — Does the source look authoritative for the topic at hand?
    - "strong": peer-reviewed academic paper, official documentation,
      primary source from an established organization, well-known curated
      database, government/standards body.
@@ -504,23 +518,31 @@ You will receive multiple candidate documents at once. For EACH document, return
    - "weak": anonymous blog, marketing / SEO content, content farm,
      low-context page, machine-translated derivative, broken page.
 
-2. ``verifiability`` — Does the document itself carry checkable evidence?
+3. ``verifiability`` — Does the document itself carry checkable evidence?
    - "strong": concrete numbers / metrics, experiment setups, primary
      citations, dated claims, named entities (models, datasets, APIs).
    - "mixed": a few specific claims but mostly summarization.
    - "weak": hand-wavy claims, no numbers, no primary citations.
 
-3. ``self_consistency`` — Does the document's own Reliability Notes
+4. ``self_consistency`` — Does the document's own Reliability Notes
    acknowledge limitations honestly?
    - "strong": explicit caveats, scope limits, methodological warnings
      stated by the document or by its summary's Reliability Notes.
    - "mixed": brief disclaimers.
    - "weak": no caveats, or overclaiming relative to the evidence shown.
 
-Combine the three sub-signals into the final ``level``:
-  - "high"   → at least TWO signals are "strong" AND none is "weak".
-  - "low"    → at least TWO signals are "weak".
-  - "medium" → everything else.
+Combine the four sub-signals into the final ``level`` — request_alignment is
+a HARD OVERRIDE, evaluated before anything else:
+
+  - If ``request_alignment`` is "weak" → ``level`` MUST be "low",
+    no matter how strong authority / verifiability / self_consistency are.
+    An off-topic document cannot be a high-trust source for this task.
+    State the off-topic nature in ``rationale`` first.
+  - Otherwise, with the remaining three signals (authority, verifiability,
+    self_consistency):
+      * "high"   → at least TWO of the three are "strong" AND none is "weak".
+      * "low"    → at least TWO of the three are "weak".
+      * "medium" → everything else.
 
 Return JSON only with this schema:
 {
@@ -530,6 +552,7 @@ Return JSON only with this schema:
       "level": "high" | "medium" | "low",
       "rationale": "<1~2 sentence verdict explaining WHY this level>",
       "signals": {
+        "request_alignment": "strong" | "mixed" | "weak",
         "authority": "strong" | "mixed" | "weak",
         "verifiability": "strong" | "mixed" | "weak",
         "self_consistency": "strong" | "mixed" | "weak"
@@ -547,7 +570,8 @@ Rules:
   request is Korean, English otherwise). Preserve proper nouns / model names
   / URLs verbatim even when writing in Korean.
 - Keep ``rationale`` concise (no preamble like "이 문서는..."); state the
-  decisive signal first ("학술 논문 출처이며 수치 근거가 풍부함.").
+  decisive signal first. When ``request_alignment`` is "weak", lead with the
+  topic mismatch (e.g. "K-뷰티 산업 자료로 AI Agent 요청과 무관함.").
 - Output JSON only. No prose, no markdown fences.
 """
 

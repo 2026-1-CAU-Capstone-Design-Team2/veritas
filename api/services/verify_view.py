@@ -45,12 +45,23 @@ _LEVEL_LABEL_REVERSE = {label: key for key, label in _LEVEL_LABEL.items()}
 # Sort order so "높음" docs rise to the top of the verify list.
 _LEVEL_SORT_RANK = {"high": 0, "medium": 1, "low": 2}
 
-# Human-readable signal labels — surfaced on the detail dialog.
+# Human-readable signal labels — surfaced on the detail dialog. The order
+# of ``_SIGNAL_ORDER`` is the order the detail dialog renders signals; we
+# put ``request_alignment`` first because it is the dominant signal (a
+# "weak" value here forces the overall level to "low" regardless of the
+# other three — see ``services.verification.reliability.llm_judge._derive_level``).
 _SIGNAL_LABEL = {
+    "request_alignment": "사용자 요구 일치성",
     "authority": "출처 권위",
     "verifiability": "검증 가능성",
     "self_consistency": "자기일관성",
 }
+_SIGNAL_ORDER: tuple[str, ...] = (
+    "request_alignment",
+    "authority",
+    "verifiability",
+    "self_consistency",
+)
 _SIGNAL_STRENGTH_LABEL = {
     "strong": "강함",
     "mixed": "보통",
@@ -166,14 +177,17 @@ def build_doc_items(
 
 
 def _format_signals(signals: dict[str, str]) -> list[dict[str, str]]:
-    """Render the three sub-signals into a UI-friendly ordered list.
+    """Render the sub-signals into a UI-friendly ordered list.
 
-    Returned order matches the prompt's order (authority → verifiability →
-    self_consistency) so the detail dialog reads top-down the same way the
-    LLM was asked to judge.
+    Order follows :data:`_SIGNAL_ORDER` (request_alignment first because
+    it is the dominant signal) so the detail dialog reads top-down the same
+    way the LLM was asked to judge. Legacy reliability artifacts written
+    before the 4-signal schema landed will be missing
+    ``request_alignment``; we default to "mixed" so the row still renders
+    and the verdict stays valid.
     """
     rendered: list[dict[str, str]] = []
-    for key in ("authority", "verifiability", "self_consistency"):
+    for key in _SIGNAL_ORDER:
         strength = (signals or {}).get(key, "mixed")
         rendered.append(
             {

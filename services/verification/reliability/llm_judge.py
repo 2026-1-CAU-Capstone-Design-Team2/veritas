@@ -138,6 +138,58 @@ def _normalize_level(value: Any, default: str = "medium") -> str:
     return default
 
 
+# Signal keys we surface to the rest of the system. Order matters: the
+# UI renders them top-down in this order so the most decisive signal
+# (request_alignment) reads first.
+_SIGNAL_KEYS: tuple[str, ...] = (
+    "request_alignment",
+    "authority",
+    "verifiability",
+    "self_consistency",
+)
+
+
+def _derive_level(signals: dict[str, str], llm_level: str) -> str:
+    """Re-derive the final level from the 4 sub-signals.
+
+    Pure rule-based — the LLM's own ``level`` is intentionally NOT used as
+    a tiebreaker. If a drifting LLM picks "high" while emitting (mixed,
+    strong, weak) signals, we override with "medium" so the verdict the
+    user sees matches the explanation they can verify in the signal
+    breakdown. ``llm_level`` is accepted for caller-side logging /
+    debugging only.
+
+    Decision matrix (in order):
+
+    1. ``request_alignment == "weak"`` → ``"low"`` (HARD OVERRIDE)
+       Off-topic documents are useless regardless of authority etc.
+
+    2. Otherwise, with the remaining three signals:
+       * 2+ of {authority, verifiability, self_consistency} are "strong"
+         AND none of the three is "weak"             → ``"high"``
+       * 2+ of those three are "weak"                → ``"low"``
+       * everything else                             → ``"medium"``
+    """
+    _ = llm_level  # accepted for trace/debug parity, not used in decision
+    request_alignment = signals.get("request_alignment", "mixed")
+    if request_alignment == "weak":
+        return "low"
+
+    rest = (
+        signals.get("authority", "mixed"),
+        signals.get("verifiability", "mixed"),
+        signals.get("self_consistency", "mixed"),
+    )
+    strong = sum(1 for s in rest if s == "strong")
+    weak = sum(1 for s in rest if s == "weak")
+
+    if strong >= 2 and weak == 0:
+        return "high"
+    if weak >= 2:
+        return "low"
+    return "medium"
+
+
 def _verdicts_from_response(
     raw: dict[str, Any] | None,
     docs: list[DocRecord],
@@ -175,16 +227,15 @@ def _verdicts_from_response(
                     doc_id=doc.doc_id,
                     level="medium",
                     rationale="자동 판정 결과를 받지 못해 중간으로 표시했습니다.",
-                    signals={
-                        "authority": "mixed",
-                        "verifiability": "mixed",
-                        "self_consistency": "mixed",
-                    },
+                    signals={key: "mixed" for key in _SIGNAL_KEYS},
                 )
             )
             continue
 
         signals_raw = entry.get("signals") if isinstance(entry.get("signals"), dict) else {}
+        normalized_signals = {
+            key: _normalize_signal(signals_raw.get(key)) for key in _SIGNAL_KEYS
+        }
         rationale = str(entry.get("rationale", "")).strip()
         # Trim runaway rationales so the UI card stays scannable.
         if len(rationale) > 400:
@@ -192,16 +243,27 @@ def _verdicts_from_response(
         if not rationale:
             rationale = "판정 사유가 비어 있습니다."
 
+        llm_level = _normalize_level(entry.get("level"))
+        final_level = _derive_level(normalized_signals, llm_level)
+
+        # If the rule-based decision disagrees with the LLM's stated level,
+        # prepend a short note so the user can see the override. The most
+        # common case is the request_alignment=weak override that drops a
+        # mis-labelled "medium" K-뷰티 doc into "low".
+        if (
+            normalized_signals["request_alignment"] == "weak"
+            and llm_level != "low"
+        ):
+            note = "사용자 요청 주제와 불일치로 자동 강등됨. "
+            if not rationale.startswith(note):
+                rationale = note + rationale
+
         verdicts.append(
             ReliabilityVerdict(
                 doc_id=doc.doc_id,
-                level=_normalize_level(entry.get("level")),
+                level=final_level,
                 rationale=rationale,
-                signals={
-                    "authority": _normalize_signal(signals_raw.get("authority")),
-                    "verifiability": _normalize_signal(signals_raw.get("verifiability")),
-                    "self_consistency": _normalize_signal(signals_raw.get("self_consistency")),
-                },
+                signals=normalized_signals,
             )
         )
     return verdicts
@@ -222,11 +284,7 @@ def _fallback_batch(docs: Iterable[DocRecord], reason: str) -> list[ReliabilityV
             doc_id=doc.doc_id,
             level="medium",
             rationale=note,
-            signals={
-                "authority": "mixed",
-                "verifiability": "mixed",
-                "self_consistency": "mixed",
-            },
+            signals={key: "mixed" for key in _SIGNAL_KEYS},
         )
         for doc in docs
     ]
