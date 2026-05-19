@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 from typing import Any, Callable
 
+from core.latex_cleanup import clean_latex_in_markdown
 from core.prompts import (
     BATCH_SUMMARY_PROMPT,
     DOC_CHUNK_NOTES_PROMPT,
@@ -582,6 +583,10 @@ class DocumentSummarizeTool(BaseTool):
                 stream=getattr(self._llm, "stream_summary", False),
                 stream_label=f"batch:{batch_number:03d}",
             )
+            # Same LaTeX over-escape fix applied to the final report — batch
+            # notes feed final.md, so math expressions inside repeated /
+            # new findings must already be canonical before they propagate.
+            batch_markdown = clean_latex_in_markdown(batch_markdown)
             self._run_store_service.write_batch_summary(batch_number, batch_markdown)
             batch_files.append(str(batch_path))
             self._run_store_service.set_batch_counter_from_count(batch_number)
@@ -620,6 +625,7 @@ class DocumentSummarizeTool(BaseTool):
                 stream=getattr(self._llm, "stream_summary", False),
                 stream_label=f"batch:{next_batch_number:03d}",
             )
+            batch_markdown = clean_latex_in_markdown(batch_markdown)
             self._run_store_service.write_batch_summary(next_batch_number, batch_markdown)
             self._run_store_service.set_batch_counter_from_count(next_batch_number)
             batch_files.append(str(batch_path))
