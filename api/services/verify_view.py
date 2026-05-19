@@ -92,13 +92,26 @@ def build_doc_items(
     if reliability is not None:
         items_by_doc = {item.doc_id: item for item in reliability.items}
 
-    # Duplicate documents inherit their verdict from their source (so the
-    # reliability artifact stays complete on disk) but the verify card list
-    # must NOT show them as separate cards — they are not standalone sources.
-    # ``_load_doc_titles`` already skips ``duplicate_of`` records, so taking
-    # its key set as the canonical doc list automatically drops dup_NNN ids
-    # that crept into ``reliability.items`` via the inheritance pass.
-    doc_ids = sorted(doc_titles.keys())
+    # Authoritative doc set: the deduped title map ``_load_doc_titles``
+    # built from ``index.json`` (it already skips ``duplicate_of`` records,
+    # so dup_NNN ids that crept into ``reliability.items`` via the
+    # inheritance pass are filtered out for free).
+    #
+    # Defensive fallback: if the title map is empty (e.g. ``index.json``
+    # was unreadable or pointed at the wrong path), fall back to the
+    # reliability verdicts themselves — the user is still better served
+    # by un-titled cards ("문서 NNN") than by a completely blank verify
+    # page that hides the fact that verify *did* run. The fallback
+    # explicitly drops inherited duplicates so dup_NNN never sneaks in
+    # via that path either.
+    if doc_titles:
+        doc_ids = sorted(doc_titles.keys())
+    else:
+        doc_ids = sorted(
+            doc_id
+            for doc_id, item in items_by_doc.items()
+            if item.inherited_from is None
+        )
 
     items: list[dict[str, Any]] = []
     for doc_id in doc_ids:
