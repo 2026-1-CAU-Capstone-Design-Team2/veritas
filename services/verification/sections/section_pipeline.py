@@ -25,8 +25,9 @@ from tools.verify_flow_planner_tool import VerifyFlowPlannerTool
 
 from ..indexing.bm25_index import BM25Index
 from ..indexing.dense_index import DenseIndex
+from core.models import ParsedDocRecord
+
 from ..models import (
-    DocRecord,
     SectionResult,
     SentenceUnit,
     VerificationConfig,
@@ -40,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 def run_section_pipeline(
-    docs: list[DocRecord],
+    docs: list[ParsedDocRecord],
     dense: DenseIndex,
     flow_planner_tool: VerifyFlowPlannerTool,
     request_text: str,

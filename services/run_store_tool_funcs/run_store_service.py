@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-from core.models import DocRecord
+from core.models import IndexedDocRecord
 from services.run_store_tool_funcs.path_manager import RunPathManager
 from services.run_store_tool_funcs.record_serializer import RecordSerializer
 
@@ -208,7 +208,7 @@ class RunStoreService:
         history.append(entry)
         self.save_json(self.paths.plan_history_path, {"entries": history})
 
-    def load_records(self) -> list[DocRecord]:
+    def load_records(self) -> list[IndexedDocRecord]:
         if not self.paths.index_path.exists():
             return []
 
@@ -227,7 +227,7 @@ class RunStoreService:
 
         return records
 
-    def save_records(self, records: list[DocRecord]) -> None:
+    def save_records(self, records: list[IndexedDocRecord]) -> None:
         self.save_json(
             self.paths.index_path,
             {
@@ -257,13 +257,13 @@ class RunStoreService:
             return True
         return path.stat().st_size == 0
 
-    def is_invalid_document_record(self, record: DocRecord) -> bool:
+    def is_invalid_document_record(self, record: IndexedDocRecord) -> bool:
         return self.is_zero_byte_file(record.text_path) or self.is_zero_byte_file(record.html_path)
 
-    def list_non_duplicate_records(self) -> list[DocRecord]:
+    def list_non_duplicate_records(self) -> list[IndexedDocRecord]:
         return [r for r in self.load_records() if r.duplicate_of is None]
 
-    def list_duplicate_records(self) -> list[DocRecord]:
+    def list_duplicate_records(self) -> list[IndexedDocRecord]:
         return [r for r in self.load_records() if r.duplicate_of is not None]
 
     def sanitize_text(self, content: Any) -> str:
@@ -289,7 +289,7 @@ class RunStoreService:
     def get_batch_summary_path(self, batch_index: int):
         return self.paths.batch_path(batch_index)
 
-    def write_document_summary(self, record: DocRecord, content: str) -> None:
+    def write_document_summary(self, record: IndexedDocRecord, content: str) -> None:
         self.save_text(record.summary_path, content)
 
     def write_batch_summary(self, batch_index: int, content: str) -> None:
@@ -471,7 +471,7 @@ class RunStoreService:
     def write_fetch_error_note(self, *, url: str, error: str) -> str:
         """Record a Crawl4AI fetch failure as a standalone note; return its id.
 
-        A fetch error is not a document: it gets no ``DocRecord`` and no entry
+        A fetch error is not a document: it gets no ``IndexedDocRecord`` and no entry
         in ``index.json``. The note is written under the ``fetch_error_*``
         namespace so it never shares a number with a kept document's
         ``doc_*.md`` summary.
@@ -507,7 +507,7 @@ class RunStoreService:
         dup_index = sum(1 for r in records if r.duplicate_of is not None)
         dup_id = f"dup_{dup_index:03d}"
 
-        record = DocRecord(
+        record = IndexedDocRecord(
             doc_id=dup_id,
             title=title,
             url=url,
@@ -558,7 +558,7 @@ class RunStoreService:
         self.save_text(html_path, html)
         self.save_text(text_path, text)
 
-        record = DocRecord(
+        record = IndexedDocRecord(
             doc_id=doc_id,
             title=title,
             url=url,

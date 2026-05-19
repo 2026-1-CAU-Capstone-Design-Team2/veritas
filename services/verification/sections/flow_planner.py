@@ -5,8 +5,8 @@ The LLM call, prompt and JSON validation all live in the tool itself
 (``tools/verify_flow_planner_tool/``) so the same capability is registrable
 in the chat tool registry. This module:
 
-1. Builds ``doc_hints`` from the loaded :class:`DocRecord` list (the tool
-   itself stays I/O-free and doesn't know about ``DocRecord``).
+1. Builds ``doc_hints`` from the loaded :class:`ParsedDocRecord` list (the tool
+   itself stays I/O-free and doesn't know about ``ParsedDocRecord``).
 2. Calls :meth:`VerifyFlowPlannerTool.run` and unpacks its
    :class:`ToolResult` into the pipeline's :class:`FlowSection` dataclasses.
 3. Falls back to a ``must_cover``-derived outline if the tool reports a
@@ -20,15 +20,17 @@ from typing import Any
 
 from tools.verify_flow_planner_tool import VerifyFlowPlannerTool
 
-from ..models import DocRecord, FlowSection, VerificationConfig
+from core.models import ParsedDocRecord
+
+from ..models import FlowSection, VerificationConfig
 
 logger = logging.getLogger(__name__)
 
 
-def _doc_hint(doc: DocRecord) -> str | None:
+def _doc_hint(doc: ParsedDocRecord) -> str | None:
     """One short '- Title: first summary line' string the tool can read.
 
-    Title comes from index.json (already in DocRecord); the summary first
+    Title comes from index.json (already in ParsedDocRecord); the summary first
     line is the LLM-authored doc summary's opening sentence, kept short so
     a large workspace doesn't blow up the planner prompt.
     """
@@ -45,7 +47,7 @@ def _doc_hint(doc: DocRecord) -> str | None:
     return f"- {title}: {summary_first_line}"
 
 
-def _build_doc_hints(docs: list[DocRecord], limit: int) -> list[str]:
+def _build_doc_hints(docs: list[ParsedDocRecord], limit: int) -> list[str]:
     eligible = [doc for doc in docs if not doc.is_duplicate][: max(0, int(limit))]
     return [hint for hint in (_doc_hint(doc) for doc in eligible) if hint]
 
@@ -119,7 +121,7 @@ def plan_report_flow(
     request_text: str,
     plan: dict,
     grounding: dict,
-    docs: list[DocRecord],
+    docs: list[ParsedDocRecord],
     cfg: VerificationConfig,
 ) -> tuple[list[FlowSection], str]:
     """Return ``(sections, source)``. ``source`` ∈ ``{"llm", "fallback"}``.

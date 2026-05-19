@@ -25,9 +25,10 @@ from .artifact_loader import ArtifactLoader, key_points_from_docs
 from .consensus.consensus_pipeline import run_consensus_pipeline
 from .indexing.bm25_index import BM25Index
 from .indexing.dense_index import DenseIndex
+from core.models import ParsedDocRecord
+
 from .models import (
     ChunkRecord,
-    DocRecord,
     KeyPointRecord,
     VerificationArtifacts,
     VerificationConfig,
@@ -121,7 +122,7 @@ class VerificationService:
     # -- input resources (cached once per service instance) -------------------
 
     @cached_property
-    def docs(self) -> list[DocRecord]:
+    def docs(self) -> list[ParsedDocRecord]:
         return self._loader.load_docs(self._workspace)
 
     @cached_property
