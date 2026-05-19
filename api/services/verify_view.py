@@ -92,7 +92,13 @@ def build_doc_items(
     if reliability is not None:
         items_by_doc = {item.doc_id: item for item in reliability.items}
 
-    doc_ids = sorted(set(items_by_doc) | set(doc_titles))
+    # Duplicate documents inherit their verdict from their source (so the
+    # reliability artifact stays complete on disk) but the verify card list
+    # must NOT show them as separate cards — they are not standalone sources.
+    # ``_load_doc_titles`` already skips ``duplicate_of`` records, so taking
+    # its key set as the canonical doc list automatically drops dup_NNN ids
+    # that crept into ``reliability.items`` via the inheritance pass.
+    doc_ids = sorted(doc_titles.keys())
 
     items: list[dict[str, Any]] = []
     for doc_id in doc_ids:
