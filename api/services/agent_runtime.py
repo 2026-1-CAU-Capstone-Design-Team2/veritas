@@ -6,9 +6,8 @@ import re
 import shutil
 import threading
 import time
-from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Iterator
 
 from fastapi import HTTPException
 
@@ -19,9 +18,9 @@ from tools.loader import build_registry, load_schema
 from workflows import AutoSurveyConfig, AutoSurveyWorkflow
 
 from .progress_buffer import BUFFER_DEFAULT_MAX, ProgressBuffer
+from .screen_monitor import SCREEN_EVENT_BUFFER_MAX, ScreenMonitor
 
 
-SCREEN_EVENT_BUFFER_MAX = 100
 RESEARCH_PROGRESS_BUFFER_MAX = BUFFER_DEFAULT_MAX
 
 
@@ -53,10 +52,11 @@ class AgentRuntime:
             trace_latency=os.getenv("VERITAS_TRACE_LATENCY", "1") != "0",
         )
         self._workspace_lock = threading.RLock()
-        self._screen_events: deque[dict[str, Any]] = deque(maxlen=SCREEN_EVENT_BUFFER_MAX)
-        self._screen_event_seq = 0
-        self._screen_event_lock = threading.Lock()
-        self._screen_monitoring_started_at: str | None = None
+        # ScreenMonitor owns the intervention event ring buffer + lifecycle
+        # state (started_at flag, chat_agent / registry references). The
+        # actual screen poller thread still lives inside ChatAgent —
+        # ScreenMonitor is just the runtime-side coordinator.
+        self._screen_monitor = ScreenMonitor(workspace_lock=self._workspace_lock)
         # Two parallel progress streams. Same buffer class, two instances —
         # so a research run and a verify run can be in flight at the same
         # time without their events colliding. The verify task pollers
@@ -113,6 +113,14 @@ class AgentRuntime:
         self.chat_agent.chat_history = self._load_workspace_chat_history()
         if self.rag_service is not None:
             self.rag_service.chat_history = list(self.chat_agent.chat_history)
+        # Rebind the screen-monitor's view of the workspace — same controller
+        # instance, fresh chat_agent / registry every workspace switch. Avoids
+        # the stale-reference race the pre-extraction code didn't even
+        # acknowledge because everything was on AgentRuntime directly.
+        self._screen_monitor.bind(
+            chat_agent=self.chat_agent,
+            registry=self.registry,
+        )
 
     def set_workspace(self, workspace_id: str) -> None:
         workspace_id = str(workspace_id or "").strip()
@@ -130,16 +138,11 @@ class AgentRuntime:
         with self._workspace_lock:
             if workspace_id == self.workspace_id:
                 return
-            was_monitoring = bool(
-                self._screen_monitoring_started_at
-                and self.chat_agent._screen_monitor_thread
-                and self.chat_agent._screen_monitor_thread.is_alive()
-            )
-            if was_monitoring:
-                try:
-                    self.chat_agent.stop_screen_monitoring()
-                except Exception as e:
-                    print(f"[screen_monitoring][warn] stop on workspace switch failed: {e}")
+            # Stop the screen poller (if any) before swapping in a new
+            # chat_agent — otherwise the old thread keeps running against a
+            # released registry. The controller remembers whether it was
+            # running so we can re-start cleanly after the switch.
+            was_monitoring = self._screen_monitor.stop_for_workspace_switch()
             leaving_default = self.workspace_id == "default"
             self.workspace_id = workspace_id
             output_dir = (
@@ -766,167 +769,32 @@ class AgentRuntime:
             "documentCount": len(service.docs),
         }
 
+    # -------------------------------------------------------------- screen
+    # Thin facades over :class:`ScreenMonitor`. The route handlers in
+    # ``api/services/screen_monitoring_service.py`` keep calling these on
+    # the runtime so the public surface is unchanged; the controller owns
+    # the state.
+
     def start_screen_monitoring(self) -> dict[str, Any]:
-        """Start proactive screen monitoring on the active ChatAgent.
-
-        Captured screen interventions are converted into assistant answers and
-        appended to an in-memory event buffer that the frontend can poll.
-        """
-        with self._workspace_lock:
-            if not self.chat_agent.has_screen_context():
-                raise HTTPException(
-                    status_code=409,
-                    detail="screen_context tool is not registered. Enable VERITAS_ENABLE_SCREEN_CONTEXT before starting the API.",
-                )
-            started = self.chat_agent.start_screen_monitoring(
-                on_answer=self._on_screen_assist_answer,
-                stream=False,
-            )
-            if not started:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Failed to start screen monitoring. Check screen_context tool status and capture logs.",
-                )
-            if self._screen_monitoring_started_at is None:
-                from datetime import datetime, timezone
-
-                self._screen_monitoring_started_at = (
-                    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-                )
-            return self.screen_monitoring_status()
+        """Start the screen poller; record assistant answers into the buffer."""
+        return self._screen_monitor.start(
+            on_answer=lambda answer, intervention: self._screen_monitor.record_assist_answer(
+                answer, intervention, workspace_id=self.workspace_id
+            ),
+        )
 
     def stop_screen_monitoring(self) -> dict[str, Any]:
-        with self._workspace_lock:
-            if self.chat_agent.has_screen_context():
-                self.chat_agent.stop_screen_monitoring()
-            self._screen_monitoring_started_at = None
-            return self.screen_monitoring_status()
+        return self._screen_monitor.stop()
 
     def screen_monitoring_status(self) -> dict[str, Any]:
-        registered = bool(
-            self.registry is not None and self.registry.has("screen_context")
+        return self._screen_monitor.status(workspace_id=self.workspace_id)
+
+    def get_screen_events_since(self, *, since: int, limit: int) -> dict[str, Any]:
+        return self._screen_monitor.get_events_since(
+            since=since,
+            limit=limit,
+            workspace_id=self.workspace_id,
         )
-        polling = False
-        last_poll_error: str | None = None
-        latest_event_id: str | None = None
-        latest_captured_at: str | None = None
-        latest_diagnostics: dict[str, Any] = {}
-        pending_intervention_count = 0
-        capture_log_path: str | None = None
-        if registered:
-            try:
-                result = self.registry.call("screen_context", action="status")
-            except Exception as e:
-                last_poll_error = f"status call failed: {e}"
-                result = None
-            if result is not None and getattr(result, "success", False):
-                data = result.data if isinstance(result.data, dict) else {}
-                polling = bool(data.get("polling"))
-                last_poll_error = data.get("last_poll_error")
-                latest_event_id = data.get("latest_event_id")
-                latest_captured_at = data.get("latest_captured_at")
-                diagnostics = data.get("latest_diagnostics") or {}
-                if isinstance(diagnostics, dict):
-                    latest_diagnostics = diagnostics
-                pending_intervention_count = int(
-                    data.get("pending_intervention_count") or 0
-                )
-                capture_log_path = data.get("capture_log_path")
-            elif result is not None:
-                last_poll_error = getattr(result, "error", None) or last_poll_error
-
-        with self._screen_event_lock:
-            latest_seq = self._screen_event_seq
-            event_buffer_size = len(self._screen_events)
-
-        return {
-            "registered": registered,
-            "polling": polling,
-            "monitoringStartedAt": self._screen_monitoring_started_at,
-            "workspaceId": self.workspace_id,
-            "lastPollError": last_poll_error,
-            "latestCaptureEventId": latest_event_id,
-            "latestCapturedAt": latest_captured_at,
-            "latestDiagnostics": latest_diagnostics,
-            "pendingInterventionCount": pending_intervention_count,
-            "captureLogPath": capture_log_path,
-            "eventBufferSize": event_buffer_size,
-            "latestEventSeq": latest_seq,
-        }
-
-    def get_screen_events_since(
-        self,
-        *,
-        since: int,
-        limit: int,
-    ) -> dict[str, Any]:
-        if limit <= 0:
-            limit = 20
-        limit = min(limit, SCREEN_EVENT_BUFFER_MAX)
-        with self._screen_event_lock:
-            latest_seq = self._screen_event_seq
-            events = [
-                event for event in self._screen_events if int(event.get("seq", 0)) > since
-            ]
-        events.sort(key=lambda item: int(item.get("seq", 0)))
-        events = events[:limit]
-        next_cursor = events[-1]["seq"] if events else since
-        return {
-            "items": events,
-            "nextCursor": next_cursor,
-            "latestSeq": latest_seq,
-            "workspaceId": self.workspace_id,
-        }
-
-    def _on_screen_assist_answer(
-        self,
-        answer: str,
-        intervention: dict[str, Any],
-    ) -> None:
-        from datetime import datetime, timezone
-
-        text = str(answer or "").strip()
-        if not text:
-            return
-        with self._screen_event_lock:
-            self._screen_event_seq += 1
-            seq = self._screen_event_seq
-            workspace_id = self.workspace_id
-        writing_context = intervention.get("writing_context") if isinstance(intervention, dict) else {}
-        if not isinstance(writing_context, dict):
-            writing_context = {}
-        app_context = intervention.get("app_context") if isinstance(intervention, dict) else {}
-        if not isinstance(app_context, dict):
-            app_context = {}
-        focused = " ".join(str(writing_context.get("focused_sentence") or "").split()).strip()
-        recent = " ".join(str(writing_context.get("recent_sentences") or "").split()).strip()
-        trigger_text = focused or recent
-        event = {
-            "seq": seq,
-            "eventId": str(intervention.get("event_id") or "") or f"proactive_{seq}",
-            "workspaceId": workspace_id,
-            "answer": text,
-            "category": "proactive",
-            "tone": "working",
-            "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "capturedAt": intervention.get("captured_at"),
-            "triggerText": trigger_text,
-            "appContext": {
-                "title": app_context.get("title") or app_context.get("window_title"),
-                "processName": app_context.get("process_name"),
-                "activeAppType": app_context.get("active_app_type")
-                or writing_context.get("active_app_type"),
-            },
-            "writingContext": {
-                "focusedSentence": focused,
-                "recentSentences": recent,
-                "paragraphSource": writing_context.get("paragraph_source"),
-                "fullTextChars": writing_context.get("full_text_chars"),
-                "confidence": writing_context.get("confidence"),
-            },
-        }
-        with self._screen_event_lock:
-            self._screen_events.append(event)
 
     def _compact_workflow_result(self, result: Any) -> dict[str, Any]:
         if not isinstance(result, dict):
