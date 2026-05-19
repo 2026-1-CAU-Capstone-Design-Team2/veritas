@@ -1,25 +1,22 @@
 """VerificationService — single external entry point (VERIFY_DESIGN.md §6 / §8.7).
 
-The facade owns the *connections, indices and caches* the three task pipelines
+The facade owns the *connections, indices and caches* the task pipelines
 share; the pipelines themselves stay pure-ish functions of the inputs. Every
-heavy resource (Kiwi tokenizer, BM25 indices, chunk embedding matrix) is built
-once via :class:`functools.cached_property` so a multi-task run pays the cost
-only on the first task and a single-task rerun (``run(tasks=("sections",))``)
-during tuning is cheap.
+heavy resource (Kiwi tokenizer, BM25 indices) is built once via
+:class:`functools.cached_property` so a multi-task run pays the cost only on
+the first task and a single-task rerun (``run(tasks=("sections",))``) during
+tuning is cheap.
 
-Layering (§1.2): this module sits *between* ``api/services/`` and the algorithm
-layer; it imports from ``indexing/`` / ``sections/`` / ``intent/`` / ``consensus/``
-but never from ``api/`` or ``frontend/``.
+Layering (§1.2): this module sits *between* ``api/services/`` and the
+algorithm layer; it imports from ``indexing/`` / ``sections/`` / ``consensus/``
+/ ``reliability/`` but never from ``api/`` or ``frontend/``.
 """
 
 from __future__ import annotations
 
 from functools import cached_property
-from typing import Callable, Sequence
-
-import numpy as np
-
 from pathlib import Path
+from typing import Callable, Sequence
 
 from tools.loader import load_schema
 from tools.verify_flow_planner_tool import VerifyFlowPlannerTool
@@ -28,7 +25,6 @@ from .artifact_loader import ArtifactLoader, key_points_from_docs
 from .consensus.consensus_pipeline import run_consensus_pipeline
 from .indexing.bm25_index import BM25Index
 from .indexing.dense_index import DenseIndex
-from .intent.intent_pipeline import run_intent_pipeline
 from .models import (
     ChunkRecord,
     DocRecord,
@@ -38,7 +34,6 @@ from .models import (
 )
 from .persistence import VerificationPersistence
 from .reliability import run_reliability_pipeline
-from .retrieval import stack_chunk_embeddings
 from .sections.section_pipeline import run_section_pipeline
 from .tokenization import HybridTokenizer
 
@@ -51,21 +46,11 @@ _FLOW_PLANNER_SCHEMA_PATH = (
     / "tool_schema.json"
 )
 
-# Task names accepted by :meth:`VerificationService.run`. The order here is
-# the order pipelines execute when ``tasks`` is left at the default.
-#
-# ``intent`` was retired in favour of ``reliability`` — the LLM-graded trust
-# verdict explains the per-doc level the user actually wants to see, whereas
-# the old BM25+Dense+RRF intent score was misleading at small workspace
-# sizes (raw scores ≲ 0.02 and rendered as a percentage). The legacy
-# ``intent`` pipeline + ``intent_coverage.json`` reader are kept on the
-# artifact for backward compatibility, but the default task set no longer
-# runs it; callers can still opt in via ``tasks=("intent",)`` for tuning.
+# Task names the service dispatches when ``tasks`` is left at the default.
+# The order here is the order pipelines execute. To run a subset during
+# tuning, pass an explicit tuple to :meth:`VerificationService.run`.
 ALL_TASKS: tuple[str, ...] = ("sections", "reliability", "consensus")
 DEFAULT_TASKS: tuple[str, ...] = ALL_TASKS
-# Every task name the service knows how to dispatch — superset of
-# ``ALL_TASKS`` so an explicit ``tasks=("intent",)`` request still works.
-_KNOWN_TASKS: frozenset[str] = frozenset({*ALL_TASKS, "intent"})
 
 # Progress callback: same shape as ``workflows.autosurvey_workflow``'s callback
 # (§1.7), so the API ring buffer + frontend poller from research are reused
@@ -78,8 +63,8 @@ Bm25Factory = Callable[[Sequence[str]], BM25Index]
 def _default_bm25_factory(tokenizer: HybridTokenizer, cfg: VerificationConfig) -> Bm25Factory:
     """Factory that builds a fresh :class:`BM25Index` over the given texts.
 
-    Closed over the shared tokenizer so every corpus (chunks, Key Points) goes
-    through the same tokenization rules.
+    Closed over the shared tokenizer so every corpus (Key Points, sentences)
+    goes through the same tokenization rules.
     """
 
     def _build(texts: Sequence[str]) -> BM25Index:
@@ -112,12 +97,12 @@ class VerificationService:
         self._workspace = workspace
         self._loader = artifact_loader
         self._dense = dense
-        # ``flow_planner_tool`` is required for Task 1 (sections). Callers may
-        # pass a pre-built instance — e.g. one already registered in the
-        # chat ToolRegistry — or omit it and pass ``llm`` to let the service
-        # spin up its own tool against the schema next to the implementation.
-        # Tasks 2/3 don't need it; ``run`` raises a clear error if Task 1
-        # is requested with neither supplied.
+        # ``flow_planner_tool`` is required for the sections task. Callers may
+        # pass a pre-built instance — e.g. one already registered in the chat
+        # ToolRegistry — or omit it and pass ``llm`` to let the service spin up
+        # its own tool against the schema next to the implementation. The
+        # reliability and consensus tasks don't need it; ``run`` raises a clear
+        # error if sections is requested with neither supplied.
         self._llm = llm
         if flow_planner_tool is not None:
             self._flow_planner_tool: VerifyFlowPlannerTool | None = flow_planner_tool
@@ -142,14 +127,6 @@ class VerificationService:
     @cached_property
     def chunks(self) -> list[ChunkRecord]:
         return self._loader.load_chunks(self._workspace)
-
-    @cached_property
-    def chunk_embeddings(self) -> np.ndarray:
-        return stack_chunk_embeddings(self.chunks)
-
-    @cached_property
-    def chunk_bm25(self) -> BM25Index:
-        return self._bm25_factory([chunk.text for chunk in self.chunks])
 
     @cached_property
     def key_points(self) -> list[KeyPointRecord]:
@@ -184,12 +161,9 @@ class VerificationService:
         cached_property indices ensure unused inputs are never loaded.
         Persistence writes only the files for ``completed`` so a partial rerun
         does not clobber other tasks' previously saved JSON on disk.
-
-        ``intent`` is accepted but not in the default set; opt in explicitly
-        when tuning the legacy facet-coverage pipeline.
         """
         cb = progress_callback or (lambda *_a, **_k: None)
-        requested = [task for task in tasks if task in _KNOWN_TASKS]
+        requested = [task for task in tasks if task in ALL_TASKS]
         if not requested:
             cb("completed", "검증할 작업이 없습니다.", final=True)
             return VerificationArtifacts(config_hash=self._cfg.fingerprint())
@@ -206,7 +180,7 @@ class VerificationService:
         if "sections" in requested:
             if self._flow_planner_tool is None:
                 raise RuntimeError(
-                    "Task 1 (sections) needs the verify_flow_planner tool; "
+                    "sections task needs the verify_flow_planner tool; "
                     "construct VerificationService with llm=... (auto-builds the tool) "
                     "or pass flow_planner_tool=... directly, or omit 'sections' from tasks."
                 )
@@ -265,31 +239,6 @@ class VerificationService:
                 },
             )
             completed.append("reliability")
-
-        if "intent" in requested:
-            # Legacy facet-coverage pipeline; no longer in the default task set
-            # but still wired in for tuning / regression comparisons.
-            cb("intent", "사용자 의도 적합도 분석 중 (legacy)...")
-            artifacts.intent = run_intent_pipeline(
-                docs=self.docs,
-                chunks=self.chunks,
-                chunk_bm25=self.chunk_bm25,
-                dense=self._dense,
-                request_text=self.request_text,
-                plan=self.plan,
-                grounding=self.grounding,
-                cfg=self._cfg,
-                chunk_embeddings=self.chunk_embeddings,
-                tokenizer=self._tokenizer,
-            )
-            facet_count = len(artifacts.intent.facets)
-            gap_count = len(artifacts.intent.coverage_gap)
-            cb(
-                "intent",
-                f"의도 분석 완료 · 의도 그룹 {facet_count}개 · 부족한 의도 {gap_count}개",
-                detail={"facets": facet_count, "gaps": gap_count},
-            )
-            completed.append("intent")
 
         if "consensus" in requested:
             cb("consensus", "교차 출처 합의 분석 중...")

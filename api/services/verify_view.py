@@ -13,7 +13,10 @@ the previous version of this module mapped a BM25+Dense+RRF "의도 일치율"
 into a percentage band. The raw scores were tiny (≲ 0.02) and the rendered
 percentage was a workspace-internal ratio that users could not interpret.
 The reliability task replaces that signal entirely; the LLM emits the band
-directly and the rationale that justified it.
+directly and the rationale that justified it. That pipeline and its
+``IntentResult`` / ``Facet`` / ``CoverageGap`` models were removed wholesale
+in the intent dead-path cleanup — if anyone ever wants a coverage-style
+signal again, write it fresh against the current schema.
 """
 
 from __future__ import annotations
@@ -23,7 +26,6 @@ from typing import Any
 from services.verification.models import (
     ConflictFlag,
     ConsensusResult,
-    IntentResult,
     SectionResult,
     SentenceAssignment,
     VerificationArtifacts,
@@ -90,10 +92,10 @@ def build_doc_items(
 ) -> list[dict[str, Any]]:
     """One ranked item per doc — what the verify card list renders.
 
-    Driven by ``artifacts.reliability`` (the LLM-graded verdict). Older
-    workspaces that only carry a legacy ``intent_coverage.json`` end up with
-    a neutral "중간" verdict for every doc — they need a fresh verify run to
-    get the LLM verdict.
+    Driven by ``artifacts.reliability`` (the LLM-graded verdict). Workspaces
+    persisted before the reliability task landed end up with a neutral "중간"
+    verdict for every doc — they need a fresh verify run to get the LLM
+    verdict.
     """
     reliability: ReliabilityResult | None = artifacts.reliability
     sections: SectionResult | None = artifacts.sections
@@ -523,77 +525,6 @@ def issues_overview(
     return rows
 
 
-# ---------------------------------------------------------------------------
-# Legacy aliases — kept so existing imports do not break while old workspaces
-# are still being read.
-# ---------------------------------------------------------------------------
-
-
-def facet_breakdown_for(doc_id: str, intent: IntentResult | None) -> list[dict[str, Any]]:
-    """Legacy facet breakdown — only meaningful when the legacy intent task ran.
-
-    Newly-verified workspaces have ``intent is None`` and this returns ``[]``,
-    which the UI renders as an empty panel.
-    """
-    if intent is None or intent.doc_facet_matrix is None:
-        return []
-    try:
-        column = intent.doc_order.index(doc_id)
-    except ValueError:
-        return []
-    matrix = intent.doc_facet_matrix
-    if column >= matrix.shape[1]:
-        return []
-    rows: list[dict[str, Any]] = []
-    for row_idx, facet in enumerate(intent.facets):
-        if row_idx >= matrix.shape[0]:
-            break
-        rows.append(
-            {
-                "facetId": facet.id,
-                "labels": list(facet.label_terms[:6]),
-                "score": round(float(matrix[row_idx, column]), 6),
-            }
-        )
-    rows.sort(key=lambda item: -item["score"])
-    return rows
-
-
-def ratio_normalize_percent(scores: dict[str, float]) -> dict[str, int]:
-    """Legacy helper — no longer used by the verify card pipeline.
-
-    Kept so any external smoke test that imported the old name still
-    resolves. Returns an empty dict for an empty input rather than raising.
-    """
-    if not scores:
-        return {}
-    max_score = max(scores.values())
-    if max_score <= 0.0:
-        return {doc: 0 for doc in scores}
-    return {
-        doc: max(0, min(100, int(round(score / max_score * 100))))
-        for doc, score in scores.items()
-    }
-
-
-# Backwards-compatible aliases for any caller that imported the old names.
-rank_normalize_percent = ratio_normalize_percent
-
-
-def level_for(percent: int) -> str:
-    """Legacy converter — clamps a percent into a Korean band label.
-
-    The current verify pipeline does not use this; LLM verdicts carry the
-    band directly. The function stays so any legacy code path (or test)
-    that called it still resolves.
-    """
-    if percent >= 70:
-        return "높음"
-    if percent >= 40:
-        return "중간"
-    return "낮음"
-
-
 __all__ = [
     "build_doc_items",
     "level_label",
@@ -601,9 +532,4 @@ __all__ = [
     "concept_participation_for",
     "sections_overview",
     "issues_overview",
-    # Legacy
-    "facet_breakdown_for",
-    "ratio_normalize_percent",
-    "rank_normalize_percent",
-    "level_for",
 ]
