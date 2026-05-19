@@ -59,6 +59,14 @@ class AgentRuntime:
         self._research_progress_seq = 0
         self._research_progress_lock = threading.Lock()
         self._research_active_job: dict[str, Any] | None = None
+        # Verification (services/verification) reuses the same ring-buffer +
+        # cursor pattern as research progress so the frontend can poll
+        # /api/v1/verify/progress with the same `since` semantics, without two
+        # streams of events colliding inside one buffer.
+        self._verify_progress: deque[dict[str, Any]] = deque(maxlen=RESEARCH_PROGRESS_BUFFER_MAX)
+        self._verify_progress_seq = 0
+        self._verify_progress_lock = threading.Lock()
+        self._verify_active_job: dict[str, Any] | None = None
 
         # Boot-time workspace selection: prefer the most recently-used real
         # workspace so we never create `runs/api/` when one already exists.
@@ -706,6 +714,199 @@ class AgentRuntime:
             "nextCursor": next_cursor,
             "latestSeq": latest_seq,
             "activeJob": job_snapshot or None,
+        }
+
+    # ------------------------------------------------------------------ verify
+    # The verification layer (services/verification) reuses the research-style
+    # progress pattern: ring buffer + cursor + lock + active-job snapshot. Two
+    # parallel streams (one for research, one for verify) so the frontend can
+    # show the two pages live without their events colliding in one buffer.
+
+    def _reset_verify_progress(
+        self,
+        *,
+        job_id: str | None,
+        workspace_id: str,
+    ) -> None:
+        from datetime import datetime, timezone
+
+        with self._verify_progress_lock:
+            self._verify_progress.clear()
+            self._verify_progress_seq = 0
+            self._verify_active_job = {
+                "jobId": job_id,
+                "workspaceId": workspace_id,
+                "startedAt": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "status": "running",
+            }
+
+    def _emit_verify_progress(
+        self,
+        stage: str,
+        message: str,
+        *,
+        detail: dict[str, Any] | None = None,
+        final: bool = False,
+    ) -> None:
+        from datetime import datetime, timezone
+
+        message_text = " ".join(str(message or "").split()).strip()[:280]
+        with self._verify_progress_lock:
+            self._verify_progress_seq += 1
+            seq = self._verify_progress_seq
+            event = {
+                "seq": seq,
+                "stage": str(stage or "").strip() or "info",
+                "message": message_text,
+                "detail": detail or {},
+                "timestamp": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+            self._verify_progress.append(event)
+            if self._verify_active_job is not None and final:
+                # ``stage=='failed'`` lets the frontend distinguish a graceful
+                # completion from a thrown failure that emitted a final event.
+                self._verify_active_job["status"] = (
+                    "failed" if str(stage) == "failed" else "completed"
+                )
+
+    def get_verify_progress(self, *, since: int, limit: int) -> dict[str, Any]:
+        if limit <= 0:
+            limit = 50
+        limit = min(limit, RESEARCH_PROGRESS_BUFFER_MAX)
+        with self._verify_progress_lock:
+            latest_seq = self._verify_progress_seq
+            events = [
+                event
+                for event in self._verify_progress
+                if int(event.get("seq", 0)) > since
+            ]
+            job_snapshot = dict(self._verify_active_job or {})
+        events.sort(key=lambda item: int(item.get("seq", 0)))
+        events = events[:limit]
+        next_cursor = events[-1]["seq"] if events else since
+        return {
+            "items": events,
+            "nextCursor": next_cursor,
+            "latestSeq": latest_seq,
+            "activeJob": job_snapshot or None,
+        }
+
+    def run_verification(
+        self,
+        *,
+        workspace_id: str | None,
+        tasks: list[str] | None = None,
+        job_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Run the verification pipelines on a workspace, emitting progress events.
+
+        Resolves the "default" placeholder to the most recent real workspace
+        (matching :meth:`set_workspace` semantics) so the user never sees a
+        verification job hit the empty boot workspace. Returns a compact
+        summary dict — the *full* artifacts live in
+        ``runs/<workspace>/verification/*.json`` and are read back on demand
+        through :class:`VerificationPersistence`.
+        """
+        from services.verification import (
+            ArtifactLoader,
+            DenseIndex,
+            VerificationConfig,
+            VerificationPersistence,
+            VerificationService,
+        )
+        from services.verification.service import ALL_TASKS, _KNOWN_TASKS
+
+        resolved_workspace = (workspace_id or "").strip() or self.workspace_id
+        if resolved_workspace == "default":
+            initial = self._discover_initial_workspace()
+            if initial is not None:
+                resolved_workspace = initial.name
+        if not resolved_workspace or resolved_workspace == "default":
+            raise HTTPException(
+                status_code=422,
+                detail="검증할 워크스페이스가 없습니다. 먼저 조사를 진행해 주세요.",
+            )
+
+        workspace_dir = self.output_root / resolved_workspace
+        if not workspace_dir.exists() or not (workspace_dir / "summary").exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"workspace '{resolved_workspace}' has no research output to verify",
+            )
+
+        chromadb_dir = workspace_dir / "chromadb"
+        if not chromadb_dir.exists():
+            raise HTTPException(
+                status_code=409,
+                detail="이 워크스페이스에는 인덱스(chromadb)가 없어 검증할 수 없습니다.",
+            )
+
+        # Honour explicitly-passed legacy tasks (e.g. ``["intent"]``) too —
+        # the dispatcher knows about them even when they are no longer in
+        # the default set.
+        selected_tasks = [task for task in (tasks or ALL_TASKS) if task in _KNOWN_TASKS]
+        if not selected_tasks:
+            selected_tasks = list(ALL_TASKS)
+
+        self._reset_verify_progress(job_id=job_id, workspace_id=resolved_workspace)
+        self._emit_verify_progress(
+            "queued",
+            f"검증 시작 · 워크스페이스 {resolved_workspace}",
+            detail={"tasks": list(selected_tasks)},
+        )
+
+        config = VerificationConfig()
+        service = VerificationService(
+            workspace=resolved_workspace,
+            artifact_loader=ArtifactLoader(self.output_root),
+            dense=DenseIndex(self.llm),
+            config=config,
+            persistence=VerificationPersistence(self.output_root),
+            # Task 1's flow planner needs a chat-completion LLM; the same
+            # llama-server backs the embed channel via DenseIndex above.
+            llm=self.llm,
+        )
+
+        try:
+            artifacts = service.run(
+                tasks=selected_tasks,
+                progress_callback=self._emit_verify_progress,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            self._emit_verify_progress("failed", f"검증 실패: {exc}", final=True)
+            raise HTTPException(
+                status_code=502,
+                detail=f"verification pipeline failed: {exc}",
+            ) from exc
+
+        return {
+            "workspaceId": resolved_workspace,
+            "completedTasks": list(selected_tasks),
+            "configHash": artifacts.config_hash,
+            "sectionCount": (
+                len(artifacts.sections.sections) if artifacts.sections else 0
+            ),
+            "facetCount": (
+                len(artifacts.intent.facets) if artifacts.intent else 0
+            ),
+            "conceptClusterCount": (
+                len(artifacts.consensus.concept_clusters) if artifacts.consensus else 0
+            ),
+            "conflictCount": (
+                len(artifacts.consensus.conflicts) if artifacts.consensus else 0
+            ),
+            "reliabilityDistribution": (
+                dict(artifacts.reliability.distribution)
+                if artifacts.reliability
+                else {}
+            ),
+            "documentCount": len(service.docs),
         }
 
     def start_screen_monitoring(self) -> dict[str, Any]:

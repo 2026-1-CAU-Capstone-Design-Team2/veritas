@@ -1,0 +1,23 @@
+{
+  "type": "function",
+  "function": {
+    "name": "document_cleanup",
+    "description": "Identify boilerplate paragraphs in a Crawl4AI raw Markdown document and extract its keywords + key points via a single LLM index-only call. The caller (AutoSurvey workflow) writes the post-cleanup body to clean_md/<doc_id>.md and persists the metadata to summary/doc_<doc_id>.md.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "doc_ids": {
+          "type": "array",
+          "description": "Document ids (matching raw_md/<doc_id>.md) to clean. When omitted, all kept documents in index.json are cleaned.",
+          "items": {"type": "string"}
+        },
+        "overwrite": {
+          "type": "boolean",
+          "description": "When true, re-cleans even if clean_md/<doc_id>.md already exists.",
+          "default": false
+        }
+      },
+      "required": []
+    }
+  }
+}

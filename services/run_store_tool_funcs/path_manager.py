@@ -6,8 +6,15 @@ class RunPathManager:
         self.root = Path(root)
         self.corpus_dir = self.root / "corpus"
         self.raw_html_dir = self.corpus_dir / "raw_html"
-        # Crawl4AI-extracted clean Markdown for each fetched document. This is
-        # the RAG answer source and the input to both per-doc and batch summary.
+        # Crawl4AI-extracted Markdown for each fetched document — pre-cleanup
+        # source. Renamed from ``clean_md`` because that name was historically
+        # misleading: Crawl4AI's output still carries nav / footer / share /
+        # cookie boilerplate that the downstream layers had to step around.
+        self.raw_md_dir = self.root / "raw_md"
+        # Post-cleanup Markdown — the document_cleanup tool removes the LLM-
+        # identified boilerplate paragraphs from raw_md and writes the result
+        # here. This is now the *real* clean source: it feeds batch summary,
+        # RAG indexing, verify sentence retrieval, and the doc detail UI.
         self.clean_md_dir = self.root / "clean_md"
         self.summary_dir = self.root / "summary"
         self.vector_dir = self.root / "chromadb"
@@ -25,6 +32,7 @@ class RunPathManager:
 
     def prepare_dirs(self) -> None:
         self.raw_html_dir.mkdir(parents=True, exist_ok=True)
+        self.raw_md_dir.mkdir(parents=True, exist_ok=True)
         self.clean_md_dir.mkdir(parents=True, exist_ok=True)
         self.summary_dir.mkdir(parents=True, exist_ok=True)
         self.vector_dir.mkdir(parents=True, exist_ok=True)

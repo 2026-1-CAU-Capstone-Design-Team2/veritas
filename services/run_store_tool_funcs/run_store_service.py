@@ -46,6 +46,41 @@ class RunStoreService:
         return self.paths.clean_md_dir
 
     @property
+    def raw_md_dir(self):
+        return self.paths.raw_md_dir
+
+    def write_clean_md(self, doc_id: str, text: str) -> Path:
+        """Persist the post-cleanup body for ``doc_id`` into ``clean_md/``.
+
+        Called by the document_cleanup tool after stripping LLM-flagged
+        boilerplate from the raw Markdown. Idempotent — overwrites in place
+        so re-running cleanup just replaces the file.
+        """
+        target = self.paths.clean_md_dir / f"{doc_id}.md"
+        self.save_text(target, text)
+        return target
+
+    def read_raw_md(self, doc_id: str) -> str:
+        """Read the pre-cleanup Markdown for ``doc_id``.
+
+        Workspaces created before the ``raw_md`` / ``clean_md`` split only have
+        ``clean_md/<id>.md`` — at that time it carried the Crawl4AI pre-cleanup
+        body (the name was historically misleading). Fall back to that file so
+        the cleanup tool can still operate on legacy workspaces.
+        """
+        path = self.paths.raw_md_dir / f"{doc_id}.md"
+        if not path.exists():
+            legacy_path = self.paths.clean_md_dir / f"{doc_id}.md"
+            if legacy_path.exists():
+                path = legacy_path
+            else:
+                return ""
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
+    @property
     def index_path(self):
         return self.paths.index_path
 
@@ -507,15 +542,17 @@ class RunStoreService:
         of kept (non-duplicate) records — so kept documents are numbered
         contiguously (``000``, ``001``, ...) no matter how many fetch errors or
         duplicates occurred in between. Every on-disk artifact for the document
-        shares that number: ``clean_md/<id>.md``, ``corpus/raw_html/<id>.html``
-        and ``summary/doc_<id>.md``.
+        shares that number: ``raw_md/<id>.md``, ``clean_md/<id>.md`` (post
+        cleanup), ``corpus/raw_html/<id>.html`` and ``summary/doc_<id>.md``.
         """
         records = self.load_records()
         doc_id = f"{sum(1 for r in records if r.duplicate_of is None):03d}"
         html_path = self.paths.raw_html_dir / f"{doc_id}.html"
-        # Crawl4AI clean Markdown — stored as .md so every text artifact in the
-        # workspace is Markdown (raw HTML is the only non-.md document file).
-        text_path = self.paths.clean_md_dir / f"{doc_id}.md"
+        # Crawl4AI Markdown — written to ``raw_md/`` (pre-cleanup). The
+        # document_cleanup tool later strips LLM-flagged boilerplate and writes
+        # the post-cleanup result to ``clean_md/<id>.md``, which is what every
+        # downstream consumer (batch summary, RAG, verify) actually reads.
+        text_path = self.paths.raw_md_dir / f"{doc_id}.md"
         summary_path = self.paths.summary_path_for(int(doc_id))
 
         self.save_text(html_path, html)

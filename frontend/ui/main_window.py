@@ -197,7 +197,8 @@ class MainWindow(QMainWindow):
 		# tearing down the active research display.
 		self.research_page.workspaceCreated.connect(self._on_research_workspace_created)
 		self._add_page("research", self.research_page)
-		self._add_page("verify", VerifyPage())
+		self.verify_page = VerifyPage()
+		self._add_page("verify", self.verify_page)
 		self.draft_page = DraftPage()
 		self._add_page("draft", self.draft_page)
 		self._add_page("document_assist", DocumentAssistPage())
@@ -402,6 +403,7 @@ class MainWindow(QMainWindow):
 		self.draft_page.set_workspace_by_name(workspace_name)
 		self.research_page.set_workspace_by_name(workspace_name)
 		self.write_page.set_workspace_by_name(workspace_name)
+		self.verify_page.set_workspace_by_name(workspace_name)
 		self.document_page.refresh()
 
 	def _on_research_workspace_created(self, workspace_id: str, workspace_name: str) -> None:

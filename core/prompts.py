@@ -156,6 +156,11 @@ Rules:
 """
 
 BATCH_SUMMARY_PROMPT = """You are given an original user request and the clean Markdown of multiple collected documents.
+Each document is introduced with a header line of the form ``=== doc_<id> ===``
+followed by its title/URL/domain metadata and its body. The ``<id>`` is the
+document's stable identifier (three-digit string such as ``000``, ``017``); use
+that exact identifier when you cite the document.
+
 Create a markdown batch note with these sections:
 # Batch Summary
 ## Repeated Findings
@@ -174,6 +179,41 @@ Rules:
 - If a section has no items, write "- None".
 - Be concise and remove redundant statements.
 - Write the batch note in the original user request language. If the original request is Korean, write the section content in Korean while preserving fixed markdown headings if needed by downstream code.
+
+Citation policy — downstream verification needs to map every finding back to
+its source documents, so every claim in ``## Repeated Findings``,
+``## New Findings``, and ``## Reliability Notes`` MUST end with one or more
+inline doc citations of the form ``[doc_<id>]``:
+- Cite every supporting document. A finding repeated across three sources
+  ends with ``[doc_001][doc_004][doc_009]``; a single-source finding ends with
+  ``[doc_007]``.
+- Use ONLY the doc_ids that appear as ``=== doc_<id> ===`` headers in the
+  input. Never invent or guess an id. Never abbreviate as ``doc_7`` — keep
+  the original three-digit form.
+- Place the marker(s) at the end of the bullet (or at the end of the
+  sentence inside a multi-sentence bullet). Do not wrap them in parentheses;
+  the bare ``[doc_<id>]`` form is required so a regex parser can find them.
+- Gap section bullets (``### Core Gap`` / ``### Supporting Gap`` /
+  ``### Off-topic`` ) describe what is *missing* and so do not need citations.
+
+Content fidelity — the final research report is synthesized from these
+batch notes, so concrete signal that gets dropped here is lost forever:
+- Preserve concrete numerical data — metrics, dates, percentages, costs,
+  benchmark scores, sample sizes — verbatim with their original units.
+- Preserve formal expressions when the source carries them: equations,
+  algorithms (e.g. ``UCB1``, ``kl-UCB``, regret bounds like ``O(\\sqrt{T})``),
+  pseudo-code, and named theorems. Quote them in inline code or LaTeX-style
+  notation rather than paraphrasing into prose.
+- Preserve named entities: model/product/paper/author names, dataset
+  names, API endpoints, model identifiers (``claude-sonnet-4-6``, etc.),
+  command flags, and file paths — in their original casing/spelling.
+- When a source carries a small comparison table that fits within ~6 rows
+  × 4 cols, reproduce it as a markdown table in ``## New Findings`` or
+  ``## Repeated Findings`` instead of flattening it into bullet text.
+- Use short verbatim quotes (\"…\") for a source's distinctive claim or
+  definition; the citation marker still goes at the end of the bullet.
+- These fidelity rules override the general \"be concise\" rule whenever
+  the concrete signal would otherwise be paraphrased away.
 """
 
 FINAL_PROMPT = """Create the final markdown report.
@@ -352,3 +392,223 @@ KNOWLEDGE BASE CONTEXT:
 
 Write the assistant message that should appear in the chat for this screen context now.
 Language rule: answer in the dominant language of SCREEN WRITING CONTEXT. If SCREEN WRITING CONTEXT is Korean, answer in Korean."""
+
+
+DOCUMENT_CLEANUP_PROMPT = """You are cleaning a research document for downstream analysis.
+
+The input is the Markdown body of one web page, with every paragraph prefixed
+by a stable index of the form ``[P0]``, ``[P1]``, ``[P2]`` …. Web Markdown
+typically carries non-body chrome (site navigation, footer, share/cookie
+strips, breadcrumbs, theme-switcher logos, "on this page" sidebars, repeated
+menu blocks). Your job is to *identify the paragraph indices that are NOT
+body content*, extract the body's keywords + key points, and write a short
+descriptive summary of the body.
+
+Output format — plain text only, exactly four sections separated by ``===``
+lines. Do NOT output JSON; the body language often contains quotes / commas
+that break JSON escaping. The sections in order:
+
+BOILERPLATE_PARAGRAPHS
+<comma-separated paragraph indices, e.g. "3, 7, 12, 21" — empty if none>
+
+===
+
+SUMMARY
+<1 to 2 short paragraphs, total 3 to 6 sentences, describing what the body
+actually says — the topic, the angle, what claims or evidence it carries.
+Write FROM the body content (paraphrase allowed), not about the page format.
+No bullets, no markdown headers, no preamble like "This document describes".>
+
+===
+
+KEYWORDS
+- <keyword 1>
+- <keyword 2>
+(5 to 10 items, one per line, prefixed by "- ")
+
+===
+
+KEY_POINTS
+- <key point 1>
+- <key point 2>
+(5 to 7 items, one per line, prefixed by "- ")
+
+Rules:
+
+A. ``BOILERPLATE_PARAGRAPHS``
+   - List the P-indices of paragraphs that are NOT body content.
+   - Include: navigation / menu lines, breadcrumbs, "Skip to content", "Edit
+     this page", "Share on …", cookie banners, footer text, repeated logo
+     captions, raw nav-link rows, sidebar-of-contents.
+   - Do NOT include: real prose, definitions, examples, code blocks that
+     illustrate concepts, tables that carry data, lists that contain
+     content (not menu items).
+   - When uncertain, KEEP the paragraph (do not list it). The downstream
+     pipeline tolerates leftover noise far better than missing body text.
+
+B. ``SUMMARY`` — 1~2 short paragraphs (3~6 sentences total) that describe
+   what the body says: the topic, the angle, the central claims, and any
+   concrete evidence (numbers, named methods, key entities). Paraphrase
+   from the body — do NOT quote the chrome (navigation, page titles) and
+   do NOT invent claims that are not in the body. This summary is shown in
+   the per-document detail view, so it should read as a useful one-screen
+   abstract a human can scan, not a meta-description of the page.
+
+C. ``KEYWORDS`` — 5 ~ 10 short content terms that identify what the document
+   is about. Use the language of the body. Proper nouns / technical terms
+   stay in their original form. No stop words, no nav phrases.
+
+D. ``KEY_POINTS`` — 5 ~ 7 short, citation-shaped sentences pulled FROM the
+   body (paraphrase allowed) that capture the document's main claims or
+   findings. Each sentence < 200 chars. Use the body's language. These feed
+   the verification layer's cross-source consensus task.
+
+If the document is mostly empty / mostly chrome, return four empty sections:
+
+BOILERPLATE_PARAGRAPHS
+
+
+===
+
+SUMMARY
+
+
+===
+
+KEYWORDS
+
+
+===
+
+KEY_POINTS
+
+
+— and the caller will treat the doc as unusable.
+
+Language policy: respond in the body's dominant language (Korean if the body
+is Korean, otherwise English). Preserve URLs, code identifiers, model names,
+file paths, and citations in their original form. Output the four sections
+exactly as shown — no surrounding prose, no markdown headers, no JSON."""
+
+
+RELIABILITY_JUDGE_PROMPT = """You are a senior research analyst assessing the trustworthiness of source documents collected by an automated research pipeline.
+
+You will receive multiple candidate documents at once. For EACH document, return ONE trust verdict that combines FOUR sub-signals:
+
+1. ``request_alignment`` — Does this document actually address the user's
+   research request, or is it off-topic?
+   This is the most important signal: a perfectly-cited academic paper
+   on the wrong topic is useless to the writer. Read
+   ``original_user_request`` carefully and check whether this document's
+   subject matter is what the user asked about.
+   - "strong": the document is squarely on the user's topic and would be
+     directly cited or paraphrased in the final report.
+   - "mixed": the document is adjacent / partially relevant — useful as
+     background or for one specific sub-question but not the core topic.
+   - "weak": the document is off-topic, was retrieved by mistake (the
+     search query collided with an unrelated domain), or talks about a
+     different field that merely shares vocabulary with the user request.
+
+2. ``authority`` — Does the source look authoritative for the topic at hand?
+   - "strong": peer-reviewed academic paper, official documentation,
+     primary source from an established organization, well-known curated
+     database, government/standards body.
+   - "mixed": research preprint mirror, industry blog from a reputable
+     company, expert practitioner's site, established news outlet.
+   - "weak": anonymous blog, marketing / SEO content, content farm,
+     low-context page, machine-translated derivative, broken page.
+
+3. ``verifiability`` — Does the document itself carry checkable evidence?
+   - "strong": concrete numbers / metrics, experiment setups, primary
+     citations, dated claims, named entities (models, datasets, APIs).
+   - "mixed": a few specific claims but mostly summarization.
+   - "weak": hand-wavy claims, no numbers, no primary citations.
+
+4. ``self_consistency`` — Does the document's own Reliability Notes
+   acknowledge limitations honestly?
+   - "strong": explicit caveats, scope limits, methodological warnings
+     stated by the document or by its summary's Reliability Notes.
+   - "mixed": brief disclaimers.
+   - "weak": no caveats, or overclaiming relative to the evidence shown.
+
+Combine the four sub-signals into the final ``level`` — request_alignment is
+a HARD OVERRIDE, evaluated before anything else:
+
+  - If ``request_alignment`` is "weak" → ``level`` MUST be "low",
+    no matter how strong authority / verifiability / self_consistency are.
+    An off-topic document cannot be a high-trust source for this task.
+    State the off-topic nature in ``rationale`` first.
+  - Otherwise, with the remaining three signals (authority, verifiability,
+    self_consistency):
+      * "high"   → at least TWO of the three are "strong" AND none is "weak".
+      * "low"    → at least TWO of the three are "weak".
+      * "medium" → everything else.
+
+Return JSON only with this schema:
+{
+  "items": [
+    {
+      "doc_id": "<the exact doc_id from the input, e.g. '007'>",
+      "level": "high" | "medium" | "low",
+      "rationale": "<1~2 sentence verdict explaining WHY this level>",
+      "signals": {
+        "request_alignment": "strong" | "mixed" | "weak",
+        "authority": "strong" | "mixed" | "weak",
+        "verifiability": "strong" | "mixed" | "weak",
+        "self_consistency": "strong" | "mixed" | "weak"
+      }
+    }
+  ]
+}
+
+Rules:
+- Emit ONE entry per input document, in the SAME order as the input.
+- Use the EXACT doc_id string from the input — never invent or renumber.
+- Judge each document INDEPENDENTLY of the others in the batch; do not rank
+  them against each other.
+- Write ``rationale`` in the language of the User Request (Korean if the
+  request is Korean, English otherwise). Preserve proper nouns / model names
+  / URLs verbatim even when writing in Korean.
+- Keep ``rationale`` concise (no preamble like "이 문서는..."); state the
+  decisive signal first. When ``request_alignment`` is "weak", lead with the
+  topic mismatch (e.g. "K-뷰티 산업 자료로 AI Agent 요청과 무관함.").
+- Output JSON only. No prose, no markdown fences.
+"""
+
+
+VERIFY_FLOW_PLANNER_PROMPT = """You are an editor planning the outline of a research report.
+
+Given the user's request, the planner's topic / goal / must_cover items, the
+grounded terms, and a few document titles & summary snippets, decide the
+ordered list of report sections the writer will need.
+
+Output JSON only, matching exactly this schema:
+
+{
+  "sections": [
+    {
+      "title": "섹션 제목 (자연어 명사구, 한 문장)",
+      "description": "이 섹션에서 다룰 내용을 1~2문장으로 설명",
+      "role": "intro" | "body" | "conclusion",
+      "keywords": ["섹션 내부 검색에 도움될 키워드 3~6개"]
+    }
+  ]
+}
+
+Rules:
+- ``sections`` length must be between min_sections and max_sections (inclusive),
+  values are provided in the user payload.
+- The very first section's role must be ``intro``; the very last section's
+  role must be ``conclusion``; everything in between is ``role=body``.
+- Order the sections by the actual reading flow of the report
+  (e.g. 정의/배경 → 핵심 메커니즘 → 응용/한계 → 마무리).
+- ``title`` is a natural-language noun phrase, NOT a keyword dump
+  ("MCP 개요" OK, "mcp ai docs" NOT OK).
+- ``description`` must read like a one-sentence editorial brief so the
+  writer immediately knows why the section exists.
+- Do not invent sections the source documents could not plausibly support —
+  stay inside the topic + must_cover + grounded_terms space.
+- Use the language of the user's request (Korean if Korean; English otherwise)
+  for ``title``/``description``/``keywords``. Preserve domain proper nouns
+  in their original form even when answering in Korean.
+- Output JSON only. No prose, no markdown fences."""
