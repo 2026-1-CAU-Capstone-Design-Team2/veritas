@@ -51,7 +51,17 @@ async def verify_list(
     workspaceId: str | None = Query(default=None),
     level: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
-    pageSize: int = Query(default=10, ge=1, le=100),
+    # ``le`` was 100 originally, but the verify page deliberately requests
+    # every doc in one round-trip (``page_size=200``) and handles paging
+    # client-side so the level chips can show accurate per-level counts
+    # without a second fetch. A page_size > 100 was tripping FastAPI's
+    # validator and returning 422; the frontend silently caught the
+    # ``ApiError`` and rendered an empty card list while the summary
+    # endpoint (no such cap) kept working — that is exactly the bug
+    # report "헤더는 있는데 아래 카드만 0개". Raising the cap to 500
+    # gives every plausible corpus headroom without forcing the
+    # frontend to paginate over the network.
+    pageSize: int = Query(default=10, ge=1, le=500),
 ) -> dict[str, Any]:
     return verify_service.list_verify_results(workspaceId, level, page, pageSize)
 
