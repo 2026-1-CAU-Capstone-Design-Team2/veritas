@@ -818,7 +818,7 @@ class AgentRuntime:
             VerificationPersistence,
             VerificationService,
         )
-        from services.verification.service import ALL_TASKS, _KNOWN_TASKS
+        from services.verification.service import ALL_TASKS
 
         resolved_workspace = (workspace_id or "").strip() or self.workspace_id
         if resolved_workspace == "default":
@@ -845,10 +845,7 @@ class AgentRuntime:
                 detail="이 워크스페이스에는 인덱스(chromadb)가 없어 검증할 수 없습니다.",
             )
 
-        # Honour explicitly-passed legacy tasks (e.g. ``["intent"]``) too —
-        # the dispatcher knows about them even when they are no longer in
-        # the default set.
-        selected_tasks = [task for task in (tasks or ALL_TASKS) if task in _KNOWN_TASKS]
+        selected_tasks = [task for task in (tasks or ALL_TASKS) if task in ALL_TASKS]
         if not selected_tasks:
             selected_tasks = list(ALL_TASKS)
 
@@ -891,9 +888,6 @@ class AgentRuntime:
             "configHash": artifacts.config_hash,
             "sectionCount": (
                 len(artifacts.sections.sections) if artifacts.sections else 0
-            ),
-            "facetCount": (
-                len(artifacts.intent.facets) if artifacts.intent else 0
             ),
             "conceptClusterCount": (
                 len(artifacts.consensus.concept_clusters) if artifacts.consensus else 0
