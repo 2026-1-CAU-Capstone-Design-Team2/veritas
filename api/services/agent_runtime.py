@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import shutil
 import threading
 import time
 from pathlib import Path
@@ -17,6 +15,7 @@ from tools.autosurvey_tool import AutoSurveyTool
 from tools.loader import build_registry, load_schema
 from workflows import AutoSurveyConfig, AutoSurveyWorkflow
 
+from . import workspace_paths
 from .progress_buffer import BUFFER_DEFAULT_MAX, ProgressBuffer
 from .screen_monitor import SCREEN_EVENT_BUFFER_MAX, ScreenMonitor
 
@@ -395,40 +394,15 @@ class AgentRuntime:
         }
 
     def _grounding_workspace_from_request(self, request: str) -> tuple[str, dict[str, Any] | None]:
-        try:
-            from tools.term_grounding_tool import TermGroundingTool
-
-            schema_path = Path(__file__).resolve().parents[2] / "tools" / "term_grounding_tool" / "tool_schema.json"
-            result = TermGroundingTool(
-                schema=load_schema(schema_path),
-                llm=self.llm,
-            ).run(user_request=request, max_terms=8)
-            payload = result.data if result.success and isinstance(result.data, dict) else {}
-            terms = payload.get("grounded_terms", [])
-            if isinstance(terms, list):
-                for term in terms:
-                    text = str(term or "").strip()
-                    if text:
-                        return text, payload
-        except Exception:
-            pass
-        return "research", None
+        return workspace_paths.extract_workspace_name_from_request(
+            request, llm=self.llm
+        )
 
     def _reserve_workspace_dir(self, workspace_name: str) -> Path:
-        safe_name = self._safe_workspace_name(workspace_name)
-        target = self.output_root / safe_name
-        if target.exists():
-            suffix = 2
-            while (self.output_root / f"{safe_name}-{suffix}").exists():
-                suffix += 1
-            target = self.output_root / f"{safe_name}-{suffix}"
-        target.mkdir(parents=True, exist_ok=False)
-        return target
+        return workspace_paths.reserve_workspace_dir(self.output_root, workspace_name)
 
     def _safe_workspace_name(self, name: str) -> str:
-        text = re.sub(r"[^\w가-힣.-]+", "_", str(name or "").strip(), flags=re.UNICODE)
-        text = text.strip("._-")
-        return text[:80] or "research"
+        return workspace_paths.safe_workspace_name(name)
 
     def _publish_new_workspace(self, workspace_dir: Path, user_request: str) -> None:
         """Surface a freshly-reserved workspace before the workflow runs.
@@ -493,75 +467,13 @@ class AgentRuntime:
         )
 
     def _cleanup_pending_dirs(self) -> None:
-        try:
-            root = self.output_root.resolve()
-            for path in root.glob("_pending_*"):
-                if not path.is_dir():
-                    continue
-                resolved = path.resolve()
-                if root not in resolved.parents:
-                    continue
-                try:
-                    shutil.rmtree(resolved)
-                except Exception as e:
-                    print(f"[workspace][cleanup][warn] could not remove {resolved}: {e}")
-        except Exception as e:
-            print(f"[workspace][cleanup][warn] pending cleanup skipped: {e}")
+        workspace_paths.cleanup_pending_dirs(self.output_root)
 
     def _discover_initial_workspace(self) -> Path | None:
-        """Return the most-recently-modified real workspace dir, or None.
-
-        A "real" workspace has at least one piece of research evidence:
-        a final report, a summary index, or any `doc_*.md` summary file.
-        Used to avoid creating `runs/api/` when there is already a workspace
-        to land on at boot, or to resolve frontend requests for the
-        "default" workspace to something concrete.
-        """
-        if not self.output_root.exists():
-            return None
-        candidates: list[Path] = []
-        try:
-            for path in self.output_root.iterdir():
-                if not path.is_dir():
-                    continue
-                name = path.name
-                if name in {"api", "__pycache__"} or name.startswith("_"):
-                    continue
-                summary_dir = path / "summary"
-                has_final = (path / "final.md").exists()
-                has_index = (summary_dir / "index.json").exists()
-                has_summaries = summary_dir.exists() and any(summary_dir.glob("doc_*.md"))
-                if has_final or has_index or has_summaries:
-                    candidates.append(path)
-        except Exception as e:
-            print(f"[workspace][discover][warn] {e}")
-            return None
-        if not candidates:
-            return None
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        return candidates[0]
+        return workspace_paths.discover_initial_workspace(self.output_root)
 
     def _cleanup_empty_api_dir(self) -> None:
-        """Remove `runs/api/` if it has no meaningful research data.
-
-        Called at boot (to clear a stale `api/` from a prior session) and
-        whenever we transition off the default workspace, so the directory
-        never sticks around as a phantom side-effect of initialization.
-        """
-        api_dir = self.output_root / "api"
-        if not api_dir.exists() or not api_dir.is_dir():
-            return
-        summary_dir = api_dir / "summary"
-        has_final = (api_dir / "final.md").exists()
-        has_index = (summary_dir / "index.json").exists()
-        has_summaries = summary_dir.exists() and any(summary_dir.glob("doc_*.md"))
-        if has_final or has_index or has_summaries:
-            return
-        # Only chromadb/corpus skeletons remain — safe to remove.
-        try:
-            shutil.rmtree(api_dir)
-        except Exception as e:
-            print(f"[workspace][cleanup][warn] could not remove {api_dir}: {e}")
+        workspace_paths.cleanup_empty_api_dir(self.output_root)
 
     def _ensure_rag_index(self, *, require_documents: bool) -> None:
         if self.rag_service.get_document_count() > 0:
