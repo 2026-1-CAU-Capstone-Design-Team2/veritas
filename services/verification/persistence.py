@@ -6,9 +6,10 @@ disk; every other module stays close to a pure function. Output layout:
 ```
 runs/<workspace>/verification/
     meta.json                # config_hash · timestamp · tasks completed · doc count
-    sections.json            # Task 1 — SectionResult
-    intent_coverage.json     # Task 2 — IntentResult
-    consensus.json           # Task 3 — ConsensusResult
+    sections.json            # Task — SectionResult
+    intent_coverage.json     # (legacy) — IntentResult, read-only for old workspaces
+    consensus.json           # Task — ConsensusResult
+    reliability.json         # Task — ReliabilityResult (LLM-graded trust verdicts)
 ```
 
 The frontend reads these back through ``api/services/verify_service.py`` —
@@ -39,6 +40,11 @@ from .models import (
     VerificationArtifacts,
     VerificationConfig,
 )
+from .reliability import (
+    ReliabilityItem,
+    ReliabilityMentionDTO,
+    ReliabilityResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +52,7 @@ _META_FILE = "meta.json"
 _SECTIONS_FILE = "sections.json"
 _INTENT_FILE = "intent_coverage.json"
 _CONSENSUS_FILE = "consensus.json"
+_RELIABILITY_FILE = "reliability.json"
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +152,11 @@ class VerificationPersistence:
             _write_json(directory / _INTENT_FILE, _serialize_intent_result(artifacts.intent))
         if artifacts.consensus is not None and "consensus" in completed_tasks:
             _write_json(directory / _CONSENSUS_FILE, _serialize_consensus_result(artifacts.consensus))
+        if artifacts.reliability is not None and "reliability" in completed_tasks:
+            _write_json(
+                directory / _RELIABILITY_FILE,
+                _serialize_reliability_result(artifacts.reliability),
+            )
 
         _write_json(
             directory / _META_FILE,
@@ -179,6 +191,10 @@ class VerificationPersistence:
         consensus_payload = _read_json(directory / _CONSENSUS_FILE)
         if consensus_payload is not None:
             artifacts.consensus = _deserialize_consensus_result(consensus_payload)
+
+        reliability_payload = _read_json(directory / _RELIABILITY_FILE)
+        if reliability_payload is not None:
+            artifacts.reliability = _deserialize_reliability_result(reliability_payload)
 
         return artifacts, meta
 
@@ -306,6 +322,46 @@ def _deserialize_consensus_result(payload: dict) -> ConsensusResult:
         domain_authority=domain_auth,
         conflicts=conflicts,
     )
+
+
+def _serialize_reliability_result(result: ReliabilityResult) -> dict:
+    return _to_jsonable(result)
+
+
+def _deserialize_reliability_result(payload: dict) -> ReliabilityResult:
+    items: list[ReliabilityItem] = []
+    for item in payload.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        signals_raw = item.get("signals") if isinstance(item.get("signals"), dict) else {}
+        mentions = [
+            ReliabilityMentionDTO(
+                batch_id=str(m.get("batch_id", "")),
+                kind=str(m.get("kind", "")),
+                snippet=str(m.get("snippet", "")),
+            )
+            for m in item.get("batch_mentions", [])
+            if isinstance(m, dict)
+        ]
+        items.append(
+            ReliabilityItem(
+                doc_id=str(item.get("doc_id", "")),
+                level=str(item.get("level", "medium")),
+                rationale=str(item.get("rationale", "")),
+                signals={str(k): str(v) for k, v in signals_raw.items()},
+                batch_mentions=mentions,
+                inherited_from=(
+                    str(item["inherited_from"])
+                    if item.get("inherited_from")
+                    else None
+                ),
+            )
+        )
+    distribution = {
+        str(k): int(v)
+        for k, v in (payload.get("distribution") or {}).items()
+    }
+    return ReliabilityResult(items=items, distribution=distribution)
 
 
 __all__ = ["VerificationPersistence"]

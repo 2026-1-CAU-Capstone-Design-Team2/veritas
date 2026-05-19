@@ -318,11 +318,21 @@ class ConsensusResult:
 
 @dataclass
 class VerificationArtifacts:
-    """Container for the three task outputs (VERIFY_DESIGN.md §1.3)."""
+    """Container for the verify task outputs (VERIFY_DESIGN.md §1.3).
+
+    ``intent`` is kept on the artifact for backward compatibility — workspaces
+    persisted before the reliability task replaced intent_coverage can still
+    be loaded. Newly-run verifications no longer populate it; the field
+    stays ``None`` and ``reliability`` carries the user-facing signal instead.
+    """
 
     sections: SectionResult | None = None
     intent: IntentResult | None = None
     consensus: ConsensusResult | None = None
+    # ``reliability`` is typed as ``Any`` here to avoid pulling the
+    # ``reliability/`` sub-package into this module (and creating a cycle).
+    # Real type: ``services.verification.reliability.ReliabilityResult``.
+    reliability: Any | None = None
     config_hash: str = ""
 
 

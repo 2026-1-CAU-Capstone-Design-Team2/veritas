@@ -37,6 +37,7 @@ from .models import (
     VerificationConfig,
 )
 from .persistence import VerificationPersistence
+from .reliability import run_reliability_pipeline
 from .retrieval import stack_chunk_embeddings
 from .sections.section_pipeline import run_section_pipeline
 from .tokenization import HybridTokenizer
@@ -50,9 +51,21 @@ _FLOW_PLANNER_SCHEMA_PATH = (
     / "tool_schema.json"
 )
 
-# Task names accepted by :meth:`VerificationService.run`. The order here is the
-# order pipelines execute when ``tasks`` is left at the default.
-ALL_TASKS: tuple[str, ...] = ("sections", "intent", "consensus")
+# Task names accepted by :meth:`VerificationService.run`. The order here is
+# the order pipelines execute when ``tasks`` is left at the default.
+#
+# ``intent`` was retired in favour of ``reliability`` — the LLM-graded trust
+# verdict explains the per-doc level the user actually wants to see, whereas
+# the old BM25+Dense+RRF intent score was misleading at small workspace
+# sizes (raw scores ≲ 0.02 and rendered as a percentage). The legacy
+# ``intent`` pipeline + ``intent_coverage.json`` reader are kept on the
+# artifact for backward compatibility, but the default task set no longer
+# runs it; callers can still opt in via ``tasks=("intent",)`` for tuning.
+ALL_TASKS: tuple[str, ...] = ("sections", "reliability", "consensus")
+DEFAULT_TASKS: tuple[str, ...] = ALL_TASKS
+# Every task name the service knows how to dispatch — superset of
+# ``ALL_TASKS`` so an explicit ``tasks=("intent",)`` request still works.
+_KNOWN_TASKS: frozenset[str] = frozenset({*ALL_TASKS, "intent"})
 
 # Progress callback: same shape as ``workflows.autosurvey_workflow``'s callback
 # (§1.7), so the API ring buffer + frontend poller from research are reused
@@ -171,9 +184,12 @@ class VerificationService:
         cached_property indices ensure unused inputs are never loaded.
         Persistence writes only the files for ``completed`` so a partial rerun
         does not clobber other tasks' previously saved JSON on disk.
+
+        ``intent`` is accepted but not in the default set; opt in explicitly
+        when tuning the legacy facet-coverage pipeline.
         """
         cb = progress_callback or (lambda *_a, **_k: None)
-        requested = [task for task in tasks if task in ALL_TASKS]
+        requested = [task for task in tasks if task in _KNOWN_TASKS]
         if not requested:
             cb("completed", "검증할 작업이 없습니다.", final=True)
             return VerificationArtifacts(config_hash=self._cfg.fingerprint())
@@ -222,8 +238,38 @@ class VerificationService:
             )
             completed.append("sections")
 
+        if "reliability" in requested:
+            if self._llm is None:
+                raise RuntimeError(
+                    "reliability task needs an LLM client; "
+                    "construct VerificationService with llm=... "
+                    "or omit 'reliability' from tasks."
+                )
+            cb("reliability", "출처 신뢰도 분석 중 (LLM)...")
+            artifacts.reliability = run_reliability_pipeline(
+                docs=self.docs,
+                llm=self._llm,
+                summary_dir=self._loader.summary_dir_for(self._workspace),
+                request_text=self.request_text,
+            )
+            distribution = dict(artifacts.reliability.distribution)
+            cb(
+                "reliability",
+                f"신뢰도 분석 완료 · 높음 {distribution.get('high', 0)}"
+                f" · 중간 {distribution.get('medium', 0)}"
+                f" · 낮음 {distribution.get('low', 0)}",
+                detail={
+                    "high": int(distribution.get("high", 0)),
+                    "medium": int(distribution.get("medium", 0)),
+                    "low": int(distribution.get("low", 0)),
+                },
+            )
+            completed.append("reliability")
+
         if "intent" in requested:
-            cb("intent", "사용자 의도 적합도 분석 중...")
+            # Legacy facet-coverage pipeline; no longer in the default task set
+            # but still wired in for tuning / regression comparisons.
+            cb("intent", "사용자 의도 적합도 분석 중 (legacy)...")
             artifacts.intent = run_intent_pipeline(
                 docs=self.docs,
                 chunks=self.chunks,
@@ -280,4 +326,4 @@ class VerificationService:
         return artifacts
 
 
-__all__ = ["VerificationService", "ProgressCallback", "ALL_TASKS"]
+__all__ = ["VerificationService", "ProgressCallback", "ALL_TASKS", "DEFAULT_TASKS"]

@@ -577,7 +577,7 @@ class DocumentSummarizeTool(BaseTool):
             documents = self._read_batch_documents(batch_records)
             batch_markdown = self._llm.ask(
                 BATCH_SUMMARY_PROMPT,
-                self._build_batch_prompt_input(documents),
+                self._build_batch_prompt_input(batch_records, documents),
                 reasoning=False,
                 stream=getattr(self._llm, "stream_summary", False),
                 stream_label=f"batch:{batch_number:03d}",
@@ -615,7 +615,7 @@ class DocumentSummarizeTool(BaseTool):
             documents = self._read_batch_documents(batch_records)
             batch_markdown = self._llm.ask(
                 BATCH_SUMMARY_PROMPT,
-                self._build_batch_prompt_input(documents),
+                self._build_batch_prompt_input(batch_records, documents),
                 reasoning=False,
                 stream=getattr(self._llm, "stream_summary", False),
                 stream_label=f"batch:{next_batch_number:03d}",
@@ -626,17 +626,42 @@ class DocumentSummarizeTool(BaseTool):
 
         return {"batch_files": batch_files, "count": len(batch_files)}
 
-    def _build_batch_prompt_input(self, documents: list[str]) -> str:
+    def _build_batch_prompt_input(self, batch_records, documents: list[str]) -> str:
+        """Render the batch summary user prompt.
+
+        Each document is wrapped in a ``=== doc_<id> ===`` header so the LLM
+        can cite findings back with ``[doc_<id>]`` markers (the verification
+        layer parses those markers to map findings to source documents).
+        Title / domain / URL are surfaced alongside the id so the model has
+        enough context to attribute claims correctly even when the body is
+        clipped.
+        """
         try:
             user_request = self._run_store_service.load_request()
         except Exception:
             user_request = ""
+
+        rendered_docs: list[str] = []
+        for record, body in zip(batch_records, documents):
+            doc_id = getattr(record, "doc_id", "") or ""
+            title = getattr(record, "title", "") or ""
+            domain = getattr(record, "domain", "") or ""
+            url = getattr(record, "url", "") or ""
+            header_lines = [f"=== doc_{doc_id} ==="]
+            if title:
+                header_lines.append(f"Title: {title}")
+            if domain:
+                header_lines.append(f"Domain: {domain}")
+            if url:
+                header_lines.append(f"URL: {url}")
+            header = "\n".join(header_lines)
+            rendered_docs.append(f"{header}\n\n{body or ''}".rstrip())
 
         sections = [
             "Original User Request:",
             user_request or "(missing)",
             "",
             "Document Contents (clean Markdown):",
-            "\n\n---\n\n".join(documents),
+            "\n\n---\n\n".join(rendered_docs),
         ]
         return "\n".join(sections).strip() + "\n"
