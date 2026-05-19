@@ -3,11 +3,17 @@
 Kept separate from ``verify_service.py`` so the *thin* API layer stays thin:
 service.py owns the request flow (workspace resolution, persistence load,
 progress polling), this module owns the *translation* into the user-facing
-shape (``docId / title / matchRate / level / issues`` + detail breakdowns).
+shape (``docId / title / level / rationale / issues`` + detail breakdowns).
 
 All non-technical phrasing — level labels, issue sentences — lives here. The
-algorithm layer (``services/verification/``) never sees Korean labels or
-percentile thresholds.
+algorithm layer (``services/verification/``) never sees Korean labels.
+
+History (kept here so future readers do not rediscover the same mistake):
+the previous version of this module mapped a BM25+Dense+RRF "의도 일치율"
+into a percentage band. The raw scores were tiny (≲ 0.02) and the rendered
+percentage was a workspace-internal ratio that users could not interpret.
+The reliability task replaces that signal entirely; the LLM emits the band
+directly and the rationale that justified it.
 """
 
 from __future__ import annotations
@@ -22,12 +28,44 @@ from services.verification.models import (
     SentenceAssignment,
     VerificationArtifacts,
 )
+from services.verification.reliability import (
+    ReliabilityItem,
+    ReliabilityResult,
+)
 
-# Match-rate thresholds for the "신뢰도" badge. These are workspace-internal
-# *rank percentiles* (0-100), not raw RRF scores, so the bands stay intuitive
-# even when raw intent scores are tiny.
-_LEVEL_HIGH = 70
-_LEVEL_MEDIUM = 40
+# Map LLM verdict ("high" / "medium" / "low") -> Korean badge label so the
+# rest of the UI (filter chips, badges) keeps using the same vocabulary
+# without knowing about the underlying English token.
+_LEVEL_LABEL = {
+    "high": "높음",
+    "medium": "중간",
+    "low": "낮음",
+}
+_LEVEL_LABEL_REVERSE = {label: key for key, label in _LEVEL_LABEL.items()}
+# Sort order so "높음" docs rise to the top of the verify list.
+_LEVEL_SORT_RANK = {"high": 0, "medium": 1, "low": 2}
+
+# Human-readable signal labels — surfaced on the detail dialog.
+_SIGNAL_LABEL = {
+    "authority": "출처 권위",
+    "verifiability": "검증 가능성",
+    "self_consistency": "자기일관성",
+}
+_SIGNAL_STRENGTH_LABEL = {
+    "strong": "강함",
+    "mixed": "보통",
+    "weak": "약함",
+}
+
+_MENTION_KIND_LABEL = {
+    "new_finding": "New Finding",
+    "reliability_note": "Reliability Note",
+}
+
+# Cap how much batch evidence we hand the UI per doc so a verbose run does
+# not flood a card. The detail dialog can show more if we ever expose a
+# drill-down for it.
+_BATCH_MENTIONS_PER_CARD = 3
 
 
 # ---------------------------------------------------------------------------
@@ -41,84 +79,120 @@ def build_doc_items(
 ) -> list[dict[str, Any]]:
     """One ranked item per doc — what the verify card list renders.
 
-    ``doc_titles`` is the lookup the caller built from ``summary/index.json``;
-    keeping it as an input keeps this module pure (no I/O).
+    Driven by ``artifacts.reliability`` (the LLM-graded verdict). Older
+    workspaces that only carry a legacy ``intent_coverage.json`` end up with
+    a neutral "중간" verdict for every doc — they need a fresh verify run to
+    get the LLM verdict.
     """
-    intent: IntentResult | None = artifacts.intent
+    reliability: ReliabilityResult | None = artifacts.reliability
     sections: SectionResult | None = artifacts.sections
     consensus: ConsensusResult | None = artifacts.consensus
 
-    intent_scores = dict(intent.doc_intent_score) if intent else {}
-    rank_pct = ratio_normalize_percent(intent_scores)
-    doc_ids = sorted(set(rank_pct) | set(doc_titles))
+    items_by_doc: dict[str, ReliabilityItem] = {}
+    if reliability is not None:
+        items_by_doc = {item.doc_id: item for item in reliability.items}
+
+    doc_ids = sorted(set(items_by_doc) | set(doc_titles))
 
     items: list[dict[str, Any]] = []
     for doc_id in doc_ids:
-        percent = rank_pct.get(doc_id, 0)
-        raw_intent = intent_scores.get(doc_id, 0.0)
-        level = level_for(percent)
+        verdict = items_by_doc.get(doc_id)
+        if verdict is None:
+            level_key = "medium"
+            rationale = "검증을 다시 실행하면 신뢰도 등급이 갱신됩니다."
+            signals_payload: list[dict[str, str]] = []
+            mentions_payload: list[dict[str, str]] = []
+            inherited_from = None
+        else:
+            level_key = verdict.level if verdict.level in _LEVEL_LABEL else "medium"
+            rationale = verdict.rationale
+            signals_payload = _format_signals(verdict.signals)
+            mentions_payload = _format_mentions(
+                verdict.batch_mentions, limit=_BATCH_MENTIONS_PER_CARD
+            )
+            inherited_from = verdict.inherited_from
+
+        level_label = _LEVEL_LABEL[level_key]
         items.append(
             {
                 "docId": doc_id,
                 "title": doc_titles.get(doc_id, f"문서 {doc_id}"),
-                "matchRate": f"의도 일치율 {percent}%",
-                "matchRatePercent": percent,
-                "intentScore": round(float(raw_intent), 6),
-                "level": level,
+                "level": level_label,
+                "levelKey": level_key,
+                # Headline phrase the card shows under the title — replaces
+                # the old "의도 일치율 N%" string.
+                "matchRate": f"신뢰도 {level_label}",
+                "reliabilityRationale": rationale,
+                "reliabilitySignals": signals_payload,
+                "batchMentions": mentions_payload,
+                "inheritedFrom": inherited_from,
                 "issues": _issues_for_doc(
                     doc_id=doc_id,
-                    percent=percent,
-                    intent=intent,
+                    rationale=rationale,
+                    mentions=mentions_payload,
                     sections=sections,
                     consensus=consensus,
+                    inherited_from=inherited_from,
                 ),
             }
         )
 
-    items.sort(key=lambda item: -item["matchRatePercent"])
+    items.sort(
+        key=lambda item: (
+            _LEVEL_SORT_RANK.get(item["levelKey"], 9),
+            item["docId"],
+        )
+    )
     return items
 
 
-def ratio_normalize_percent(scores: dict[str, float]) -> dict[str, int]:
-    """Workspace-internal proportion of the best raw score, 0-100.
+def _format_signals(signals: dict[str, str]) -> list[dict[str, str]]:
+    """Render the three sub-signals into a UI-friendly ordered list.
 
-    The doc with the highest raw intent score lands at 100; every other doc
-    scales linearly as ``raw / max * 100``. Unlike a rank percentile, this
-    preserves the raw score *distribution* — a workspace where docs cluster
-    tightly reads as a tight band near the top (and a meaningful average),
-    while a workspace with a clear standout shows it as a wide spread.
-
-    Why not the raw RRF score itself: RRF scores are tiny (≲ 0.02), so
-    showing them as a "match rate" reads as 1% to a user. Scaling against the
-    workspace's own max keeps the relative order *and* makes the unit
-    intuitive ("% of the best doc in this workspace").
+    Returned order matches the prompt's order (authority → verifiability →
+    self_consistency) so the detail dialog reads top-down the same way the
+    LLM was asked to judge.
     """
-    if not scores:
-        return {}
-    max_score = max(scores.values())
-    if max_score <= 0.0:
-        # Every doc has zero intent signal — surface them all as 0% rather
-        # than dividing by zero. The caller will mark them "낮음".
-        return {doc: 0 for doc in scores}
-    return {
-        doc: max(0, min(100, int(round(score / max_score * 100))))
-        for doc, score in scores.items()
-    }
+    rendered: list[dict[str, str]] = []
+    for key in ("authority", "verifiability", "self_consistency"):
+        strength = (signals or {}).get(key, "mixed")
+        rendered.append(
+            {
+                "key": key,
+                "label": _SIGNAL_LABEL.get(key, key),
+                "strength": strength,
+                "strengthLabel": _SIGNAL_STRENGTH_LABEL.get(strength, strength),
+            }
+        )
+    return rendered
 
 
-# Backwards-compatible alias for any caller that imported the old name.
-# The rank-percentile semantics it used to carry (forced uniform distribution,
-# constant ~50% workspace average) hid genuine quality differences between
-# workspaces, so the implementation now delegates to the ratio normalizer.
-rank_normalize_percent = ratio_normalize_percent
+def _format_mentions(mentions: list[Any], *, limit: int) -> list[dict[str, str]]:
+    rendered: list[dict[str, str]] = []
+    for mention in mentions[:limit]:
+        batch_id = getattr(mention, "batch_id", "")
+        kind = getattr(mention, "kind", "")
+        snippet = getattr(mention, "snippet", "")
+        rendered.append(
+            {
+                "batchId": str(batch_id),
+                "kind": str(kind),
+                "kindLabel": _MENTION_KIND_LABEL.get(str(kind), str(kind)),
+                "snippet": str(snippet),
+            }
+        )
+    return rendered
 
 
-def level_for(percent: int) -> str:
-    if percent >= _LEVEL_HIGH:
-        return "높음"
-    if percent >= _LEVEL_MEDIUM:
-        return "중간"
-    return "낮음"
+def level_label(level_key: str) -> str:
+    """Stable mapping from internal key to display label.
+
+    Kept as a public helper so other modules (notably the get_summary
+    distribution counts) can render the same band names without re-deriving
+    them. The reverse mapping ``_LEVEL_LABEL_REVERSE`` covers the legacy
+    code paths that still hand a Korean string and need the English key.
+    """
+    return _LEVEL_LABEL.get(level_key, "중간")
 
 
 # ---------------------------------------------------------------------------
@@ -129,77 +203,51 @@ def level_for(percent: int) -> str:
 def _issues_for_doc(
     *,
     doc_id: str,
-    percent: int,
-    intent: IntentResult | None,
+    rationale: str,
+    mentions: list[dict[str, str]],
     sections: SectionResult | None,
     consensus: ConsensusResult | None,
+    inherited_from: str | None,
 ) -> list[str]:
     """At most a handful of one-line notes about this document.
 
-    Each helper appends 0-N lines; an empty list lets the UI fall back to
-    "특이사항이 없습니다." without us having to special-case here.
+    Order matters: the card footer only renders the *first* line, so the
+    most informative signal goes first. Priority:
+      1. duplicate inheritance — most important context if present
+      2. LLM rationale (the one-line trust summary)
+      3. concrete batch-mention snippet (what *this* doc contributed)
+      4. supporting sections (where the writer can use this doc)
+      5. cross-source conflict touching this concept (if any)
     """
     notes: list[str] = []
-    notes.extend(_intent_notes(doc_id, intent, percent))
+    if inherited_from:
+        notes.append(
+            f"원본 자료(doc_{inherited_from})와 동일 컨텐츠로 식별되어 등급을 상속받았습니다."
+        )
+    if rationale:
+        notes.append(rationale)
+    notes.extend(_mention_notes(mentions))
     notes.extend(_section_notes(doc_id, sections))
     notes.extend(_consensus_notes(doc_id, consensus))
     return notes
 
 
-def _intent_notes(
-    doc_id: str,
-    intent: IntentResult | None,
-    percent: int,
-) -> list[str]:
-    if intent is None or intent.doc_facet_matrix is None or not intent.facets:
+def _mention_notes(mentions: list[dict[str, str]]) -> list[str]:
+    if not mentions:
         return []
-    try:
-        column = intent.doc_order.index(doc_id)
-    except ValueError:
+    first = mentions[0]
+    kind = str(first.get("kindLabel") or "Batch")
+    snippet = str(first.get("snippet") or "").strip()
+    if not snippet:
         return []
-    matrix = intent.doc_facet_matrix
-    if column >= matrix.shape[1]:
-        return []
-
-    notes: list[str] = []
-    facet_scores = matrix[:, column]
-    if facet_scores.size == 0 or float(facet_scores.max()) <= 0.0:
-        return notes
-
-    # "Weak" = below 40% of this doc's own facet peak. Surface only the
-    # weakest facet to keep the card readable.
-    threshold = float(facet_scores.max()) * 0.4
-    weak_rows = [
-        row
-        for row in range(len(intent.facets))
-        if row < matrix.shape[0] and float(facet_scores[row]) <= threshold
-    ]
-    if weak_rows and percent < _LEVEL_HIGH:
-        weakest = min(weak_rows, key=lambda r: float(facet_scores[r]))
-        if 0 <= weakest < len(intent.facets):
-            label = _format_label_list(intent.facets[weakest].label_terms)
-            if label:
-                notes.append(f"이 자료는 다음 주제를 충분히 다루지 않은 것으로 보입니다: {label}.")
-
-    strong_index = int(facet_scores.argmax())
-    if 0 <= strong_index < len(intent.facets):
-        label = _format_label_list(intent.facets[strong_index].label_terms)
-        if label:
-            notes.append(f"이 자료가 가장 잘 다룬 주제: {label}.")
-    return notes
+    return [f"이 자료의 기여({kind}): {snippet}"]
 
 
 def _section_notes(
     doc_id: str,
     sections: SectionResult | None,
 ) -> list[str]:
-    """Tell the user which flow sections actually use sentences from this doc.
-
-    Rewritten for the sentence-flow model: a doc "contributes" to a section
-    when at least one of its sentences was assigned there. Surfacing the
-    contribution makes the per-doc card immediately useful to the writer
-    ("이 자료는 *서론* / *본론* 의 어디에 쓸 수 있다").
-    """
+    """Tell the user which flow sections actually use sentences from this doc."""
     if sections is None or not sections.sections:
         return []
 
@@ -281,31 +329,6 @@ def section_breakdown_for(doc_id: str, sections: SectionResult | None) -> list[d
     return rows
 
 
-def facet_breakdown_for(doc_id: str, intent: IntentResult | None) -> list[dict[str, Any]]:
-    if intent is None or intent.doc_facet_matrix is None:
-        return []
-    try:
-        column = intent.doc_order.index(doc_id)
-    except ValueError:
-        return []
-    matrix = intent.doc_facet_matrix
-    if column >= matrix.shape[1]:
-        return []
-    rows: list[dict[str, Any]] = []
-    for row_idx, facet in enumerate(intent.facets):
-        if row_idx >= matrix.shape[0]:
-            break
-        rows.append(
-            {
-                "facetId": facet.id,
-                "labels": list(facet.label_terms[:6]),
-                "score": round(float(matrix[row_idx, column]), 6),
-            }
-        )
-    rows.sort(key=lambda item: -item["score"])
-    return rows
-
-
 def concept_participation_for(consensus: ConsensusResult | None) -> list[dict[str, Any]]:
     if consensus is None:
         return []
@@ -329,15 +352,10 @@ def concept_participation_for(consensus: ConsensusResult | None) -> list[dict[st
 def sections_overview(artifacts: VerificationArtifacts) -> list[dict[str, Any]]:
     """One row per *ordered* flow section — what the section panel renders.
 
-    The new sentence-flow model carries:
-      * an ``order`` (writer-readable left-to-right narrative)
-      * a ``role`` (intro / body / conclusion) the UI chips up
-      * a list of ``SentenceAssignment`` per section
-
-    Per-section ``topDocs`` are the documents that contributed the most
-    sentence weight to *this* section (i.e. the writer can grab their text
-    first). ``sentenceCount`` and ``documentCount`` are the section's
-    quick-glance scope.
+    Carries the per-section ``topDocs`` (the documents that contributed the
+    most sentence weight) so the writer can grab their text first; the
+    sentence assignments themselves are inlined for the detail dialog so it
+    does not need a second round-trip.
     """
     sections = artifacts.sections
     if sections is None or not sections.sections:
@@ -345,7 +363,6 @@ def sections_overview(artifacts: VerificationArtifacts) -> list[dict[str, Any]]:
     ordered = sorted(sections.sections, key=lambda s: (s.order, s.id))
     rows: list[dict[str, Any]] = []
     for section in ordered:
-        # Aggregate per-doc weight inside this section.
         doc_weight: dict[str, float] = {}
         for assignment in section.sentence_assignments:
             doc_weight[assignment.doc_id] = (
@@ -389,21 +406,15 @@ def issues_overview(
 
     Three kinds, each with a short non-technical message:
 
-    * ``unmet_must_cover`` — a topic the plan wanted covered but the corpus
-      does not actually support.
-    * ``intent_gap``       — a user-intent facet no document covers well.
-    * ``conflict``         — a concept cluster where sources disagree.
+    * ``underweighted_section`` — a flow-planned section the corpus cannot
+      really support (fewer than ~1/3 of ``section_sentence_top_k``).
+    * ``low_reliability`` — a doc the LLM judged low-trust.
+    * ``conflict`` — a concept cluster where sources disagree.
 
-    Ordered so the most actionable items (unmet must_cover, then conflicts,
-    then gaps) appear first.
+    Ordered so the most actionable items appear first.
     """
     rows: list[dict[str, Any]] = []
 
-    # "근거 부족 섹션": an LLM-planned section the corpus cannot fully support.
-    # Cutoff is ~ 1/3 of ``section_sentence_top_k`` so this fires when the
-    # writer can read it as "the outline asked for more than the corpus has",
-    # not on the trivial case of a few-doc workspace where 5-7 sentences may
-    # still be reasonable.
     _UNDERWEIGHTED_MIN_SENTENCES = 8
     if artifacts.sections is not None:
         for section in artifacts.sections.sections:
@@ -420,33 +431,26 @@ def issues_overview(
                 }
             )
 
-    # New "전반적 자료 품질 약함" signal: when most documents in the workspace
-    # match the intent very weakly, the writer should know the *corpus*, not
-    # any single doc, is the bottleneck. Triggered when ≥ 60% of docs end up
-    # in the "낮음" band (< 40% match rate by ratio).
-    if artifacts.intent is not None and artifacts.intent.doc_intent_score:
-        scores = list(artifacts.intent.doc_intent_score.values())
-        if scores:
-            max_score = max(scores)
-            if max_score > 0.0:
-                weak = sum(1 for s in scores if (s / max_score) < 0.4)
-                weak_ratio = weak / len(scores)
-                if weak_ratio >= 0.6:
-                    rows.append(
-                        {
-                            "kind": "corpus_weakness",
-                            "title": "대부분의 자료가 사용자 의도와 약하게 매칭됩니다",
-                            "detail": (
-                                f"전체 {len(scores)}개 자료 중 {weak}개가 워크스페이스 최고"
-                                f" 매칭 자료의 40% 미만으로 매칭됩니다."
-                            ),
-                            "hint": (
-                                "조사 주제를 더 좁히거나, 의도와 직접 맞물리는 자료를"
-                                " 추가로 수집한 뒤 재검증해 보세요."
-                            ),
-                            "metric": f"약한 매칭 비율 {weak_ratio * 100:.0f}%",
-                        }
-                    )
+    # Low-reliability per-doc issues — surface the LLM's rationale so the
+    # writer immediately sees why it landed in 낮음.
+    if artifacts.reliability is not None:
+        for item in artifacts.reliability.items:
+            if item.level != "low":
+                continue
+            doc_title = doc_titles.get(item.doc_id, f"문서 {item.doc_id}")
+            rationale = (item.rationale or "").strip()
+            detail = doc_title
+            if rationale and rationale not in detail:
+                detail = f"{doc_title} — {rationale}"
+            rows.append(
+                {
+                    "kind": "low_reliability",
+                    "title": "출처 신뢰도가 낮게 평가된 자료",
+                    "detail": detail,
+                    "hint": "동일 주제의 권위 있는 다른 자료로 교차 검증한 뒤 인용하세요.",
+                    "metric": f"doc_{item.doc_id}",
+                }
+            )
 
     if artifacts.consensus is not None:
         cluster_by_id = {
@@ -475,41 +479,98 @@ def issues_overview(
                 }
             )
 
-    if artifacts.intent is not None:
-        for gap in artifacts.intent.coverage_gap:
-            label = _format_label_list(gap.label_terms[:4]) or "(라벨이 비어 있는 의도)"
-            rows.append(
-                {
-                    "kind": "intent_gap",
-                    "title": "사용자 의도 중 자료가 충분히 받쳐주지 못한 주제",
-                    "detail": label,
-                    "hint": "이 주제를 잘 다룬 자료가 거의 없어 보강이 필요합니다.",
-                    "metric": f"최고 자료 점수 {gap.top_doc_score:.3f}",
-                }
-            )
-
     order = {
-        "corpus_weakness": 0,
-        "underweighted_section": 1,
+        "underweighted_section": 0,
+        "low_reliability": 1,
         "conflict": 2,
-        "intent_gap": 3,
     }
     rows.sort(key=lambda row: order.get(row["kind"], 99))
 
-    # ``doc_titles`` is accepted for future per-doc surfacing; the three issue
-    # kinds are workspace-level today, not individual docs.
     _ = doc_titles
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Legacy aliases — kept so existing imports do not break while old workspaces
+# are still being read.
+# ---------------------------------------------------------------------------
+
+
+def facet_breakdown_for(doc_id: str, intent: IntentResult | None) -> list[dict[str, Any]]:
+    """Legacy facet breakdown — only meaningful when the legacy intent task ran.
+
+    Newly-verified workspaces have ``intent is None`` and this returns ``[]``,
+    which the UI renders as an empty panel.
+    """
+    if intent is None or intent.doc_facet_matrix is None:
+        return []
+    try:
+        column = intent.doc_order.index(doc_id)
+    except ValueError:
+        return []
+    matrix = intent.doc_facet_matrix
+    if column >= matrix.shape[1]:
+        return []
+    rows: list[dict[str, Any]] = []
+    for row_idx, facet in enumerate(intent.facets):
+        if row_idx >= matrix.shape[0]:
+            break
+        rows.append(
+            {
+                "facetId": facet.id,
+                "labels": list(facet.label_terms[:6]),
+                "score": round(float(matrix[row_idx, column]), 6),
+            }
+        )
+    rows.sort(key=lambda item: -item["score"])
+    return rows
+
+
+def ratio_normalize_percent(scores: dict[str, float]) -> dict[str, int]:
+    """Legacy helper — no longer used by the verify card pipeline.
+
+    Kept so any external smoke test that imported the old name still
+    resolves. Returns an empty dict for an empty input rather than raising.
+    """
+    if not scores:
+        return {}
+    max_score = max(scores.values())
+    if max_score <= 0.0:
+        return {doc: 0 for doc in scores}
+    return {
+        doc: max(0, min(100, int(round(score / max_score * 100))))
+        for doc, score in scores.items()
+    }
+
+
+# Backwards-compatible aliases for any caller that imported the old names.
+rank_normalize_percent = ratio_normalize_percent
+
+
+def level_for(percent: int) -> str:
+    """Legacy converter — clamps a percent into a Korean band label.
+
+    The current verify pipeline does not use this; LLM verdicts carry the
+    band directly. The function stays so any legacy code path (or test)
+    that called it still resolves.
+    """
+    if percent >= 70:
+        return "높음"
+    if percent >= 40:
+        return "중간"
+    return "낮음"
+
+
 __all__ = [
     "build_doc_items",
-    "ratio_normalize_percent",
-    "rank_normalize_percent",  # alias — kept for the existing smoke test
-    "level_for",
+    "level_label",
     "section_breakdown_for",
-    "facet_breakdown_for",
     "concept_participation_for",
     "sections_overview",
     "issues_overview",
+    # Legacy
+    "facet_breakdown_for",
+    "ratio_normalize_percent",
+    "rank_normalize_percent",
+    "level_for",
 ]

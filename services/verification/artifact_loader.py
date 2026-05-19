@@ -137,6 +137,16 @@ class ArtifactLoader:
             root = self._output_root / workspace
         return RunPathManager(root)
 
+    def summary_dir_for(self, workspace: str | Path) -> Path:
+        """Public path lookup for callers outside this module.
+
+        The reliability pipeline needs to read ``summary/batch_*.md`` directly;
+        exposing the resolved directory here keeps ``RunPathManager``'s
+        construction rules (relative vs absolute workspace) inside one
+        well-known place rather than reinventing them at each call site.
+        """
+        return self._paths(workspace).summary_dir
+
     @staticmethod
     def _read_json(path: Path) -> dict:
         if not path.exists():

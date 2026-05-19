@@ -114,8 +114,10 @@ def list_verify_results(
 def get_verify_detail(doc_id: str, workspace_id: str | None = None) -> dict[str, Any]:
     """Detail payload for one document.
 
-    Includes the per-section / per-facet score breakdowns and which concept
-    clusters touch the doc — the data the detail dialog renders.
+    Carries the per-section breakdown, the LLM-graded reliability signals,
+    and any concept clusters that touch the doc — the data the detail
+    dialog renders. ``facetBreakdown`` is kept on the payload for back-compat
+    but is empty for workspaces verified after intent was retired.
     """
     resolved = _resolve_workspace_id(workspace_id)
     if not resolved:
@@ -163,11 +165,6 @@ def get_summary(workspace_id: str | None) -> dict[str, Any]:
     high = sum(1 for item in items if item["level"] == "높음")
     medium = sum(1 for item in items if item["level"] == "중간")
     low = sum(1 for item in items if item["level"] == "낮음")
-    average_pct = (
-        round(sum(item["matchRatePercent"] for item in items) / len(items))
-        if items
-        else 0
-    )
 
     # Sections that the LLM-planned outline asked for but the corpus does not
     # really support — fewer than 8 sentences assigned (~1/3 of the default
@@ -189,14 +186,13 @@ def get_summary(workspace_id: str | None) -> dict[str, Any]:
         "updatedAt": meta.get("updatedAt"),
         "completedTasks": list(meta.get("completedTasks") or []),
         "documentCount": len(items),
-        "averageMatchPercent": average_pct,
+        # Reliability distribution replaces the old averageMatchPercent — the
+        # frontend now shows "신뢰도 분포" tiles instead of one blended %.
         "highCount": high,
         "mediumCount": medium,
         "lowCount": low,
         "underweightedSectionCount": underweighted_sections,
-        "intentGapCount": (
-            len(artifacts.intent.coverage_gap) if artifacts.intent else 0
-        ),
+        "lowReliabilityCount": low,
         "conflictCount": (
             len(artifacts.consensus.conflicts) if artifacts.consensus else 0
         ),
@@ -300,12 +296,11 @@ def _empty_summary(workspace_id: str | None) -> dict[str, Any]:
         "updatedAt": None,
         "completedTasks": [],
         "documentCount": 0,
-        "averageMatchPercent": 0,
         "highCount": 0,
         "mediumCount": 0,
         "lowCount": 0,
         "underweightedSectionCount": 0,
-        "intentGapCount": 0,
+        "lowReliabilityCount": 0,
         "conflictCount": 0,
         "flowSource": "empty",
         "sentenceCount": 0,

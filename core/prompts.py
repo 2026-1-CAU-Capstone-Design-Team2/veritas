@@ -156,6 +156,11 @@ Rules:
 """
 
 BATCH_SUMMARY_PROMPT = """You are given an original user request and the clean Markdown of multiple collected documents.
+Each document is introduced with a header line of the form ``=== doc_<id> ===``
+followed by its title/URL/domain metadata and its body. The ``<id>`` is the
+document's stable identifier (three-digit string such as ``000``, ``017``); use
+that exact identifier when you cite the document.
+
 Create a markdown batch note with these sections:
 # Batch Summary
 ## Repeated Findings
@@ -175,6 +180,22 @@ Rules:
 - Be concise and remove redundant statements.
 - Write the batch note in the original user request language. If the original request is Korean, write the section content in Korean while preserving fixed markdown headings if needed by downstream code.
 
+Citation policy — downstream verification needs to map every finding back to
+its source documents, so every claim in ``## Repeated Findings``,
+``## New Findings``, and ``## Reliability Notes`` MUST end with one or more
+inline doc citations of the form ``[doc_<id>]``:
+- Cite every supporting document. A finding repeated across three sources
+  ends with ``[doc_001][doc_004][doc_009]``; a single-source finding ends with
+  ``[doc_007]``.
+- Use ONLY the doc_ids that appear as ``=== doc_<id> ===`` headers in the
+  input. Never invent or guess an id. Never abbreviate as ``doc_7`` — keep
+  the original three-digit form.
+- Place the marker(s) at the end of the bullet (or at the end of the
+  sentence inside a multi-sentence bullet). Do not wrap them in parentheses;
+  the bare ``[doc_<id>]`` form is required so a regex parser can find them.
+- Gap section bullets (``### Core Gap`` / ``### Supporting Gap`` /
+  ``### Off-topic`` ) describe what is *missing* and so do not need citations.
+
 Content fidelity — the final research report is synthesized from these
 batch notes, so concrete signal that gets dropped here is lost forever:
 - Preserve concrete numerical data — metrics, dates, percentages, costs,
@@ -190,8 +211,7 @@ batch notes, so concrete signal that gets dropped here is lost forever:
   × 4 cols, reproduce it as a markdown table in ``## New Findings`` or
   ``## Repeated Findings`` instead of flattening it into bullet text.
 - Use short verbatim quotes (\"…\") for a source's distinctive claim or
-  definition; attach a parenthetical doc reference (e.g. ``(doc_007)``)
-  when the document id is obvious from context.
+  definition; the citation marker still goes at the end of the bullet.
 - These fidelity rules override the general \"be concise\" rule whenever
   the concrete signal would otherwise be paraphrased away.
 """
@@ -469,6 +489,67 @@ Language policy: respond in the body's dominant language (Korean if the body
 is Korean, otherwise English). Preserve URLs, code identifiers, model names,
 file paths, and citations in their original form. Output the four sections
 exactly as shown — no surrounding prose, no markdown headers, no JSON."""
+
+
+RELIABILITY_JUDGE_PROMPT = """You are a senior research analyst assessing the trustworthiness of source documents collected by an automated research pipeline.
+
+You will receive multiple candidate documents at once. For EACH document, return ONE trust verdict that combines three sub-signals:
+
+1. ``authority`` — Does the source look authoritative for the topic at hand?
+   - "strong": peer-reviewed academic paper, official documentation,
+     primary source from an established organization, well-known curated
+     database, government/standards body.
+   - "mixed": research preprint mirror, industry blog from a reputable
+     company, expert practitioner's site, established news outlet.
+   - "weak": anonymous blog, marketing / SEO content, content farm,
+     low-context page, machine-translated derivative, broken page.
+
+2. ``verifiability`` — Does the document itself carry checkable evidence?
+   - "strong": concrete numbers / metrics, experiment setups, primary
+     citations, dated claims, named entities (models, datasets, APIs).
+   - "mixed": a few specific claims but mostly summarization.
+   - "weak": hand-wavy claims, no numbers, no primary citations.
+
+3. ``self_consistency`` — Does the document's own Reliability Notes
+   acknowledge limitations honestly?
+   - "strong": explicit caveats, scope limits, methodological warnings
+     stated by the document or by its summary's Reliability Notes.
+   - "mixed": brief disclaimers.
+   - "weak": no caveats, or overclaiming relative to the evidence shown.
+
+Combine the three sub-signals into the final ``level``:
+  - "high"   → at least TWO signals are "strong" AND none is "weak".
+  - "low"    → at least TWO signals are "weak".
+  - "medium" → everything else.
+
+Return JSON only with this schema:
+{
+  "items": [
+    {
+      "doc_id": "<the exact doc_id from the input, e.g. '007'>",
+      "level": "high" | "medium" | "low",
+      "rationale": "<1~2 sentence verdict explaining WHY this level>",
+      "signals": {
+        "authority": "strong" | "mixed" | "weak",
+        "verifiability": "strong" | "mixed" | "weak",
+        "self_consistency": "strong" | "mixed" | "weak"
+      }
+    }
+  ]
+}
+
+Rules:
+- Emit ONE entry per input document, in the SAME order as the input.
+- Use the EXACT doc_id string from the input — never invent or renumber.
+- Judge each document INDEPENDENTLY of the others in the batch; do not rank
+  them against each other.
+- Write ``rationale`` in the language of the User Request (Korean if the
+  request is Korean, English otherwise). Preserve proper nouns / model names
+  / URLs verbatim even when writing in Korean.
+- Keep ``rationale`` concise (no preamble like "이 문서는..."); state the
+  decisive signal first ("학술 논문 출처이며 수치 근거가 풍부함.").
+- Output JSON only. No prose, no markdown fences.
+"""
 
 
 VERIFY_FLOW_PLANNER_PROMPT = """You are an editor planning the outline of a research report.

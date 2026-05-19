@@ -44,13 +44,16 @@ from ...controllers import AgentController, JobCategory, get_job_manager
 
 _FILTERS = ("전체", "높음", "중간", "낮음")
 # Verification has three task pipelines; reaching "검증 완료" maps to 100%.
-# Stages emitted in order: queued → start → sections → intent → consensus →
-# persisting → completed. Hold a small floor for the prep stages so the bar
-# is not pinned at 0 while we wait for the first task to finish.
+# Stages emitted in order: queued → start → sections → reliability →
+# consensus → persisting → completed. Hold a small floor for the prep
+# stages so the bar is not pinned at 0 while we wait for the first task to
+# finish. ``intent`` is kept on the table for legacy reruns that explicitly
+# request the deprecated pipeline; it sits between sections and consensus.
 _STAGE_PROGRESS = {
 	"queued": 4.0,
 	"start": 8.0,
 	"sections": 35.0,
+	"reliability": 65.0,
 	"intent": 65.0,
 	"consensus": 90.0,
 	"persisting": 96.0,
@@ -137,11 +140,17 @@ class _ClickableLabel(QLabel):
 
 
 class _SummaryStripe(QFrame):
-	"""Headline counts: 평균 일치율 · 신뢰도 분포 · 점검 필요 항목.
+	"""Headline counts: 검토 자료 · 신뢰도 분포 · 점검 필요 항목.
 
 	The "점검 필요 항목" stat is clickable: clicking it asks the page to open
 	the issues dialog. When no issues exist (or no verification has run yet)
 	the click is a no-op and the styling stays subdued.
+
+	The old "평균 일치율" tile was retired alongside the intent_coverage
+	pipeline — that percentage averaged a max/mean/breadth blend of
+	BM25+Dense+RRF facet scores into a single number that users could not
+	interpret. The reliability task now emits the band directly, so the
+	stripe shows the band distribution (높음 / 중간 / 낮음) instead.
 	"""
 
 	issuesClicked = Signal()
@@ -162,14 +171,14 @@ class _SummaryStripe(QFrame):
 		row.setContentsMargins(16, 12, 16, 12)
 		row.setSpacing(18)
 
-		self._average = self._stat("평균 일치율", "—")
+		self._total = self._stat("검토 자료", "—")
 		self._high = self._stat("높음", "—")
 		self._medium = self._stat("중간", "—")
 		self._low = self._stat("낮음", "—")
 		self._issues = self._stat("점검 필요 항목", "—", clickable=True, action_hint="자세히 보기")
 		self._issues["value"].clicked.connect(self.issuesClicked)
 
-		for stat in (self._average, self._high, self._medium, self._low, self._issues):
+		for stat in (self._total, self._high, self._medium, self._low, self._issues):
 			row.addLayout(stat["layout"])
 			row.addStretch(0)
 		row.addStretch(1)
@@ -216,20 +225,20 @@ class _SummaryStripe(QFrame):
 
 	def apply(self, summary: dict[str, Any] | None) -> None:
 		if not summary or not summary.get("available"):
-			for stat in (self._average, self._high, self._medium, self._low, self._issues):
+			for stat in (self._total, self._high, self._medium, self._low, self._issues):
 				stat["value"].setText("—")
 			self._hint.setText("")
 			self._issue_count = 0
 			self._update_issues_affordance()
 			return
-		avg = int(summary.get("averageMatchPercent") or 0)
-		self._average["value"].setText(f"{avg}%")
+		total = int(summary.get("documentCount") or 0)
+		self._total["value"].setText(f"{total}건")
 		self._high["value"].setText(str(int(summary.get("highCount") or 0)))
 		self._medium["value"].setText(str(int(summary.get("mediumCount") or 0)))
 		self._low["value"].setText(str(int(summary.get("lowCount") or 0)))
 		self._issue_count = (
 			int(summary.get("underweightedSectionCount") or 0)
-			+ int(summary.get("intentGapCount") or 0)
+			+ int(summary.get("lowReliabilityCount") or 0)
 			+ int(summary.get("conflictCount") or 0)
 		)
 		self._issues["value"].setText(str(self._issue_count))
@@ -257,9 +266,11 @@ class _SummaryStripe(QFrame):
 class VerifyDetailDialog(QDialog):
 	"""Modal drill-down for one document.
 
-	Splits the per-doc detail into three sections — overall · 섹션별 · 의도 facet
-	— so the user can quickly see *which* report sections are weak and *which*
-	intent facets are uncovered, without needing to read percentages on the card.
+	Splits the per-doc detail into three sections — overall · 섹션별 · 출처
+	신뢰도 분석 — so the user can quickly see *which* report sections this
+	doc supports and *why* the LLM landed on the trust band that it did
+	(authority / verifiability / self_consistency sub-signals + the batch
+	mentions that grounded the verdict).
 	"""
 
 	def __init__(self, payload: dict[str, Any], parent: QWidget | None = None) -> None:
@@ -267,7 +278,7 @@ class VerifyDetailDialog(QDialog):
 		self.setObjectName("VerifyDetailDialog")
 		self.setWindowTitle("검증 상세")
 		self.setModal(True)
-		self.resize(680, 600)
+		self.resize(720, 640)
 		self.setStyleSheet(
 			"""
 			QDialog#VerifyDetailDialog { background-color: #F8FAFC; }
@@ -290,6 +301,16 @@ class VerifyDetailDialog(QDialog):
 				border-radius: 12px; color: #3730A3; font-size: 11px;
 				font-weight: 800; padding: 3px 8px;
 			}
+			QLabel#SignalLabel { color: #1F2937; font-size: 12px; font-weight: 700; }
+			QLabel#SignalStrong { color: #15803D; font-size: 12px; font-weight: 800; }
+			QLabel#SignalMixed { color: #B45309; font-size: 12px; font-weight: 800; }
+			QLabel#SignalWeak { color: #B91C1C; font-size: 12px; font-weight: 800; }
+			QLabel#MentionKind {
+				background-color: #EEF2FF; color: #3730A3; border: 1px solid #C7D2FE;
+				border-radius: 10px; padding: 2px 8px; font-size: 10px; font-weight: 800;
+			}
+			QLabel#MentionBatch { color: #64748B; font-size: 10px; font-weight: 700; }
+			QLabel#MentionSnippet { color: #1F2937; font-size: 12px; font-weight: 500; }
 			"""
 		)
 		layout = QVBoxLayout(self)
@@ -308,11 +329,9 @@ class VerifyDetailDialog(QDialog):
 		container_layout.setSpacing(10)
 
 		container_layout.addWidget(self._issue_block(payload))
+		container_layout.addWidget(self._reliability_block(payload))
 		container_layout.addWidget(
 			self._breakdown_block("보고서 섹션별 근거 강도", payload.get("sectionBreakdown") or [])
-		)
-		container_layout.addWidget(
-			self._breakdown_block("의도 주제별 커버", payload.get("facetBreakdown") or [])
 		)
 		container_layout.addStretch(1)
 
@@ -323,6 +342,103 @@ class VerifyDetailDialog(QDialog):
 		buttons.rejected.connect(self.reject)
 		buttons.accepted.connect(self.accept)
 		layout.addWidget(buttons)
+
+	def _reliability_block(self, payload: dict[str, Any]) -> QFrame:
+		"""Render the LLM verdict: rationale, 3 sub-signals, batch mentions.
+
+		Designed so each chunk *stands alone* — the rationale is the headline,
+		the sub-signals justify the headline, and the batch mentions show the
+		concrete evidence the LLM had access to. A doc with no batch mentions
+		(legacy batch_*.md without citation markers, or a workspace where the
+		batch summary failed) renders the mentions sub-section as a one-line
+		"근거 자료가 비어 있습니다." note rather than disappearing.
+		"""
+		frame = QFrame()
+		frame.setObjectName("DetailSection")
+		layout = QVBoxLayout(frame)
+		layout.setContentsMargins(14, 12, 14, 12)
+		layout.setSpacing(8)
+
+		title = QLabel("출처 신뢰도 분석")
+		title.setObjectName("DetailSectionTitle")
+		layout.addWidget(title)
+
+		rationale_text = str(payload.get("reliabilityRationale") or "").strip()
+		if rationale_text:
+			rationale = QLabel(rationale_text)
+			rationale.setObjectName("CardSecondary")
+			rationale.setWordWrap(True)
+			rationale.setTextInteractionFlags(
+				Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+			)
+			layout.addWidget(rationale)
+
+		signals = payload.get("reliabilitySignals") or []
+		if isinstance(signals, list) and signals:
+			signals_frame = QFrame()
+			signals_layout = QVBoxLayout(signals_frame)
+			signals_layout.setContentsMargins(0, 4, 0, 4)
+			signals_layout.setSpacing(4)
+			for signal in signals:
+				row = QHBoxLayout()
+				row.setContentsMargins(0, 0, 0, 0)
+				row.setSpacing(10)
+				label = QLabel(str(signal.get("label") or signal.get("key") or ""))
+				label.setObjectName("SignalLabel")
+				row.addWidget(label, 1)
+				strength = str(signal.get("strength") or "mixed").lower()
+				strength_label = QLabel(str(signal.get("strengthLabel") or strength))
+				if strength == "strong":
+					strength_label.setObjectName("SignalStrong")
+				elif strength == "weak":
+					strength_label.setObjectName("SignalWeak")
+				else:
+					strength_label.setObjectName("SignalMixed")
+				row.addWidget(strength_label, 0, Qt.AlignRight)
+				signals_layout.addLayout(row)
+			layout.addWidget(signals_frame)
+
+		mentions = payload.get("batchMentions") or []
+		if not isinstance(mentions, list) or not mentions:
+			empty = QLabel(
+				"이 자료를 인용한 batch summary 가 아직 없습니다."
+				" 조사 단계의 batch_*.md 가 새 citation 마커로 재생성되면 자동으로 채워집니다."
+			)
+			empty.setObjectName("CardSecondary")
+			empty.setWordWrap(True)
+			layout.addWidget(empty)
+			return frame
+
+		mentions_title = QLabel("이 자료를 인용한 batch summary 발췌")
+		mentions_title.setObjectName("DetailSectionTitle")
+		layout.addWidget(mentions_title)
+		for mention in mentions:
+			if not isinstance(mention, dict):
+				continue
+			row_frame = QFrame()
+			row_layout = QVBoxLayout(row_frame)
+			row_layout.setContentsMargins(0, 4, 0, 4)
+			row_layout.setSpacing(2)
+			head = QHBoxLayout()
+			head.setContentsMargins(0, 0, 0, 0)
+			head.setSpacing(8)
+			kind = QLabel(str(mention.get("kindLabel") or mention.get("kind") or ""))
+			kind.setObjectName("MentionKind")
+			head.addWidget(kind, 0, Qt.AlignLeft)
+			batch_id = QLabel(f"batch_{mention.get('batchId') or '???'}")
+			batch_id.setObjectName("MentionBatch")
+			head.addStretch(1)
+			head.addWidget(batch_id, 0, Qt.AlignRight)
+			row_layout.addLayout(head)
+			snippet = QLabel(str(mention.get("snippet") or ""))
+			snippet.setObjectName("MentionSnippet")
+			snippet.setWordWrap(True)
+			snippet.setTextInteractionFlags(
+				Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+			)
+			row_layout.addWidget(snippet)
+			layout.addWidget(row_frame)
+		return frame
 
 	def _header(self, payload: dict[str, Any]) -> QFrame:
 		header = QFrame()
@@ -466,10 +582,14 @@ def _normalize_score(value: float, hi: float) -> float:
 
 # Per-issue palette: header chip + body tint. Tuned to match the badge tones
 # used elsewhere on the verify page so the user reads the kind at a glance.
+# ``corpus_weakness`` / ``intent_gap`` were retired with intent_coverage but
+# kept in the palette so a stale workspace's issues_overview still renders
+# the right colour instead of falling through to the neutral default.
 _ISSUE_PALETTE = {
-	"corpus_weakness": ("#FEE2E2", "#B91C1C", "#FCA5A5", "자료 품질 약함"),
+	"low_reliability": ("#FEE2E2", "#B91C1C", "#FCA5A5", "신뢰도 낮음"),
 	"underweighted_section": ("#FEF3C7", "#B45309", "#FDE68A", "근거 부족"),
 	"conflict": ("#FEE2E2", "#B91C1C", "#FCA5A5", "출처 충돌"),
+	"corpus_weakness": ("#FEE2E2", "#B91C1C", "#FCA5A5", "자료 품질 약함"),
 	"intent_gap": ("#E0E7FF", "#3730A3", "#C7D2FE", "의도 미커버"),
 }
 
@@ -530,9 +650,9 @@ class VerifyIssuesDialog(QDialog):
 		title = QLabel("점검 필요 항목")
 		title.setObjectName("CardTitle")
 		caption = QLabel(
-			"조사 결과에서 자동으로 감지된 점검 항목입니다. 각 항목은 자료 보강이"
-			" 필요한 부분(근거 부족), 출처 간 입장 차이(출처 충돌), 또는 사용자 의도가"
-			" 충분히 받쳐지지 않은 영역(의도 미커버)을 의미합니다."
+			"조사 결과에서 자동으로 감지된 점검 항목입니다. 각 항목은 자료가 부족한"
+			" 보고서 섹션(근거 부족), 신뢰도가 낮게 평가된 자료(신뢰도 낮음), 또는"
+			" 출처 간 입장 차이가 감지된 주제(출처 충돌)를 의미합니다."
 		)
 		caption.setObjectName("CardSecondary")
 		caption.setWordWrap(True)
@@ -1009,11 +1129,11 @@ def _tone_for_level(level: str) -> str:
 
 def _summary_for_level(level: str) -> str:
 	if level == "높음":
-		return "이 자료는 조사 의도와 맞물려 잘 활용할 수 있습니다."
+		return "출처 권위·검증성·자기일관성 모두 양호한 자료입니다. 안심하고 인용 가능합니다."
 	if level == "중간":
-		return "일부 주제 커버가 약하므로 활용 시 추가 자료와 함께 확인하세요."
+		return "일부 신호가 약하게 평가되었으므로 인용 시 추가 자료와 함께 확인하세요."
 	if level == "낮음":
-		return "신뢰도 보강이 필요합니다. 인용 전 추가 출처로 교차 확인을 권장합니다."
+		return "신뢰도가 낮게 평가된 자료입니다. 인용 전 권위 있는 다른 출처로 교차 검증을 권장합니다."
 	return "검증 결과를 확인해 주세요."
 
 
@@ -1057,7 +1177,7 @@ class VerifyPage(QWidget):
 		# Header card with the run/re-run button + workspace label.
 		header_card = CardWidget("검증")
 		subtitle = QLabel(
-			"조사 결과를 자동 분석하여 자료별 의도 일치율, 보고서 섹션 커버리지,"
+			"조사 결과를 자동 분석하여 자료별 출처 신뢰도, 보고서 섹션 커버리지,"
 			" 그리고 출처 간 합의/충돌을 확인합니다."
 		)
 		subtitle.setObjectName("PageSubtitle")
@@ -1082,13 +1202,13 @@ class VerifyPage(QWidget):
 		self._progress_bar.set_idle()
 		root.addWidget(self._progress_bar)
 
-		# Summary stripe (counts + averages). The "점검 필요 항목" stat is
-		# clickable — :class:`VerifyIssuesDialog` opens with the full list.
+		# Summary stripe (counts + reliability distribution). The "점검 필요 항목"
+		# stat is clickable — :class:`VerifyIssuesDialog` opens with the full list.
 		summary_caption = QLabel(
-			"‘평균 일치율’ 은 이 워크스페이스의 가장 잘 매칭된 자료를 100% 로 두고"
-			" 각 자료가 그 대비 얼마나 매칭되는지를 평균낸 값입니다 — 워크스페이스"
-			" 자료들의 평균 품질에 비례합니다 (모든 자료가 균등하게 잘 매칭되면 100% 에"
-			" 가깝고, 한두 자료만 강하게 매칭되면 낮아집니다)."
+			"각 자료의 신뢰도는 LLM 이 출처 권위 · 검증 가능성 · 자기일관성 세 신호를"
+			" 종합 판단해 ‘높음 / 중간 / 낮음’ 중 하나로 분류한 결과입니다."
+			" ‘점검 필요 항목’ 은 근거 부족 섹션, 신뢰도 낮음 자료, 그리고 출처 간"
+			" 입장 차이를 합산한 수입니다."
 		)
 		summary_caption.setObjectName("CardSecondary")
 		summary_caption.setWordWrap(True)
@@ -1128,10 +1248,10 @@ class VerifyPage(QWidget):
 		results_header.layout.addWidget(self._results_count_badge, 0, Qt.AlignLeft)
 
 		results_header_caption = QLabel(
-			"각 자료의 ‘일치율 %’는 이 워크스페이스에서 가장 잘 매칭된 자료를 100% 로 두고"
-			" 그 대비 비율을 보여줍니다.  ≥ 70% → 높음, 40 ~ 70% → 중간, < 40% → 낮음."
-			" 아래 칩을 누르면 해당 단계의 자료만 추려서 볼 수 있고, ‘상세 보기’ 로"
-			" 그 자료가 약하게 다룬 섹션·의도 주제를 확인할 수 있습니다."
+			"각 자료에는 LLM 이 종합 판정한 신뢰도 등급(높음 / 중간 / 낮음)과 그"
+			" 근거가 한 줄로 표시됩니다. 아래 칩을 누르면 해당 등급의 자료만 추려"
+			" 볼 수 있고, ‘상세 보기’ 로 권위·검증성·자기일관성 세 sub-signal 과"
+			" 이 자료를 인용한 batch summary 발췌를 확인할 수 있습니다."
 		)
 		results_header_caption.setObjectName("CardSecondary")
 		results_header_caption.setWordWrap(True)
