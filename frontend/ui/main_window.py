@@ -20,7 +20,13 @@ from PySide6.QtWidgets import (
 
 from ..api_common import ApiError, current_workspace_id
 from ..components.cards import CardWidget
-from ..controllers import AgentController, JobCategory, get_chat_bus, get_job_manager
+from ..controllers import (
+	AgentController,
+	JobCategory,
+	get_chat_bus,
+	get_job_manager,
+	get_screen_event_store,
+)
 from ..components.stepper import WorkflowStepper
 from .pages.dashboard_page import DashboardPage
 from .pages.document_page import DocumentPage
@@ -241,6 +247,11 @@ class MainWindow(QMainWindow):
 
 		self._screen_monitor_worker: ScreenEventPollWorker | None = None
 		self._screen_monitor_active = False
+		# screen-monitoring 이벤트 broker — polling worker가 store에 append하면 보조창/페이지가 동시 구독.
+		self._screen_event_store = get_screen_event_store()
+		# 폴링 시작 조건: 보조창 visible OR document_assist 페이지 활성 (count > 0 인 동안 폴링).
+		self._monitor_subscriber_count = 0
+		self._active_route: str | None = None
 
 		self._assist_toggle_shortcut = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
 		self._assist_toggle_shortcut.activated.connect(self.toggle_document_assist_window)
@@ -274,7 +285,8 @@ class MainWindow(QMainWindow):
 		self._screen_monitor_active = True
 		self.document_assist_window.title_bar.status.setText("● 모니터링 중")
 		worker = ScreenEventPollWorker(self._agent_controller, self)
-		worker.eventsReceived.connect(self._on_proactive_events_received)
+		# raw items를 store에 push — 보조창/페이지 위젯이 각자 store.eventsAppended를 구독해 렌더.
+		worker.eventsReceived.connect(self._screen_event_store.append)
 		worker.pollError.connect(self._on_proactive_poll_error)
 		self._screen_monitor_worker = worker
 		worker.start()
@@ -292,22 +304,6 @@ class MainWindow(QMainWindow):
 			self._agent_controller.stop_screen_monitoring()
 		except ApiError:
 			pass
-
-	def _on_proactive_events_received(self, items: list) -> None:
-		for item in items:
-			if not isinstance(item, dict):
-				continue
-			answer = str(item.get("answer") or "").strip()
-			if not answer:
-				continue
-			trigger = str(item.get("triggerText") or "").strip()
-			category = "실시간 보조"
-			text = f"{trigger}\n→ {answer}" if trigger else answer
-			self.document_assist_window.suggestion_list.add_suggestion(
-				category,
-				text,
-				tone="working",
-			)
 
 	def _on_proactive_poll_error(self, message: str) -> None:
 		print(f"[screen_monitoring][poll][warn] {message}")
@@ -328,9 +324,43 @@ class MainWindow(QMainWindow):
 		if visible:
 			if not self._assist_streaming:
 				self._hydrate_assist_history_from_backend()
-			self._start_screen_monitoring()
+			self._increment_monitor_subscriber()
 		else:
+			self._decrement_monitor_subscriber()
+
+	def _increment_monitor_subscriber(self) -> None:
+		"""활성 subscriber 카운트++. 0→1 전이 시 폴링 시작."""
+		self._monitor_subscriber_count += 1
+		if self._monitor_subscriber_count == 1:
+			self._start_screen_monitoring()
+
+	def _decrement_monitor_subscriber(self) -> None:
+		"""활성 subscriber 카운트--. 1→0 전이 시 폴링 중단."""
+		if self._monitor_subscriber_count <= 0:
+			return
+		self._monitor_subscriber_count -= 1
+		if self._monitor_subscriber_count == 0:
 			self._stop_screen_monitoring()
+
+	def _update_monitor_subscriber_for_route(self, new_route: str) -> None:
+		"""라우트 전환 시 document_assist 진입/이탈에 따라 카운트 조정."""
+		if self._active_route == new_route:
+			return
+		if self._active_route == "document_assist":
+			self._decrement_monitor_subscriber()
+		if new_route == "document_assist":
+			self._increment_monitor_subscriber()
+		self._active_route = new_route
+
+	def _restart_screen_monitoring_for_workspace_change(self) -> None:
+		"""워크스페이스 전환 시 backend monitoring을 새 workspace로 재시작.
+		비활성 상태면 아무 동작 안 함 — 다음 활성화 시 새 workspace_id로 자연스럽게 시작.
+		재시작 흐름: stop → worker 종료/대기 → start(new workspace_id) + 새 worker (cursor=0).
+		"""
+		if not self._screen_monitor_active:
+			return
+		self._stop_screen_monitoring()
+		self._start_screen_monitoring()
 
 	def _send_assist_window_message(self, message: str) -> None:
 		mode = self.document_assist_window.input_bar.mode()
@@ -399,6 +429,10 @@ class MainWindow(QMainWindow):
 		self.document_assist_window.title_bar.status.setText("● 오류")
 
 	def _on_workspace_changed(self, workspace_name: str) -> None:
+		# 워크스페이스 경계: 이전 workspace의 screen 이벤트 잔류 방지 — 양쪽 suggestion_list 동시 reset.
+		self._screen_event_store.clear()
+		# backend monitoring도 새 workspace_id로 재시작 (active 상태에서만).
+		self._restart_screen_monitoring_for_workspace_change()
 		self.settings_page.set_default_workspace_by_name(workspace_name)
 		self.draft_page.set_workspace_by_name(workspace_name)
 		self.research_page.set_workspace_by_name(workspace_name)
@@ -440,6 +474,9 @@ class MainWindow(QMainWindow):
 		)
 
 		self.document_assist_window.hydrate_history([])
+		# 새 워크스페이스: 이전 screen 이벤트 잔류 방지 + backend monitoring 재시작.
+		self._screen_event_store.clear()
+		self._restart_screen_monitoring_for_workspace_change()
 
 	def _toggle_sidebar(self) -> None:
 		start = self.sidebar.width()
@@ -540,6 +577,9 @@ class MainWindow(QMainWindow):
 
 		if is_workflow_route:
 			self.stepper.set_current_step(self.STEP_ORDER.index(route))
+
+		# document_assist 페이지 진입/이탈 → polling 활성 카운트 조정.
+		self._update_monitor_subscriber_for_route(route)
 
 	def _build_stylesheet(self) -> str:
 		return """

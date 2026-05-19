@@ -8,6 +8,8 @@ from typing import Any, Callable, Iterator
 from core.prompts import (
     SCREEN_INTERVENTION_SYSTEM_PROMPT,
     SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE,
+    SCREEN_SCENARIO_GUIDANCE,
+    SCREEN_SCENARIO_GUIDANCE_DEFAULT,
     SYSTEM_PROMPT,
     TOOL_CHAT_FINAL_PROMPT_TEMPLATE,
     TOOL_CHAT_SYSTEM_PROMPT,
@@ -500,6 +502,10 @@ class ChatAgent:
         with self._conversation_lock:
             query = self._screen_intervention_query(intervention)
             knowledge_context = self._screen_knowledge_context(query)
+            intervention_type = intervention.get("intervention_type") or "none"
+            scenario_guidance = SCREEN_SCENARIO_GUIDANCE.get(
+                intervention_type, SCREEN_SCENARIO_GUIDANCE_DEFAULT
+            )
             prompt = SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE.format(
                 history=self._format_recent_history(),
                 app_context=self._pretty_payload(
@@ -509,6 +515,7 @@ class ChatAgent:
                     self._screen_prompt_writing_context(intervention)
                 ),
                 routing_hint=self._pretty_payload(intervention.get("tool_routing_hint") or {}),
+                scenario_guidance=scenario_guidance,
                 knowledge_context=knowledge_context,
             )
             try:
@@ -530,6 +537,86 @@ class ChatAgent:
             self._append_history(history_question, answer)
             return answer.strip()
 
+    
+    #single queue version with peek + separate consume
+    def _screen_intervention_loop(self, *, stream: bool) -> None:
+        while not self._screen_stop_event.wait(self.SCREEN_INTERVENTION_POLL_SEC):
+            try:
+                pending = self._peek_screen_interventions(limit=1)
+                if not pending:
+                    continue
+                intervention = pending[0]
+                # peek만 — LLM 처리 동안 큐에 남겨 producer가 점유중으로 인식하게 함
+                try:
+                    if not self._fresh_screen_interventions([intervention]):
+                        continue  # dup/stale → finally에서 제거
+                    event_id = str(intervention.get("event_id") or "-")
+                    if self.screen_debug:
+                        query = self._screen_intervention_query(intervention)
+                        print(
+                            "[screen_context][assist] "
+                            f"event={event_id} generating query={query[:160]!r}"
+                        )
+                    answer = self.answer_screen_intervention(intervention, stream=stream)
+                    if self.screen_debug:
+                        print(
+                            "[screen_context][assist] "
+                            f"event={event_id} answer_chars={len(answer)}"
+                        )
+                    if self._screen_answer_callback is not None:
+                        self._screen_answer_callback(answer, intervention)
+                    else:
+                        print("\n[Screen Assist]")
+                        print(answer)
+                        print()
+                finally:
+                    # 처리·스킵 결과와 무관하게 큐에서 1개 제거 — producer 점유 해제용,
+                    # 실패해도 같은 항목 무한 재시도 방지
+                    self._remove_screen_intervention()
+            except Exception as e:
+                print(f"[screen_context][assist][error] {type(e).__name__}: {e}")
+
+
+    def _peek_screen_interventions(self, *, limit: int) -> list[dict[str, Any]]:
+        """큐에서 제거하지 않고 대기 개입을 읽기만 한다."""
+        if not self.has_screen_context():
+            return []
+        try:
+            result = self.tool_registry.call(
+                "screen_context", action="pending_interventions", limit=limit,
+            )
+        except Exception as e:
+            print(f"[screen_context][warn] failed to peek interventions: {e}")
+            return []
+        if not result.success:
+            print(f"[screen_context][warn] failed to peek interventions: {result.error}")
+            return []
+        data = result.data if isinstance(result.data, dict) else {}
+        return [item for item in data.get("interventions", []) if isinstance(item, dict)]
+
+    def _remove_screen_intervention(self) -> None:
+        """큐 맨 앞 1개를 제거한다 (peek 후 처리/스킵을 마친 항목)."""
+        if not self.has_screen_context():
+            return
+        try:
+            result = self.tool_registry.call(
+                "screen_context", action="consume_interventions", limit=1,
+            )
+        except Exception as e:
+            print(f"[screen_context][warn] failed to remove intervention: {e}")
+            return
+        if not result.success:
+            print(f"[screen_context][warn] failed to remove intervention: {result.error}")
+            return
+        if self.screen_debug:
+            data = result.data if isinstance(result.data, dict) else {}
+            ids = [str(i.get("event_id") or "-") for i in data.get("interventions", []) if isinstance(i, dict)]
+            if ids:
+                print(f"[screen_context][queue] removed event_ids={ids}")
+
+
+    """
+    "multiple size queue version" 
     def _screen_intervention_loop(self, *, stream: bool) -> None:
         while not self._screen_stop_event.wait(self.SCREEN_INTERVENTION_POLL_SEC):
             try:
@@ -581,6 +668,7 @@ class ChatAgent:
             ids = [str(item.get("event_id") or "-") for item in valid]
             print(f"[screen_context][queue] consumed={len(valid)} event_ids={ids}")
         return valid
+    """
 
     def _fresh_screen_interventions(
         self,

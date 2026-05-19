@@ -5,3 +5,4 @@ __pycache__/
 /test/_screen_poll_output/
 /runs/
 .claude/
+services/screen_tool_funcs/test/outputs/

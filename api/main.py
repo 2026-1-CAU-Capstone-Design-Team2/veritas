@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run VERITAS UI or API server.")
     parser.add_argument("--api", action="store_true", help="Run the FastAPI server instead of the UI.")
     parser.add_argument("--host", default="127.0.0.1", help="API server host.")
-    parser.add_argument("--port", type=int, default=8000, help="API server port.")
+    parser.add_argument("--port", type=int, default=8001, help="API server port.")
     parser.add_argument("--reload", action="store_true", help="Enable uvicorn auto-reload.")
     return parser.parse_args()
 

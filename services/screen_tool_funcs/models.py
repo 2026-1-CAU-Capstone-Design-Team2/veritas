@@ -95,6 +95,7 @@ class InterventionDecision:
     """Rule-based decision about whether the LLM should consider intervening."""
 
     should_consider_llm: bool = False
+    intervention_type: str = "none"
     score: float = 0.0
     priority: str = "low"
     reason_codes: list[str] = field(default_factory=list)
