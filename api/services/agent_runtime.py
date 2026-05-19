@@ -16,7 +16,7 @@ from agent import ChatAgent
 from llm.llama_server_llm import LLMClient
 from tools.autosurvey_tool import AutoSurveyTool
 from tools.loader import build_registry, load_schema
-from workflows import AutoSurveyWorkflow
+from workflows import AutoSurveyConfig, AutoSurveyWorkflow
 
 
 SCREEN_EVENT_BUFFER_MAX = 100
@@ -104,9 +104,7 @@ class AgentRuntime:
         self.workflow = AutoSurveyWorkflow(
             registry=self.registry,
             run_store_service=self.run_store_service,
-            max_docs=int(os.getenv("VERITAS_MAX_DOCS", "15")),
-            collect_batch_size=int(os.getenv("VERITAS_BATCH_SIZE", "5")),
-            scout_docs=int(os.getenv("VERITAS_SCOUT_DOCS", "3")),
+            config=AutoSurveyConfig.from_env(),
         )
         self._register_autosurvey_tool()
         self.chat_agent = ChatAgent(
@@ -295,36 +293,27 @@ class AgentRuntime:
         # AutoSurvey pacing — per-request values from the research page
         # (maxDocs) and 설정 > 고급 설정 > 조사 진행 방식 (scoutDocs /
         # collectBatchSize) take precedence; otherwise the VERITAS_* env
-        # defaults apply. collectBatchSize doubles as the document_summarize
-        # batch size so one collect cycle maps to one batch summary.
-        resolved_max_docs = (
-            int(max_docs)
-            if max_docs is not None and int(max_docs) > 0
-            else int(os.getenv("VERITAS_MAX_DOCS", "15"))
-        )
-        resolved_collect_batch_size = (
-            int(collect_batch_size)
-            if collect_batch_size is not None and int(collect_batch_size) > 0
-            else int(os.getenv("VERITAS_BATCH_SIZE", "5"))
-        )
-        resolved_scout_docs = (
-            int(scout_docs)
-            if scout_docs is not None and int(scout_docs) > 0
-            else int(os.getenv("VERITAS_SCOUT_DOCS", "3"))
+        # defaults apply. ``AutoSurveyConfig.from_env`` owns the full
+        # resolution chain so this call site only has to express the
+        # caller-provided overrides. ``collect_batch_size`` doubles as the
+        # ``document_summarize`` batch size so one collect cycle maps to
+        # one batch summary.
+        autosurvey_config = AutoSurveyConfig.from_env(
+            max_docs=max_docs,
+            collect_batch_size=collect_batch_size,
+            scout_docs=scout_docs,
         )
         registry, run_store_service, rag_service = build_registry(
             llm=self.llm,
             run_root=workspace_dir,
-            batch_size=resolved_collect_batch_size,
+            batch_size=autosurvey_config.collect_batch_size,
             max_context=int(os.getenv("VERITAS_MAX_CONTEXT", "16384")),
             enable_screen_context=False,
         )
         workflow = AutoSurveyWorkflow(
             registry=registry,
             run_store_service=run_store_service,
-            max_docs=resolved_max_docs,
-            collect_batch_size=resolved_collect_batch_size,
-            scout_docs=resolved_scout_docs,
+            config=autosurvey_config,
             progress_callback=self._emit_research_progress,
         )
         result = workflow.run_all(
