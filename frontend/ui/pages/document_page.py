@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QLabel, QTextEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
 
-from ...api_common import ApiError, current_workspace_id
+from ...api_common import current_workspace_id
 from ...components.badges import Badge
 from ...components.cards import CardWidget
-from ...controllers import AgentController
+from ...controllers import AgentController, get_job_manager
 from ..markdown_view import apply_markdown
 
 
@@ -14,15 +14,15 @@ class DocumentPage(QWidget):
 		super().__init__(parent)
 		self._workspace_id = current_workspace_id()
 		self._controller = AgentController()
+		# Monotonic guard so an out-of-order summary fetch can't overwrite a
+		# newer refresh (rapid page switches / workspace changes).
+		self._summary_token = 0
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
 		root.setSpacing(12)
 
-		summary_card = CardWidget("문서")
-		summary_subtitle = QLabel("AutoSurvey가 생성한 최종 보고서(final.md)를 markdown 형태로 확인합니다.")
-		summary_subtitle.setObjectName("PageSubtitle")
-		summary_card.layout.addWidget(summary_subtitle)
+		summary_card = CardWidget("요약")
 
 		summary_badge = Badge("요약본", "info")
 		summary_card.layout.addWidget(summary_badge)
@@ -31,35 +31,42 @@ class DocumentPage(QWidget):
 		self.summary_text.setObjectName("DocEditor")
 		self.summary_text.setReadOnly(True)
 		self.summary_text.setMinimumHeight(360)
-		summary_card.layout.addWidget(self.summary_text)
-		root.addWidget(summary_card)
+		# Stretch the editor inside the card, and the card across the page, so
+		# the summary fills the whole screen.
+		summary_card.layout.addWidget(self.summary_text, 1)
+		root.addWidget(summary_card, 1)
 
-		merged_card = CardWidget("수집 문서")
-		merged_badge = Badge("제목 및 링크", "neutral")
-		merged_card.layout.addWidget(merged_badge)
-
-		self.merged_text = QTextEdit()
-		self.merged_text.setObjectName("DocEditor")
-		self.merged_text.setReadOnly(True)
-		self.merged_text.setMinimumHeight(220)
-		merged_card.layout.addWidget(self.merged_text)
-		root.addWidget(merged_card)
-
-		root.addStretch(1)
 		self.refresh()
 
 	def refresh(self) -> None:
 		self._workspace_id = current_workspace_id()
-		try:
-			summary = self._controller.get_document_summary(self._workspace_id)
-			merged = self._controller.get_document_merged(self._workspace_id)
-		except ApiError as e:
-			self.summary_text.setPlainText(f"API 요청 실패: {e}")
-			self.merged_text.clear()
-			return
+		self.summary_text.setPlainText("요약을 불러오는 중입니다...")
 
-		if summary.strip():
-			apply_markdown(self.summary_text, summary)
-		else:
-			self.summary_text.setPlainText("아직 표시할 final.md가 없습니다. 조사 섹션에서 AutoSurvey를 먼저 실행하세요.")
-		self.merged_text.setPlainText(merged or "아직 수집 문서 목록이 없습니다.")
+		# get_document_summary is a blocking HTTP call — run it off the UI
+		# thread so navigating to this page never freezes. The token guards
+		# against an out-of-order completion overwriting a newer refresh.
+		self._summary_token += 1
+		token = self._summary_token
+		workspace_id = self._workspace_id
+		controller = self._controller
+
+		def _load() -> str:
+			return controller.get_document_summary(workspace_id)
+
+		def _apply(summary: object) -> None:
+			if token != self._summary_token:
+				return
+			text = str(summary or "")
+			if text.strip():
+				apply_markdown(self.summary_text, text)
+			else:
+				self.summary_text.setPlainText(
+					"아직 표시할 final.md가 없습니다. 조사 섹션에서 AutoSurvey를 먼저 실행하세요."
+				)
+
+		def _failed(message: str) -> None:
+			if token != self._summary_token:
+				return
+			self.summary_text.setPlainText(f"API 요청 실패: {message}")
+
+		get_job_manager().run_detached(_load, on_success=_apply, on_error=_failed)

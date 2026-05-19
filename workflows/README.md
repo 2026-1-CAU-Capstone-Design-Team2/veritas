@@ -73,9 +73,10 @@ def run_all(
     """
     전체 파이프라인 실행:
     1. Plan: 검색 쿼리 계획 생성
-    2. Collect: 웹 검색 및 문서 수집
-    3. Summarize: 개별 요약 및 배치 요약
-    4. Final: 최종 보고서 생성
+    2. Collect: 웹 검색 및 문서 수집 (clean_md 저장)
+    3. (루프 내) 배치 요약 → gap 분석 → replan 반복
+    4. (루프 종료 후) per-doc 요약 일괄 수행
+    5. Final: 최종 보고서 생성
     
     Returns:
         {
@@ -96,8 +97,19 @@ def run_plan(self, user_request: str, *, force_plan: bool = False) -> dict:
 def run_collect(self, plan: dict) -> dict:
     """2단계: 웹 검색 및 문서 수집"""
 
-def run_summarize(self, *, overwrite: bool = False) -> dict:
-    """3단계: 문서 요약 생성"""
+def run_summarize(
+    self, *, overwrite: bool = False,
+    doc_ids: list[str] | None = None, phase: str = "all",
+) -> dict:
+    """문서 요약. clean_md를 읽는다.
+    phase="batch"   → 배치 요약만 (수집 루프 안에서 gap 분석/replan용)
+    phase="per_doc" → per-doc 요약만 (조사 종료 시 1회, summary/doc_*.md)
+    phase="all"     → 둘 다 (standalone --phase summarize)
+
+    per-doc 루프가 도는 phase("per_doc"/"all")에서는 document_summarize
+    tool에 progress_callback(_on_summarize_progress)을 넘겨, 문서별
+    document_summarize / doc_summarized / doc_failed 진행 이벤트를
+    실시간으로 흘려보낸다 — 진행률 막대 전진 + doc_*.md 카드 즉시 활성화."""
 
 def run_final(self, *, user_request: str | None = None) -> dict:
     """4단계: 최종 보고서 생성"""
@@ -184,19 +196,35 @@ final_result = workflow.run_final()
    - 이미 수집된 URL인지 확인
    - `fetch_webpage`로 페이지 수집
    - 중복 문서 검사 (Jaccard 유사도 0.82 이상)
-   - 고유 문서만 저장
-3. `max_docs`에 도달하면 중단
+   - 고유 문서만 **보존 문서**로 저장 — `doc_id`는 `_fetch_one`에서 미리
+     할당하지 않고 `write_fetched_record`가 write 시점에 보존 문서 수로
+     연속 할당(`000`, `001`, ...)한다. fetch 실패(`fetch_error_*`)와
+     중복(`dup_*`)은 별도 id 네임스페이스로 분리되어 보존 문서 번호를
+     소비하거나 가로채지 않는다.
+3. `max_docs`에 도달하면 중단 (`_kept_record_count()` = 보존 문서 수 기준)
 
-### Summarize 단계
-1. 비중복 문서 목록 로드
-2. 각 문서에 대해 `document_summarize` 실행
-3. 5개 문서마다 배치 요약 생성
-4. 요약 파일을 `summary/` 디렉토리에 저장
+### Summarize 단계 — clean_md를 읽는 두 개의 독립 소비자 (체인 아님)
+- **배치 요약** (수집 루프 안, `phase="batch"`): 사이클의 새 문서 `clean_md`를
+  `batch_size`개씩 묶어 배치 노트(`summary/batch_*.md`)를 만들고, 그 안의 Gap
+  섹션이 다음 replan 신호가 됩니다. per-doc 요약이 아니라 clean_md를 직접 읽어
+  요약-of-요약으로 인한 손실을 피합니다.
+- **per-doc 요약** (수집 루프 종료 후 1회, `phase="per_doc"`): 모든 `clean_md`를
+  문서별로 요약해 `summary/doc_*.md`를 만듭니다. replan에 관여하지 않는 UX
+  디스크립터(출처 카드/인용/검증용)이므로 루프 임계 경로에서 빼 종료 단계에
+  일괄 수행합니다. 다만 이 일괄 단계 안에서도 `document_summarize` tool에
+  넘긴 `progress_callback`(`_on_summarize_progress`)을 통해 문서 하나가
+  시작/완료/실패할 때마다 진행 이벤트를 실시간 emit합니다 — 그래서 UI
+  진행률 막대가 per-doc 구간에서 멈췄다 튀지 않고 문서마다 전진하고,
+  `doc_*.md` 출처 카드도 요약이 끝나는 즉시 하나씩 활성화됩니다.
 
 ### Final 단계
 1. 모든 배치 요약 로드
 2. `final_report` 도구로 최종 보고서 생성
 3. `final.md`로 저장
+
+### RAG 인덱싱 (workflow 종료 후, API runtime이 수행)
+RAG는 `summary/`가 아니라 **`clean_md/`** 를 인덱싱합니다. 요약은 lossy하므로
+답변 근거는 정제된 원문(`clean_md/<doc_id>.md`)에서 가져옵니다.
 
 ---
 

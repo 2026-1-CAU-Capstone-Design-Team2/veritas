@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .scenarios import ScenarioType
+from .scenario import ScenarioType
 from .store import ScreenContextStore
 
 
@@ -28,11 +28,13 @@ class ScenarioSchedulerState:
     last_activity_at: float = 0.0
     last_reset_at: float = 0.0
     # {시나리오명: unix_ts} — 각 시나리오가 마지막으로 선택(발동)된 캡처 시각.
-    # 시간 기반 cooldown 게이트가 읽음. 
+    # 시간 기반 cooldown 게이트가 읽음.
     last_fired_at: dict[str, float] = field(default_factory=dict)
     # {시나리오명: 발동 시점의 정규화 문서 길이}. last_fired_at과 짝을 이루는 보조 데이터.
     # "직전 리뷰 이후 추가된 글자 수" 같은 글자수 기반 cooldown 판정에 사용.
     last_fired_doc_chars: dict[str, int] = field(default_factory=dict)
+    # 시나리오 무관 가장 최근 발동 시각. 스케줄러의 전역 rate-limit이 사용.
+    last_global_fire_at: float = 0.0
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -44,6 +46,7 @@ class ScenarioSchedulerState:
             "last_reset_at": self.last_reset_at,
             "last_fired_at": dict(self.last_fired_at),
             "last_fired_doc_chars": dict(self.last_fired_doc_chars),
+            "last_global_fire_at": self.last_global_fire_at,
         }
 
     @classmethod
@@ -69,6 +72,7 @@ class ScenarioSchedulerState:
                 str(k): int(v)
                 for k, v in (payload.get("last_fired_doc_chars") or {}).items()
             },
+            last_global_fire_at=float(payload.get("last_global_fire_at") or 0.0),
         )
 
 
@@ -94,6 +98,7 @@ class ScenarioScheduler:
         reset_idle_sec: float = 3600.0,
         reset_interval_sec: float = 7200.0,
         max_documents: int = 50,
+        min_global_fire_interval_sec: float = 10.0,
         console_log: bool = False,
     ) -> None:
         if scenarios is not None and weights is not None:
@@ -116,6 +121,8 @@ class ScenarioScheduler:
         self.reset_idle_sec = max(reset_idle_sec, 0.0)
         self.reset_interval_sec = max(reset_interval_sec, 0.0)
         self.max_documents = max(max_documents, 1)
+        # 시나리오 무관 발화 간 최소 간격. 0 이하면 throttle 비활성.
+        self.min_global_fire_interval_sec = max(min_global_fire_interval_sec, 0.0)
         self.console_log = console_log
 
         self._cache: dict[str, ScenarioSchedulerState] = {}
@@ -196,6 +203,7 @@ class ScenarioScheduler:
         *,
         now: float | None = None,
         doc_chars: int | None = None,
+        trace_out: dict[str, Any] | None = None,
     ) -> str | None:
         """Pick the winner and charge its vruntime in a single decay step.
 
@@ -204,30 +212,72 @@ class ScenarioScheduler:
         Doing both inside one critical section with a single `now` guarantees
         decay is applied at most once per capture and that no concurrent
         `flush_loop`/`get_state` can mutate state between the two operations.
+
+        trace_out: 호출자가 dict를 전달하면 결정 과정(후보·vruntime·선택·throttle·거부 사유)을
+        그 dict에 채움. 디버깅·진단용. None이면 무시.
         """
+        # trace는 None이어도 dict처럼 쓸 수 있게 로컬 buffer 사용
+        trace: dict[str, Any] = trace_out if trace_out is not None else {}
+        trace["ready_candidates"] = list(ready_names)
+        trace["vruntimes_before"] = {}
+        trace["selected"] = None
+        trace["selected_vruntime_before"] = None
+        trace["selected_vruntime_after"] = None
+        trace["global_throttle"] = {
+            "active": False,
+            "elapsed_since_last_fire_sec": None,
+            "min_interval_sec": self.min_global_fire_interval_sec,
+            "last_global_fire_at": 0.0,
+        }
+        trace["rejected_reason"] = None
+
         if not ready_names:
+            trace["rejected_reason"] = "no_ready_candidates"
             return None
         now = now if now is not None else time.time()
         with self._lock:
             state = self.get_state(document_key, now=now)
+            trace["global_throttle"]["last_global_fire_at"] = state.last_global_fire_at
+            # 시나리오 무관 전역 rate-limit — 직전 발동으로부터 일정 시간 안엔 누구도 발화 X
+            if self.min_global_fire_interval_sec > 0 and state.last_global_fire_at > 0:
+                elapsed = now - state.last_global_fire_at
+                trace["global_throttle"]["elapsed_since_last_fire_sec"] = round(elapsed, 1)
+                if elapsed < self.min_global_fire_interval_sec:
+                    trace["global_throttle"]["active"] = True
+                    trace["rejected_reason"] = "global_throttle"
+                    if self.console_log:
+                        print(
+                            "[screen_context][scheduler] "
+                            f"global throttle: {elapsed:.1f}s < {self.min_global_fire_interval_sec:.1f}s, "
+                            f"ready_names={ready_names}"
+                        )
+                    return None
             scored: list[tuple[float, float, str]] = []
             for name in ready_names:
                 if name not in self.weights:
                     continue
                 vruntime = state.vruntimes.get(name, self.weights[name].initial_vruntime)
                 scored.append((vruntime, self.weights[name].initial_vruntime, name))
+                trace["vruntimes_before"][name] = round(vruntime, 4)
             if not scored:
+                trace["rejected_reason"] = "no_weights_match"
                 return None
             scored.sort(key=lambda item: (item[0], item[1], item[2]))
             selected = scored[0][2]
             current = state.vruntimes.get(selected, self.weights[selected].initial_vruntime)
-            state.vruntimes[selected] = current + self.weights[selected].vruntime_increment
+            new_vruntime = current + self.weights[selected].vruntime_increment
+            state.vruntimes[selected] = new_vruntime
             state.last_activity_at = now
             # 당첨 시나리오의 마지막 발동 시각 기록
             state.last_fired_at[selected] = now
+            # 전역 throttle 기준점 갱신
+            state.last_global_fire_at = now
             if doc_chars is not None:
                 # 발동 시점의 문서 길이 기록
                 state.last_fired_doc_chars[selected] = doc_chars
+            trace["selected"] = selected
+            trace["selected_vruntime_before"] = round(current, 4)
+            trace["selected_vruntime_after"] = round(new_vruntime, 4)
             return selected
 
     def snapshot(self, document_key: str, *, now: float | None = None) -> dict[str, Any]:
@@ -241,6 +291,8 @@ class ScenarioScheduler:
             "last_reset_at": state.last_reset_at,
             "last_fired_at": dict(state.last_fired_at),
             "last_fired_doc_chars": dict(state.last_fired_doc_chars),
+            "last_global_fire_at": state.last_global_fire_at,
+            "min_global_fire_interval_sec": self.min_global_fire_interval_sec,
         }
 
     def flush_all(self) -> None:
@@ -359,9 +411,10 @@ class ScenarioScheduler:
         for name, weight in self.weights.items():
             state.vruntimes[name] = weight.initial_vruntime
             state.initial_vruntimes[name] = weight.initial_vruntime
-        # 발동 기록 초기화 → 모든 cooldown 면제
+        # 발동 기록 초기화 → 모든 cooldown 면제 (전역 throttle 포함)
         state.last_fired_at.clear()
         state.last_fired_doc_chars.clear()
+        state.last_global_fire_at = 0.0
         state.last_decay_at = now
         state.last_activity_at = now
         state.last_reset_at = now

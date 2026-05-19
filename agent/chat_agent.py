@@ -8,6 +8,8 @@ from typing import Any, Callable, Iterator
 from core.prompts import (
     SCREEN_INTERVENTION_SYSTEM_PROMPT,
     SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE,
+    SCREEN_SCENARIO_GUIDANCE,
+    SCREEN_SCENARIO_GUIDANCE_DEFAULT,
     SYSTEM_PROMPT,
     TOOL_CHAT_FINAL_PROMPT_TEMPLATE,
     TOOL_CHAT_SYSTEM_PROMPT,
@@ -500,6 +502,10 @@ class ChatAgent:
         with self._conversation_lock:
             query = self._screen_intervention_query(intervention)
             knowledge_context = self._screen_knowledge_context(query)
+            intervention_type = intervention.get("intervention_type") or "none"
+            scenario_guidance = SCREEN_SCENARIO_GUIDANCE.get(
+                intervention_type, SCREEN_SCENARIO_GUIDANCE_DEFAULT
+            )
             prompt = SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE.format(
                 history=self._format_recent_history(),
                 app_context=self._pretty_payload(
@@ -509,6 +515,7 @@ class ChatAgent:
                     self._screen_prompt_writing_context(intervention)
                 ),
                 routing_hint=self._pretty_payload(intervention.get("tool_routing_hint") or {}),
+                scenario_guidance=scenario_guidance,
                 knowledge_context=knowledge_context,
             )
             try:

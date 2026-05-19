@@ -51,6 +51,19 @@ class RAGService:
     def get_document_count(self) -> int:
         return self.vector_store.get_document_count()
 
+    def close(self) -> None:
+        """Release the underlying ChromaDB vector store handles.
+
+        Called when a workspace is switched away from or deleted so its
+        SQLite file handle does not keep the workspace directory locked.
+        """
+        vector_store = getattr(self, "vector_store", None)
+        if vector_store is not None:
+            try:
+                vector_store.close()
+            except Exception:
+                pass
+
     def _format_recent_history(self) -> str:
         if not self.chat_history:
             return "(No previous conversation)"
@@ -125,7 +138,14 @@ class RAGService:
             contents.append(chunk)
             metadatas.append(chunk_metadata)
 
-    def index_autosurvey_output(self, summary_dir: Path, index_path: Path | None = None, clear_first: bool = True) -> int:
+    def index_autosurvey_output(self, clean_md_dir: Path, index_path: Path | None = None, clear_first: bool = True) -> int:
+        """Index a workspace's clean Markdown documents for RAG.
+
+        The RAG answer source is each document's Crawl4AI clean Markdown
+        (``clean_md/<doc_id>.md``), not the lossy per-document summaries — so a
+        retrieved chunk carries the fuller original content. Per-doc summaries
+        stay a separate UX layer and are not indexed here.
+        """
         if clear_first:
             self.clear_index()
 
@@ -143,23 +163,21 @@ class RAGService:
             except Exception as e:
                 print(f"[rag] Warning: Could not load index.json: {e}")
 
-        summary_files = sorted(summary_dir.glob("doc_*.md"))
-        if not summary_files:
-            print("[rag] No summary files found to index")
+        clean_md_files = sorted(clean_md_dir.glob("*.md")) if clean_md_dir else []
+        if not clean_md_files:
+            print("[rag] No clean_md files found to index")
             return 0
 
         doc_ids: list[str] = []
         contents: list[str] = []
         metadatas: list[dict[str, Any]] = []
 
-        for summary_file in summary_files:
-            if "_error" in summary_file.stem:
-                continue
-
-            doc_id = summary_file.stem.replace("doc_", "")
-            content = summary_file.read_text(encoding="utf-8")
-
-            if "Duplicate of:" in content or not content.strip():
+        for clean_md_file in clean_md_files:
+            # clean_md/<doc_id>.md — the stem is the doc_id. Duplicate documents
+            # never get a clean_md file, so there is nothing to skip here.
+            doc_id = clean_md_file.stem
+            content = clean_md_file.read_text(encoding="utf-8")
+            if not content.strip():
                 continue
 
             self._append_chunked_document(

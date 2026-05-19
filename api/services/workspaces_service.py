@@ -138,8 +138,18 @@ def _scan_run_workspaces() -> list[dict[str, Any]]:
         summary_dir = path / "summary"
         final_path = path / "final.md"
         index_path = summary_dir / "index.json"
+        request_path = summary_dir / "request.md"
         has_summaries = summary_dir.exists() and any(summary_dir.glob("doc_*.md"))
-        if not final_path.exists() and not index_path.exists() and not has_summaries:
+        # `request.md` is materialized by `_publish_new_workspace` as soon
+        # as the workspace dir is reserved, so a workspace that's currently
+        # being researched also shows up here (with status="running").
+        has_request = request_path.exists()
+        if (
+            not final_path.exists()
+            and not index_path.exists()
+            and not has_summaries
+            and not has_request
+        ):
             continue
 
         document_count = _document_count(index_path)

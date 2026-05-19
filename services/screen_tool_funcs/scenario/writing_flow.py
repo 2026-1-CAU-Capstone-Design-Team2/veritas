@@ -1,162 +1,24 @@
+"""작성 흐름 기반 시나리오 — 사용자의 타이핑/멈춤/지속 작성 등 글쓰기 행위 자체에서 트리거.
+
+포함 시나리오 (Phase 1-3 도입 기존 5개):
+- IdleAfterWritingScenario: 문단 작성 후 멈춤 → 부드러운 이어쓰기 제안
+- WholeDocumentReviewScenario: 지속 대량 작성 후 멈춤 → 전체 문서 검토 보조
+- LongStaticReviewScenario: 오랜 무편집(읽기) → 교정 + 추가 제안
+- ParagraphChurnScenario: 같은 문단을 작은 편집으로 만지작거리는 막힘 상태 → 대안 표현
+- BlankDocumentStartScenario: 거의 빈 문서를 열고 머무름 → 시작 구조/방향 제안
+
+이 카테고리는 캡처 텍스트 비교(같은 문서 이벤트 윈도우)와 idle/static 패턴 감지가
+공통 분석 도구. ParagraphChurnScenario는 캡처간 diff를 일부 사용하지만, 본질이
+"같은 문단 churn"이라 작성 흐름 카테고리에 둠.
+"""
 from __future__ import annotations
 
 import difflib
-import hashlib
-import re
-import time
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from typing import Any
 
-from .models import FilteredScreenContext, WindowContext
-
-
-def _event_document_key(event: dict[str, Any]) -> str:
-    """Derive document_key from any event shape (current snapshot or disk event)."""
-    direct = str(event.get("document_key") or "").strip()
-    if direct:
-        return direct
-    intervention = event.get("intervention") or {}
-    metadata = intervention.get("metadata") or {}
-    nested = str(metadata.get("document_key") or "").strip()
-    if nested:
-        return nested
-    window = event.get("window") or {}
-    process_name = str(window.get("process_name") or "").lower()
-    title = " ".join(str(window.get("window_title") or "").split()).lower()
-    title = re.sub(r"\s+", " ", title).strip()
-    return f"{process_name}|{title}"
-
-
-def _event_paragraph_fingerprint(event: dict[str, Any]) -> str:
-    direct = str(event.get("paragraph_fingerprint") or "").strip()
-    if direct:
-        return direct
-    intervention = event.get("intervention") or {}
-    metadata = intervention.get("metadata") or {}
-    nested = str(metadata.get("paragraph_fingerprint") or "").strip()
-    if nested:
-        return nested
-    filtered = event.get("filtered") or {}
-    text = str(filtered.get("current_paragraph_text") or "")
-    normalized = " ".join(text.split()).strip().lower()[:500]
-    if not normalized:
-        return ""
-    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
-
-
-@dataclass
-class ScenarioContext:
-    """Snapshot of inputs shared across scenarios within one capture cycle."""
-
-    window: WindowContext
-    filtered: FilteredScreenContext
-    history_events: list[dict[str, Any]]
-    same_document_events: list[dict[str, Any]]
-    document_key: str
-    paragraph_fingerprint: str
-    # 문서 단위 {시나리오명: 마지막 발동 unix_ts}. detector가 scheduler 상태에서
-    # 읽어 채움. 시간 기반 cooldown 게이트가 사용.
-    last_fired_at: dict[str, float] = field(default_factory=dict)
-    # 문서 단위 {시나리오명: 마지막 발동 시점의 정규화 문서 길이}. 
-    # whole_document_review의 "리뷰 이후 추가된 글자 수" 판정에 사용.
-    last_fired_doc_chars: dict[str, int] = field(default_factory=dict)
-
-
-@dataclass
-class ScenarioEvaluation:
-    """Uniform per-scenario evaluation result."""
-
-    name: str
-    ready: bool = False
-    score: float = 0.0
-    priority: str = "low"
-    reasons: list[str] = field(default_factory=list)
-    blockers: list[str] = field(default_factory=list)
-    gate_results: dict[str, dict[str, Any]] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-class ScenarioType(ABC):
-    """Abstract base for intervention scenarios.
-
-    A scenario is a TCB-like object holding its own gate functions, priority,
-    and CFS scheduling parameters. evaluate() returns a uniform
-    ScenarioEvaluation that the detector can compare against others.
-    """
-
-    name: str = ""
-    priority: str = "medium"
-    initial_vruntime: float = 0.0
-    vruntime_increment: float = 1.0
-
-    def __init__(
-        self,
-        *,
-        initial_vruntime: float | None = None,
-        vruntime_increment: float | None = None,
-    ) -> None:
-        if initial_vruntime is not None:
-            self.initial_vruntime = initial_vruntime
-        if vruntime_increment is not None:
-            self.vruntime_increment = vruntime_increment
-
-    @abstractmethod
-    def evaluate(self, context: ScenarioContext) -> ScenarioEvaluation:
-        """Run scenario-specific gates and return a uniform evaluation."""
-
-    def writing_context_overrides(
-        self,
-        *,
-        filtered: FilteredScreenContext,
-        base: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Return partial fields the dispatcher should merge into writing_context.
-
-        Default: no overrides. Subclasses can replace `focus_scope`,
-        `recent_sentences`, `focused_sentence`, etc. when this scenario fires.
-        """
-        return {}
-
-    def tool_routing_hint_overrides(
-        self,
-        *,
-        event: Any,
-        base: dict[str, Any],
-        focused_sentence: str,
-    ) -> dict[str, Any]:
-        """Return partial fields the dispatcher should merge into tool_routing_hint.
-
-        Default: no overrides. Subclasses set `tone`, `preferred_action`, or
-        merge into `signals` when this scenario fires.
-        """
-        return {}
-
-    def _gate_result(
-        self,
-        passed: bool,
-        reason: str,
-        extra: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        result: dict[str, Any] = {"passed": passed, "reason": reason}
-        if extra:
-            for key, value in extra.items():
-                if key in ("passed", "reason"):
-                    continue
-                result[key] = value
-        return result
-
-    def _has_substantial_paragraph(
-        self,
-        filtered: FilteredScreenContext,
-        *,
-        min_chars: int = 20,
-    ) -> bool:
-        """현재 문단(`filtered.current_paragraph_text`)이 `min_chars` 이상인지 판정.
-        문단 단위 시나리오가 자기 게이트로 호출하는 공유 헬퍼.
-        """
-        paragraph = " ".join((filtered.current_paragraph_text or "").split())
-        return len(paragraph) >= min_chars
+from ..models import FilteredScreenContext
+from ._shared import _event_document_key, _event_paragraph_fingerprint
+from .base import ScenarioContext, ScenarioEvaluation, ScenarioType
 
 
 class IdleAfterWritingScenario(ScenarioType):
@@ -175,6 +37,7 @@ class IdleAfterWritingScenario(ScenarioType):
         min_idle_captures: int = 2,
         idle_similarity_threshold: float = 0.985,
         cooldown_events: int = 3,
+        cooldown_min_seconds: float = 60.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -187,17 +50,20 @@ class IdleAfterWritingScenario(ScenarioType):
         self.min_idle_captures = min_idle_captures
         self.idle_similarity_threshold = idle_similarity_threshold
         self.cooldown_events = cooldown_events
+        self.cooldown_min_seconds = cooldown_min_seconds
 
     def evaluate(self, context: ScenarioContext) -> ScenarioEvaluation:
         evaluation = ScenarioEvaluation(name=self.name, priority=self.priority)
 
         typing_pause = self._typing_pause_status(context.same_document_events)
         typing_pause_passed = bool(typing_pause.get("ready"))
-        cooldown_passed = self._passes_paragraph_cooldown(
-            history_events=context.history_events,
-            document_key=context.document_key,
-            paragraph_fingerprint=context.paragraph_fingerprint,
-        )
+        # paragraph_cooldown(`_passes_paragraph_cooldown`) 게이트는 의도적으로
+        # 평가에서 제외 — `time_cooldown`(60s)이 같은 시나리오의 재발화를 이미
+        # 막아주고, paragraph fingerprint 기반 윈도우(`cooldown_events`)는 같은
+        # 문단에 머무는 동안 사실상 영구 차단으로 동작해 "최빈도 2번 후 침묵"
+        # 증상의 원인이었다. 메서드/필드는 보존하므로 필요 시 재활성화 가능.
+        time_cooldown = self._time_cooldown_status(context.last_fired_at)
+        time_cooldown_passed = bool(time_cooldown.get("passed"))
         # 현재 문단 길이 게이트 — 문단 단위 시나리오가 자기 책임으로 확인
         paragraph_chars = len(
             " ".join((context.filtered.current_paragraph_text or "").split())
@@ -212,14 +78,10 @@ class IdleAfterWritingScenario(ScenarioType):
                 "typing_pause_satisfied" if typing_pause_passed else "not_paused_after_typing",
                 typing_pause,
             ),
-            "paragraph_cooldown": self._gate_result(
-                cooldown_passed,
-                "cooldown_dedupe_passed" if cooldown_passed else "cooldown_or_duplicate",
-                {
-                    "cooldown_events": self.cooldown_events,
-                    "document_key": context.document_key,
-                    "paragraph_fingerprint": context.paragraph_fingerprint,
-                },
+            "time_cooldown": self._gate_result(
+                time_cooldown_passed,
+                "time_cooldown_passed" if time_cooldown_passed else "time_cooldown_active",
+                time_cooldown,
             ),
             "substantial_paragraph": self._gate_result(
                 substantial_paragraph_passed,
@@ -231,17 +93,20 @@ class IdleAfterWritingScenario(ScenarioType):
             ),
         }
 
+        # typing_pause 점수 0.8 = 기존 0.5(typing_pause) + 0.3(paragraph_cooldown 흡수).
+        # priority="high" 임계 0.7 을 그대로 유지하면서 paragraph_cooldown 게이트
+        # 제거로 인한 점수 회귀를 방지.
         if typing_pause_passed:
-            evaluation.score += 0.5
+            evaluation.score += 0.8
             evaluation.reasons.append("typing_pause_satisfied")
         else:
             evaluation.blockers.append("not_paused_after_typing")
 
-        if cooldown_passed:
-            evaluation.score += 0.3
-            evaluation.reasons.append("cooldown_dedupe_passed")
+        # 시간 cooldown은 prereq: 점수 없이 blocker에만 기여
+        if time_cooldown_passed:
+            evaluation.reasons.append("time_cooldown_passed")
         else:
-            evaluation.blockers.append("cooldown_or_duplicate")
+            evaluation.blockers.append("time_cooldown_active")
 
         # 점수 없는 순수 prerequisite: blocker에만 기여
         if substantial_paragraph_passed:
@@ -251,7 +116,7 @@ class IdleAfterWritingScenario(ScenarioType):
 
         evaluation.ready = not evaluation.blockers
         evaluation.priority = "high" if evaluation.ready and evaluation.score >= 0.7 else "medium"
-        evaluation.metadata = {"typing_pause": typing_pause}
+        evaluation.metadata = {"typing_pause": typing_pause, "time_cooldown": time_cooldown}
         return evaluation
 
     def writing_context_overrides(
@@ -340,6 +205,9 @@ class IdleAfterWritingScenario(ScenarioType):
         document_key: str,
         paragraph_fingerprint: str,
     ) -> bool:
+        """[Deprecated] paragraph fingerprint 기반 dedupe. `evaluate()` 에서 호출
+        하지 않는다 — `time_cooldown`(60s) 으로 통합됨. 같은 문단 윈도우 안에서
+        영구 차단으로 작동하는 부작용 때문에 비활성. 필요 시 재활성화 가능."""
         if not paragraph_fingerprint:
             return False
         for event in reversed(history_events[-self.cooldown_events:]):
@@ -623,10 +491,13 @@ class WholeDocumentReviewScenario(ScenarioType):
         last_fired_doc_chars: dict[str, int],
         current_chars: int,
     ) -> dict[str, Any]:
-        """직전 발동 시각(`last_fired_at`)과 그 시점의 문서 길이
-        (`last_fired_doc_chars`)를 받아, 경과 시간이 `cooldown_min_seconds`
-        이상이고 추가된 글자 수가 `cooldown_min_added_chars` 이상이면 통과.
+        """직전 발동 시각(`last_fired_at`)과 그 시점의 문서 길이(`last_fired_doc_chars`)를
+        받아, 경과 시간이 `cooldown_min_seconds` 이상이고 추가된 글자 수가
+        `cooldown_min_added_chars` 이상이면 통과시키는 시간+글자수 결합 cooldown.
+        WholeDocumentReview만 이 형태를 쓰며, 다른 시나리오는 base의 `_time_cooldown_status` 사용.
         """
+        import time as _time
+
         last_at = last_fired_at.get(self.name)
         if last_at is None:
             return {
@@ -638,7 +509,7 @@ class WholeDocumentReviewScenario(ScenarioType):
 
         previous_chars = last_fired_doc_chars.get(self.name, 0)
         added_chars = max(current_chars - previous_chars, 0)
-        elapsed_seconds = max(time.time() - last_at, 0.0)
+        elapsed_seconds = max(_time.time() - last_at, 0.0)
         time_ok = elapsed_seconds >= self.cooldown_min_seconds
         chars_ok = added_chars >= self.cooldown_min_added_chars
         passed = time_ok and chars_ok
@@ -707,7 +578,7 @@ class LongStaticReviewScenario(ScenarioType):
 
         static = self._prolonged_static_status(context.same_document_events)
         static_passed = bool(static.get("passed"))
-        cooldown = self._review_cooldown_status(context.last_fired_at)
+        cooldown = self._time_cooldown_status(context.last_fired_at)
         cooldown_passed = bool(cooldown.get("passed"))
 
         evaluation.gate_results = {
@@ -836,27 +707,6 @@ class LongStaticReviewScenario(ScenarioType):
             "min_document_chars": self.min_document_chars,
         }
 
-    def _review_cooldown_status(self, last_fired_at: dict[str, float]) -> dict[str, Any]:
-        """`last_fired_at[self.name]`(직전 발동 시각)과 현재 시각을 비교해,
-        경과가 `cooldown_min_seconds` 이상이면 통과시키는 시간 기반 cooldown.
-        """
-        last_at = last_fired_at.get(self.name)
-        if last_at is None:
-            return {
-                "passed": True,
-                "reason": "no_prior_review",
-                "min_seconds": self.cooldown_min_seconds,
-            }
-
-        elapsed_seconds = max(time.time() - last_at, 0.0)
-        passed = elapsed_seconds >= self.cooldown_min_seconds
-        return {
-            "passed": passed,
-            "reason": "ok" if passed else "cooldown_active",
-            "elapsed_seconds": round(elapsed_seconds, 1),
-            "min_seconds": self.cooldown_min_seconds,
-        }
-
     def _normalized_active_text(self, event: dict[str, Any]) -> str:
         filtered = event.get("filtered") or {}
         text = str(filtered.get("active_editor_text") or "")
@@ -917,7 +767,7 @@ class ParagraphChurnScenario(ScenarioType):
 
         churn = self._small_churn_status(context.same_document_events)
         churn_passed = bool(churn.get("passed"))
-        cooldown = self._churn_cooldown_status(context.last_fired_at)
+        cooldown = self._time_cooldown_status(context.last_fired_at)
         cooldown_passed = bool(cooldown.get("passed"))
         # 문단 단위 시나리오의 공유 prereq — 현재 문단이 개입할 만큼 충분한 길이인지
         substantial_passed = self._has_substantial_paragraph(
@@ -1035,24 +885,6 @@ class ParagraphChurnScenario(ScenarioType):
             "max_net_change": self.max_net_change,
         }
 
-    def _churn_cooldown_status(self, last_fired_at: dict[str, float]) -> dict[str, Any]:
-        """`last_fired_at[self.name]`과 현재 시각을 비교하는 시간 기반 cooldown."""
-        last_at = last_fired_at.get(self.name)
-        if last_at is None:
-            return {
-                "passed": True,
-                "reason": "no_prior_fire",
-                "min_seconds": self.cooldown_min_seconds,
-            }
-        elapsed_seconds = max(time.time() - last_at, 0.0)
-        passed = elapsed_seconds >= self.cooldown_min_seconds
-        return {
-            "passed": passed,
-            "reason": "ok" if passed else "cooldown_active",
-            "elapsed_seconds": round(elapsed_seconds, 1),
-            "min_seconds": self.cooldown_min_seconds,
-        }
-
     def _normalized_active_text(self, event: dict[str, Any]) -> str:
         filtered = event.get("filtered") or {}
         text = str(filtered.get("active_editor_text") or "")
@@ -1094,7 +926,7 @@ class BlankDocumentStartScenario(ScenarioType):
 
         blank = self._near_empty_status(context.same_document_events)
         blank_passed = bool(blank.get("passed"))
-        cooldown = self._start_cooldown_status(context.last_fired_at)
+        cooldown = self._time_cooldown_status(context.last_fired_at)
         cooldown_passed = bool(cooldown.get("passed"))
 
         evaluation.gate_results = {
@@ -1178,24 +1010,6 @@ class BlankDocumentStartScenario(ScenarioType):
             "min_blank_captures": self.min_blank_captures,
             "current_text_chars": last_chars,
             "max_document_chars": self.max_document_chars,
-        }
-
-    def _start_cooldown_status(self, last_fired_at: dict[str, float]) -> dict[str, Any]:
-        """`last_fired_at[self.name]`과 현재 시각을 비교하는 시간 기반 cooldown."""
-        last_at = last_fired_at.get(self.name)
-        if last_at is None:
-            return {
-                "passed": True,
-                "reason": "no_prior_fire",
-                "min_seconds": self.cooldown_min_seconds,
-            }
-        elapsed_seconds = max(time.time() - last_at, 0.0)
-        passed = elapsed_seconds >= self.cooldown_min_seconds
-        return {
-            "passed": passed,
-            "reason": "ok" if passed else "cooldown_active",
-            "elapsed_seconds": round(elapsed_seconds, 1),
-            "min_seconds": self.cooldown_min_seconds,
         }
 
     def _normalized_active_text(self, event: dict[str, Any]) -> str:

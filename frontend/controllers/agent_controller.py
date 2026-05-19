@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Iterator
 
 from ..api_common import api_client
+
+
+# An AutoSurvey run blocks the POST /research/jobs request for the whole
+# workflow (the route is synchronous by design). Allow a long ceiling so a
+# normal multi-document run on a local model is not cut off mid-run by the
+# default request timeout — the run continues server-side regardless, but a
+# client-side timeout would surface as a spurious "오류" in the UI.
+RESEARCH_JOB_TIMEOUT_SEC = float(os.getenv("VERITAS_RESEARCH_JOB_TIMEOUT_SEC", "5400"))
 
 
 class AgentController:
@@ -52,14 +61,25 @@ class AgentController:
 		workspace_id: str,
 		instruction: str,
 		reference_urls: list[str],
+		max_docs: int | None = None,
+		scout_docs: int | None = None,
+		collect_batch_size: int | None = None,
 	) -> dict[str, Any]:
+		payload: dict[str, Any] = {
+			"workspaceId": workspace_id,
+			"instruction": instruction,
+			"referenceUrls": reference_urls,
+		}
+		if max_docs is not None:
+			payload["maxDocs"] = int(max_docs)
+		if scout_docs is not None:
+			payload["scoutDocs"] = int(scout_docs)
+		if collect_batch_size is not None:
+			payload["collectBatchSize"] = int(collect_batch_size)
 		return api_client.post(
 			"/api/v1/research/jobs",
-			{
-				"workspaceId": workspace_id,
-				"instruction": instruction,
-				"referenceUrls": reference_urls,
-			},
+			payload,
+			timeout=RESEARCH_JOB_TIMEOUT_SEC,
 		)
 
 	def list_research_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -77,6 +97,18 @@ class AgentController:
 
 	def get_feedback_result(self, file_id: str) -> dict[str, Any]:
 		return api_client.get(f"/api/v1/feedback/results/{file_id}")
+
+	def update_document_tools(self, custom_tools: list[dict[str, str]]) -> dict[str, Any]:
+		return api_client.put(
+			"/api/v1/settings/document-tools",
+			{"customTools": custom_tools},
+		)
+
+	def update_research_method(self, sample_count: int, plan_count: int) -> dict[str, Any]:
+		return api_client.put(
+			"/api/v1/settings/research-method",
+			{"sampleCount": int(sample_count), "planCount": int(plan_count)},
+		)
 
 	def get_document_summary(self, workspace_id: str) -> str:
 		response = api_client.get(f"/api/v1/documents/{workspace_id}/summary")

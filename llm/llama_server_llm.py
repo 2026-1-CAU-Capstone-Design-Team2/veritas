@@ -66,6 +66,11 @@ class LLMClient:
             raise RuntimeError("No models available from llama-server.")
         self.model = models[0].id
 
+        # Detect the server's context window so downstream tools can size their
+        # input budgets to the model instead of guessing with a fixed default.
+        self.n_ctx = self._detect_n_ctx(host, port)
+        print(f"[llm] model={self.model} n_ctx={self.n_ctx}")
+
         # Embedding client. If only one embedding endpoint arg is provided,
         # inherit the missing value from chat endpoint.
         resolved_embed_host = embed_host or host
@@ -89,6 +94,29 @@ class LLMClient:
         self.stream_summary = stream_summary
         self.stream_reasoning = stream_reasoning
         self.trace_latency = trace_latency
+
+    def _detect_n_ctx(self, host: str, port: int, *, default: int = 8192) -> int:
+        """Query llama-server /props for the context window size, in tokens.
+
+        Falls back to a conservative default when the endpoint is unavailable
+        (e.g. a non-llama-server OpenAI-compatible backend).
+        """
+        try:
+            response = httpx.get(f"http://{host}:{port}/props", timeout=5.0)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            return default
+
+        generation_settings = payload.get("default_generation_settings") or {}
+        for value in (payload.get("n_ctx"), generation_settings.get("n_ctx")):
+            try:
+                n_ctx = int(value)
+            except (TypeError, ValueError):
+                continue
+            if n_ctx > 0:
+                return n_ctx
+        return default
 
     def ask(
         self,
@@ -736,17 +764,25 @@ class LLMClient:
                         all_embeddings.append(response.data[0].embedding)
                     except Exception as fallback_error:
                         fallback_failed = True
+                        # Surface the underlying server error verbatim — the
+                        # generic wrapper alone hides the actual cause (e.g. a
+                        # 500 "input is too large to process. increase the
+                        # physical batch size" when the embedding server's
+                        # -b / -ub is smaller than the longest input).
                         raise RuntimeError(
                             "Embedding request failed. "
                             f"endpoint={self.embed_base_url}, model={self.embed_model}. "
-                            "If llama-server is separate for embeddings, run with --embeddings "
-                            "and pass --embed-port (and optionally --embed-host)."
+                            f"Underlying error: {type(fallback_error).__name__}: {fallback_error}. "
+                            "If a separate embedding server is used, confirm it is started "
+                            "with --embeddings and that its physical batch size (-b / -ub) "
+                            "is large enough for the longest input chunk."
                         ) from fallback_error
 
                 if fallback_failed:
                     raise RuntimeError(
                         "Embedding batch request failed. "
-                        f"endpoint={self.embed_base_url}, model={self.embed_model}"
+                        f"endpoint={self.embed_base_url}, model={self.embed_model}. "
+                        f"Underlying error: {type(e).__name__}: {e}"
                     ) from e
 
         if self.trace_latency:

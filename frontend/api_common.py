@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Iterator
-from uuid import uuid4
+
+import httpx
 
 
-API_BASE_URL = os.getenv("VERITAS_API_BASE_URL", "http://127.0.0.1:8000")
+API_BASE_URL = os.getenv("VERITAS_API_BASE_URL", "http://127.0.0.1:8001")
+
+# Default per-request ceiling. AutoSurvey and the chat stream pass their own
+# longer timeouts; everything else inherits this.
+_DEFAULT_TIMEOUT = 600.0
 
 STATE: dict[str, object] = {
     "current_workspace_id": "default",
@@ -32,6 +35,17 @@ STATE: dict[str, object] = {
         "localAccess": {
             "folderPaths": [],
         },
+        "documentTools": {
+            "custom": [],
+        },
+        # AutoSurvey pacing (설정 > 고급 설정 > 조사 진행 방식). The real values
+        # come from the backend via /fe/bootstrap — load_bootstrap_state()
+        # replaces STATE["settings"] wholesale, so this default only seeds the
+        # pre-bootstrap window.
+        "research": {
+            "sampleCount": 3,
+            "planCount": 5,
+        },
     },
 }
 
@@ -41,37 +55,42 @@ class ApiError(RuntimeError):
 
 
 class ApiClient:
+    """HTTP client for the local VERITAS API.
+
+    Backed by a single shared :class:`httpx.Client`, so TCP connections are
+    pooled and kept alive across calls instead of paying a fresh connection per
+    request. ``httpx.Client`` is safe to share across threads, which matters
+    here: the frontend issues requests from several worker threads (chat
+    stream, progress poller, detached loaders).
+    """
+
     def __init__(self, base_url: str = API_BASE_URL) -> None:
         self.base_url = base_url.rstrip("/")
+        # follow_redirects mirrors urllib's default behaviour (FastAPI 307s on
+        # trailing-slash mismatches); httpx does not follow redirects otherwise.
+        self._client = httpx.Client(
+            timeout=_DEFAULT_TIMEOUT, follow_redirects=True
+        )
 
     def get(self, path: str, query: dict[str, Any] | None = None) -> dict[str, Any]:
-        url = self._url(path, query)
-        request = urllib.request.Request(url, method="GET")
-        return self._send_json(request)
+        return self._request_json("GET", self._url(path, query))
 
-    def post(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        data = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            self._url(path),
-            data=data,
-            method="POST",
-            headers={"Content-Type": "application/json"},
+    def post(
+        self,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        return self._request_json(
+            "POST", self._url(path), payload=payload, timeout=timeout
         )
-        return self._send_json(request)
 
     def delete(self, path: str, query: dict[str, Any] | None = None) -> dict[str, Any]:
-        request = urllib.request.Request(self._url(path, query), method="DELETE")
-        return self._send_json(request)
+        return self._request_json("DELETE", self._url(path, query))
 
     def put(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        data = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            self._url(path),
-            data=data,
-            method="PUT",
-            headers={"Content-Type": "application/json"},
-        )
-        return self._send_json(request)
+        return self._request_json("PUT", self._url(path), payload=payload)
 
     def stream_post_sse(
         self,
@@ -83,96 +102,120 @@ class ApiClient:
         Server-Sent Events format: 'event: <name>\\ndata: <json>\\n\\n'.
         Non-JSON data lines are yielded with the raw string under data['_raw'].
         """
-        data = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            self._url(path),
-            data=data,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-            },
-        )
+        data = json.dumps(payload or {}, ensure_ascii=False)
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
         try:
-            response = urllib.request.urlopen(request, timeout=600)
-        except urllib.error.HTTPError as e:
-            raw = e.read().decode("utf-8", errors="ignore")
-            raise ApiError(self._error_message(raw) or f"HTTP {e.code}") from e
+            with self._client.stream(
+                "POST",
+                self._url(path),
+                content=data,
+                headers=headers,
+                timeout=600.0,
+            ) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    raise ApiError(
+                        self._error_message(response.text)
+                        or f"HTTP {response.status_code}"
+                    )
+                event_name = "message"
+                data_buffer: list[str] = []
+                for line in response.iter_lines():
+                    text = line.rstrip("\r\n")
+                    if text == "":
+                        if data_buffer:
+                            raw_data = "\n".join(data_buffer)
+                            try:
+                                decoded: dict[str, Any] = json.loads(raw_data)
+                                if not isinstance(decoded, dict):
+                                    decoded = {"value": decoded}
+                            except json.JSONDecodeError:
+                                decoded = {"_raw": raw_data}
+                            yield event_name, decoded
+                        event_name = "message"
+                        data_buffer = []
+                        continue
+                    if text.startswith(":"):
+                        continue
+                    if text.startswith("event:"):
+                        event_name = text[len("event:") :].strip() or "message"
+                    elif text.startswith("data:"):
+                        data_buffer.append(text[len("data:") :].lstrip())
+        except ApiError:
+            raise
         except Exception as e:
             raise ApiError(str(e)) from e
 
-        with response:
-            event_name = "message"
-            data_buffer: list[str] = []
-            while True:
-                line = response.readline()
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").rstrip("\r\n")
-                if text == "":
-                    if data_buffer:
-                        raw_data = "\n".join(data_buffer)
-                        try:
-                            decoded: dict[str, Any] = json.loads(raw_data)
-                            if not isinstance(decoded, dict):
-                                decoded = {"value": decoded}
-                        except json.JSONDecodeError:
-                            decoded = {"_raw": raw_data}
-                        yield event_name, decoded
-                    event_name = "message"
-                    data_buffer = []
-                    continue
-                if text.startswith(":"):
-                    continue
-                if text.startswith("event:"):
-                    event_name = text[len("event:") :].strip() or "message"
-                elif text.startswith("data:"):
-                    data_buffer.append(text[len("data:") :].lstrip())
-
     def upload_files(self, path: str, files: list[Path]) -> dict[str, Any]:
-        boundary = f"----veritas-{uuid4().hex}"
-        body = bytearray()
-        for file_path in files:
-            name = file_path.name
-            body.extend(f"--{boundary}\r\n".encode("utf-8"))
-            body.extend(
-                (
-                    'Content-Disposition: form-data; name="files"; '
-                    f'filename="{name}"\r\n'
-                    "Content-Type: application/octet-stream\r\n\r\n"
-                ).encode("utf-8")
+        # httpx builds the multipart/form-data body (boundary, headers) itself.
+        file_parts = [
+            (
+                "files",
+                (file_path.name, file_path.read_bytes(), "application/octet-stream"),
             )
-            body.extend(file_path.read_bytes())
-            body.extend(b"\r\n")
-        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
-        request = urllib.request.Request(
-            self._url(path),
-            data=bytes(body),
-            method="POST",
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        )
-        return self._send_json(request)
+            for file_path in files
+        ]
+        try:
+            response = self._client.post(self._url(path), files=file_parts)
+        except Exception as e:
+            raise ApiError(str(e)) from e
+        return self._handle_response(response)
 
     def _url(self, path: str, query: dict[str, Any] | None = None) -> str:
+        from urllib.parse import quote, urlencode
+
         normalized = path if path.startswith("/") else f"/{path}"
+        # Percent-encode the path so non-ASCII segments are transmitted safely.
+        # Workspace ids come from term-grounding and are typically Korean (e.g.
+        # /api/v1/workspaces/<한글 id>). `safe="/"` keeps the path separators
+        # intact, and FastAPI/Starlette percent-decodes path params on the way
+        # in, so the route still sees the original id. Plain-ASCII paths are
+        # unaffected (quote is a no-op), and httpx leaves existing %XX escapes
+        # alone rather than double-encoding them.
+        normalized = quote(normalized, safe="/")
         url = f"{self.base_url}{normalized}"
         if not query:
             return url
-        from urllib.parse import urlencode
-
         cleaned = {k: v for k, v in query.items() if v is not None}
         return f"{url}?{urlencode(cleaned)}" if cleaned else url
 
-    def _send_json(self, request: urllib.request.Request) -> dict[str, Any]:
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        content: str | None = None
+        headers: dict[str, str] = {}
+        if method in ("POST", "PUT"):
+            # Match the previous behaviour: POST/PUT always send a JSON body,
+            # even an empty {}. ensure_ascii=False keeps Korean readable on the
+            # wire (the server decodes either form correctly).
+            content = json.dumps(payload or {}, ensure_ascii=False)
+            headers["Content-Type"] = "application/json"
         try:
-            with urllib.request.urlopen(request, timeout=600) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as e:
-            raw = e.read().decode("utf-8", errors="ignore")
-            raise ApiError(self._error_message(raw) or f"HTTP {e.code}") from e
+            response = self._client.request(
+                method,
+                url,
+                content=content,
+                headers=headers,
+                timeout=timeout or _DEFAULT_TIMEOUT,
+            )
         except Exception as e:
             raise ApiError(str(e)) from e
+        return self._handle_response(response)
 
+    def _handle_response(self, response: httpx.Response) -> dict[str, Any]:
+        raw = response.text
+        if response.status_code >= 400:
+            raise ApiError(
+                self._error_message(raw) or f"HTTP {response.status_code}"
+            )
         if not raw.strip():
             return {}
         try:
@@ -234,10 +277,17 @@ def load_bootstrap_state() -> dict[str, Any]:
 
 
 def current_workspace_id() -> str:
-    try:
-        load_bootstrap_state()
-    except Exception:
-        pass
+    """Return the cached current workspace id — never blocks.
+
+    This is read on the UI thread on every page navigation and message send, so
+    it must not do I/O. The cache is seeded at startup (``frontend.ui.main``
+    calls :func:`load_bootstrap_state` before the window opens) and kept fresh
+    afterwards by :func:`switch_workspace` and the explicit
+    :func:`load_bootstrap_state` calls that follow every workspace-mutating
+    operation (research completion, workspace creation/deletion). Callers that
+    must see a guaranteed-fresh value should call :func:`load_bootstrap_state`
+    on a worker thread first.
+    """
     return str(STATE.get("current_workspace_id") or "default")
 
 

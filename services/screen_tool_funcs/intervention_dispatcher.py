@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 
 from .models import ScreenContextEvent
-from .scenarios import ScenarioType
+from .scenario import ScenarioType
 from .store import ScreenContextStore
 
 

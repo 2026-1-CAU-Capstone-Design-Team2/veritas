@@ -20,7 +20,13 @@ from PySide6.QtWidgets import (
 
 from ..api_common import ApiError, current_workspace_id
 from ..components.cards import CardWidget
-from ..controllers import AgentController, JobCategory, get_chat_bus, get_job_manager
+from ..controllers import (
+	AgentController,
+	JobCategory,
+	get_chat_bus,
+	get_job_manager,
+	get_screen_event_store,
+)
 from ..components.stepper import WorkflowStepper
 from .pages.dashboard_page import DashboardPage
 from .pages.document_page import DocumentPage
@@ -33,7 +39,7 @@ from .pages.verify_page import VerifyPage
 from .pages.write_page import WritePage
 
 from .sidebar import Sidebar
-from .windows.document_assist_window import DocumentAssistWindow
+from .windows.document_assist_window import DocumentAssistWindow, render_history_html
 
 
 class ScreenEventPollWorker(QThread):
@@ -122,7 +128,7 @@ class PlaceholderPage(QWidget):
 
 
 class MainWindow(QMainWindow):
-	STEP_ORDER = ["research", "verify", "draft", "document_assist", "write", "document", "feedback"]
+	STEP_ORDER = ["research", "document", "verify", "draft", "document_assist", "write", "feedback"]
 
 	def __init__(self) -> None:
 		super().__init__()
@@ -183,7 +189,7 @@ class MainWindow(QMainWindow):
 		self.assist_toggle_button.clicked.connect(self.toggle_document_assist_window)
 		top_hero_layout.addWidget(self.assist_toggle_button, 0, Qt.AlignTop)
 
-		self.stepper = WorkflowStepper(["조사", "검증", "초안 생성", "문서 보조", "채팅", "문서", "피드백"])
+		self.stepper = WorkflowStepper(["조사", "요약", "검증", "초안 생성", "문서 보조", "채팅", "피드백"])
 
 		self.pages = AnimatedStackedWidget()
 
@@ -192,6 +198,10 @@ class MainWindow(QMainWindow):
 		self.research_page = ResearchPage()
 		self.research_page.workspaceChanged.connect(self.sidebar.set_current_workspace)
 		self.research_page.workspaceChanged.connect(self._on_workspace_changed)
+		# Mid-research workspace switch: light reset so the user sees the
+		# new workspace name in the sidebar and a clean chat panel without
+		# tearing down the active research display.
+		self.research_page.workspaceCreated.connect(self._on_research_workspace_created)
 		self._add_page("research", self.research_page)
 		self._add_page("verify", VerifyPage())
 		self.draft_page = DraftPage()
@@ -221,6 +231,9 @@ class MainWindow(QMainWindow):
 		self.document_assist_window.visibilityChanged.connect(self._on_assist_visibility_changed)
 		self.document_assist_window.hide()
 		self._assist_streaming = False
+		# Monotonic guard for the background history-hydration fetch — see
+		# _hydrate_assist_history_from_backend.
+		self._assist_history_token = 0
 		self._chat_bus.userMessageQueued.connect(self._on_chat_user_queued)
 		self._chat_bus.assistantStreamStarted.connect(self._on_chat_stream_started)
 		self._chat_bus.assistantChunk.connect(self._on_chat_stream_chunk)
@@ -233,6 +246,11 @@ class MainWindow(QMainWindow):
 
 		self._screen_monitor_worker: ScreenEventPollWorker | None = None
 		self._screen_monitor_active = False
+		# screen-monitoring 이벤트 broker — polling worker가 store에 append하면 보조창/페이지가 동시 구독.
+		self._screen_event_store = get_screen_event_store()
+		# 폴링 시작 조건: 보조창 visible OR document_assist 페이지 활성 (count > 0 인 동안 폴링).
+		self._monitor_subscriber_count = 0
+		self._active_route: str | None = None
 
 		self._assist_toggle_shortcut = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
 		self._assist_toggle_shortcut.activated.connect(self.toggle_document_assist_window)
@@ -266,7 +284,8 @@ class MainWindow(QMainWindow):
 		self._screen_monitor_active = True
 		self.document_assist_window.title_bar.status.setText("● 모니터링 중")
 		worker = ScreenEventPollWorker(self._agent_controller, self)
-		worker.eventsReceived.connect(self._on_proactive_events_received)
+		# raw items를 store에 push — 보조창/페이지 위젯이 각자 store.eventsAppended를 구독해 렌더.
+		worker.eventsReceived.connect(self._screen_event_store.append)
 		worker.pollError.connect(self._on_proactive_poll_error)
 		self._screen_monitor_worker = worker
 		worker.start()
@@ -284,22 +303,6 @@ class MainWindow(QMainWindow):
 			self._agent_controller.stop_screen_monitoring()
 		except ApiError:
 			pass
-
-	def _on_proactive_events_received(self, items: list) -> None:
-		for item in items:
-			if not isinstance(item, dict):
-				continue
-			answer = str(item.get("answer") or "").strip()
-			if not answer:
-				continue
-			trigger = str(item.get("triggerText") or "").strip()
-			category = "실시간 보조"
-			text = f"{trigger}\n→ {answer}" if trigger else answer
-			self.document_assist_window.suggestion_list.add_suggestion(
-				category,
-				text,
-				tone="working",
-			)
 
 	def _on_proactive_poll_error(self, message: str) -> None:
 		print(f"[screen_monitoring][poll][warn] {message}")
@@ -320,9 +323,43 @@ class MainWindow(QMainWindow):
 		if visible:
 			if not self._assist_streaming:
 				self._hydrate_assist_history_from_backend()
-			self._start_screen_monitoring()
+			self._increment_monitor_subscriber()
 		else:
+			self._decrement_monitor_subscriber()
+
+	def _increment_monitor_subscriber(self) -> None:
+		"""활성 subscriber 카운트++. 0→1 전이 시 폴링 시작."""
+		self._monitor_subscriber_count += 1
+		if self._monitor_subscriber_count == 1:
+			self._start_screen_monitoring()
+
+	def _decrement_monitor_subscriber(self) -> None:
+		"""활성 subscriber 카운트--. 1→0 전이 시 폴링 중단."""
+		if self._monitor_subscriber_count <= 0:
+			return
+		self._monitor_subscriber_count -= 1
+		if self._monitor_subscriber_count == 0:
 			self._stop_screen_monitoring()
+
+	def _update_monitor_subscriber_for_route(self, new_route: str) -> None:
+		"""라우트 전환 시 document_assist 진입/이탈에 따라 카운트 조정."""
+		if self._active_route == new_route:
+			return
+		if self._active_route == "document_assist":
+			self._decrement_monitor_subscriber()
+		if new_route == "document_assist":
+			self._increment_monitor_subscriber()
+		self._active_route = new_route
+
+	def _restart_screen_monitoring_for_workspace_change(self) -> None:
+		"""워크스페이스 전환 시 backend monitoring을 새 workspace로 재시작.
+		비활성 상태면 아무 동작 안 함 — 다음 활성화 시 새 workspace_id로 자연스럽게 시작.
+		재시작 흐름: stop → worker 종료/대기 → start(new workspace_id) + 새 worker (cursor=0).
+		"""
+		if not self._screen_monitor_active:
+			return
+		self._stop_screen_monitoring()
+		self._start_screen_monitoring()
 
 	def _send_assist_window_message(self, message: str) -> None:
 		mode = self.document_assist_window.input_bar.mode()
@@ -333,11 +370,34 @@ class MainWindow(QMainWindow):
 			)
 
 	def _hydrate_assist_history_from_backend(self) -> None:
-		try:
-			history = self._agent_controller.get_chat_history(current_workspace_id())
-		except ApiError:
-			history = []
-		self.document_assist_window.hydrate_history(history)
+		# Fetch the history AND render its markdown on a worker thread — both the
+		# HTTP round-trip and the per-message parse used to run on the UI thread
+		# every time the assist window was shown.
+		self._assist_history_token += 1
+		token = self._assist_history_token
+		workspace_id = current_workspace_id()
+		controller = self._agent_controller
+
+		def _load() -> list:
+			history = controller.get_chat_history(workspace_id)
+			return render_history_html(history if isinstance(history, list) else [])
+
+		def _apply(prepared: object) -> None:
+			# Drop a stale result: a newer hydrate request, or a chat stream that
+			# started while we were fetching — applying now would clear the live
+			# streaming bubble.
+			if token != self._assist_history_token or self._assist_streaming:
+				return
+			self.document_assist_window.hydrate_history(
+				prepared if isinstance(prepared, list) else []
+			)
+
+		def _failed(_message: str) -> None:
+			if token != self._assist_history_token or self._assist_streaming:
+				return
+			self.document_assist_window.hydrate_history([])
+
+		get_job_manager().run_detached(_load, on_success=_apply, on_error=_failed)
 
 	def _on_chat_user_queued(self, _workspace_id: str, text: str) -> None:
 		# Both views render the user bubble in response to the bus event.
@@ -368,11 +428,53 @@ class MainWindow(QMainWindow):
 		self.document_assist_window.title_bar.status.setText("● 오류")
 
 	def _on_workspace_changed(self, workspace_name: str) -> None:
+		# 워크스페이스 경계: 이전 workspace의 screen 이벤트 잔류 방지 — 양쪽 suggestion_list 동시 reset.
+		self._screen_event_store.clear()
+		# backend monitoring도 새 workspace_id로 재시작 (active 상태에서만).
+		self._restart_screen_monitoring_for_workspace_change()
 		self.settings_page.set_default_workspace_by_name(workspace_name)
 		self.draft_page.set_workspace_by_name(workspace_name)
 		self.research_page.set_workspace_by_name(workspace_name)
 		self.write_page.set_workspace_by_name(workspace_name)
 		self.document_page.refresh()
+
+	def _on_research_workspace_created(self, workspace_id: str, workspace_name: str) -> None:
+		"""Mid-research workspace adoption.
+
+		Unlike :meth:`_on_workspace_changed`, this does NOT call
+		`research_page.set_workspace_by_name` (which would reload the
+		page state from disk and wipe the live DocumentBar timeline). It
+		only touches the surfaces that should reflect the new workspace
+		immediately:
+
+		- bootstrap state cache (so `current_workspace_id()` resolves to
+		  the new id everywhere)
+		- sidebar footer + dropdown
+		- write_page chat panel (cleared because the new workspace has
+		  no chat history yet — and chat is JobManager-blocked during
+		  research so there's no in-flight stream to interrupt)
+		- document_assist window chat panel (same reason)
+		"""
+		try:
+			from ..api_common import load_bootstrap_state
+
+			load_bootstrap_state()
+		except Exception:
+			pass
+		self.sidebar.set_current_workspace(workspace_name)
+
+		self.write_page._workspace_id = workspace_id
+		self.write_page.chat_panel.clear_messages()
+		self.write_page.chat_panel.add_message(
+			"VERITAS",
+			"새 워크스페이스가 준비되었습니다. 조사가 완료되면 대화를 시작할 수 있습니다.",
+			False,
+		)
+
+		self.document_assist_window.hydrate_history([])
+		# 새 워크스페이스: 이전 screen 이벤트 잔류 방지 + backend monitoring 재시작.
+		self._screen_event_store.clear()
+		self._restart_screen_monitoring_for_workspace_change()
 
 	def _toggle_sidebar(self) -> None:
 		start = self.sidebar.width()
@@ -452,7 +554,7 @@ class MainWindow(QMainWindow):
 			"draft": ("초안 생성", "선택한 워크스페이스를 바탕으로 복사 가능한 초안을 생성합니다."),
 			"document_assist": ("문서 보조", "실시간 문서 작성 보조 내용을 확인합니다."),
 			"write": ("AI 채팅", "워크스페이스 기반 AI와 채팅이 가능합니다."),
-			"document": ("문서", "스크랩 합본과 요약본을 검토합니다."),
+			"document": ("요약", "최종 보고서 요약본을 확인합니다."),
 			"feedback": ("문서 피드백", "약한 주장과 저신뢰 문장을 우선 교정합니다."),
 			"settings": ("설정", "모델명과 로컬 접근 폴더를 구성합니다."),
 		}
@@ -473,6 +575,9 @@ class MainWindow(QMainWindow):
 
 		if is_workflow_route:
 			self.stepper.set_current_step(self.STEP_ORDER.index(route))
+
+		# document_assist 페이지 진입/이탈 → polling 활성 카운트 조정.
+		self._update_monitor_subscriber_for_route(route)
 
 	def _build_stylesheet(self) -> str:
 		return """
@@ -538,22 +643,22 @@ class MainWindow(QMainWindow):
 		}
 
 		QFrame#SidebarFooterCard {
-			background-color: rgba(255, 255, 255, 0.06);
-			border: 1px solid rgba(148, 163, 184, 0.24);
+			background-color: rgba(99, 102, 241, 0.18);
+			border: 1px solid rgba(165, 180, 252, 0.55);
 			border-radius: 11px;
 		}
 
 		QLabel#SidebarFooterTitle {
-			color: #E2E8F0;
+			color: #C7D2FE;
 			font-size: 11px;
 			font-weight: 800;
 			letter-spacing: 0.3px;
 		}
 
 		QLabel#SidebarFooterDesc {
-			color: #94A3B8;
-			font-size: 10px;
-			font-weight: 600;
+			color: #F8FAFC;
+			font-size: 14px;
+			font-weight: 700;
 		}
 
 		QPushButton#SidebarWorkspaceButton {
@@ -763,10 +868,12 @@ class MainWindow(QMainWindow):
 			font-weight: 800;
 		}
 
-		QLabel#AssistBubbleText {
+		QTextBrowser#AssistBubbleText {
 			color: #1F2937;
 			font-size: 12px;
 			font-weight: 600;
+			background: transparent;
+			border: none;
 		}
 
 		QFrame#AssistInputBar {
@@ -802,26 +909,32 @@ class MainWindow(QMainWindow):
 			background-color: #2563EB;
 		}
 
-		QToolButton#AssistModeButton {
-			background-color: #F8FAFC;
-			color: #111827;
+		QPushButton#AssistModeButton {
+			background-color: #F1F5F9;
+			color: #475569;
 			border: 1px solid #D1D5DB;
 			border-radius: 11px;
-			padding: 0px 8px;
-			font-size: 12px;
-			font-weight: 850;
+			padding: 0px;
+			font-size: 13px;
+			font-weight: 800;
 		}
 
-		QToolButton#AssistModeButton:hover {
-			background-color: #EEF2FF;
+		QPushButton#AssistModeButton:hover {
+			background-color: #E0E7FF;
 			border-color: #818CF8;
 			color: #3730A3;
 		}
 
-		QToolButton#AssistModeButton::menu-indicator {
-			image: none;
-			width: 0px;
-			height: 0px;
+		QPushButton#AssistModeButton[researchActive="true"] {
+			background-color: #1E3A8A;
+			border-color: #1E3A8A;
+			color: #FFFFFF;
+		}
+
+		QPushButton#AssistModeButton[researchActive="true"]:hover {
+			background-color: #1E40AF;
+			border-color: #1E40AF;
+			color: #FFFFFF;
 		}
 
 		QFrame#ComposerCard {
@@ -1340,5 +1453,92 @@ class MainWindow(QMainWindow):
 			padding: 10px 11px;
 			font-size: 12px;
 			font-weight: 700;
+		}
+
+		QFrame#ResearchCountCard {
+			background-color: #F8FAFC;
+			border: 1px solid #E2E8F0;
+			border-radius: 12px;
+		}
+
+		QFrame#DocCountStepper {
+			background-color: #FFFFFF;
+			border: 1px solid #E2E8F0;
+			border-radius: 22px;
+		}
+
+		QToolButton#StepperButton {
+			background-color: #EEF2FF;
+			border: 1px solid #E0E7FF;
+			border-radius: 16px;
+		}
+
+		QToolButton#StepperButton:hover {
+			background-color: #E0E7FF;
+			border-color: #C7D2FE;
+		}
+
+		QToolButton#StepperButton:pressed {
+			background-color: #C7D2FE;
+		}
+
+		QToolButton#StepperButton:disabled {
+			background-color: #F1F5F9;
+			border-color: #E2E8F0;
+		}
+
+		QLineEdit#StepperValue {
+			font-size: 15px;
+			font-weight: 800;
+			color: #0F172A;
+			background: transparent;
+			border: none;
+			padding: 0px;
+		}
+
+		QLineEdit#StepperValue:focus {
+			background: #EEF2FF;
+			border-radius: 6px;
+		}
+
+		QLabel#StepperUnit {
+			font-size: 13px;
+			font-weight: 700;
+			color: #64748B;
+		}
+
+		QLabel#ResearchCountTitle {
+			font-size: 13px;
+			font-weight: 800;
+			color: #0F172A;
+		}
+
+		QLabel#ResearchCountHint {
+			font-size: 11px;
+			font-weight: 600;
+			color: #94A3B8;
+		}
+
+		QLabel#ToolChip {
+			background-color: #EEF2FF;
+			color: #3730A3;
+			border: 1px solid #C7D2FE;
+			border-radius: 13px;
+			padding: 5px 12px;
+			font-size: 11px;
+			font-weight: 700;
+		}
+
+		QFrame#DocToolAddRow {
+			background-color: #F8FAFC;
+			border: 1px solid #E2E8F0;
+			border-radius: 12px;
+		}
+
+		QLabel#FieldLabel {
+			font-size: 11px;
+			font-weight: 700;
+			color: #64748B;
+			letter-spacing: 0.2px;
 		}
 		"""

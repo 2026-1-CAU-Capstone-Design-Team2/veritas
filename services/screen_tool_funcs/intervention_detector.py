@@ -7,7 +7,7 @@ from typing import Any
 
 from .models import FilteredScreenContext, InterventionDecision, WindowContext
 from .scenario_scheduler import ScenarioScheduler, ScenarioWeights
-from .scenarios import (
+from .scenario import (
     IdleAfterWritingScenario,
     ScenarioContext,
     ScenarioEvaluation,
@@ -127,6 +127,35 @@ class InterventionDetector:
         }
 
         common_blockers = [name for name, check in common_checks.items() if not check["passed"]]
+
+        # Blank-document escape: stable_paragraph(+ dwell)가 유일하게 막힌 게이트이고
+        # 현재 캡처가 정말로 빈 문서면 fan-out 을 허용한다. BlankDocumentStartScenario
+        # 처럼 "텍스트가 없다"는 상태 자체를 트리거로 쓰는 시나리오는
+        #   - stable_paragraph 게이트: source="" → False
+        #   - dwell 게이트: 새 문서로 막 들어오면 history_count<min_history_count
+        # 두 게이트에서 동시에 막혀 평가조차 안 됐다. editing_app 이 막힌 경우는
+        # editor 자체가 아니므로 escape 대상 아님.
+        #
+        # dwell 까지 풀어도 너무 일찍 발화하지 않는 이유:
+        # BlankDocumentStartScenario._near_empty_status 가 자체적으로
+        # min_blank_captures(=3) 만큼 연속 빈 캡처를 요구한다. 다른 시나리오들은
+        # 어차피 빈 텍스트에서 ready 조건을 충족하지 못한다.
+        blank_document_allowed = False
+        escapable_gates = {"stable_paragraph", "dwell"}
+        if common_blockers and set(common_blockers).issubset(escapable_gates):
+            active_text = " ".join((filtered.active_editor_text or "").split())
+            paragraph_text = " ".join((filtered.current_paragraph_text or "").split())
+            no_source = not (filtered.current_paragraph_source or "")
+            # 30 = BlankDocumentStartScenario.max_document_chars default
+            if no_source and len(active_text) <= 30 and len(paragraph_text) == 0:
+                blank_document_allowed = True
+                for gate_name in common_blockers:
+                    check = common_checks[gate_name]
+                    check["passed"] = True
+                    check["reason"] = "blank_document_allowed"
+                    check["blank_document_allowed"] = True
+                common_blockers = []
+
         if common_blockers:
             return InterventionDecision(
                 should_consider_llm=False,
@@ -141,6 +170,7 @@ class InterventionDetector:
                     "blockers": common_blockers,
                     "selected": None,
                     "scheduler": None,
+                    "scheduler_trace": None,
                 },
             )
 
@@ -177,15 +207,18 @@ class InterventionDetector:
 
         ready_names = [name for name, ev in scenario_results.items() if ev.ready]
         scheduler_snapshot: dict[str, Any] | None = None
+        scheduler_trace: dict[str, Any] | None = None
         selected_name: str | None = None
         if schedule and ready_names and self.scheduler is not None:
             # 발동 시점의 정규화 문서 길이 — 글자수 기반 cooldown 판정용
             doc_chars = len(" ".join((filtered.active_editor_text or "").split()))
+            scheduler_trace = {}
             selected_name = self.scheduler.select_and_charge(
                 current_snapshot["document_key"],
                 ready_names,
                 now=now,
                 doc_chars=doc_chars,
+                trace_out=scheduler_trace,
             )
             scheduler_snapshot = self.scheduler.snapshot(
                 current_snapshot["document_key"], now=now
@@ -208,6 +241,9 @@ class InterventionDetector:
 
         if selected_name is None:
             blockers = [f"scenario:{name}:not_ready" for name in scenario_results if not scenario_results[name].ready]
+            # ready 후보가 있었는데 throttle로 막힌 경우, 전역 blocker도 함께 표시
+            if scheduler_trace and scheduler_trace.get("rejected_reason") == "global_throttle":
+                blockers.append("global_throttle_active")
             return InterventionDecision(
                 should_consider_llm=False,
                 intervention_type="none",
@@ -221,6 +257,7 @@ class InterventionDetector:
                     "blockers": blockers,
                     "selected": None,
                     "scheduler": scheduler_snapshot,
+                    "scheduler_trace": scheduler_trace,
                 },
             )
 
@@ -238,6 +275,7 @@ class InterventionDetector:
                 "blockers": [],
                 "selected": selected_name,
                 "scheduler": scheduler_snapshot,
+                "scheduler_trace": scheduler_trace,
             },
         )
 

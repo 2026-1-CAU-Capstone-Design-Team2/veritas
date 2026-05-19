@@ -2,9 +2,9 @@
 
 ## 최신 RAG/문서 표시 동작
 
-- AutoSurvey 완료 후 API runtime은 `RAGService.index_autosurvey_output(summary_dir, index_path)`를 호출해 `summary/doc_*.md`를 chunking하고 embedding server에 batch embedding을 요청합니다.
+- AutoSurvey 완료 후 API runtime은 `RAGService.index_autosurvey_output(clean_md_dir, index_path)`를 호출해 `clean_md/<doc_id>.md`(요약이 아닌 Crawl4AI 정제 원문)를 chunking하고 embedding server에 batch embedding을 요청합니다. 요약은 lossy하므로 RAG 답변 근거는 clean_md에서 가져옵니다.
 - API/CLI 기본 embedding endpoint는 `127.0.0.1:8081/v1/embeddings`입니다.
-- `RunStoreService.index_path`는 `summary/index.json`이며, UI 조사 결과의 문서 제목/링크/문서 수는 이 파일의 records를 기준으로 표시됩니다.
+- `RunStoreService.index_path`는 `summary/index.json`이며, UI 조사 결과의 문서 제목/링크/문서 수는 이 파일의 records 중 **보존 문서(중복 제외)** 를 기준으로 표시됩니다. 중복 record(`duplicate_of` 설정, `dup_*` id)는 같은 URL 재수집을 막기 위해 index.json에 남지만, 사용자에게 보이는 문서 목록·카운트에서는 제외됩니다.
 - `RunStoreService.final_path`는 `final.md`이며, UI 문서 화면의 요약본은 이 markdown 내용을 API가 저장한 workspace document state에서 읽어 표시합니다.
 - API research runtime은 workflow 시작 전에 lightweight term-grounding으로 workspace 이름을 정하고, 곧바로 `runs/<workspace>` 폴더에 `RunStoreService`와 ChromaDB를 생성합니다. Windows에서 열린 `chroma.sqlite3` 때문에 폴더 이동이 실패하지 않도록 pending 폴더 이동을 사용하지 않습니다.
 
@@ -25,20 +25,24 @@
 ```
 services/
 ├── __init__.py
-├── hints.py                        # HTML 힌트 패턴 re-export
-├── rag_service.py                  # RAGService 호환 alias (구현은 tools/rag_tool/)
+├── rag_service.py                  # RAGService: 인덱싱/검색/근거 기반 답변
 │
-├── fetch_webpage_tool_funcs/       # fetch_webpage 도구 전용 함수들
+├── fetch_webpage_tool_funcs/       # fetch_webpage 도구 전용 함수
 │   ├── __init__.py
-│   ├── hints.py                    # HTML 콘텐츠 판별 정규식 패턴
-│   └── html_document_preprocessing.py  # HTML 전처리 함수들
+│   └── crawl4ai_fetch.py           # Crawl4AI HTTP 전용 in-process fetch
 │
-└── run_store_tool_funcs/           # 리서치 실행 상태 관리 서비스
-    ├── __init__.py
-    ├── path_manager.py             # 파일 경로 관리
-    ├── record_serializer.py        # DocRecord 직렬화/역직렬화
-    └── run_store_service.py        # 핵심 상태 관리 서비스
+├── run_store_tool_funcs/           # 리서치 실행 상태 관리 서비스
+│   ├── __init__.py
+│   ├── path_manager.py             # 파일 경로 관리
+│   ├── record_serializer.py        # DocRecord 직렬화/역직렬화
+│   └── run_store_service.py        # 핵심 상태 관리 서비스
+│
+└── screen_tool_funcs/              # 화면 캡처/개입 감지 (screen_context 도구용)
 ```
+
+> 과거의 `services/hints.py`, `fetch_webpage_tool_funcs/hints.py`,
+> `html_document_preprocessing.py`(BeautifulSoup 휴리스틱 추출)는 fetch가
+> Crawl4AI 단일 경로로 전환되면서 제거되었습니다.
 
 ---
 
@@ -68,10 +72,10 @@ class RunStoreService:
     def list_non_duplicate_records(self) -> list[DocRecord]
     def list_duplicate_records(self) -> list[DocRecord]
     
-    # 문서 저장/읽기
-    def write_fetched_record(...) -> None
-    def write_duplicate_record(...) -> None
-    def write_fetch_error_note(...) -> None
+    # 문서 저장/읽기 — write_* 는 doc_id를 인자로 받지 않고, 할당된 id를 반환한다
+    def write_fetched_record(...) -> str    # 보존 문서: 연속 "000","001",...
+    def write_duplicate_record(...) -> str  # 중복: "dup_000",... (doc_*.md 미생성)
+    def write_fetch_error_note(...) -> str  # fetch 실패: "fetch_error_000",...
     def write_document_summary(record, content) -> None
     def write_batch_summary(batch_index, content) -> None
     
@@ -92,45 +96,50 @@ class RunPathManager:
         self.root = Path(root)
         self.corpus_dir = root / "corpus"
         self.raw_html_dir = corpus_dir / "raw_html"
-        self.raw_text_dir = corpus_dir / "raw_text"
+        self.clean_md_dir = root / "clean_md"   # Crawl4AI 정제 Markdown
         self.summary_dir = root / "summary"
         self.vector_dir = root / "chromadb"
         
         # 주요 파일 경로
         self.index_path = summary_dir / "index.json"
-        self.request_path = summary_dir / "request.txt"
+        self.request_path = summary_dir / "request.md"
         self.plan_path = summary_dir / "plan.json"
         self.final_path = root / "final.md"
 ```
 
-**출력 디렉토리 구조**:
+**출력 디렉토리 구조** — 문서 텍스트 산출물은 항상 `.md`입니다 (raw HTML만 `.html`, 구조화 데이터만 `.json`):
 ```
 output_dir/
 ├── final.md                    # 최종 보고서
-├── chromadb/                   # 벡터 저장소
+├── chromadb/                   # 벡터 저장소 (RAG 인덱스는 clean_md 기준)
+├── clean_md/                   # Crawl4AI 정제 Markdown (000.md, 001.md, ...)
+│                               #   = RAG 답변 근거 + per-doc/batch 요약 입력
 ├── corpus/
-│   ├── raw_html/               # 원본 HTML (000.html, 001.html, ...)
-│   └── raw_text/               # 추출된 텍스트 (000.txt, 001.txt, ...)
+│   └── raw_html/               # 원본 HTML 아카이브 (000.html, 001.html, ...)
 └── summary/
-    ├── index.json              # 문서 레코드 인덱스
-    ├── request.txt             # 사용자 요청
+    ├── index.json              # 문서 레코드 인덱스 (보존 문서 + 중복 record)
+    ├── request.md              # 사용자 요청
     ├── plan.json               # 리서치 계획
-    ├── doc_000.md              # 개별 문서 요약
+    ├── timing.json             # 실행 시각/소요 시간 — 완료·재시작 후에도 소요 시간 표시
+    ├── doc_000.md              # 개별 문서 요약 (조사 종료 시 일괄 생성, 보존 문서만)
     ├── doc_001.md
-    ├── batch_001.md            # 배치 요약
+    ├── fetch_error_000.md      # Crawl4AI fetch 실패 노트 (doc_*.md와 번호 분리)
+    ├── batch_001.md            # 배치 요약 (수집 루프 중 clean_md에서 생성)
     └── batch_002.md
 ```
 
+**문서 번호 체계** — `doc_id`는 **보존 문서(성공 fetch · 비중복)에만** 연속 할당됩니다(`000`, `001`, ...). 같은 번호의 `clean_md/<id>.md`, `corpus/raw_html/<id>.html`, `summary/doc_<id>.md`가 한 문서를 가리킵니다. fetch 실패는 `summary/fetch_error_*.md`(별도 네임스페이스 — `doc_*.md`와 번호가 충돌하지 않음), 중복은 `dup_*` id로 `index.json`에만 기록되고 요약 파일을 만들지 않습니다. 따라서 건너뛴 fetch나 중복이 보존 문서의 번호를 밀거나 가로채지 않으며, "수집된 문서 수"는 항상 보존 문서 수(≤ `max_docs`)와 일치합니다.
+
 ---
 
-### 2. `rag_service.py` - RAG 호환 경로
+### 2. `rag_service.py` - RAG 서비스
 
-현재 RAG의 실제 구현은 `tools/rag_tool/RAGTool`로 이동했습니다. 이 파일은 기존 코드의 `from services.rag_service import RAGService` import를 깨지 않기 위한 얇은 호환 계층입니다. 신규 RAG 기능, LLM-facing schema, multi-turn chat tool-use 정책은 `tools/rag_tool/`에서 관리합니다.
-
-수집된 문서를 기반으로 대화형 Q&A를 제공하는 서비스입니다.
+`RAGService`가 인덱싱·검색·쿼리 재작성·근거 기반 답변 생성을 모두 소유합니다.
+`tools/rag_tool/`은 LLM tool-calling용 얇은 `rag_search` 어댑터일 뿐입니다.
+RAG는 요약이 아닌 **clean_md**(`clean_md/<doc_id>.md`)를 인덱싱·검색합니다.
 
 ```python
-class RAGService(RAGTool):
+class RAGService:
     def __init__(
         self,
         llm,                        # LLMClient 인스턴스
@@ -143,8 +152,8 @@ class RAGService(RAGTool):
         max_history_turns: int = 3,
     ):
         
-    # 인덱싱
-    def index_autosurvey_output(summary_dir, index_path, clear_first=True) -> int
+    # 인덱싱 (clean_md 기준 — 요약이 아닌 정제 원문을 RAG 근거로 사용)
+    def index_autosurvey_output(clean_md_dir, index_path, clear_first=True) -> int
     def index_all_markdown(base_dir, clear_first=True) -> int
     def clear_index() -> None
     
@@ -163,35 +172,20 @@ class RAGService(RAGTool):
 
 ---
 
-### 3. `fetch_webpage_tool_funcs/` - HTML 전처리 함수
+### 3. `fetch_webpage_tool_funcs/` - Crawl4AI 페이지 수집
 
-웹페이지에서 본문 콘텐츠를 추출하기 위한 전처리 함수 모음입니다.
+문서 수집은 Crawl4AI HTTP 전용 크롤러 단일 경로입니다. BeautifulSoup 휴리스틱
+추출(`hints.py`, `html_document_preprocessing.py`)은 제거되었습니다.
 
-#### `hints.py` - 콘텐츠 판별 패턴
-
-```python
-# 본문 콘텐츠 힌트 (높은 점수)
-MAIN_CONTENT_HINT = re.compile(
-    r"article|content|post|entry|story|main|markdown|blog|news|body|text",
-    re.IGNORECASE,
-)
-
-# 보일러플레이트 힌트 (감점)
-BOILERPLATE_HINT = re.compile(
-    r"nav|menu|header|footer|sidebar|breadcrumb|share|social|comment|ads|promo",
-    re.IGNORECASE,
-)
-```
-
-#### `html_document_preprocessing.py` - 전처리 함수
+#### `crawl4ai_fetch.py`
 
 | 함수 | 역할 |
 |------|------|
-| `_strip_noise_tags(root)` | 불필요한 태그 제거 (script, nav, footer 등) |
-| `_candidate_nodes(root)` | 본문 후보 노드 선별 (article, main, section 등) |
-| `_content_score(node)` | 노드의 본문 점수 계산 |
-| `_select_main_content_node(root)` | 최적의 본문 노드 선택 |
-| `_extract_meaningful_text(node, max_chars)` | 의미 있는 텍스트만 추출 |
+| `crawl4ai_available()` | `crawl4ai` 패키지 import 가능 여부 |
+| `fetch_with_crawl4ai(url, timeout_sec, max_chars)` | `AsyncHTTPCrawlerStrategy`(브라우저 없음)로 fetch → `DefaultMarkdownGenerator` + `PruningContentFilter`로 clean Markdown 추출. 성공/실패를 `dict`로 반환 |
+
+Crawl4AI가 가져오지 못하는 URL은 실패로 처리되어 수집 대상에서 제외됩니다 —
+따라서 저장되는 모든 문서는 clean Markdown(`clean_md/<doc_id>.md`)으로 보관됩니다.
 
 ---
 
@@ -208,10 +202,10 @@ store = RunStoreService(root="./output")
 store.save_request("AI 윤리에 대한 최신 연구")
 store.save_plan({"search_queries": ["AI ethics", "AI safety"], ...})
 
-# 문서 레코드 관리
+# 문서 레코드 관리 — doc_id는 인자로 받지 않는다. write 시점에 보존 문서
+# 수로 자동 할당("000","001",...)되고, 할당된 id가 반환된다.
 records = store.load_records()
-store.write_fetched_record(
-    doc_id="001",
+doc_id = store.write_fetched_record(
     title="AI Ethics Overview",
     url="https://example.com/ai-ethics",
     ...
@@ -230,8 +224,8 @@ from tools.rag_tool import RAGTool
 vector_store = VectorStore(persist_dir=output_dir / "chromadb")
 rag = RAGTool(llm=llm, vector_store=vector_store)
 
-# 문서 인덱싱
-rag.index_autosurvey_output(summary_dir=output_dir / "summary")
+# 문서 인덱싱 (clean_md 기준)
+rag.index_autosurvey_output(clean_md_dir=output_dir / "clean_md")
 
 # 질문 응답
 answer = rag.answer("AI 윤리의 주요 쟁점은?", stream=True)
@@ -303,8 +297,8 @@ tools/
 
 services/
 ├── run_store_tool_funcs/ ──▶ core/models.DocRecord
-├── rag_service.py ──────────▶ tools/rag_tool.RAGTool (compat alias)
-└── fetch_webpage_tool_funcs/ ──▶ bs4 (BeautifulSoup)
+├── rag_service.py ──────────▶ storage/vector_store.VectorStore (ChromaDB)
+└── fetch_webpage_tool_funcs/ ──▶ crawl4ai (HTTP 전용 크롤러)
 ```
 
 **핵심 규칙**:

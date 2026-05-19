@@ -1,25 +1,53 @@
 from __future__ import annotations
 
+import math
 import re
+from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt, Signal, QTimer
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QKeyEvent, QMouseEvent
+from PySide6.QtCore import (
+	QPoint,
+	QPointF,
+	QRectF,
+	QSize,
+	Qt,
+	QTimer,
+	Signal,
+)
+from PySide6.QtGui import (
+	QBrush,
+	QColor,
+	QCloseEvent,
+	QKeyEvent,
+	QKeySequence,
+	QMouseEvent,
+	QPainter,
+	QPainterPath,
+	QPen,
+	QPixmap,
+	QRadialGradient,
+	QShortcut,
+	QTextCursor,
+	QTextDocument,
+	QWheelEvent,
+)
 from PySide6.QtWidgets import (
 	QApplication,
 	QFrame,
 	QGraphicsDropShadowEffect,
 	QHBoxLayout,
 	QLabel,
-	QMenu,
 	QPushButton,
 	QScrollArea,
 	QSizeGrip,
 	QSizePolicy,
+	QTextBrowser,
 	QTextEdit,
-	QToolButton,
 	QVBoxLayout,
 	QWidget,
 )
+
+from ...controllers import format_screen_event, get_screen_event_store
+from ..markdown_view import render_markdown_html
 
 
 def add_text_breakpoints(text: str, chunk_size: int = 24) -> str:
@@ -28,6 +56,76 @@ def add_text_breakpoints(text: str, chunk_size: int = 24) -> str:
 		return "\u200b".join(token[index : index + chunk_size] for index in range(0, len(token), chunk_size))
 
 	return re.sub(r"\S{32,}", break_long_token, text)
+
+
+def _render_assistant_markdown(text: str) -> str:
+	"""Render an assistant message (markdown) to an HTML fragment.
+
+	A finished assistant answer is parsed once and shown in a QTextBrowser as
+	formatted HTML instead of raw `**` / `#` / table syntax. Prefers the
+	`markdown` package (correct GFM tables); falls back to Qt's own markdown
+	parser so formatting still works even when that package is not installed.
+	"""
+	rendered = render_markdown_html(text or "", font_size=None)
+	if rendered:
+		return rendered
+	doc = QTextDocument()
+	doc.setMarkdown(text or "")
+	return doc.toHtml()
+
+
+def render_history_html(history: list) -> list[dict]:
+	"""Pre-render a raw chat history into display-ready bubble specs.
+
+	Each spec is ``{"role", "text", "is_user", "html"}``. This is pure and
+	Qt-free (only :func:`render_markdown_html`), so it is safe to run on a
+	worker thread — that is the point: hydrating a long workspace history used
+	to parse every assistant message's markdown on the UI thread. ``html`` is an
+	empty string for user messages and whenever the optional ``markdown``
+	package is missing; the bubble then falls back to its own rendering.
+	"""
+	prepared: list[dict] = []
+	for item in history:
+		if not isinstance(item, dict):
+			continue
+		role = str(item.get("role") or "")
+		text = str(item.get("text") or "")
+		if not text:
+			continue
+		is_user = role == "user"
+		prepared.append(
+			{
+				"role": role,
+				"text": text,
+				"is_user": is_user,
+				"html": "" if is_user else render_markdown_html(text, font_size=None),
+			}
+		)
+	return prepared
+
+
+try:
+	from shiboken6 import isValid as _shiboken_is_valid
+except Exception:  # pragma: no cover - shiboken6 ships with PySide6
+	_shiboken_is_valid = None
+
+
+def _qt_is_alive(obj: object) -> bool:
+	"""True when *obj*'s underlying Qt C++ object still exists.
+
+	A streaming chat answer can outlive the bubble it is writing into \u2014 e.g.
+	a workspace switch (research completion) clears the panel mid-stream. A
+	late chunk that touches the freed QLabel would otherwise raise
+	``RuntimeError: Internal C++ object already deleted``.
+	"""
+	if obj is None:
+		return False
+	if _shiboken_is_valid is None:
+		return True
+	try:
+		return bool(_shiboken_is_valid(obj))
+	except Exception:
+		return False
 
 
 class ChatInputEdit(QTextEdit):
@@ -164,6 +262,9 @@ class SuggestionCard(QFrame):
 		body.setTextFormat(Qt.PlainText)
 		body.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
 		body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+		# Keep the text pinned to the top: the last card may be stretched to
+		# fill the panel, and its text should not float to the middle.
+		body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
 		layout.addLayout(header)
 		layout.addWidget(body)
@@ -180,25 +281,37 @@ class SuggestionCard(QFrame):
 
 
 class SuggestionList(QFrame):
-	def __init__(self, parent: QWidget | None = None) -> None:
+	# When ``hug_content`` is set the card sizes itself to its actual content
+	# instead of claiming whatever slice of the window the layout offers, so
+	# no blank space trails the last suggestion. It still refuses to grow past
+	# this share of the parent's height — beyond that the list scrolls (still
+	# no trailing gap). Left off, the card keeps the default fill behaviour for
+	# callers that give it a whole panel (e.g. DocumentAssistPage).
+	MAX_HEIGHT_RATIO = 0.55
+
+	def __init__(self, parent: QWidget | None = None, *, hug_content: bool = False) -> None:
 		super().__init__(parent)
 		self.setObjectName("AssistSectionCard")
+		self._hug_content = hug_content
+		if hug_content:
+			# Maximum: take exactly the content height when it fits, never more.
+			self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 		self._suggestions: list[dict[str, str]] = []
 		self._cards: list[SuggestionCard] = []
 
-		root = QVBoxLayout(self)
-		root.setContentsMargins(12, 12, 12, 12)
-		root.setSpacing(8)
+		self._root = QVBoxLayout(self)
+		self._root.setContentsMargins(12, 12, 12, 12)
+		self._root.setSpacing(8)
 
 		header = QHBoxLayout()
 		header.setSpacing(8)
 
-		title = QLabel("실시간 수정 결과")
-		title.setObjectName("AssistSectionTitle")
+		self._title = QLabel("실시간 수정 결과")
+		self._title.setObjectName("AssistSectionTitle")
 		self.count_label = QLabel("0개")
 		self.count_label.setObjectName("AssistSubText")
 
-		header.addWidget(title)
+		header.addWidget(self._title)
 		header.addStretch(1)
 		header.addWidget(self.count_label)
 
@@ -207,6 +320,7 @@ class SuggestionList(QFrame):
 		self.scroll.setFrameShape(QFrame.NoFrame)
 		self.scroll.setObjectName("AssistScrollArea")
 		self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+		self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
 		self.container = QWidget()
 		self.container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
@@ -220,8 +334,8 @@ class SuggestionList(QFrame):
 		self.empty.setAlignment(Qt.AlignCenter)
 		self.empty.setWordWrap(True)
 
-		root.addLayout(header)
-		root.addWidget(self.scroll, 1)
+		self._root.addLayout(header)
+		self._root.addWidget(self.scroll, 1)
 		self.set_suggestions([])
 
 	def set_suggestions(self, suggestions: list[dict[str, str]]) -> None:
@@ -230,12 +344,16 @@ class SuggestionList(QFrame):
 		self._cards = []
 		if not self._suggestions:
 			self.layout.addWidget(self.empty)
+			self.empty.show()
 			self.count_label.setText("0개")
 			self.layout.addStretch(1)
 			self.schedule_width_update()
+			if self._hug_content:
+				self.updateGeometry()
 			return
 
-		for item in self._suggestions:
+		last_index = len(self._suggestions) - 1
+		for index, item in enumerate(self._suggestions):
 			card = SuggestionCard(
 				item.get("category", "수정"),
 				item.get("text", item.get("description", "")),
@@ -243,17 +361,47 @@ class SuggestionList(QFrame):
 			)
 			card.set_card_width(self._content_width())
 			self._cards.append(card)
-			self.layout.addWidget(card, 0)
+			# The last card carries the stretch factor so it grows down to the
+			# bottom of the panel — no blank gap trails the list. Earlier cards
+			# keep their natural height. In hug_content mode the frame is sized
+			# to the content, so there is no slack for it to absorb.
+			self.layout.addWidget(card, 1 if index == last_index else 0)
 
 		self.count_label.setText(f"{len(self._suggestions)}개")
-		self.layout.addStretch(1)
 		self.schedule_width_update()
 		self.schedule_scroll_to_bottom()
+		if self._hug_content:
+			self.updateGeometry()
 
 	def add_suggestion(self, category: str, text: str, tone: str = "working") -> None:
-		items = [dict(item) for item in self._suggestions]
-		items.append({"category": category, "text": text, "tone": tone})
-		self.set_suggestions(items)
+		"""Append a single suggestion card.
+
+		Unlike :meth:`set_suggestions`, this does not tear down and rebuild every
+		existing card. The screen-monitoring poller feeds suggestions in one at a
+		time, so a full rebuild per event would be O(n²) as the list grows.
+		"""
+		item = {"category": category, "text": text, "tone": tone}
+		if not self._cards:
+			# Leaving the empty state: drop the placeholder + its trailing stretch.
+			self._clear()
+		else:
+			# The previous last card carried the fill stretch; hand it off so the
+			# new card is the one that grows to the bottom of the panel.
+			prev_index = self.layout.indexOf(self._cards[-1])
+			if prev_index >= 0:
+				self.layout.setStretch(prev_index, 0)
+
+		self._suggestions.append(item)
+		card = SuggestionCard(item["category"], item["text"], item["tone"])
+		card.set_card_width(self._content_width())
+		self._cards.append(card)
+		self.layout.addWidget(card, 1)
+
+		self.count_label.setText(f"{len(self._suggestions)}개")
+		self.schedule_width_update()
+		self.schedule_scroll_to_bottom()
+		if self._hug_content:
+			self.updateGeometry()
 
 	def schedule_scroll_to_bottom(self) -> None:
 		for delay in (0, 25, 80):
@@ -272,10 +420,46 @@ class SuggestionList(QFrame):
 	def resizeEvent(self, event) -> None:  # type: ignore[override]
 		super().resizeEvent(event)
 		self.schedule_width_update()
+		# The height cap tracks the parent, which changes as the window
+		# resizes — re-query our sizeHint so the cap stays in sync.
+		if self._hug_content:
+			self.updateGeometry()
 
 	def showEvent(self, event) -> None:  # type: ignore[override]
 		super().showEvent(event)
 		self.schedule_width_update()
+		if self._hug_content:
+			self.updateGeometry()
+
+	def sizeHint(self) -> QSize:  # type: ignore[override]
+		hint = super().sizeHint()
+		if self._hug_content:
+			hint.setHeight(self._preferred_height())
+		return hint
+
+	def _preferred_height(self) -> int:
+		"""Height that exactly wraps the current content, capped so a long
+		list scrolls instead of crowding out the chat panel."""
+		margins = self._root.contentsMargins()
+		chrome = margins.top() + margins.bottom() + self._root.spacing()
+		header_h = max(
+			self._title.sizeHint().height(),
+			self.count_label.sizeHint().height(),
+		)
+		# +2px rounding cushion so the list never shows a scrollbar while it
+		# actually fits; the trailing stretch soaks up the slack.
+		content_h = self.container.sizeHint().height() + 2
+		total = chrome + header_h + content_h
+		cap = self._max_height()
+		if cap:
+			total = min(total, cap)
+		return max(96, total)
+
+	def _max_height(self) -> int:
+		parent = self.parentWidget()
+		if parent is None:
+			return 0
+		return max(160, int(parent.height() * self.MAX_HEIGHT_RATIO))
 
 	def _content_width(self) -> int:
 		return max(120, self.scroll.viewport().width() - 2)
@@ -285,6 +469,9 @@ class SuggestionList(QFrame):
 		self.container.setMinimumWidth(width)
 		for card in self._cards:
 			card.set_card_width(width)
+		# Card heights (word-wrapped text) just changed — refresh our hint.
+		if self._hug_content:
+			self.updateGeometry()
 
 	def _clear(self) -> None:
 		while self.layout.count():
@@ -294,9 +481,252 @@ class SuggestionList(QFrame):
 				widget.setParent(None)
 
 
-class ChatMessageBubble(QFrame):
-	def __init__(self, sender: str, message: str, is_user: bool, parent: QWidget | None = None) -> None:
+class CopyButton(QPushButton):
+	"""Icon-only button that copies a chat message to the clipboard.
+
+	The conventional "two overlapping sheets" copy glyph is hand-painted so it
+	looks identical regardless of which window's stylesheet is active, and
+	briefly swaps to a green checkmark as copy confirmation.
+	"""
+
+	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
+		self.setObjectName("ChatCopyButton")
+		self.setCursor(Qt.PointingHandCursor)
+		self.setFixedSize(22, 22)
+		self.setToolTip("답변 복사")
+		self.setStyleSheet(
+			"QPushButton#ChatCopyButton { background-color: transparent; border: none; "
+			"border-radius: 6px; }"
+			"QPushButton#ChatCopyButton:hover { background-color: rgba(15, 23, 42, 0.07); }"
+		)
+		self._copied = False
+		self._reset_timer = QTimer(self)
+		self._reset_timer.setSingleShot(True)
+		self._reset_timer.setInterval(1300)
+		self._reset_timer.timeout.connect(self._reset_state)
+
+	def show_copied(self) -> None:
+		self._copied = True
+		self.setToolTip("복사됨")
+		self._reset_timer.start()
+		self.update()
+
+	def _reset_state(self) -> None:
+		self._copied = False
+		self.setToolTip("답변 복사")
+		self.update()
+
+	def paintEvent(self, event) -> None:  # type: ignore[override]
+		super().paintEvent(event)  # hover background from the stylesheet
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.Antialiasing, True)
+		center = self.rect().center()
+		cx, cy = center.x() + 0.5, center.y() + 0.5
+
+		if self._copied:
+			pen = QPen(QColor("#15803D"))
+			pen.setWidthF(1.7)
+			pen.setCapStyle(Qt.RoundCap)
+			pen.setJoinStyle(Qt.RoundJoin)
+			painter.setPen(pen)
+			check = QPainterPath()
+			check.moveTo(cx - 4.2, cy + 0.4)
+			check.lineTo(cx - 1.2, cy + 3.4)
+			check.lineTo(cx + 4.6, cy - 3.6)
+			painter.drawPath(check)
+			return
+
+		color = QColor("#0F172A") if self.underMouse() else QColor("#94A3B8")
+		pen = QPen(color)
+		pen.setWidthF(1.4)
+		pen.setJoinStyle(Qt.RoundJoin)
+		painter.setPen(pen)
+		# Back sheet peeks out to the top-right; the front sheet is filled so it
+		# cleanly occludes the overlapping back-sheet edges.
+		back = QRectF(cx - 2.4, cy - 5.8, 8.2, 8.2)
+		front = QRectF(cx - 5.8, cy - 2.4, 8.2, 8.2)
+		painter.drawRoundedRect(back, 1.8, 1.8)
+		front_path = QPainterPath()
+		front_path.addRoundedRect(front, 1.8, 1.8)
+		painter.fillPath(front_path, QColor("#FFFFFF"))
+		painter.drawPath(front_path)
+
+
+class TypingIndicator(QWidget):
+	"""Animated 'assistant is generating an answer' indicator.
+
+	Ports the 'pulse' loader from logo.html: the Veritas logo gently breathes
+	(scale + opacity) over a soft blue radial glow that pulses behind it.
+	Shown inside an assistant bubble in place of the answer text until the
+	first streamed token arrives, replacing the old static '…' placeholder.
+
+	A plain ``QTimer`` drives the motion: it is started/stopped explicitly by
+	``set_typing`` and never tied to show/hide events, so a transient hide — a
+	page switch, a layout reflow — can never silently freeze it.
+	"""
+
+	_SIZE = 40
+	_LOGO_SIZE = 22
+	_GLOW_BASE_RADIUS = 14.0
+	_TICK_MS = 40
+	_PERIOD_MS = 1400
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self._phase = 0.0
+		self.setFixedSize(self._SIZE, self._SIZE)
+		logo_path = (
+			Path(__file__).resolve().parent.parent
+			/ "public" / "images" / "veritas_logo.png"
+		)
+		pixmap = QPixmap(str(logo_path)) if logo_path.exists() else QPixmap()
+		if not pixmap.isNull():
+			pixmap = pixmap.scaled(
+				self._LOGO_SIZE * 2,
+				self._LOGO_SIZE * 2,
+				Qt.KeepAspectRatio,
+				Qt.SmoothTransformation,
+			)
+		self._logo = pixmap
+		self._timer = QTimer(self)
+		self._timer.setInterval(self._TICK_MS)
+		self._timer.timeout.connect(self._advance)
+
+	def _advance(self) -> None:
+		self._phase = (self._phase + self._TICK_MS / self._PERIOD_MS) % 1.0
+		self.update()
+
+	def start(self) -> None:
+		if not self._timer.isActive():
+			self._timer.start()
+
+	def stop(self) -> None:
+		self._timer.stop()
+
+	def paintEvent(self, event) -> None:  # type: ignore[override]
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.Antialiasing, True)
+		painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+		cx = self.width() / 2.0
+		cy = self.height() / 2.0
+		# Smooth 0 -> 1 -> 0 'breathing' value (ease-in-out), matching the
+		# logo.html 'pulse' keyframes (0%/100% small, 50% large).
+		breath = (1.0 - math.cos(2.0 * math.pi * self._phase)) / 2.0
+
+		# Pulsing radial glow behind the logo (scale 0.6..1.4, fades in/out).
+		glow_radius = self._GLOW_BASE_RADIUS * (0.6 + 0.8 * breath)
+		if glow_radius > 0.5:
+			gradient = QRadialGradient(cx, cy, glow_radius)
+			center = QColor(30, 98, 255)
+			center.setAlphaF(0.33 * breath)
+			edge = QColor(30, 98, 255, 0)
+			gradient.setColorAt(0.0, center)
+			gradient.setColorAt(0.65, edge)
+			gradient.setColorAt(1.0, edge)
+			painter.fillRect(self.rect(), QBrush(gradient))
+
+		# Breathing logo (scale 0.85..1.05, opacity 0.7..1.0).
+		logo_scale = 0.85 + 0.20 * breath
+		if not self._logo.isNull():
+			draw = self._LOGO_SIZE * logo_scale
+			painter.setOpacity(0.7 + 0.30 * breath)
+			painter.drawPixmap(
+				QRectF(cx - draw / 2.0, cy - draw / 2.0, draw, draw),
+				self._logo,
+				QRectF(self._logo.rect()),
+			)
+			painter.setOpacity(1.0)
+		else:
+			# Fallback when the logo asset is missing: a breathing blue dot.
+			radius = (self._LOGO_SIZE / 2.0) * logo_scale
+			dot = QColor(30, 98, 255)
+			dot.setAlphaF(0.7 + 0.30 * breath)
+			painter.setPen(Qt.NoPen)
+			painter.setBrush(dot)
+			painter.drawEllipse(QPointF(cx, cy), radius, radius)
+
+
+class _BubbleTextBrowser(QTextBrowser):
+	"""Read-only QTextBrowser used as a chat-message body.
+
+	It grows to fit its content (the inner scrollbar is disabled) so the bubble
+	height tracks the message. While a streamed answer is still arriving the
+	raw text is shown verbatim — fast, no markdown parse per token — and the
+	finished answer is rendered from markdown to HTML exactly once.
+	"""
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self.setObjectName("AssistBubbleText")
+		self.setReadOnly(True)
+		self.setOpenExternalLinks(True)
+		self.setFrameShape(QFrame.NoFrame)
+		self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+		self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+		self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+		self.setTextInteractionFlags(
+			Qt.TextSelectableByMouse
+			| Qt.TextSelectableByKeyboard
+			| Qt.LinksAccessibleByMouse
+		)
+		self.viewport().setAutoFillBackground(False)
+		self.document().setDocumentMargin(0)
+		self.document().contentsChanged.connect(self._sync_height)
+
+	def set_plain(self, text: str) -> None:
+		self.setPlainText(text or "")
+
+	def append_plain(self, chunk: str) -> None:
+		"""Append a streamed chunk at the end — O(chunk), unlike re-setting the
+		whole document with setPlainText() on every token."""
+		cursor = QTextCursor(self.document())
+		cursor.movePosition(QTextCursor.End)
+		cursor.insertText(chunk)
+
+	def set_html(self, html: str) -> None:
+		self.setHtml(html or "")
+
+	def refresh_height(self) -> None:
+		self._sync_height()
+
+	def _sync_height(self) -> None:
+		"""Pin the widget height to the document height so the bubble — not an
+		inner scrollbar — grows with the message."""
+		width = self.viewport().width()
+		if width <= 0:
+			return
+		doc = self.document()
+		doc.setTextWidth(width)
+		height = int(math.ceil(doc.size().height())) + 2
+		if height != self.height():
+			self.setFixedHeight(height)
+
+	def resizeEvent(self, event) -> None:  # type: ignore[override]
+		super().resizeEvent(event)
+		self._sync_height()
+
+	def wheelEvent(self, event) -> None:  # type: ignore[override]
+		# Don't consume wheel scrolling — let it bubble up to the chat panel's
+		# scroll area so the conversation scrolls when hovering over a message.
+		event.ignore()
+
+
+class ChatMessageBubble(QFrame):
+	def __init__(
+		self,
+		sender: str,
+		message: str,
+		is_user: bool,
+		parent: QWidget | None = None,
+		*,
+		rendered_html: str | None = None,
+	) -> None:
+		super().__init__(parent)
+		self._is_user = is_user
+		# The original message text, kept so the copy button yields clean text
+		# rather than anything re-extracted from the rendered HTML.
+		self._raw_message = message or ""
 		self.setObjectName("AssistUserBubble" if is_user else "AssistAiBubble")
 		self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
@@ -306,27 +736,124 @@ class ChatMessageBubble(QFrame):
 
 		meta = QLabel(sender)
 		meta.setObjectName("AssistBubbleMeta")
-		self.text = QLabel(add_text_breakpoints(message))
-		text = self.text
-		text.setObjectName("AssistBubbleText")
-		text.setWordWrap(True)
-		text.setTextFormat(Qt.PlainText)
-		text.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
-		text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+
+		self.text = _BubbleTextBrowser()
+		# User messages and the live streaming view are shown as raw text — fast,
+		# no markdown parse on the per-token path. A finished assistant answer is
+		# rendered from markdown to HTML once, via set_markdown(); an empty
+		# assistant bubble is a streaming turn about to begin, so it stays in
+		# raw-text mode until then. `rendered_html` lets a caller supply HTML that
+		# was already parsed off the UI thread (history hydration) so the parse
+		# is never paid here.
+		if is_user:
+			self.text.set_plain(message or "")
+		elif rendered_html:
+			self.text.set_html(rendered_html)
+		elif message:
+			self.text.set_html(_render_assistant_markdown(message))
+		else:
+			self.text.set_plain("")
 
 		layout.addWidget(meta)
-		layout.addWidget(text)
+		layout.addWidget(self.text)
+
+		# Animated 'generating…' indicator, shown in place of `text` while a
+		# streaming answer has not produced its first token yet.
+		self.typing: TypingIndicator | None = None
+		if not is_user:
+			self.typing = TypingIndicator()
+			self.typing.hide()
+			layout.addWidget(self.typing, 0, Qt.AlignLeft)
+
+		# Only AI answers are copyable; user messages already came from them.
+		# The copy button sits in a footer row, aligned to the bottom-right.
+		self.copy_button: CopyButton | None = None
+		if not is_user:
+			footer = QHBoxLayout()
+			footer.setContentsMargins(0, 0, 0, 0)
+			footer.setSpacing(0)
+			footer.addStretch(1)
+			self.copy_button = CopyButton()
+			self.copy_button.clicked.connect(self._copy_to_clipboard)
+			footer.addWidget(self.copy_button, 0, Qt.AlignVCenter)
+			layout.addLayout(footer)
+
+	def set_typing(self, active: bool) -> None:
+		"""Show the animated typing indicator in place of the answer text.
+
+		Used on an assistant bubble between the request and its first streamed
+		token; the first ``append_text`` call flips it back off.
+		"""
+		if self.typing is None:
+			return
+		if not _qt_is_alive(self.typing) or not _qt_is_alive(self.text):
+			return
+		self.typing.setVisible(active)
+		self.text.setVisible(not active)
+		if active:
+			self.typing.start()
+		else:
+			self.typing.stop()
+
+	def append_text(self, chunk: str) -> None:
+		"""Append one streamed chunk as raw text.
+
+		Appends only the new chunk (O(chunk)) instead of re-setting the whole
+		answer every token, so streaming stays fast as the answer grows. The
+		finished answer is re-rendered once from markdown via set_markdown().
+		"""
+		if not chunk:
+			return
+		# Defensive: the browser can be torn down (panel cleared / window
+		# closed) while a streaming answer is still arriving.
+		if not _qt_is_alive(self.text):
+			return
+		self.text.append_plain(chunk)
+		# The first streamed token ends the typing phase.
+		self.set_typing(False)
+
+	def set_markdown(self, raw: str) -> None:
+		"""Render *raw* markdown to HTML once and show it — used when a streamed
+		answer is finalised, so the expensive parse happens a single time.
+		"""
+		self._raw_message = raw or ""
+		if not _qt_is_alive(self.text):
+			return
+		self.text.set_html(_render_assistant_markdown(self._raw_message))
+		self.set_typing(False)
+
+	def _copy_to_clipboard(self) -> None:
+		# `_raw_message` is filled in by set_markdown() once the answer is
+		# finalised; mid-stream it is still empty, so fall back to whatever raw
+		# text the browser is currently showing.
+		text = self._raw_message
+		if not text and _qt_is_alive(self.text):
+			text = self.text.toPlainText()
+		app = QApplication.instance()
+		if app is not None:
+			app.clipboard().setText(text)
+		if self.copy_button is not None:
+			self.copy_button.show_copied()
 
 	def set_bubble_width(self, max_width: int) -> None:
 		self.setMaximumWidth(max_width)
-		self.text.setMaximumWidth(max(80, max_width - 22))
-		self.text.updateGeometry()
+		# The browser fills the bubble width; nudge it to re-measure its height
+		# for the new wrap width (and after a font-zoom change).
+		if _qt_is_alive(self.text):
+			self.text.refresh_height()
 
 
 class ChatPanel(QFrame):
+	# Chat-answer text size. The base is bumped up from the old 12px (the
+	# answers read too small) and Ctrl +/- steps it between these bounds.
+	_BASE_FONT_PT = 14
+	_MIN_FONT_PT = 9
+	_MAX_FONT_PT = 30
+
 	def __init__(self, title_text: str = "문서 채팅", parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("AssistSectionCard")
+		self._bubble_font_pt = self._BASE_FONT_PT
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(12, 12, 12, 12)
@@ -358,21 +885,71 @@ class ChatPanel(QFrame):
 		root.addWidget(title)
 		root.addWidget(self.scroll, 1)
 		self._bubbles: list[ChatMessageBubble] = []
+		self._streaming_chunks: list[str] = []
+		# Throttles scroll-to-bottom: a burst of streamed chunks coalesces into
+		# one scroll per tick instead of queuing fresh timers on every token.
+		self._scroll_timer = QTimer(self)
+		self._scroll_timer.setSingleShot(True)
+		self._scroll_timer.setInterval(55)
+		self._scroll_timer.timeout.connect(self._scroll_to_bottom)
+		# Throttles bubble re-flow during a window drag-resize: re-measuring
+		# every bubble on every resize frame is wasted work, so a burst of
+		# resize events coalesces into one re-flow per tick.
+		self._resize_timer = QTimer(self)
+		self._resize_timer.setSingleShot(True)
+		self._resize_timer.setInterval(60)
+		self._resize_timer.timeout.connect(self._update_bubble_widths)
+		self._apply_bubble_font()
 
-	def add_message(self, sender: str, message: str, is_user: bool) -> ChatMessageBubble:
+	# -- chat answer text zoom (Ctrl +/-) --------------------------------
+
+	def _apply_bubble_font(self) -> None:
+		"""Push the current bubble font size onto this panel.
+
+		A stylesheet set on the panel itself wins over the window-level
+		`QTextBrowser#AssistBubbleText` rule for every bubble beneath it, so
+		zoom only has to touch this one selector. Bubble heights change with the
+		font, so widths/scroll are refreshed on the next ticks.
+		"""
+		self.setStyleSheet(
+			f"QTextBrowser#AssistBubbleText {{ font-size: {self._bubble_font_pt}px; }}"
+		)
+		for delay in (0, 30):
+			QTimer.singleShot(delay, self._update_bubble_widths)
+		self.schedule_scroll_to_bottom()
+
+	def zoom_chat_text(self, step: int) -> None:
+		"""Grow/shrink the chat answer text by ``step`` points, clamped."""
+		new_pt = max(self._MIN_FONT_PT, min(self._MAX_FONT_PT, self._bubble_font_pt + step))
+		if new_pt == self._bubble_font_pt:
+			return
+		self._bubble_font_pt = new_pt
+		self._apply_bubble_font()
+
+	def reset_chat_zoom(self) -> None:
+		if self._bubble_font_pt == self._BASE_FONT_PT:
+			return
+		self._bubble_font_pt = self._BASE_FONT_PT
+		self._apply_bubble_font()
+
+	def add_message(
+		self,
+		sender: str,
+		message: str,
+		is_user: bool,
+		*,
+		rendered_html: str | None = None,
+	) -> ChatMessageBubble:
 		self.empty.hide()
-		bubble = ChatMessageBubble(sender, message, is_user)
+		bubble = ChatMessageBubble(sender, message, is_user, rendered_html=rendered_html)
 		bubble.set_bubble_width(self._bubble_width())
 		self._bubbles.append(bubble)
 
 		row = QHBoxLayout()
 		row.setContentsMargins(0, 0, 0, 0)
-		if is_user:
-			row.addStretch(1)
-			row.addWidget(bubble, 0, Qt.AlignRight)
-		else:
-			row.addWidget(bubble, 0, Qt.AlignLeft)
-			row.addStretch(1)
+		# Both user and assistant bubbles span the full panel width so the chat
+		# fills the screen horizontally; sender is distinguished by colour.
+		row.addWidget(bubble, 1)
 
 		insert_at = max(0, self.layout.count() - 1)
 		self.layout.insertLayout(insert_at, row)
@@ -380,41 +957,64 @@ class ChatPanel(QFrame):
 		return bubble
 
 	def start_streaming_assistant(self, sender: str = "VERITAS") -> ChatMessageBubble:
-		bubble = self.add_message(sender, "…", False)
+		# Empty body + animated typing dots until the first token streams in.
+		bubble = self.add_message(sender, "", False)
+		bubble.set_typing(True)
 		self._streaming_bubble = bubble
-		self._streaming_buffer = ""
+		self._streaming_chunks = []
+		return bubble
+
+	def _live_streaming_bubble(self) -> ChatMessageBubble | None:
+		"""Return the streaming bubble only if its C++ object still exists.
+
+		``clear_messages()`` / workspace switches can delete the bubble while a
+		streamed answer is still arriving; a stale reference here would crash
+		on the next chunk.
+		"""
+		bubble = getattr(self, "_streaming_bubble", None)
+		if bubble is None or not _qt_is_alive(bubble):
+			self._streaming_bubble = None
+			return None
 		return bubble
 
 	def append_streaming_chunk(self, chunk: str) -> None:
-		bubble = getattr(self, "_streaming_bubble", None)
+		bubble = self._live_streaming_bubble()
 		if bubble is None:
 			return
-		self._streaming_buffer = (getattr(self, "_streaming_buffer", "") or "") + chunk
-		bubble.text.setText(add_text_breakpoints(self._streaming_buffer))
+		self._streaming_chunks.append(chunk)
+		bubble.append_text(chunk)
 		self.schedule_scroll_to_bottom()
 
 	def finalize_streaming_assistant(self, text: str | None = None) -> None:
-		bubble = getattr(self, "_streaming_bubble", None)
+		bubble = self._live_streaming_bubble()
 		if bubble is None:
+			self._streaming_bubble = None
+			self._streaming_chunks = []
 			return
-		final_text = text if text is not None else getattr(self, "_streaming_buffer", "")
-		bubble.text.setText(add_text_breakpoints(final_text or ""))
+		final_text = text if text is not None else "".join(self._streaming_chunks)
+		bubble.set_markdown(final_text or "")
 		self._streaming_bubble = None
-		self._streaming_buffer = ""
+		self._streaming_chunks = []
 		self.schedule_scroll_to_bottom()
 
 	def cancel_streaming_assistant(self, error_text: str) -> None:
-		bubble = getattr(self, "_streaming_bubble", None)
+		bubble = self._live_streaming_bubble()
 		if bubble is None:
+			self._streaming_bubble = None
+			self._streaming_chunks = []
 			return
-		current = getattr(self, "_streaming_buffer", "")
+		current = "".join(self._streaming_chunks)
 		display = f"{current}\n\n[오류] {error_text}" if current else f"[오류] {error_text}"
-		bubble.text.setText(add_text_breakpoints(display))
+		bubble.set_markdown(display)
 		self._streaming_bubble = None
-		self._streaming_buffer = ""
+		self._streaming_chunks = []
 		self.schedule_scroll_to_bottom()
 
 	def clear_messages(self) -> None:
+		# Drop any in-flight streaming reference *first*: the bubble it points
+		# at is about to be deleted, and a late chunk must not touch it.
+		self._streaming_bubble = None
+		self._streaming_chunks = []
 		while self.layout.count():
 			item = self.layout.takeAt(0)
 			self._dispose_layout_item(item)
@@ -435,22 +1035,34 @@ class ChatPanel(QFrame):
 				self._dispose_layout_item(layout.takeAt(0))
 
 	def schedule_scroll_to_bottom(self) -> None:
-		for delay in (0, 25, 80):
-			QTimer.singleShot(delay, self._scroll_to_bottom)
+		# Throttle: while it is already armed, extra chunks are no-ops, so a
+		# burst coalesces into a single scroll instead of three timers per token.
+		if not self._scroll_timer.isActive():
+			self._scroll_timer.start()
 
 	def _scroll_to_bottom(self) -> None:
-		self._update_bubble_widths()
+		# While a stream is live only the streaming bubble grows, and it keeps
+		# its own height current via contentsChanged → _sync_height; re-flowing
+		# every other (unchanged) bubble each tick would be wasted work.
+		if self._live_streaming_bubble() is None:
+			self._update_bubble_widths()
 		self.container.adjustSize()
 		bar = self.scroll.verticalScrollBar()
 		bar.setValue(bar.maximum())
 
 	def resizeEvent(self, event) -> None:  # type: ignore[override]
 		super().resizeEvent(event)
-		self._update_bubble_widths()
+		# Coalesce a drag-resize burst: re-measuring every bubble's wrapped
+		# height on every resize frame is wasted work. The throttle still
+		# re-flows roughly every 60ms during the drag and once when it settles,
+		# so the answers keep tracking the window width without the per-frame
+		# cost over the whole bubble list.
+		if not self._resize_timer.isActive():
+			self._resize_timer.start()
 
 	def _bubble_width(self) -> int:
 		viewport_width = max(280, self.scroll.viewport().width())
-		return max(220, int(viewport_width * 0.94))
+		return max(220, viewport_width - 2)
 
 	def _update_bubble_widths(self) -> None:
 		width = self._bubble_width()
@@ -465,26 +1077,22 @@ class ChatInputBar(QFrame):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("AssistInputBar")
-		self._mode = "research"
+		# RAG ("채팅") is the default chat mode; "조사" (research) is the opt-in
+		# mode. The mode button shows the active one and toggles between them.
+		self._mode = "rag"
 
 		layout = QHBoxLayout(self)
 		layout.setContentsMargins(10, 8, 10, 8)
 		layout.setSpacing(8)
 
-		self.mode_button = QToolButton()
+		# A rounded-rectangle toggle: it shows the active mode ("채팅" by default)
+		# and clicking it flips straight to "조사" — research mode — turning navy
+		# to signal it is on.
+		self.mode_button = QPushButton("채팅")
 		self.mode_button.setObjectName("AssistModeButton")
-		self.mode_button.setPopupMode(QToolButton.InstantPopup)
 		self.mode_button.setCursor(Qt.PointingHandCursor)
-		self.mode_button.setFixedSize(82, 46)
-
-		mode_menu = QMenu(self.mode_button)
-		research_action = QAction("자료조사", self)
-		research_action.triggered.connect(lambda: self.set_mode("research"))
-		rag_action = QAction("RAG", self)
-		rag_action.triggered.connect(lambda: self.set_mode("rag"))
-		mode_menu.addAction(research_action)
-		mode_menu.addAction(rag_action)
-		self.mode_button.setMenu(mode_menu)
+		self.mode_button.setFixedSize(60, 46)
+		self.mode_button.clicked.connect(self._toggle_mode)
 
 		self.input = ChatInputEdit()
 		self.input.setObjectName("AssistChatInput")
@@ -503,16 +1111,25 @@ class ChatInputBar(QFrame):
 		layout.addWidget(self.send_button)
 		self.set_mode(self._mode, emit=False)
 
+	def _toggle_mode(self) -> None:
+		"""Flip between the default RAG ("채팅") and research ("조사") modes."""
+		self.set_mode("rag" if self._mode == "research" else "research")
+
 	def set_mode(self, mode: str, emit: bool = True) -> None:
-		self._mode = "rag" if mode == "rag" else "research"
-		if self._mode == "rag":
-			self.mode_button.setText("RAG")
-			self.mode_button.setToolTip("RAG 모드")
-			self.input.setPlaceholderText("RAG 모드로 질문하기...")
-		else:
-			self.mode_button.setText("자료조사")
-			self.mode_button.setToolTip("자료조사 모드")
+		self._mode = "research" if mode == "research" else "rag"
+		is_research = self._mode == "research"
+		# The label doubles as the state read-out; the navy "active" styling is
+		# driven by a dynamic property + repolish.
+		self.mode_button.setText("조사" if is_research else "채팅")
+		self.mode_button.setProperty("researchActive", is_research)
+		self.mode_button.style().unpolish(self.mode_button)
+		self.mode_button.style().polish(self.mode_button)
+		if is_research:
+			self.mode_button.setToolTip("자료조사 모드 사용 중 (눌러서 끄기)")
 			self.input.setPlaceholderText("자료조사 모드로 질문하기...")
+		else:
+			self.mode_button.setToolTip("자료조사 모드 켜기")
+			self.input.setPlaceholderText("문서에 대해 질문하기...")
 		if emit:
 			self.modeChanged.emit(self._mode)
 
@@ -535,8 +1152,10 @@ class DocumentAssistWindow(QWidget):
 		super().__init__(parent)
 		self.setWindowTitle("Veritas Assist")
 		self.setWindowFlags(Qt.Window | Qt.Tool | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
-		self.resize(560, 760)
-		self.setMinimumSize(380, 540)
+		# Wider default/min footprint — the previous 560/380 px made the chat
+		# answers feel cramped horizontally.
+		self.resize(680, 820)
+		self.setMinimumSize(470, 580)
 		self.setAttribute(Qt.WA_TranslucentBackground, True)
 		self.setMouseTracking(True)
 		self._resize_margin = 8
@@ -547,7 +1166,32 @@ class DocumentAssistWindow(QWidget):
 
 		self._build_ui()
 		self._apply_stylesheet()
-		self._load_demo_data()
+		self._install_chat_zoom_shortcuts()
+		# screen-monitoring 이벤트 broker 연결 — 보조창과 DocumentAssistPage가 같은 데이터 공유.
+		self._screen_store = get_screen_event_store()
+		self._screen_store.eventsAppended.connect(self._on_screen_events_appended)
+		# 워크스페이스 전환 시 store.clear() → cleared emit → hydrate로 위젯 reset.
+		self._screen_store.cleared.connect(self._hydrate_screen_suggestions)
+		self._hydrate_screen_suggestions()
+
+	def _install_chat_zoom_shortcuts(self) -> None:
+		"""Ctrl +/- (and Ctrl+0) resize the chat answer text.
+
+		`QShortcut` with the default WindowShortcut context fires no matter
+		which child widget holds focus — including the chat input — so the
+		zoom works while the user is typing.
+		"""
+		bindings = (
+			("Ctrl++", lambda: self.chat_panel.zoom_chat_text(1)),
+			("Ctrl+=", lambda: self.chat_panel.zoom_chat_text(1)),
+			("Ctrl+-", lambda: self.chat_panel.zoom_chat_text(-1)),
+			("Ctrl+0", self.chat_panel.reset_chat_zoom),
+		)
+		self._chat_zoom_shortcuts: list[QShortcut] = []
+		for sequence, handler in bindings:
+			shortcut = QShortcut(QKeySequence(sequence), self)
+			shortcut.activated.connect(handler)
+			self._chat_zoom_shortcuts.append(shortcut)
 
 	def _build_ui(self) -> None:
 		root = QVBoxLayout(self)
@@ -575,14 +1219,18 @@ class DocumentAssistWindow(QWidget):
 		content_layout.setContentsMargins(12, 10, 12, 8)
 		content_layout.setSpacing(10)
 
-		self.suggestion_list = SuggestionList()
+		self.suggestion_list = SuggestionList(hug_content=True)
 		self.chat_panel = ChatPanel()
+		# Keep the chat usable even when a long suggestion list claims its cap.
+		self.chat_panel.setMinimumHeight(160)
 		self.input_bar = ChatInputBar()
 		self.input_bar.sendRequested.connect(self.on_message_submitted)
 		self.input_bar.modeChanged.connect(self._on_mode_changed)
 
-		content_layout.addWidget(self.suggestion_list, 2)
-		content_layout.addWidget(self.chat_panel, 3)
+		# suggestion_list sizes itself to its content (stretch 0); the chat
+		# panel absorbs all remaining space so no blank gap trails the list.
+		content_layout.addWidget(self.suggestion_list, 0)
+		content_layout.addWidget(self.chat_panel, 1)
 		content_layout.addWidget(self.input_bar)
 
 		grip_row = QHBoxLayout()
@@ -595,27 +1243,29 @@ class DocumentAssistWindow(QWidget):
 		panel_layout.addWidget(content, 1)
 		root.addWidget(self.panel)
 
-	def _load_demo_data(self) -> None:
-		self.suggestion_list.set_suggestions(
-			[
-				{
-					"category": "수정",
-					"text": "본 보고서는 2026년 AI 규제 변화가 기업 운영에 미치는 영향을 분석하고, 우선 대응이 필요한 리스크를 정리합니다.",
-					"tone": "working",
-				},
-				{
-					"category": "근거 보강",
-					"text": "효율성 개선 효과는 내부 처리 시간 비교 데이터 또는 외부 벤치마크 수치를 함께 제시하면 더 설득력 있습니다.",
-					"tone": "warning",
-				},
-				{
-					"category": "추천 문장",
-					"text": "따라서 단기적으로는 고위험 활용 사례를 먼저 식별하고, 검증 로그와 출처 관리 체계를 함께 정비해야 합니다.",
-					"tone": "idle",
-				},
-			]
-		)
-		self.chat_panel.add_message("VERITAS", "문서 내용에 대해 질문해보세요. 문장 흐름, 근거, 톤을 함께 검토할 수 있습니다.", False)
+	def _hydrate_screen_suggestions(self) -> None:
+		"""store history 전체로 suggestion_list 재구성. show 시점마다 호출되어 양쪽 위젯 동기화 보장."""
+		history = self._screen_store.get_history()
+		suggestions: list[dict[str, str]] = []
+		for item in history:
+			formatted = format_screen_event(item)
+			if formatted is None:
+				continue
+			category, text, tone = formatted
+			suggestions.append({"category": category, "text": text, "tone": tone})
+		self.suggestion_list.set_suggestions(suggestions)
+
+	def _on_screen_events_appended(self, items: list) -> None:
+		"""실시간 append — 보이는 동안만 add_suggestion, 숨김 동안은 다음 hydrate에서 일괄 보충."""
+		if not self.isVisible():
+			return
+		for item in items:
+			if not isinstance(item, dict):
+				continue
+			formatted = format_screen_event(item)
+			if formatted is None:
+				continue
+			self.suggestion_list.add_suggestion(*formatted)
 
 	def _apply_stylesheet(self) -> None:
 		self.setStyleSheet(
@@ -623,7 +1273,7 @@ class DocumentAssistWindow(QWidget):
 			QWidget {
 				color: #111827;
 				font-family: 'Segoe UI Variable', 'Segoe UI', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
-				font-size: 12px;
+				font-size: 13px;
 			}
 			QFrame#AssistPanel {
 				background-color: #F8FAFC;
@@ -734,13 +1384,15 @@ class DocumentAssistWindow(QWidget):
 			}
 			QLabel#AssistBubbleMeta {
 				color: #6B7280;
-				font-size: 10px;
+				font-size: 11px;
 				font-weight: 800;
 			}
-			QLabel#AssistBubbleText {
+			QTextBrowser#AssistBubbleText {
 				color: #1F2937;
-				font-size: 12px;
+				font-size: 14px;
 				font-weight: 600;
+				background: transparent;
+				border: none;
 			}
 			QFrame#AssistInputBar {
 				background-color: #FFFFFF;
@@ -753,6 +1405,7 @@ class DocumentAssistWindow(QWidget):
 				border-radius: 11px;
 				padding: 8px 10px;
 				color: #111827;
+				font-size: 13px;
 				selection-background-color: #BFDBFE;
 				selection-color: #111827;
 			}
@@ -770,24 +1423,29 @@ class DocumentAssistWindow(QWidget):
 			QPushButton#AssistSendButton:hover {
 				background-color: #2563EB;
 			}
-			QToolButton#AssistModeButton {
-				background-color: #F8FAFC;
-				color: #111827;
+			QPushButton#AssistModeButton {
+				background-color: #F1F5F9;
+				color: #475569;
 				border: 1px solid #D1D5DB;
 				border-radius: 11px;
-				padding: 0px 8px;
-				font-size: 12px;
-				font-weight: 850;
+				padding: 0px;
+				font-size: 13px;
+				font-weight: 800;
 			}
-			QToolButton#AssistModeButton:hover {
-				background-color: #EEF2FF;
+			QPushButton#AssistModeButton:hover {
+				background-color: #E0E7FF;
 				border-color: #818CF8;
 				color: #3730A3;
 			}
-			QToolButton#AssistModeButton::menu-indicator {
-				image: none;
-				width: 0px;
-				height: 0px;
+			QPushButton#AssistModeButton[researchActive="true"] {
+				background-color: #1E3A8A;
+				border-color: #1E3A8A;
+				color: #FFFFFF;
+			}
+			QPushButton#AssistModeButton[researchActive="true"]:hover {
+				background-color: #1E40AF;
+				border-color: #1E40AF;
+				color: #FFFFFF;
 			}
 			QMenu {
 				background-color: #FFFFFF;
@@ -836,9 +1494,13 @@ class DocumentAssistWindow(QWidget):
 		is_user = normalized_sender == "나"
 		self.chat_panel.add_message(normalized_sender, message, is_user)
 
-	def hydrate_history(self, history: list[dict[str, str]]) -> None:
+	def hydrate_history(self, history: list[dict]) -> None:
 		"""Replace the chat panel with the canonical workspace history so the
 		assist window mirrors the main chat page.
+
+		``history`` is a list of pre-rendered bubble specs from
+		:func:`render_history_html` — the per-message markdown parse already
+		happened on a worker thread, so this just builds bubbles.
 		"""
 		self.chat_panel.clear_messages()
 		if not history:
@@ -849,15 +1511,17 @@ class DocumentAssistWindow(QWidget):
 			)
 			self._history_hydrated = True
 			return
-		for item in history:
-			if not isinstance(item, dict):
+		for spec in history:
+			if not isinstance(spec, dict):
 				continue
-			role = str(item.get("role") or "")
-			text = str(item.get("text") or "")
+			text = str(spec.get("text") or "")
 			if not text:
 				continue
-			sender = "나" if role == "user" else "VERITAS"
-			self.chat_panel.add_message(sender, text, role == "user")
+			is_user = bool(spec.get("is_user"))
+			sender = "나" if is_user else "VERITAS"
+			self.chat_panel.add_message(
+				sender, text, is_user, rendered_html=spec.get("html") or None
+			)
 		self._history_hydrated = True
 
 	def get_current_chat_input(self) -> str:
@@ -867,8 +1531,13 @@ class DocumentAssistWindow(QWidget):
 		self.input_bar.input.clear()
 
 	def _on_mode_changed(self, mode: str) -> None:
-		label = "RAG" if mode == "rag" else "자료조사"
-		self.title_bar.status.setText(label)
+		# RAG is the implicit default, so it gets no badge; only the opt-in
+		# 자료조사 mode is surfaced. Switching back to RAG restores the
+		# default status text.
+		if mode == "research":
+			self.title_bar.status.setText("자료조사")
+		else:
+			self.title_bar.status.setText("● 분석 중")
 
 	def on_message_submitted(self, message: str) -> None:
 		# The user bubble is drawn by ChatBus subscribers (MainWindow + WritePage)
@@ -888,7 +1557,20 @@ class DocumentAssistWindow(QWidget):
 
 	def showEvent(self, event) -> None:  # type: ignore[override]
 		super().showEvent(event)
+		self._hydrate_screen_suggestions()
 		self.visibilityChanged.emit(True)
+
+	def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
+		# Ctrl + wheel mirrors the Ctrl +/- shortcut for chat answer zoom.
+		if event.modifiers() & Qt.ControlModifier:
+			delta = event.angleDelta().y()
+			if delta > 0:
+				self.chat_panel.zoom_chat_text(1)
+			elif delta < 0:
+				self.chat_panel.zoom_chat_text(-1)
+			event.accept()
+			return
+		super().wheelEvent(event)
 
 	def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
 		if event.button() == Qt.LeftButton:
