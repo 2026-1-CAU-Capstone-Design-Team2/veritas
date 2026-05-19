@@ -1,3 +1,4 @@
 from .autosurvey_workflow import AutoSurveyWorkflow
+from .config import AutoSurveyConfig
 
-__all__ = ["AutoSurveyWorkflow"]
+__all__ = ["AutoSurveyConfig", "AutoSurveyWorkflow"]

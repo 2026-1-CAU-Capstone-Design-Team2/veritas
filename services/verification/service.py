@@ -224,6 +224,7 @@ class VerificationService:
                 docs=self.docs,
                 llm=self._llm,
                 summary_dir=self._loader.summary_dir_for(self._workspace),
+                cfg=self._cfg,
                 request_text=self.request_text,
             )
             distribution = dict(artifacts.reliability.distribution)

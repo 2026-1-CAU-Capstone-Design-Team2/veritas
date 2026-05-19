@@ -60,6 +60,18 @@ class VerificationConfig:
     flow_planner_doc_hints: int = 12            # how many doc titles+summary first lines to show LLM
     flow_planner_timeout_sec: float = 90.0
 
+    # --- reliability task (LLM-graded source trust judgement) ---
+    # ``reliability_batch_size`` matches the autosurvey batch size by default
+    # so one collect cycle's worth of docs is graded in a single LLM call.
+    # The four "max" caps keep each doc's payload short enough that a
+    # 5-doc batch fits the default 8K context window comfortably (~1.1K
+    # tokens per doc × 5 + ~500-token prompt ≈ 6K tokens).
+    reliability_batch_size: int = 5
+    reliability_notes_max: int = 6              # reliability_notes bullets per doc
+    reliability_key_points_max: int = 5         # key_points bullets per doc
+    reliability_batch_mentions_max: int = 4     # batch_*.md mentions per doc
+    reliability_snippet_max_chars: int = 240    # clip length of one batch mention snippet
+
     # --- consensus task (cross-source community detection + conflict) ---
     community_resolution: float = 1.0           # Louvain resolution used by consensus
     concept_edge_threshold_rrf: float = 0.012   # min fused RRF weight kept as a graph edge
