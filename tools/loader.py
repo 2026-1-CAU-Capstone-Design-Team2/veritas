@@ -34,6 +34,7 @@ def build_registry(
     from services.screen_tool_funcs import ScreenContextService
 
     from .current_time_tool import CurrentTimeTool
+    from .document_cleanup_tool import DocumentCleanupTool
     from .document_summarize_tool import DocumentSummarizeTool
     from .fetch_webpage_tool import FetchWebpageTool
     from .final_report_tool import FinalReportTool
@@ -41,6 +42,7 @@ def build_registry(
     from .rag_tool import RAGSearchTool
     from .screen_context_tool import ScreenContextTool
     from .term_grounding_tool import TermGroundingTool
+    from .verify_flow_planner_tool import VerifyFlowPlannerTool
     from .web_search_tool import WebSearchTool
 
     registry = ToolRegistry()
@@ -91,11 +93,33 @@ def build_registry(
         )
     )
 
+    # Per-doc cleanup — strips boilerplate paragraphs the LLM flags in raw_md
+    # and persists the cleaned body to clean_md/<id>.md plus a meta-only
+    # summary/doc_<id>.md. Runs after fetch in AutoSurvey, replacing the
+    # previous per-doc LLM summarize pass on the workflow's critical path.
+    registry.register(
+        DocumentCleanupTool(
+            schema=load_schema(TOOLS_DIR / "document_cleanup_tool" / "tool_schema.json"),
+            llm=llm,
+            run_store_service=run_store_service,
+        )
+    )
+
     registry.register(
         FinalReportTool(
             schema=load_schema(TOOLS_DIR / "final_report_tool" / "tool_schema.json"),
             llm=llm,
             run_store_service=run_store_service,
+        )
+    )
+
+    # Verify flow planner — used by services/verification/sections, also
+    # exposed in the chat registry so a future "/verify-flow" command (or
+    # tool-using agent) can reach the same outline capability.
+    registry.register(
+        VerifyFlowPlannerTool(
+            schema=load_schema(TOOLS_DIR / "verify_flow_planner_tool" / "tool_schema.json"),
+            llm=llm,
         )
     )
 

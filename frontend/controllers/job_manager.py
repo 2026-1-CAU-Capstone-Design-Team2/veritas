@@ -43,6 +43,11 @@ class JobCategory:
 	FEEDBACK = "feedback"
 	DOC_ANALYZE = "doc_analyze"
 	WORKSPACE_SWITCH = "workspace_switch"
+	# Verification runs over a workspace's saved AutoSurvey artifacts. It is
+	# much lighter than research (no LLM calls, no fetching), so chat / draft /
+	# feedback can keep running in parallel — only research / workspace switch
+	# can race with it.
+	VERIFY = "verify"
 
 
 # "If any of these are active, this category cannot start."
@@ -56,6 +61,7 @@ _BLOCKS_THIS: dict[str, set[str]] = {
 		JobCategory.FEEDBACK,
 		JobCategory.DOC_ANALYZE,
 		JobCategory.WORKSPACE_SWITCH,
+		JobCategory.VERIFY,
 	},
 	JobCategory.CHAT: {JobCategory.RESEARCH, JobCategory.CHAT},
 	JobCategory.DRAFT: {JobCategory.RESEARCH, JobCategory.DRAFT},
@@ -63,6 +69,12 @@ _BLOCKS_THIS: dict[str, set[str]] = {
 	JobCategory.DOC_ANALYZE: {JobCategory.RESEARCH, JobCategory.DOC_ANALYZE},
 	JobCategory.WORKSPACE_SWITCH: {
 		JobCategory.RESEARCH,
+		JobCategory.WORKSPACE_SWITCH,
+		JobCategory.VERIFY,
+	},
+	JobCategory.VERIFY: {
+		JobCategory.RESEARCH,
+		JobCategory.VERIFY,
 		JobCategory.WORKSPACE_SWITCH,
 	},
 }

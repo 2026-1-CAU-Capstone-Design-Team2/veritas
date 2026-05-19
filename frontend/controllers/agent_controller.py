@@ -14,6 +14,12 @@ from ..api_common import api_client
 # client-side timeout would surface as a spurious "오류" in the UI.
 RESEARCH_JOB_TIMEOUT_SEC = float(os.getenv("VERITAS_RESEARCH_JOB_TIMEOUT_SEC", "5400"))
 
+# Verification is much shorter than AutoSurvey (15-60s for a typical workspace
+# per VERIFY_DESIGN.md §9) but still blocks the request; the ceiling here is
+# the same 5400s headroom used for research so even a giant workspace cannot
+# trip a spurious client timeout.
+VERIFY_JOB_TIMEOUT_SEC = float(os.getenv("VERITAS_VERIFY_JOB_TIMEOUT_SEC", "5400"))
+
 
 class AgentController:
 	"""Controller boundary between PySide views and the HTTP API."""
@@ -148,3 +154,60 @@ class AgentController:
 			"/api/v1/screen-monitoring/events",
 			{"since": since, "limit": limit},
 		)
+
+	# -- verification --------------------------------------------------------
+	# Mirrors the research controller surface: a long-running POST plus a fast
+	# cursor-based progress poll, with read-only list/detail/summary endpoints
+	# the page can call without blocking on a run.
+
+	def run_verification(
+		self,
+		workspace_id: str | None = None,
+		tasks: list[str] | None = None,
+	) -> dict[str, Any]:
+		payload: dict[str, Any] = {}
+		if workspace_id:
+			payload["workspaceId"] = workspace_id
+		if tasks:
+			payload["tasks"] = list(tasks)
+		return api_client.post(
+			"/api/v1/verify/jobs",
+			payload,
+			timeout=VERIFY_JOB_TIMEOUT_SEC,
+		)
+
+	def get_verify_progress(self, since: int = 0, limit: int = 50) -> dict[str, Any]:
+		return api_client.get(
+			"/api/v1/verify/progress",
+			{"since": since, "limit": limit},
+		)
+
+	def get_verify_summary(self, workspace_id: str | None = None) -> dict[str, Any]:
+		params: dict[str, Any] = {}
+		if workspace_id:
+			params["workspaceId"] = workspace_id
+		return api_client.get("/api/v1/verify/summary", params)
+
+	def list_verify_results(
+		self,
+		workspace_id: str | None = None,
+		level: str | None = None,
+		page: int = 1,
+		page_size: int = 100,
+	) -> dict[str, Any]:
+		params: dict[str, Any] = {"page": int(page), "pageSize": int(page_size)}
+		if workspace_id:
+			params["workspaceId"] = workspace_id
+		if level and level != "전체":
+			params["level"] = level
+		return api_client.get("/api/v1/verify/results", params)
+
+	def get_verify_detail(
+		self,
+		doc_id: str,
+		workspace_id: str | None = None,
+	) -> dict[str, Any]:
+		params: dict[str, Any] = {}
+		if workspace_id:
+			params["workspaceId"] = workspace_id
+		return api_client.get(f"/api/v1/verify/results/{doc_id}", params)

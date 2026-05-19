@@ -1,0 +1,40 @@
+{
+  "type": "function",
+  "function": {
+    "name": "verify_flow_planner",
+    "description": "Plan an ordered report-flow outline (intro / body / conclusion) for a verification run, given the user's request, the AutoSurvey plan, grounding terms, and a few document hints. Returns a list of sections with title, description, role, and keywords. The verification layer uses this to assign sentences from the corpus to each ordered section.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "request_text": {
+          "type": "string",
+          "description": "The original user request (request.md contents)."
+        },
+        "plan": {
+          "type": "object",
+          "description": "AutoSurvey planner artifact (plan.json) — topic/goal/must_cover/keywords."
+        },
+        "grounding": {
+          "type": "object",
+          "description": "Grounding artifact (grounding.json) — grounded_terms/candidate_entities."
+        },
+        "doc_hints": {
+          "type": "array",
+          "description": "Short doc descriptors used as planning hints (each '- <title>: <first-line>').",
+          "items": {"type": "string"}
+        },
+        "min_sections": {
+          "type": "integer",
+          "description": "Minimum number of sections to plan.",
+          "default": 3
+        },
+        "max_sections": {
+          "type": "integer",
+          "description": "Maximum number of sections to plan.",
+          "default": 6
+        }
+      },
+      "required": ["request_text", "plan", "doc_hints"]
+    }
+  }
+}
