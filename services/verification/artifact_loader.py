@@ -30,7 +30,9 @@ import numpy as np
 from services.run_store_tool_funcs.path_manager import RunPathManager
 
 from .indexing.dense_index import l2_normalize
-from .models import ChunkRecord, DocRecord, KeyPointRecord
+from core.models import ParsedDocRecord
+
+from .models import ChunkRecord, KeyPointRecord
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +92,7 @@ def _parse_doc_summary(md_text: str) -> tuple[str, list[str], list[str], list[st
     return summary, key_points, reliability_notes, keywords
 
 
-def key_points_from_docs(docs: list[DocRecord]) -> list[KeyPointRecord]:
+def key_points_from_docs(docs: list[ParsedDocRecord]) -> list[KeyPointRecord]:
     """Flatten kept documents' Key Points and Reliability Notes into claim units.
 
     Pure function so the facade can derive Key Points from already-loaded docs
@@ -182,8 +184,8 @@ class ArtifactLoader:
 
     # --- Domain models -------------------------------------------------------
 
-    def load_docs(self, workspace: str | Path) -> list[DocRecord]:
-        """Build one :class:`DocRecord` per ``index.json`` record.
+    def load_docs(self, workspace: str | Path) -> list[ParsedDocRecord]:
+        """Build one :class:`ParsedDocRecord` per ``index.json`` record.
 
         ``index.json`` is the authoritative list of kept documents, so
         ``doc_<id>_error.md`` fetch-error stubs are never reached (they have no
@@ -195,13 +197,13 @@ class ArtifactLoader:
         index = self._read_json(paths.index_path)
         records = index.get("records", []) if isinstance(index, dict) else []
 
-        docs: list[DocRecord] = []
+        docs: list[ParsedDocRecord] = []
         for record in records:
             doc_id = str(record.get("doc_id", "")).strip()
             if not doc_id:
                 continue
             duplicate_of = record.get("duplicate_of")
-            doc = DocRecord(
+            doc = ParsedDocRecord(
                 doc_id=doc_id,
                 title=record.get("title", ""),
                 url=record.get("url", ""),

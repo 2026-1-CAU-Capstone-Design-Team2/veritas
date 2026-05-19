@@ -22,7 +22,9 @@ from dataclasses import dataclass
 
 from kiwipiepy import Kiwi
 
-from ..models import DocRecord, SentenceUnit, VerificationConfig
+from core.models import ParsedDocRecord
+
+from ..models import SentenceUnit, VerificationConfig
 
 # Lines we never want as sentence content. Markdown headings, horizontal
 # rules, table rows, code fences, blockquote markers and pure-link lines.
@@ -189,7 +191,7 @@ def _split_paragraph(paragraph: str, kiwi: Kiwi, ctx: _SplitContext) -> list[str
 
 
 def split_docs_to_sentences(
-    docs: list[DocRecord],
+    docs: list[ParsedDocRecord],
     cfg: VerificationConfig,
     kiwi: Kiwi | None = None,
 ) -> list[SentenceUnit]:

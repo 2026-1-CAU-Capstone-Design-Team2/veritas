@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from core.models import DocRecord
+from core.models import IndexedDocRecord
 
 from .config import AutoSurveyConfig
 
@@ -791,7 +791,7 @@ class AutoSurveyWorkflow:
             "failed_documents": failed_documents,
         }
 
-    def _already_seen_url(self, records: list[DocRecord], url: str) -> bool:
+    def _already_seen_url(self, records: list[IndexedDocRecord], url: str) -> bool:
         canonical_url = self._canonicalize_url(url)
         return any(
             self._canonicalize_url(r.final_url) == canonical_url

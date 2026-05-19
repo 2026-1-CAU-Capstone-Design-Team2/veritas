@@ -125,31 +125,6 @@ class ChunkRecord:
 
 
 @dataclass
-class DocRecord:
-    """A research document: ``index.json`` metadata + parsed ``doc_<id>.md`` summary.
-
-    Duplicate documents (``index.json`` ``duplicate_of`` set) have no clean_md
-    file and therefore no chunks, but are still loaded — consensus/diversity
-    needs to see them — with ``is_duplicate=True`` and an empty ``clean_md_text``.
-    Fetch-error stubs (``doc_<id>_error.md``) are skipped entirely by the loader.
-    """
-
-    doc_id: str
-    title: str = ""
-    url: str = ""
-    final_url: str = ""
-    domain: str = ""
-    search_query: str = ""
-    duplicate_of: str | None = None
-    is_duplicate: bool = False
-    summary: str = ""
-    key_points: list[str] = field(default_factory=list)
-    reliability_notes: list[str] = field(default_factory=list)
-    keywords: list[str] = field(default_factory=list)
-    clean_md_text: str = ""  # full Crawl4AI clean markdown; "" for duplicates
-
-
-@dataclass
 class KeyPointRecord:
     """A single claim unit pulled from a ``doc_<id>.md`` summary.
 
@@ -306,7 +281,6 @@ class ProgressEvent:
 __all__ = [
     "VerificationConfig",
     "ChunkRecord",
-    "DocRecord",
     "KeyPointRecord",
     "SentenceUnit",
     "SentenceAssignment",

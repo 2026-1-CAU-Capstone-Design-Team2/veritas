@@ -29,7 +29,9 @@ from typing import Any, Iterable
 
 from core.prompts import RELIABILITY_JUDGE_PROMPT
 
-from ..models import DocRecord, VerificationConfig
+from core.models import ParsedDocRecord
+
+from ..models import VerificationConfig
 from .batch_index import BatchMention
 
 logger = logging.getLogger(__name__)
@@ -63,7 +65,7 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _doc_payload(
-    doc: DocRecord,
+    doc: ParsedDocRecord,
     mentions: list[BatchMention],
     cfg: VerificationConfig,
 ) -> dict[str, Any]:
@@ -100,7 +102,7 @@ def _doc_payload(
 
 
 def _build_user_prompt(
-    docs: list[DocRecord],
+    docs: list[ParsedDocRecord],
     mentions_by_doc: dict[str, list[BatchMention]],
     *,
     request_text: str,
@@ -190,7 +192,7 @@ def _derive_level(signals: dict[str, str], llm_level: str) -> str:
 
 def _verdicts_from_response(
     raw: dict[str, Any] | None,
-    docs: list[DocRecord],
+    docs: list[ParsedDocRecord],
 ) -> list[ReliabilityVerdict]:
     """Pull verdicts out of one LLM response, in the input ``docs`` order.
 
@@ -267,7 +269,7 @@ def _verdicts_from_response(
     return verdicts
 
 
-def _fallback_batch(docs: Iterable[DocRecord], reason: str) -> list[ReliabilityVerdict]:
+def _fallback_batch(docs: Iterable[ParsedDocRecord], reason: str) -> list[ReliabilityVerdict]:
     """Build a neutral ``medium`` verdict for every doc when the LLM call fails.
 
     Verify must always finish and persist *something* — a workspace whose
@@ -289,7 +291,7 @@ def _fallback_batch(docs: Iterable[DocRecord], reason: str) -> list[ReliabilityV
 
 
 def judge_documents(
-    docs: list[DocRecord],
+    docs: list[ParsedDocRecord],
     *,
     llm: Any,
     mentions_by_doc: dict[str, list[BatchMention]],
@@ -299,7 +301,7 @@ def judge_documents(
     """Run the reliability LLM call over ``docs`` in fixed-size batches.
 
     Returns one verdict per input doc, in the input order. Duplicate
-    documents (``DocRecord.is_duplicate``) are *not* sent to the LLM — the
+    documents (``ParsedDocRecord.is_duplicate``) are *not* sent to the LLM — the
     pipeline above inherits their verdict from the source instead. Batch
     size and per-doc caps come from ``cfg``.
     """
