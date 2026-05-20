@@ -6,6 +6,7 @@ from fastapi import APIRouter
 
 from ..api_models import (
     SettingsDocumentToolsRequest,
+    SettingsLlmParallelRequest,
     SettingsLocalAccessRequest,
     SettingsModelRequest,
     SettingsResearchMethodRequest,
@@ -40,3 +41,8 @@ async def settings_document_tools_update(payload: SettingsDocumentToolsRequest) 
 @router.put("/api/v1/settings/research-method")
 async def settings_research_method_update(payload: SettingsResearchMethodRequest) -> dict[str, Any]:
     return settings_service.update_research_method(payload.sampleCount, payload.planCount)
+
+
+@router.put("/api/v1/settings/llm-parallel")
+async def settings_llm_parallel_update(payload: SettingsLlmParallelRequest) -> dict[str, Any]:
+    return settings_service.update_llm_parallel(payload.value)

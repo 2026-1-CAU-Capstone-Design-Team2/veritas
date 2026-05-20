@@ -140,59 +140,37 @@ class DocumentSummarizeTool(BaseTool):
                     "documents above this size use chunked map-reduce"
                 )
 
-            for record in records_to_summarize:
-                if has_cycle_scope and record.doc_id not in target_doc_ids:
-                    skipped_not_in_cycle_doc_ids.append(record.doc_id)
-                    continue
-
-                summary_path = Path(record.summary_path)
-                if summary_path.exists() and summary_path.stat().st_size > 0 and not overwrite:
-                    print(f"[summarize][skip:existing] doc_id={record.doc_id}")
-                    skipped_existing_doc_ids.append(record.doc_id)
-                    continue
-
-                text = self._run_store_service.read_text_file(record.text_path)
-                print(f"[summarize][new] doc_id={record.doc_id}")
-                self._notify_progress(
-                    progress_callback,
-                    "doc_start",
-                    doc_id=record.doc_id,
-                    title=record.title or record.doc_id,
-                )
-
-                try:
-                    summary_payload = self._summarize_document(
-                        record, text, single_pass_budget
-                    )
-                except Exception as e:
-                    reason = f"{type(e).__name__}: {e}"
-                    print(f"[summarize][failed] doc_id={record.doc_id} reason={reason}")
-                    failed_doc_ids.append(record.doc_id)
-                    failed_documents.append(
-                        {
-                            "docId": record.doc_id,
-                            "title": record.title or record.doc_id,
-                            "reason": reason[:300],
-                        }
-                    )
-                    self._notify_progress(
-                        progress_callback,
-                        "doc_failed",
-                        doc_id=record.doc_id,
-                        title=record.title or record.doc_id,
-                        reason=reason[:300],
-                    )
-                    continue
-
-                summary_md = self._render_doc_summary_from_record(record, summary_payload)
-                self._run_store_service.write_document_summary(record, summary_md)
-                summarized_doc_ids.append(record.doc_id)
-                self._notify_progress(
-                    progress_callback,
-                    "doc_summarized",
-                    doc_id=record.doc_id,
-                    title=record.title or record.doc_id,
-                )
+            # Per-document summaries are independent (each reads its own
+            # clean_md and writes its own summary/doc_*.md), so the loop fans
+            # out through ``LLMClient.map_parallel``. ``max_parallel == 1``
+            # preserves the original sequential behavior; a higher value
+            # summarizes documents concurrently against llama-server's parallel
+            # slots. A long document still takes the serial map-reduce path
+            # *inside* its worker, so there is never more than one in-flight
+            # request per document and the chunk loop cannot oversubscribe the
+            # slots. Outcomes are returned in input order.
+            outcomes = self._llm.map_parallel(
+                records_to_summarize,
+                lambda record: self._summarize_one_record(
+                    record,
+                    single_pass_budget=single_pass_budget,
+                    target_doc_ids=target_doc_ids,
+                    has_cycle_scope=has_cycle_scope,
+                    overwrite=overwrite,
+                    progress_callback=progress_callback,
+                ),
+                label="summary",
+            )
+            for outcome in outcomes:
+                if "summarized" in outcome:
+                    summarized_doc_ids.append(outcome["summarized"])
+                elif "skipped_existing" in outcome:
+                    skipped_existing_doc_ids.append(outcome["skipped_existing"])
+                elif "skipped_not_in_cycle" in outcome:
+                    skipped_not_in_cycle_doc_ids.append(outcome["skipped_not_in_cycle"])
+                elif "failed_doc_id" in outcome:
+                    failed_doc_ids.append(outcome["failed_doc_id"])
+                    failed_documents.append(outcome["failed"])
 
             if skipped_not_in_cycle_doc_ids:
                 print(
@@ -223,6 +201,73 @@ class DocumentSummarizeTool(BaseTool):
             )
         except Exception as e:
             return ToolResult(success=False, error=f"Failed to summarize documents: {e}")
+
+    def _summarize_one_record(
+        self,
+        record,
+        *,
+        single_pass_budget: int,
+        target_doc_ids: set[str],
+        has_cycle_scope: bool,
+        overwrite: bool,
+        progress_callback: Callable[..., None] | None,
+    ) -> dict[str, Any]:
+        """Summarize one document and return a structured outcome.
+
+        Self-contained (reads clean_md, runs the LLM, writes
+        ``summary/doc_*.md``, emits progress) and **never raises** — failures
+        are captured into the outcome dict — so it is safe to fan out across
+        worker threads via :meth:`LLMClient.map_parallel`. Returns exactly one
+        of: ``{"skipped_not_in_cycle": id}`` / ``{"skipped_existing": id}`` /
+        ``{"summarized": id}`` / ``{"failed_doc_id": id, "failed": {...}}``.
+        """
+        if has_cycle_scope and record.doc_id not in target_doc_ids:
+            return {"skipped_not_in_cycle": record.doc_id}
+
+        summary_path = Path(record.summary_path)
+        if summary_path.exists() and summary_path.stat().st_size > 0 and not overwrite:
+            print(f"[summarize][skip:existing] doc_id={record.doc_id}")
+            return {"skipped_existing": record.doc_id}
+
+        text = self._run_store_service.read_text_file(record.text_path)
+        print(f"[summarize][new] doc_id={record.doc_id}")
+        self._notify_progress(
+            progress_callback,
+            "doc_start",
+            doc_id=record.doc_id,
+            title=record.title or record.doc_id,
+        )
+
+        try:
+            summary_payload = self._summarize_document(record, text, single_pass_budget)
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+            print(f"[summarize][failed] doc_id={record.doc_id} reason={reason}")
+            self._notify_progress(
+                progress_callback,
+                "doc_failed",
+                doc_id=record.doc_id,
+                title=record.title or record.doc_id,
+                reason=reason[:300],
+            )
+            return {
+                "failed_doc_id": record.doc_id,
+                "failed": {
+                    "docId": record.doc_id,
+                    "title": record.title or record.doc_id,
+                    "reason": reason[:300],
+                },
+            }
+
+        summary_md = self._render_doc_summary_from_record(record, summary_payload)
+        self._run_store_service.write_document_summary(record, summary_md)
+        self._notify_progress(
+            progress_callback,
+            "doc_summarized",
+            doc_id=record.doc_id,
+            title=record.title or record.doc_id,
+        )
+        return {"summarized": record.doc_id}
 
     def _notify_progress(
         self,

@@ -64,6 +64,7 @@ python -m uvicorn api.api:app --host 127.0.0.1 --port 8000 --reload
 | `VERITAS_LLM_PORT` | `8080` | LLM 서버 port |
 | `VERITAS_EMBED_HOST` | LLM과 동일 | embedding 서버 host (없으면 LLM과 같이 사용) |
 | `VERITAS_EMBED_PORT` | `8081` | embedding 서버 port |
+| `VERITAS_LLM_PARALLEL` | `1` | per-doc cleanup/summary·embedding 배치의 동시 LLM 요청 수. llama-server `-np` 슬롯 수와 맞출 것. `1`이면 직렬(기존 동작) |
 | `VERITAS_TRACE_LATENCY` | `1` | LLM 호출 지연 시간 로그 출력 |
 | `VERITAS_MAX_DOCS` | `15` | AutoSurvey 한 회 실행당 최대 수집 문서 수 |
 | `VERITAS_BATCH_SIZE` | `5` | collect/summarize 배치 크기 |

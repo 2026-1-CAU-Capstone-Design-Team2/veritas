@@ -5,8 +5,10 @@ and /v1/embeddings endpoints.
 """
 
 import json
+import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Iterator
 
 import httpx
@@ -57,6 +59,7 @@ class LLMClient:
         stream_summary: bool = False,
         stream_reasoning: bool = False,
         trace_latency: bool = True,
+        max_parallel: int | None = None,
     ):
         # Chat completions client
         self.chat_base_url = f"http://{host}:{port}/v1"
@@ -94,6 +97,80 @@ class LLMClient:
         self.stream_summary = stream_summary
         self.stream_reasoning = stream_reasoning
         self.trace_latency = trace_latency
+
+        # Degree of concurrency for batch LLM work (per-document cleanup /
+        # summarize, embedding batches). ``1`` = fully serial and is the
+        # default, so behavior is identical to the historical single-threaded
+        # path unless parallel decoding is explicitly enabled. The value is
+        # meant to match llama-server's ``-np`` slot count. When not passed
+        # explicitly it is read once from ``VERITAS_LLM_PARALLEL`` — a single
+        # env var that turns parallel decoding on at every entry point (CLI,
+        # API, tests) without any per-call-site configuration.
+        if max_parallel is None:
+            try:
+                max_parallel = int(os.getenv("VERITAS_LLM_PARALLEL", "1") or "1")
+            except ValueError:
+                max_parallel = 1
+        self.max_parallel = max(1, int(max_parallel))
+
+    def map_parallel(
+        self,
+        items: list[Any],
+        worker: Callable[[Any], Any],
+        *,
+        max_workers: int | None = None,
+        label: str = "",
+    ) -> list[Any]:
+        """Apply ``worker`` to every item, returning results in input order.
+
+        This is the single primitive every batch LLM loop (per-document
+        cleanup / summarize, embedding batches) routes through, so enabling
+        parallel decoding is a one-knob change rather than a per-call-site mode:
+
+        * ``max_parallel == 1`` (the default) runs the items **serially in the
+          calling thread** — same order, same exception propagation, no thread
+          pool created — so the behavior is identical to the historical
+          ``for`` loop.
+        * ``max_parallel > 1`` fans the items out across a
+          :class:`~concurrent.futures.ThreadPoolExecutor`. Threads (not async)
+          are deliberate: each worker spends virtually all of its wall time
+          blocked on a llama-server HTTP round-trip, and CPython releases the
+          GIL across that socket I/O, so threads yield real concurrency that
+          maps directly onto llama-server's ``-np`` slots — without rewriting
+          the whole synchronous call graph as async.
+
+        Results are always returned in input order regardless of completion
+        order. If one or more workers raise, the earliest (lowest input index)
+        exception is re-raised once the rest settle, mirroring how a serial
+        loop fails on the first bad item, so existing ``try/except`` blocks
+        around call sites keep working unchanged.
+        """
+        count = len(items)
+        if count == 0:
+            return []
+        workers = self.max_parallel if max_workers is None else max_workers
+        workers = max(1, min(int(workers), count))
+        if workers == 1:
+            return [worker(item) for item in items]
+
+        results: list[Any] = [None] * count
+        errors: list[tuple[int, BaseException]] = []
+        prefix = f"llm-map:{label}" if label else "llm-map"
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=prefix) as executor:
+            future_to_index = {
+                executor.submit(worker, item): index
+                for index, item in enumerate(items)
+            }
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    results[index] = future.result()
+                except BaseException as exc:  # noqa: BLE001 - faithfully re-raised below
+                    errors.append((index, exc))
+        if errors:
+            errors.sort(key=lambda pair: pair[0])
+            raise errors[0][1]
+        return results
 
     def _detect_n_ctx(self, host: str, port: int, *, default: int = 8192) -> int:
         """Query llama-server /props for the context window size, in tokens.
@@ -735,25 +812,30 @@ class LLMClient:
 
         start = time.perf_counter()
 
-        # Keep embedding batches small because local llama-server embedding backends
-        # can fail when a single request contains too many long inputs.
+        # Keep embedding batches small because local llama-server embedding
+        # backends can fail when a single request contains too many long
+        # inputs. Each fixed-size batch is one HTTP request; the batches
+        # themselves are dispatched through ``map_parallel`` so that, when
+        # parallel decoding is enabled (and the embedding server is started
+        # with ``-np > 1``), independent batches are embedded concurrently.
+        # With ``max_parallel == 1`` this collapses back to the previous
+        # sequential loop.
         batch_size = 8
-        all_embeddings: list[list[float]] = []
+        batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
 
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
+        def _embed_one_batch(batch: list[str]) -> list[list[float]]:
             try:
                 response = self.embed_client.embeddings.create(
                     model=self.embed_model,
                     input=batch,
                     encoding_format="float",
                 )
-                batch_embeddings = sorted(response.data, key=lambda x: x.index)
-                all_embeddings.extend([e.embedding for e in batch_embeddings])
+                ordered = sorted(response.data, key=lambda item: item.index)
+                return [item.embedding for item in ordered]
             except Exception as e:
-                # Fallback to one-by-one embedding so a single oversized request does
-                # not fail the entire indexing pass.
-                fallback_failed = False
+                # Fallback to one-by-one embedding so a single oversized request
+                # does not fail the entire indexing pass.
+                batch_embeddings: list[list[float]] = []
                 for text in batch:
                     try:
                         response = self.embed_client.embeddings.create(
@@ -761,9 +843,8 @@ class LLMClient:
                             input=text,
                             encoding_format="float",
                         )
-                        all_embeddings.append(response.data[0].embedding)
+                        batch_embeddings.append(response.data[0].embedding)
                     except Exception as fallback_error:
-                        fallback_failed = True
                         # Surface the underlying server error verbatim — the
                         # generic wrapper alone hides the actual cause (e.g. a
                         # 500 "input is too large to process. increase the
@@ -777,13 +858,12 @@ class LLMClient:
                             "with --embeddings and that its physical batch size (-b / -ub) "
                             "is large enough for the longest input chunk."
                         ) from fallback_error
+                return batch_embeddings
 
-                if fallback_failed:
-                    raise RuntimeError(
-                        "Embedding batch request failed. "
-                        f"endpoint={self.embed_base_url}, model={self.embed_model}. "
-                        f"Underlying error: {type(e).__name__}: {e}"
-                    ) from e
+        batch_results = self.map_parallel(batches, _embed_one_batch, label="embed")
+        all_embeddings: list[list[float]] = []
+        for batch_embeddings in batch_results:
+            all_embeddings.extend(batch_embeddings)
 
         if self.trace_latency:
             elapsed = time.perf_counter() - start

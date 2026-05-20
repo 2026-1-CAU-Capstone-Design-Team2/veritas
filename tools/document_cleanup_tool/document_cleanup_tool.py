@@ -109,112 +109,39 @@ class DocumentCleanupTool(BaseTool):
                 return ToolResult(success=True, data=self._empty_summary())
             records = [r for r in records if str(r.get("doc_id") or "") in target_set]
 
+        # Each document is cleaned end-to-end by ``_process_record`` and is
+        # fully independent (its own raw_md input, its own clean_md / doc_<id>.md
+        # outputs, no shared mutable state), so the per-document loop fans out
+        # through ``LLMClient.map_parallel``. With ``max_parallel == 1`` this is
+        # the original sequential loop; with a higher value the documents are
+        # cleaned concurrently against llama-server's parallel slots. Outcomes
+        # come back in input order, so the aggregate lists stay deterministic
+        # regardless of which document's LLM call finished first.
+        outcomes = self._llm.map_parallel(
+            records,
+            lambda record: self._process_record(
+                record,
+                overwrite=overwrite,
+                progress_callback=progress_callback,
+            ),
+            label="cleanup",
+        )
+
         cleaned_doc_ids: list[str] = []
         skipped_existing: list[str] = []
         failed_documents: list[dict[str, str]] = []
         fallback_documents: list[dict[str, str]] = []
-
-        for record in records:
-            doc_id = str(record.get("doc_id") or "").strip()
-            if not doc_id:
+        for outcome in outcomes:
+            if not outcome:
                 continue
-
-            clean_path = self._run_store.clean_md_dir / f"{doc_id}.md"
-            if clean_path.exists() and not overwrite:
-                skipped_existing.append(doc_id)
-                continue
-
-            raw_text = self._run_store.read_raw_md(doc_id)
-            if not raw_text.strip():
-                failed_documents.append(
-                    {
-                        "docId": doc_id,
-                        "title": str(record.get("title") or doc_id),
-                        "reason": "raw_md 파일이 비어 있거나 없습니다.",
-                    }
-                )
-                self._emit(progress_callback, _PROGRESS_KIND_FAILED, doc_id=doc_id, record=record)
-                continue
-
-            self._emit(progress_callback, _PROGRESS_KIND_START, doc_id=doc_id, record=record)
-
-            paragraphs = split_paragraphs(raw_text)
-            try:
-                payload = self._cleanup_with_retry(
-                    doc_id=doc_id,
-                    raw_text=raw_text,
-                    paragraphs=paragraphs,
-                )
-            except Exception as exc:
-                failed_documents.append(
-                    {
-                        "docId": doc_id,
-                        "title": str(record.get("title") or doc_id),
-                        "reason": f"LLM 정제 호출 실패: {exc}",
-                    }
-                )
-                self._emit(progress_callback, _PROGRESS_KIND_FAILED, doc_id=doc_id, record=record, error=str(exc))
-                continue
-
-            boilerplate = self._safe_index_list(payload.get("boilerplate_paragraphs"))
-            summary_text = self._safe_text(payload.get("summary"))
-            keywords = self._safe_string_list(payload.get("keywords"), max_items=10)
-            key_points = self._safe_string_list(payload.get("key_points"), max_items=7)
-
-            clean_body = apply_boilerplate_removal(paragraphs, boilerplate)
-            used_fallback = False
-            if not clean_body.strip():
-                # LLM nuked everything — keep the raw body so downstream
-                # consumers still have *something* to read. This is a
-                # degraded path, not a failure: surface it as a fallback
-                # notice so the UI can render the document normally without
-                # mis-classifying the run as failed.
-                clean_body = raw_text
-                used_fallback = True
-                fallback_documents.append(
-                    {
-                        "docId": doc_id,
-                        "title": str(record.get("title") or doc_id),
-                        "reason": "정제 결과가 비어 raw 본문을 그대로 사용했습니다.",
-                    }
-                )
-
-            self._run_store.write_clean_md(doc_id, clean_body)
-
-            summary_path = self._run_store.paths.summary_path_for(int(doc_id))
-            try:
-                write_doc_metadata(
-                    summary_path=summary_path,
-                    record=record,
-                    summary=summary_text,
-                    keywords=keywords,
-                    key_points=key_points,
-                )
-            except Exception as exc:
-                failed_documents.append(
-                    {
-                        "docId": doc_id,
-                        "title": str(record.get("title") or doc_id),
-                        "reason": f"doc_*.md 작성 실패: {exc}",
-                    }
-                )
-                self._emit(progress_callback, _PROGRESS_KIND_FAILED, doc_id=doc_id, record=record, error=str(exc))
-                continue
-
-            cleaned_doc_ids.append(doc_id)
-            self._emit(
-                progress_callback,
-                _PROGRESS_KIND_DONE,
-                doc_id=doc_id,
-                record=record,
-                paragraphs=len(paragraphs),
-                dropped=len(boilerplate),
-                summary=summary_text,
-                keywords=keywords,
-                key_points=key_points,
-                summary_path=str(summary_path),
-                used_fallback=used_fallback,
-            )
+            if "cleaned_doc_id" in outcome:
+                cleaned_doc_ids.append(outcome["cleaned_doc_id"])
+            if "skipped_existing_doc_id" in outcome:
+                skipped_existing.append(outcome["skipped_existing_doc_id"])
+            if outcome.get("failed"):
+                failed_documents.append(outcome["failed"])
+            if outcome.get("fallback"):
+                fallback_documents.append(outcome["fallback"])
 
         return ToolResult(
             success=True,
@@ -233,6 +160,129 @@ class DocumentCleanupTool(BaseTool):
         )
 
     # -- internals -----------------------------------------------------------
+
+    def _process_record(
+        self,
+        record: dict[str, Any],
+        *,
+        overwrite: bool,
+        progress_callback: Callable[..., None] | None,
+    ) -> dict[str, Any]:
+        """Clean one document end-to-end and return a structured outcome.
+
+        Self-contained: reads ``raw_md``, runs the LLM cleanup pass, writes
+        ``clean_md/<id>.md`` + ``summary/doc_<id>.md``, and emits the
+        start/done/failed progress events. It **never raises** — every failure
+        mode is captured into the returned outcome dict — so it is safe to fan
+        out across worker threads via :meth:`LLMClient.map_parallel`. The
+        caller merges the (input-ordered) outcomes back into the aggregate
+        result lists.
+
+        Returned keys (any subset; an empty dict means "silently skipped"):
+        ``cleaned_doc_id`` / ``skipped_existing_doc_id`` / ``failed`` /
+        ``fallback``. A fallback document sets *both* ``cleaned_doc_id`` (it
+        still produced usable output) and ``fallback`` (the degraded-path
+        notice), matching the previous inline behavior.
+        """
+        doc_id = str(record.get("doc_id") or "").strip()
+        if not doc_id:
+            return {}
+
+        clean_path = self._run_store.clean_md_dir / f"{doc_id}.md"
+        if clean_path.exists() and not overwrite:
+            return {"skipped_existing_doc_id": doc_id}
+
+        raw_text = self._run_store.read_raw_md(doc_id)
+        if not raw_text.strip():
+            self._emit(progress_callback, _PROGRESS_KIND_FAILED, doc_id=doc_id, record=record)
+            return {
+                "failed": {
+                    "docId": doc_id,
+                    "title": str(record.get("title") or doc_id),
+                    "reason": "raw_md 파일이 비어 있거나 없습니다.",
+                }
+            }
+
+        self._emit(progress_callback, _PROGRESS_KIND_START, doc_id=doc_id, record=record)
+
+        paragraphs = split_paragraphs(raw_text)
+        try:
+            payload = self._cleanup_with_retry(
+                doc_id=doc_id,
+                raw_text=raw_text,
+                paragraphs=paragraphs,
+            )
+        except Exception as exc:
+            self._emit(progress_callback, _PROGRESS_KIND_FAILED, doc_id=doc_id, record=record, error=str(exc))
+            return {
+                "failed": {
+                    "docId": doc_id,
+                    "title": str(record.get("title") or doc_id),
+                    "reason": f"LLM 정제 호출 실패: {exc}",
+                }
+            }
+
+        boilerplate = self._safe_index_list(payload.get("boilerplate_paragraphs"))
+        summary_text = self._safe_text(payload.get("summary"))
+        keywords = self._safe_string_list(payload.get("keywords"), max_items=10)
+        key_points = self._safe_string_list(payload.get("key_points"), max_items=7)
+
+        clean_body = apply_boilerplate_removal(paragraphs, boilerplate)
+        used_fallback = False
+        fallback_entry: dict[str, str] | None = None
+        if not clean_body.strip():
+            # LLM nuked everything — keep the raw body so downstream
+            # consumers still have *something* to read. This is a degraded
+            # path, not a failure: surface it as a fallback notice so the UI
+            # can render the document normally without mis-classifying the
+            # run as failed.
+            clean_body = raw_text
+            used_fallback = True
+            fallback_entry = {
+                "docId": doc_id,
+                "title": str(record.get("title") or doc_id),
+                "reason": "정제 결과가 비어 raw 본문을 그대로 사용했습니다.",
+            }
+
+        self._run_store.write_clean_md(doc_id, clean_body)
+
+        summary_path = self._run_store.paths.summary_path_for(int(doc_id))
+        try:
+            write_doc_metadata(
+                summary_path=summary_path,
+                record=record,
+                summary=summary_text,
+                keywords=keywords,
+                key_points=key_points,
+            )
+        except Exception as exc:
+            self._emit(progress_callback, _PROGRESS_KIND_FAILED, doc_id=doc_id, record=record, error=str(exc))
+            return {
+                "failed": {
+                    "docId": doc_id,
+                    "title": str(record.get("title") or doc_id),
+                    "reason": f"doc_*.md 작성 실패: {exc}",
+                }
+            }
+
+        self._emit(
+            progress_callback,
+            _PROGRESS_KIND_DONE,
+            doc_id=doc_id,
+            record=record,
+            paragraphs=len(paragraphs),
+            dropped=len(boilerplate),
+            summary=summary_text,
+            keywords=keywords,
+            key_points=key_points,
+            summary_path=str(summary_path),
+            used_fallback=used_fallback,
+        )
+
+        outcome: dict[str, Any] = {"cleaned_doc_id": doc_id}
+        if fallback_entry is not None:
+            outcome["fallback"] = fallback_entry
+        return outcome
 
     def _kept_records(self) -> list[dict[str, Any]]:
         try:

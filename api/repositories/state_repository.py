@@ -191,6 +191,18 @@ def set_research_method_settings(sample_count: int, plan_count: int) -> dict[str
     return STATE["settings"]["research"]
 
 
+def set_llm_parallel_settings(value: int) -> int:
+    """Persist the parallel-decoding concurrency (설정 > 고급 설정 > 병렬 디코딩).
+
+    Hard-clamped to 1..5: 1 keeps the historical serial path, and 5 caps how
+    many concurrent requests a low-spec local llama-server is asked to juggle.
+    The clamped value is what callers should apply to ``LLMClient.max_parallel``.
+    """
+    clamped = max(1, min(5, int(value)))
+    STATE["settings"]["llmParallel"] = clamped
+    return clamped
+
+
 def get_current_workspace_id() -> str:
     return STATE["current_workspace_id"]
 
