@@ -8,7 +8,7 @@ from typing import Any, Iterator
 import httpx
 
 
-API_BASE_URL = os.getenv("VERITAS_API_BASE_URL", "http://127.0.0.1:8001")
+API_BASE_URL = os.getenv("VERITAS_API_BASE_URL", "http://127.0.0.1:8000")
 
 # Default per-request ceiling. AutoSurvey and the chat stream pass their own
 # longer timeouts; everything else inherits this.

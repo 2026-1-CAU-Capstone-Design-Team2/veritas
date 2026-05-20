@@ -60,6 +60,8 @@ python -m uvicorn api.api:app --host 127.0.0.1 --port 8000 --reload
 | 변수 | 기본값 | 설명 |
 |---|---:|---|
 | `VERITAS_OUTPUT_DIR` | `runs` | AutoSurvey 결과, RAG index, chat history 저장 루트 |
+| `VERITAS_API_BASE_URL` | `http://127.0.0.1:8000` | **frontend** 가 연결할 API 서버 주소. API 를 다른 포트로 띄웠다면 이 값을 맞춰야 함 |
+| `VERITAS_EMBED_API` | `0` | `1`이면 frontend 가 외부 API 를 못 찾을 때 UI 프로세스 안에 API 서버를 자동 기동(in-process). 기본 `0`: 외부 API 가 없으면 조용히 임베드하지 않고 명확히 에러 표시 |
 | `VERITAS_LLM_HOST` | `127.0.0.1` | OpenAI 호환 LLM 서버 host |
 | `VERITAS_LLM_PORT` | `8080` | LLM 서버 port |
 | `VERITAS_EMBED_HOST` | LLM과 동일 | embedding 서버 host (없으면 LLM과 같이 사용) |

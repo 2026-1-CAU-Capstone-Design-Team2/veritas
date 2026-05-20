@@ -46,7 +46,10 @@ def update_llm_parallel(value: int) -> dict[str, Any]:
         # (agent_runtime imports a large dependency graph).
         from .agent_runtime import get_runtime
 
-        get_runtime().llm.max_parallel = parallel
+        # Delegate to the runtime's own setter instead of reaching through
+        # ``runtime.llm.max_parallel`` (keeps the LLM-client mutation
+        # encapsulated behind AgentRuntime).
+        get_runtime().set_llm_parallel(parallel)
     except Exception:
         pass
     return {"llmParallel": parallel, "updated": True}
