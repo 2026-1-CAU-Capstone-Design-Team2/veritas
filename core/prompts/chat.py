@@ -240,6 +240,97 @@ SCREEN_SCENARIO_GUIDANCE = {
         "Offer a low-pressure starting point - one suggested opening sentence or two, or a brief outline of how the piece could begin. "
         "Present it as an option to take or leave, not as a fixed plan."
     ),
+    "outline_phase": (
+        "The user is writing in outline form - short lines, frequent breaks, often with bullet or numbered markers. "
+        "Pick one or two of the visible outline items and offer a brief expansion (1-2 sentences each) of what could fill that item's content. "
+        "Stay within the structure the user has established; do not propose new top-level bullets or restructure the outline."
+    ),
+    "acronym_introduced": (
+        "The user's text contains an acronym (a multi-letter uppercase abbreviation). "
+        "Check whether the surrounding text already defines it on first use. "
+        "If undefined, propose one brief expansion in parentheses or as a short clarifying clause. "
+        "Limit to a single suggestion for the most prominent acronym."
+    ),
+    "heading_added": (
+        "The user has a section heading visible (Markdown '#'/'##' or numbered '1.'/'2.'). "
+        "Help them start that section: offer one opening sentence or a brief one-line outline of what could go under this heading. "
+        "Match the tone and scope of nearby existing sections; do not propose a different topic."
+    ),
+    "long_paragraph_written": (
+        "The user's current paragraph has grown long (500+ characters). "
+        "Suggest one sensible split point with a brief justification - typically where the sub-topic shifts. "
+        "Offer the proposed insertion point (which sentence to start a new paragraph at), not a full rewrite of the paragraph."
+    ),
+    "numbered_list_growth": (
+        "The user is building a numbered list with several existing items. "
+        "Suggest one or two more items that would naturally extend the list, staying consistent with the existing items in scope and granularity. "
+        "Do not restructure, merge, or rewrite the existing items."
+    ),
+    "todo_marker_present": (
+        "The user's document contains explicit TODO/FIXME/[?] markers. "
+        "Briefly summarize what is open: list each marker and (if obvious from immediate context) a minimal next action. "
+        "Stay strictly with what the markers themselves say; do not invent new tasks not anchored to a marker."
+    ),
+    "many_question_marks": (
+        "The user is posing several open questions in their writing - likely in a research or brainstorming phase. "
+        "Identify which 2-3 questions are most central and, for each, suggest what kind of evidence or source would help resolve it. "
+        "Do not try to answer every question; pick the most load-bearing ones."
+    ),
+    "code_block_present": (
+        "The user has inserted a code block. "
+        "Briefly comment on what the code appears to do (one short sentence) or flag any clearly obvious issue. "
+        "Do not propose a rewrite unless there is a clear bug. Stay within the language and conventions of the visible code."
+    ),
+    "quote_inserted": (
+        "The user's text contains a quoted passage (substantive content inside quotation marks). "
+        "Check whether attribution is present nearby; if missing, suggest a minimal attribution form (speaker/source/date). "
+        "Do not propose changing the quoted content itself."
+    ),
+    "citation_missing": (
+        "The user's text contains factual claims with statistics or year-references but no visible citation markers. "
+        "Identify the 1-2 most prominent claims that need a source and suggest a citation slot or a brief evidence pointer. "
+        "Stay specific - point to which claim, not a general 'add references' note."
+    ),
+    "factual_claim_made": (
+        "The user just wrote a factual claim with numbers, statistics, or a year reference. "
+        "Briefly note what would verify it (a category of source, not invented URLs) and ask whether the user wants help locating evidence. "
+        "Do not assert the claim is right or wrong without grounded evidence."
+    ),
+    "repeated_phrase_in_paragraph": (
+        "The user is repeating the same short phrase several times within one paragraph. "
+        "Identify the repeated phrase and suggest 1-2 alternative wordings that preserve the meaning. "
+        "Stay within the paragraph's existing scope; do not propose restructuring."
+    ),
+    "transition_word_overuse": (
+        "The user's recent writing leans heavily on transition words ('그러나', '하지만', '또한' 등). "
+        "Point out the pattern and suggest where one or two could be removed or replaced for a smoother flow. "
+        "Do not rewrite full sentences; just mark the cuts."
+    ),
+    "weak_modifier_overuse": (
+        "The user's text relies on vague intensity modifiers ('매우', '정말', '아주' 등) repeatedly. "
+        "Suggest a concrete substitute for one or two occurrences (a measurable detail or stronger verb). "
+        "Stay within the same claim; do not amplify it."
+    ),
+    "scattered_edits": (
+        "The user has been making small edits scattered across the document rather than focused in one paragraph. "
+        "Offer a quick consistency pass: identify 1-2 spots where the recent changes might create tonal or factual inconsistency with nearby unchanged text. "
+        "Stay specific to the changed spots, do not review the whole document."
+    ),
+    "large_deletion": (
+        "The user just deleted a large chunk of text in one capture. "
+        "Briefly acknowledge what was removed (or its approximate topic if visible) and offer to keep a recovery note in case the deletion needs to be reversed. "
+        "Do not insist on undoing - just make the option visible."
+    ),
+    "copy_paste_growth": (
+        "The user just added a large chunk of text in one capture - likely pasted from elsewhere. "
+        "Help integrate it: suggest a brief connector sentence, or flag if the pasted style/tone diverges from the surrounding text. "
+        "Do not summarize the pasted content; focus on integration."
+    ),
+    "undo_cycle_detected": (
+        "The user has been oscillating between two versions of the same text (A -> B -> back to A). "
+        "Briefly note which version they seem to be settling on and offer one phrasing that combines the best of both, if obvious. "
+        "Do not push either choice; just reflect what's been happening."
+    ),
 }
 
 
