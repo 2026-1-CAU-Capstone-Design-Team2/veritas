@@ -190,11 +190,57 @@ SCREEN WRITING CONTEXT:
 INTERVENTION ROUTING HINT:
 {routing_hint}
 
+SCENARIO GUIDANCE:
+{scenario_guidance}
+
 KNOWLEDGE BASE CONTEXT:
 {knowledge_context}
 
 Write the assistant message that should appear in the chat for this screen context now.
 Language rule: answer in the dominant language of SCREEN WRITING CONTEXT. If SCREEN WRITING CONTEXT is Korean, answer in Korean."""
+
+
+# Per-scenario guidance injected into ``SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE``
+# at the ``{scenario_guidance}`` slot. ``ChatAgent.answer_screen_intervention``
+# looks the active ``intervention_type`` up in this dict and falls back to
+# ``SCREEN_SCENARIO_GUIDANCE_DEFAULT`` for unknown / "none" types, so the model
+# gets scenario-specific instructions (continue a paused paragraph vs. do a
+# whole-document review vs. unstick a churning paragraph, …) instead of one
+# generic rule for every screen situation.
+SCREEN_SCENARIO_GUIDANCE_DEFAULT = (
+    "Respond helpfully to the on-screen situation, following the general rules above."
+)
+
+SCREEN_SCENARIO_GUIDANCE = {
+    "idle_after_writing": (
+        "The user just paused mid-paragraph; the writing flow is still warm. "
+        "Pick up from the last 1-2 sentences and propose either the next single sentence "
+        "to continue the thought, or one short supporting fact for what they just wrote. "
+        "If nothing useful comes to mind, return a brief no-action note rather than forcing content. "
+        "Keep it to roughly one sentence; do not break the user's momentum."
+    ),
+    "whole_document_review": (
+        "The user has built up a substantial document and it is a good moment for a holistic pass. "
+        "Comment on overall logical flow, section balance, and missing points - not individual sentence wording. "
+        "Deliver 2-3 focused observations as a short bulleted list."
+    ),
+    "long_static_review": (
+        "The document has been sitting open without edits for a long time; the user is likely re-reading and proofreading. "
+        "Scan the entire document and surface 2-3 distinct concrete issues - typos, awkward phrasing, factual slips - quoting the exact text and suggesting a fix for each. "
+        "Do not fixate on a single obvious problem; act as a copy editor making a pass through the whole text."
+    ),
+    "paragraph_churn": (
+        "The user has been writing and deleting within the same paragraph; they are stuck on phrasing. "
+        "Offer 1-2 concrete rewrites of the current paragraph (or the specific stuck sentence) as alternatives. "
+        "Stay strictly within the user's existing argument and concepts; do not introduce new ideas, terms, or supporting points they were not already trying to express. Rephrase only what is already there. "
+        "The goal is to unstick their phrasing, not to expand the argument."
+    ),
+    "blank_document_start": (
+        "The document is nearly empty; the user is at the very start. "
+        "Offer a low-pressure starting point - one suggested opening sentence or two, or a brief outline of how the piece could begin. "
+        "Present it as an option to take or leave, not as a fixed plan."
+    ),
+}
 
 
 __all__ = [
@@ -205,6 +251,8 @@ __all__ = [
     "RAG_USER_PROMPT_TEMPLATE",
     "SCREEN_INTERVENTION_SYSTEM_PROMPT",
     "SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE",
+    "SCREEN_SCENARIO_GUIDANCE",
+    "SCREEN_SCENARIO_GUIDANCE_DEFAULT",
     "SYSTEM_PROMPT",
     "TOOL_CHAT_FINAL_PROMPT_TEMPLATE",
     "TOOL_CHAT_SYSTEM_PROMPT",

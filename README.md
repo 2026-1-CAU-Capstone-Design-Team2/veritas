@@ -530,6 +530,7 @@ non-RAG tools.
 | `--port` | llama-server chat port | `8080` |
 | `--embed-host` | optional embedding server host | chat host |
 | `--embed-port` | optional embedding server port | chat port |
+| `--parallel` | max concurrent LLM requests for batch work (per-doc cleanup/summary, embeddings); should match llama-server `-np` | `VERITAS_LLM_PARALLEL` or `1` (serial) |
 | `--phase` | `all`, `plan`, `collect`, `summarize`, `final`, `rag`, `chat` | `all` |
 | `--max-docs` | CLI AutoSurvey document cap | `15` |
 | `--batch-size` | collection/summarization batch size | `5` |

@@ -46,8 +46,26 @@ class LLMClient:
         stream_summary: bool = False,      # 스트리밍 출력 옵션
         stream_reasoning: bool = False,
         trace_latency: bool = True,        # 지연시간 로깅
+        max_parallel: int | None = None,   # 병렬 디코딩 동시 요청 수
     ): ...
 ```
+
+### 병렬 디코딩 (`max_parallel` + `map_parallel`)
+
+`max_parallel`은 배치 LLM 작업(문서별 cleanup/summary, 임베딩 배치)의 **동시 요청 수**입니다. 명시하지 않으면 `VERITAS_LLM_PARALLEL` 환경변수를 읽고, 그것도 없으면 `1`(직렬 = 기존 동작)입니다. llama-server의 `-np`(parallel slot) 수와 맞추세요.
+
+호출부는 직접 스레드를 다루지 않고 단일 프리미티브 `map_parallel(items, worker)`로 라우팅합니다:
+
+```python
+# max_parallel == 1 이면 호출 스레드에서 그냥 for 루프 (기존과 byte-identical).
+# max_parallel > 1 이면 ThreadPoolExecutor로 fan-out. 각 worker는 대부분의 시간을
+# llama-server HTTP 왕복에서 블록되고 그동안 GIL이 풀리므로 스레드만으로 실효 동시성이 나옵니다.
+results = llm.map_parallel(records, worker_fn, label="cleanup")
+```
+
+- 결과는 **항상 입력 순서**로 반환됩니다(완료 순서와 무관).
+- worker가 예외를 던지면 입력 인덱스가 가장 빠른 예외가 재발생합니다(직렬 루프의 첫 실패와 동일).
+- "모드를 호출부마다 지정"하지 않습니다 — env/CLI(`--parallel`) 손잡이 하나로 전 진입점(CLI·API·테스트)에 일괄 적용됩니다.
 
 ---
 

@@ -19,6 +19,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--embed-host", default=None)
     parser.add_argument("--embed-port", type=int, default=8081)
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=None,
+        help=(
+            "Max concurrent LLM requests for batch work (per-document cleanup, "
+            "summaries, embeddings). Should match llama-server's -np slot count. "
+            "Default: VERITAS_LLM_PARALLEL env, or 1 (serial)."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=5)
     parser.add_argument("--scout-docs", type=int, default=3)
     parser.add_argument("--max-docs", type=int, default=15)
@@ -177,6 +187,7 @@ def main() -> None:
         stream_summary=args.stream_summary,
         stream_reasoning=args.stream_reasoning,
         trace_latency=not args.no_trace_latency,
+        max_parallel=args.parallel,
     )
 
     registry, run_store_service, rag_service = build_registry(
