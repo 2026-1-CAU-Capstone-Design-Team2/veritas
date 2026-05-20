@@ -1,15 +1,18 @@
 """LLM-backed source reliability judge.
 
 Wraps :data:`core.prompts.RELIABILITY_JUDGE_PROMPT` and renders one prompt per
-batch of documents (default 5 per call). Batching matters because:
+batch of documents. Batching matters because:
 
 * a small local model judges several docs more consistently when it sees them
   side-by-side (the prompt explicitly forbids cross-batch ranking, but having
   a shared frame stabilizes the bands);
-* 5 calls instead of N calls cuts the connect-handshake overhead 5x on
-  llama-server;
-* the input still fits the default 8K context window comfortably
-  (~1.1K tokens per doc × 5 + 500-token prompt ≈ 6K tokens).
+* fewer calls than N cuts the connect-handshake overhead on llama-server;
+* the input still fits the default 8K context window comfortably with the
+  per-doc caps in :class:`services.verification.models.VerificationConfig`.
+
+Every tunable lives on ``VerificationConfig`` (``reliability_batch_size``,
+``reliability_notes_max``, …) so a single ``cfg.fingerprint()`` change
+invalidates the on-disk cache when any of them moves.
 
 The judge is *defensive*: any failure to call the LLM, parse JSON, or match
 the returned ``doc_id`` to an input falls back to a neutral ``"medium"``
@@ -26,24 +29,15 @@ from typing import Any, Iterable
 
 from core.prompts import RELIABILITY_JUDGE_PROMPT
 
-from ..models import DocRecord
+from core.models import ParsedDocRecord
+
+from ..models import VerificationConfig
 from .batch_index import BatchMention
 
 logger = logging.getLogger(__name__)
 
-# Per-batch input cap. Bigger batches risk context exhaustion on small local
-# servers; smaller batches lose the consistency benefit. Five matches the
-# autosurvey batch_size default so the same batch grouping logic applies.
-_DEFAULT_BATCH_SIZE = 5
-
-# Per-doc text caps. Reliability judgement does not need full body — title +
-# domain + reliability_notes + a few key_points are enough signal, and keeping
-# the per-doc payload short means a 5-doc batch is always well under context.
-_RELIABILITY_NOTES_MAX = 6
-_KEY_POINTS_MAX = 5
-_BATCH_MENTIONS_MAX = 4
-_SNIPPET_MAX_CHARS = 240
-
+# Vocabulary the prompt commits to. Not knobs — these are the validator's
+# contract with the LLM, used to drop unknown values into a known default.
 _LEVEL_VALUES = {"high", "medium", "low"}
 _SIGNAL_VALUES = {"strong", "mixed", "weak"}
 
@@ -71,14 +65,16 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _doc_payload(
-    doc: DocRecord,
+    doc: ParsedDocRecord,
     mentions: list[BatchMention],
+    cfg: VerificationConfig,
 ) -> dict[str, Any]:
     """Compact JSON payload for one document inside the batch prompt.
 
     Only the signal-bearing fields are surfaced; the full clean_md body is
     deliberately left out (the prompt is judging trust *signals*, not
-    re-summarizing the content).
+    re-summarizing the content). Per-doc caps come from ``cfg`` so a
+    config change invalidates the cache via ``cfg.fingerprint()``.
     """
     return {
         "doc_id": doc.doc_id,
@@ -87,26 +83,30 @@ def _doc_payload(
         "url": doc.url,
         "search_query": doc.search_query,
         "summary": _clip(doc.summary, 600),
-        "key_points": [_clip(p, 240) for p in doc.key_points[:_KEY_POINTS_MAX]],
+        "key_points": [
+            _clip(p, 240) for p in doc.key_points[: cfg.reliability_key_points_max]
+        ],
         "reliability_notes": [
-            _clip(n, 280) for n in doc.reliability_notes[:_RELIABILITY_NOTES_MAX]
+            _clip(n, 280)
+            for n in doc.reliability_notes[: cfg.reliability_notes_max]
         ],
         "batch_mentions": [
             {
                 "batch_id": m.batch_id,
                 "kind": m.kind,
-                "snippet": _clip(m.snippet, _SNIPPET_MAX_CHARS),
+                "snippet": _clip(m.snippet, cfg.reliability_snippet_max_chars),
             }
-            for m in mentions[:_BATCH_MENTIONS_MAX]
+            for m in mentions[: cfg.reliability_batch_mentions_max]
         ],
     }
 
 
 def _build_user_prompt(
-    docs: list[DocRecord],
+    docs: list[ParsedDocRecord],
     mentions_by_doc: dict[str, list[BatchMention]],
     *,
     request_text: str,
+    cfg: VerificationConfig,
 ) -> str:
     """Render the user-side payload for one batch of docs.
 
@@ -119,7 +119,7 @@ def _build_user_prompt(
     payload = {
         "original_user_request": _clip(request_text, 1200),
         "documents": [
-            _doc_payload(doc, mentions_by_doc.get(doc.doc_id, []))
+            _doc_payload(doc, mentions_by_doc.get(doc.doc_id, []), cfg)
             for doc in docs
         ],
     }
@@ -192,7 +192,7 @@ def _derive_level(signals: dict[str, str], llm_level: str) -> str:
 
 def _verdicts_from_response(
     raw: dict[str, Any] | None,
-    docs: list[DocRecord],
+    docs: list[ParsedDocRecord],
 ) -> list[ReliabilityVerdict]:
     """Pull verdicts out of one LLM response, in the input ``docs`` order.
 
@@ -269,7 +269,7 @@ def _verdicts_from_response(
     return verdicts
 
 
-def _fallback_batch(docs: Iterable[DocRecord], reason: str) -> list[ReliabilityVerdict]:
+def _fallback_batch(docs: Iterable[ParsedDocRecord], reason: str) -> list[ReliabilityVerdict]:
     """Build a neutral ``medium`` verdict for every doc when the LLM call fails.
 
     Verify must always finish and persist *something* — a workspace whose
@@ -291,18 +291,19 @@ def _fallback_batch(docs: Iterable[DocRecord], reason: str) -> list[ReliabilityV
 
 
 def judge_documents(
-    docs: list[DocRecord],
+    docs: list[ParsedDocRecord],
     *,
     llm: Any,
     mentions_by_doc: dict[str, list[BatchMention]],
+    cfg: VerificationConfig,
     request_text: str = "",
-    batch_size: int = _DEFAULT_BATCH_SIZE,
 ) -> list[ReliabilityVerdict]:
     """Run the reliability LLM call over ``docs`` in fixed-size batches.
 
     Returns one verdict per input doc, in the input order. Duplicate
-    documents (``DocRecord.is_duplicate``) are *not* sent to the LLM — the
-    pipeline above inherits their verdict from the source instead.
+    documents (``ParsedDocRecord.is_duplicate``) are *not* sent to the LLM — the
+    pipeline above inherits their verdict from the source instead. Batch
+    size and per-doc caps come from ``cfg``.
     """
     if not docs:
         return []
@@ -311,10 +312,12 @@ def judge_documents(
         return _fallback_batch(docs, "LLM 클라이언트가 주입되지 않았습니다")
 
     verdicts: list[ReliabilityVerdict] = []
-    batch_size = max(1, int(batch_size))
+    batch_size = max(1, int(cfg.reliability_batch_size))
     for start in range(0, len(docs), batch_size):
         batch = docs[start : start + batch_size]
-        prompt = _build_user_prompt(batch, mentions_by_doc, request_text=request_text)
+        prompt = _build_user_prompt(
+            batch, mentions_by_doc, request_text=request_text, cfg=cfg
+        )
         try:
             response = llm.ask_json(
                 RELIABILITY_JUDGE_PROMPT,

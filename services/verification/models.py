@@ -43,16 +43,13 @@ class VerificationConfig:
     # --- Reciprocal Rank Fusion (indexing/rrf.py) ---
     rrf_k: int = 60
 
-    # --- Task 1: section flow (LLM-planned outline + sentence-level retrieval) ---
-    community_resolution: float = 1.0           # Louvain resolution (shared T2; legacy T1 retained)
+    # --- sections task (LLM-planned outline + sentence-level retrieval) ---
     section_candidate_multiplier: int = 5       # per-section sentence candidate pool size
-    section_top_chunk: int = 10                 # (retained for Task 2 retrieval helper)
-    doc_score_top_chunk: int = 5                # (retained for Task 2 doc-level aggregation)
     section_sentence_top_k: int = 24            # sentences kept per flow section
     section_sentence_min_chars: int = 24        # sentences shorter than this are dropped at split time
     section_sentence_max_chars: int = 320       # sentences longer than this get clause-split
     section_sentence_min_word_diversity: float = 0.45  # unique/total token ratio cutoff
-    label_top_n: int = 8                        # c-TF-IDF terms kept per auto label (Task 2/3)
+    label_top_n: int = 8                        # c-TF-IDF terms kept per auto label (sections/consensus)
     label_ngram_min: int = 1
     label_ngram_max: int = 3
     label_max_features: int = 5000
@@ -63,19 +60,20 @@ class VerificationConfig:
     flow_planner_doc_hints: int = 12            # how many doc titles+summary first lines to show LLM
     flow_planner_timeout_sec: float = 90.0
 
-    # --- Task 2: intent coverage ---
-    intent_query_edge_threshold: float = 0.55   # cosine edge in intent-query graph
-    intent_weight_max: float = 0.4              # doc_intent_score = max/mean/breadth blend
-    intent_weight_mean: float = 0.3
-    intent_weight_breadth: float = 0.3
-    # Ratio of the workspace's strongest facet-doc score. A facet under this
-    # ratio is flagged as a coverage gap. Was 0.3 (way under the workspace
-    # peak), but a single dominant facet in the workspace stayed at 100% of
-    # its own peak and never tripped the gap; 0.5 means "below half of the
-    # best-covered facet" and surfaces genuinely weak coverage.
-    intent_coverage_gap_threshold: float = 0.5
+    # --- reliability task (LLM-graded source trust judgement) ---
+    # ``reliability_batch_size`` matches the autosurvey batch size by default
+    # so one collect cycle's worth of docs is graded in a single LLM call.
+    # The four "max" caps keep each doc's payload short enough that a
+    # 5-doc batch fits the default 8K context window comfortably (~1.1K
+    # tokens per doc × 5 + ~500-token prompt ≈ 6K tokens).
+    reliability_batch_size: int = 5
+    reliability_notes_max: int = 6              # reliability_notes bullets per doc
+    reliability_key_points_max: int = 5         # key_points bullets per doc
+    reliability_batch_mentions_max: int = 4     # batch_*.md mentions per doc
+    reliability_snippet_max_chars: int = 240    # clip length of one batch mention snippet
 
-    # --- Task 3: cross-source consensus ---
+    # --- consensus task (cross-source community detection + conflict) ---
+    community_resolution: float = 1.0           # Louvain resolution used by consensus
     concept_edge_threshold_rrf: float = 0.012   # min fused RRF weight kept as a graph edge
     min_cluster_size: int = 2                   # clusters smaller than this are dropped
     conflict_min_cluster_size: int = 4          # conflict detection needs at least this many KPs
@@ -127,31 +125,6 @@ class ChunkRecord:
 
 
 @dataclass
-class DocRecord:
-    """A research document: ``index.json`` metadata + parsed ``doc_<id>.md`` summary.
-
-    Duplicate documents (``index.json`` ``duplicate_of`` set) have no clean_md
-    file and therefore no chunks, but are still loaded — consensus/diversity
-    needs to see them — with ``is_duplicate=True`` and an empty ``clean_md_text``.
-    Fetch-error stubs (``doc_<id>_error.md``) are skipped entirely by the loader.
-    """
-
-    doc_id: str
-    title: str = ""
-    url: str = ""
-    final_url: str = ""
-    domain: str = ""
-    search_query: str = ""
-    duplicate_of: str | None = None
-    is_duplicate: bool = False
-    summary: str = ""
-    key_points: list[str] = field(default_factory=list)
-    reliability_notes: list[str] = field(default_factory=list)
-    keywords: list[str] = field(default_factory=list)
-    clean_md_text: str = ""  # full Crawl4AI clean markdown; "" for duplicates
-
-
-@dataclass
 class KeyPointRecord:
     """A single claim unit pulled from a ``doc_<id>.md`` summary.
 
@@ -167,23 +140,8 @@ class KeyPointRecord:
     embedding: np.ndarray | None = None
 
 
-@dataclass
-class Query:
-    """A retrieval query derived from artifacts (request / plan / grounding).
-
-    ``origin`` records provenance (e.g. ``"plan.keyword[3]"``) so coverage gaps
-    can be traced back to their source. ``type`` is a coarse label
-    (``"full" | "topic" | "goal" | "keyword" | "term" | "must_cover"``).
-    """
-
-    origin: str
-    text: str
-    type: str
-    embedding: np.ndarray | None = None
-
-
 # ---------------------------------------------------------------------------
-# Output domain models — produced by the three task pipelines
+# Output domain models — produced by the task pipelines
 # ---------------------------------------------------------------------------
 
 
@@ -253,34 +211,6 @@ class SectionResult:
 
 
 @dataclass
-class Facet:
-    """A user-intent facet: a community of related intent queries (Task 2)."""
-
-    id: int
-    label_terms: list[str]
-    origin_queries: list[str] = field(default_factory=list)
-
-
-@dataclass
-class CoverageGap:
-    """An intent facet no document covers well (Task 2)."""
-
-    facet_id: int
-    label_terms: list[str]
-    top_doc_score: float
-
-
-@dataclass
-class IntentResult:
-    facets: list[Facet] = field(default_factory=list)
-    # (N_facet, N_doc); columns aligned to doc_order.
-    doc_facet_matrix: np.ndarray | None = None
-    doc_intent_score: dict[str, float] = field(default_factory=dict)
-    coverage_gap: list[CoverageGap] = field(default_factory=list)
-    doc_order: list[str] = field(default_factory=list)
-
-
-@dataclass
 class ConceptCluster:
     """A community of cross-source Key Points expressing the same concept (Task 3)."""
 
@@ -318,16 +248,9 @@ class ConsensusResult:
 
 @dataclass
 class VerificationArtifacts:
-    """Container for the verify task outputs (VERIFY_DESIGN.md §1.3).
-
-    ``intent`` is kept on the artifact for backward compatibility — workspaces
-    persisted before the reliability task replaced intent_coverage can still
-    be loaded. Newly-run verifications no longer populate it; the field
-    stays ``None`` and ``reliability`` carries the user-facing signal instead.
-    """
+    """Container for the verify task outputs (VERIFY_DESIGN.md §1.3)."""
 
     sections: SectionResult | None = None
-    intent: IntentResult | None = None
     consensus: ConsensusResult | None = None
     # ``reliability`` is typed as ``Any`` here to avoid pulling the
     # ``reliability/`` sub-package into this module (and creating a cycle).
@@ -358,16 +281,11 @@ class ProgressEvent:
 __all__ = [
     "VerificationConfig",
     "ChunkRecord",
-    "DocRecord",
     "KeyPointRecord",
-    "Query",
     "SentenceUnit",
     "SentenceAssignment",
     "FlowSection",
     "SectionResult",
-    "Facet",
-    "CoverageGap",
-    "IntentResult",
     "ConceptCluster",
     "ConflictFlag",
     "ConsensusResult",

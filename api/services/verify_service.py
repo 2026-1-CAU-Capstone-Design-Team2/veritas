@@ -116,8 +116,7 @@ def get_verify_detail(doc_id: str, workspace_id: str | None = None) -> dict[str,
 
     Carries the per-section breakdown, the LLM-graded reliability signals,
     and any concept clusters that touch the doc — the data the detail
-    dialog renders. ``facetBreakdown`` is kept on the payload for back-compat
-    but is empty for workspaces verified after intent was retired.
+    dialog renders.
     """
     resolved = _resolve_workspace_id(workspace_id)
     if not resolved:
@@ -140,7 +139,6 @@ def get_verify_detail(doc_id: str, workspace_id: str | None = None) -> dict[str,
         "workspaceId": resolved,
         "updatedAt": meta.get("updatedAt"),
         "sectionBreakdown": verify_view.section_breakdown_for(doc_id, artifacts.sections),
-        "facetBreakdown": verify_view.facet_breakdown_for(doc_id, artifacts.intent),
         "conceptParticipation": verify_view.concept_participation_for(artifacts.consensus),
     }
 

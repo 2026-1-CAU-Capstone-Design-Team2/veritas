@@ -6,7 +6,7 @@ Composes:
    for inline ``[doc_<id>]`` markers and group findings by source doc.
 2. :func:`llm_judge.judge_documents` — call the LLM in fixed-size batches
    (default 5 docs / call) to get one structured verdict per doc.
-3. Inherit verdicts for ``DocRecord.is_duplicate`` docs from their source so
+3. Inherit verdicts for ``ParsedDocRecord.is_duplicate`` docs from their source so
    duplicates do not consume LLM budget but still appear in the result.
 
 The output dataclasses are defined here (not in ``models.py``) because the
@@ -22,7 +22,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..models import DocRecord
+from core.models import ParsedDocRecord
+
+from ..models import VerificationConfig
 from .batch_index import BatchMention, build_batch_index
 from .llm_judge import judge_documents
 
@@ -77,7 +79,7 @@ def _distribution(items: list[ReliabilityItem]) -> dict[str, int]:
     return counts
 
 
-def _judge_eligible_docs(docs: list[DocRecord]) -> list[DocRecord]:
+def _judge_eligible_docs(docs: list[ParsedDocRecord]) -> list[ParsedDocRecord]:
     """Skip duplicates — they inherit from the source via ``duplicate_of``.
 
     A duplicate has no clean_md / no key_points / no reliability_notes; sending
@@ -88,7 +90,7 @@ def _judge_eligible_docs(docs: list[DocRecord]) -> list[DocRecord]:
 
 
 def _inherit_for_duplicates(
-    docs: list[DocRecord],
+    docs: list[ParsedDocRecord],
     judged: dict[str, ReliabilityItem],
     mentions_by_doc: dict[str, list[BatchMention]],
 ) -> list[ReliabilityItem]:
@@ -144,18 +146,20 @@ def _inherit_for_duplicates(
 
 
 def run_reliability_pipeline(
-    docs: list[DocRecord],
+    docs: list[ParsedDocRecord],
     *,
     llm: Any,
     summary_dir: str | Path,
+    cfg: VerificationConfig,
     request_text: str = "",
-    batch_size: int = 5,
 ) -> ReliabilityResult:
     """Run the full reliability task end-to-end.
 
     ``summary_dir`` is the path to ``runs/<ws>/summary/`` — where the
     ``batch_*.md`` files live. The pipeline is pure with respect to ``docs``;
-    it does not re-load them from disk.
+    it does not re-load them from disk. All knobs (batch size, per-doc
+    caps) come from ``cfg`` so a config change invalidates the cache via
+    ``cfg.fingerprint()``.
     """
     mentions_by_doc = build_batch_index(summary_dir)
 
@@ -164,8 +168,8 @@ def run_reliability_pipeline(
         eligible,
         llm=llm,
         mentions_by_doc=mentions_by_doc,
+        cfg=cfg,
         request_text=request_text,
-        batch_size=batch_size,
     )
 
     items: list[ReliabilityItem] = []

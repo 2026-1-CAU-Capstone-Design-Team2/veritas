@@ -7,7 +7,6 @@ disk; every other module stays close to a pure function. Output layout:
 runs/<workspace>/verification/
     meta.json                # config_hash · timestamp · tasks completed · doc count
     sections.json            # Task — SectionResult
-    intent_coverage.json     # (legacy) — IntentResult, read-only for old workspaces
     consensus.json           # Task — ConsensusResult
     reliability.json         # Task — ReliabilityResult (LLM-graded trust verdicts)
 ```
@@ -31,10 +30,7 @@ from .models import (
     ConceptCluster,
     ConflictFlag,
     ConsensusResult,
-    CoverageGap,
-    Facet,
     FlowSection,
-    IntentResult,
     SectionResult,
     SentenceAssignment,
     VerificationArtifacts,
@@ -50,7 +46,6 @@ logger = logging.getLogger(__name__)
 
 _META_FILE = "meta.json"
 _SECTIONS_FILE = "sections.json"
-_INTENT_FILE = "intent_coverage.json"
 _CONSENSUS_FILE = "consensus.json"
 _RELIABILITY_FILE = "reliability.json"
 
@@ -148,8 +143,6 @@ class VerificationPersistence:
 
         if artifacts.sections is not None and "sections" in completed_tasks:
             _write_json(directory / _SECTIONS_FILE, _serialize_section_result(artifacts.sections))
-        if artifacts.intent is not None and "intent" in completed_tasks:
-            _write_json(directory / _INTENT_FILE, _serialize_intent_result(artifacts.intent))
         if artifacts.consensus is not None and "consensus" in completed_tasks:
             _write_json(directory / _CONSENSUS_FILE, _serialize_consensus_result(artifacts.consensus))
         if artifacts.reliability is not None and "reliability" in completed_tasks:
@@ -183,10 +176,6 @@ class VerificationPersistence:
         sections_payload = _read_json(directory / _SECTIONS_FILE)
         if sections_payload is not None:
             artifacts.sections = _deserialize_section_result(sections_payload)
-
-        intent_payload = _read_json(directory / _INTENT_FILE)
-        if intent_payload is not None:
-            artifacts.intent = _deserialize_intent_result(intent_payload)
 
         consensus_payload = _read_json(directory / _CONSENSUS_FILE)
         if consensus_payload is not None:
@@ -240,45 +229,6 @@ def _deserialize_section_result(payload: dict) -> SectionResult:
         flow_source=str(payload.get("flow_source") or "llm"),
         sentence_count=int(payload.get("sentence_count") or 0),
         document_count=int(payload.get("document_count") or 0),
-    )
-
-
-def _serialize_intent_result(result: IntentResult) -> dict:
-    return _to_jsonable(result)
-
-
-def _deserialize_intent_result(payload: dict) -> IntentResult:
-    facets = [
-        Facet(
-            id=int(item.get("id", 0)),
-            label_terms=[str(t) for t in item.get("label_terms", [])],
-            origin_queries=[str(o) for o in item.get("origin_queries", [])],
-        )
-        for item in payload.get("facets", [])
-        if isinstance(item, dict)
-    ]
-    matrix_raw = payload.get("doc_facet_matrix")
-    matrix = (
-        np.asarray(matrix_raw, dtype=np.float32)
-        if isinstance(matrix_raw, list) and matrix_raw
-        else None
-    )
-    doc_intent = {str(k): float(v) for k, v in (payload.get("doc_intent_score") or {}).items()}
-    gaps = [
-        CoverageGap(
-            facet_id=int(item.get("facet_id", 0)),
-            label_terms=[str(t) for t in item.get("label_terms", [])],
-            top_doc_score=float(item.get("top_doc_score", 0.0)),
-        )
-        for item in payload.get("coverage_gap", [])
-        if isinstance(item, dict)
-    ]
-    return IntentResult(
-        facets=facets,
-        doc_facet_matrix=matrix,
-        doc_intent_score=doc_intent,
-        coverage_gap=gaps,
-        doc_order=[str(d) for d in payload.get("doc_order", [])],
     )
 
 

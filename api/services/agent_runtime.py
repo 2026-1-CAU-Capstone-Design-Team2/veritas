@@ -2,13 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import shutil
 import threading
 import time
-from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Iterator
 
 from fastapi import HTTPException
 
@@ -16,11 +13,14 @@ from agent import ChatAgent
 from llm.llama_server_llm import LLMClient
 from tools.autosurvey_tool import AutoSurveyTool
 from tools.loader import build_registry, load_schema
-from workflows import AutoSurveyWorkflow
+from workflows import AutoSurveyConfig, AutoSurveyWorkflow
+
+from . import workspace_paths
+from .progress_buffer import BUFFER_DEFAULT_MAX, ProgressBuffer
+from .screen_monitor import SCREEN_EVENT_BUFFER_MAX, ScreenMonitor
 
 
-SCREEN_EVENT_BUFFER_MAX = 100
-RESEARCH_PROGRESS_BUFFER_MAX = 500
+RESEARCH_PROGRESS_BUFFER_MAX = BUFFER_DEFAULT_MAX
 
 
 class AgentRuntime:
@@ -51,22 +51,18 @@ class AgentRuntime:
             trace_latency=os.getenv("VERITAS_TRACE_LATENCY", "1") != "0",
         )
         self._workspace_lock = threading.RLock()
-        self._screen_events: deque[dict[str, Any]] = deque(maxlen=SCREEN_EVENT_BUFFER_MAX)
-        self._screen_event_seq = 0
-        self._screen_event_lock = threading.Lock()
-        self._screen_monitoring_started_at: str | None = None
-        self._research_progress: deque[dict[str, Any]] = deque(maxlen=RESEARCH_PROGRESS_BUFFER_MAX)
-        self._research_progress_seq = 0
-        self._research_progress_lock = threading.Lock()
-        self._research_active_job: dict[str, Any] | None = None
-        # Verification (services/verification) reuses the same ring-buffer +
-        # cursor pattern as research progress so the frontend can poll
-        # /api/v1/verify/progress with the same `since` semantics, without two
-        # streams of events colliding inside one buffer.
-        self._verify_progress: deque[dict[str, Any]] = deque(maxlen=RESEARCH_PROGRESS_BUFFER_MAX)
-        self._verify_progress_seq = 0
-        self._verify_progress_lock = threading.Lock()
-        self._verify_active_job: dict[str, Any] | None = None
+        # ScreenMonitor owns the intervention event ring buffer + lifecycle
+        # state (started_at flag, chat_agent / registry references). The
+        # actual screen poller thread still lives inside ChatAgent —
+        # ScreenMonitor is just the runtime-side coordinator.
+        self._screen_monitor = ScreenMonitor(workspace_lock=self._workspace_lock)
+        # Two parallel progress streams. Same buffer class, two instances —
+        # so a research run and a verify run can be in flight at the same
+        # time without their events colliding. The verify task pollers
+        # already enforce ``Query(..., le=500)`` for the cursor read so the
+        # ``BUFFER_DEFAULT_MAX`` ceiling matches.
+        self._research_progress = ProgressBuffer(maxlen=RESEARCH_PROGRESS_BUFFER_MAX)
+        self._verify_progress = ProgressBuffer(maxlen=RESEARCH_PROGRESS_BUFFER_MAX)
 
         # Boot-time workspace selection: prefer the most recently-used real
         # workspace so we never create `runs/api/` when one already exists.
@@ -104,9 +100,7 @@ class AgentRuntime:
         self.workflow = AutoSurveyWorkflow(
             registry=self.registry,
             run_store_service=self.run_store_service,
-            max_docs=int(os.getenv("VERITAS_MAX_DOCS", "15")),
-            collect_batch_size=int(os.getenv("VERITAS_BATCH_SIZE", "5")),
-            scout_docs=int(os.getenv("VERITAS_SCOUT_DOCS", "3")),
+            config=AutoSurveyConfig.from_env(),
         )
         self._register_autosurvey_tool()
         self.chat_agent = ChatAgent(
@@ -118,6 +112,14 @@ class AgentRuntime:
         self.chat_agent.chat_history = self._load_workspace_chat_history()
         if self.rag_service is not None:
             self.rag_service.chat_history = list(self.chat_agent.chat_history)
+        # Rebind the screen-monitor's view of the workspace — same controller
+        # instance, fresh chat_agent / registry every workspace switch. Avoids
+        # the stale-reference race the pre-extraction code didn't even
+        # acknowledge because everything was on AgentRuntime directly.
+        self._screen_monitor.bind(
+            chat_agent=self.chat_agent,
+            registry=self.registry,
+        )
 
     def set_workspace(self, workspace_id: str) -> None:
         workspace_id = str(workspace_id or "").strip()
@@ -135,16 +137,11 @@ class AgentRuntime:
         with self._workspace_lock:
             if workspace_id == self.workspace_id:
                 return
-            was_monitoring = bool(
-                self._screen_monitoring_started_at
-                and self.chat_agent._screen_monitor_thread
-                and self.chat_agent._screen_monitor_thread.is_alive()
-            )
-            if was_monitoring:
-                try:
-                    self.chat_agent.stop_screen_monitoring()
-                except Exception as e:
-                    print(f"[screen_monitoring][warn] stop on workspace switch failed: {e}")
+            # Stop the screen poller (if any) before swapping in a new
+            # chat_agent — otherwise the old thread keeps running against a
+            # released registry. The controller remembers whether it was
+            # running so we can re-start cleanly after the switch.
+            was_monitoring = self._screen_monitor.stop_for_workspace_switch()
             leaving_default = self.workspace_id == "default"
             self.workspace_id = workspace_id
             output_dir = (
@@ -281,8 +278,12 @@ class AgentRuntime:
         started_at = time.perf_counter()
         started_wall = datetime.now(timezone.utc)
         request = self._append_reference_sites(instruction, reference_urls or [])
-        self._reset_research_progress(job_id=job_id, instruction=instruction)
-        self._emit_research_progress("term_grounding", "주제어 추출 중...")
+        self._research_progress.reset(
+            jobId=job_id,
+            workspaceId=self.workspace_id,
+            instruction=instruction,
+        )
+        self._research_progress.emit("term_grounding", "주제어 추출 중...")
         workspace_name, grounding = self._grounding_workspace_from_request(request)
         workspace_dir = self._reserve_workspace_dir(workspace_name)
         # Make the new workspace visible to the rest of the system *immediately*.
@@ -295,37 +296,28 @@ class AgentRuntime:
         # AutoSurvey pacing — per-request values from the research page
         # (maxDocs) and 설정 > 고급 설정 > 조사 진행 방식 (scoutDocs /
         # collectBatchSize) take precedence; otherwise the VERITAS_* env
-        # defaults apply. collectBatchSize doubles as the document_summarize
-        # batch size so one collect cycle maps to one batch summary.
-        resolved_max_docs = (
-            int(max_docs)
-            if max_docs is not None and int(max_docs) > 0
-            else int(os.getenv("VERITAS_MAX_DOCS", "15"))
-        )
-        resolved_collect_batch_size = (
-            int(collect_batch_size)
-            if collect_batch_size is not None and int(collect_batch_size) > 0
-            else int(os.getenv("VERITAS_BATCH_SIZE", "5"))
-        )
-        resolved_scout_docs = (
-            int(scout_docs)
-            if scout_docs is not None and int(scout_docs) > 0
-            else int(os.getenv("VERITAS_SCOUT_DOCS", "3"))
+        # defaults apply. ``AutoSurveyConfig.from_env`` owns the full
+        # resolution chain so this call site only has to express the
+        # caller-provided overrides. ``collect_batch_size`` doubles as the
+        # ``document_summarize`` batch size so one collect cycle maps to
+        # one batch summary.
+        autosurvey_config = AutoSurveyConfig.from_env(
+            max_docs=max_docs,
+            collect_batch_size=collect_batch_size,
+            scout_docs=scout_docs,
         )
         registry, run_store_service, rag_service = build_registry(
             llm=self.llm,
             run_root=workspace_dir,
-            batch_size=resolved_collect_batch_size,
+            batch_size=autosurvey_config.collect_batch_size,
             max_context=int(os.getenv("VERITAS_MAX_CONTEXT", "16384")),
             enable_screen_context=False,
         )
         workflow = AutoSurveyWorkflow(
             registry=registry,
             run_store_service=run_store_service,
-            max_docs=resolved_max_docs,
-            collect_batch_size=resolved_collect_batch_size,
-            scout_docs=resolved_scout_docs,
-            progress_callback=self._emit_research_progress,
+            config=autosurvey_config,
+            progress_callback=self._research_progress.emit,
         )
         result = workflow.run_all(
             user_request=request,
@@ -337,7 +329,7 @@ class AgentRuntime:
         clean_md_dir = getattr(run_store_service, "clean_md_dir", None)
         index_path = getattr(run_store_service, "index_path", None)
         if clean_md_dir is not None:
-            self._emit_research_progress("indexing", "검색 색인 생성 중...")
+            self._research_progress.emit("indexing", "검색 색인 생성 중...")
             indexed_chunks = rag_service.index_autosurvey_output(
                 clean_md_dir=Path(clean_md_dir),
                 index_path=Path(index_path) if index_path is not None else None,
@@ -351,13 +343,13 @@ class AgentRuntime:
             failed_documents = []
 
         if failed_documents:
-            self._emit_research_progress(
+            self._research_progress.emit(
                 "completed",
                 f"조사 완료 · 요약 실패 {len(failed_documents)}건",
                 final=True,
             )
         else:
-            self._emit_research_progress("completed", "조사 완료", final=True)
+            self._research_progress.emit("completed", "조사 완료", final=True)
 
         final_path = run_store_service.final_path
         records = self._read_index_records(index_path)
@@ -402,40 +394,15 @@ class AgentRuntime:
         }
 
     def _grounding_workspace_from_request(self, request: str) -> tuple[str, dict[str, Any] | None]:
-        try:
-            from tools.term_grounding_tool import TermGroundingTool
-
-            schema_path = Path(__file__).resolve().parents[2] / "tools" / "term_grounding_tool" / "tool_schema.json"
-            result = TermGroundingTool(
-                schema=load_schema(schema_path),
-                llm=self.llm,
-            ).run(user_request=request, max_terms=8)
-            payload = result.data if result.success and isinstance(result.data, dict) else {}
-            terms = payload.get("grounded_terms", [])
-            if isinstance(terms, list):
-                for term in terms:
-                    text = str(term or "").strip()
-                    if text:
-                        return text, payload
-        except Exception:
-            pass
-        return "research", None
+        return workspace_paths.extract_workspace_name_from_request(
+            request, llm=self.llm
+        )
 
     def _reserve_workspace_dir(self, workspace_name: str) -> Path:
-        safe_name = self._safe_workspace_name(workspace_name)
-        target = self.output_root / safe_name
-        if target.exists():
-            suffix = 2
-            while (self.output_root / f"{safe_name}-{suffix}").exists():
-                suffix += 1
-            target = self.output_root / f"{safe_name}-{suffix}"
-        target.mkdir(parents=True, exist_ok=False)
-        return target
+        return workspace_paths.reserve_workspace_dir(self.output_root, workspace_name)
 
     def _safe_workspace_name(self, name: str) -> str:
-        text = re.sub(r"[^\w가-힣.-]+", "_", str(name or "").strip(), flags=re.UNICODE)
-        text = text.strip("._-")
-        return text[:80] or "research"
+        return workspace_paths.safe_workspace_name(name)
 
     def _publish_new_workspace(self, workspace_dir: Path, user_request: str) -> None:
         """Surface a freshly-reserved workspace before the workflow runs.
@@ -489,7 +456,7 @@ class AgentRuntime:
             print(f"[workspace][publish][warn] catalog: {e}")
 
         # 3. Tell the frontend.
-        self._emit_research_progress(
+        self._research_progress.emit(
             "workspace_created",
             f"새 워크스페이스 생성: {workspace_id}",
             detail={
@@ -500,75 +467,13 @@ class AgentRuntime:
         )
 
     def _cleanup_pending_dirs(self) -> None:
-        try:
-            root = self.output_root.resolve()
-            for path in root.glob("_pending_*"):
-                if not path.is_dir():
-                    continue
-                resolved = path.resolve()
-                if root not in resolved.parents:
-                    continue
-                try:
-                    shutil.rmtree(resolved)
-                except Exception as e:
-                    print(f"[workspace][cleanup][warn] could not remove {resolved}: {e}")
-        except Exception as e:
-            print(f"[workspace][cleanup][warn] pending cleanup skipped: {e}")
+        workspace_paths.cleanup_pending_dirs(self.output_root)
 
     def _discover_initial_workspace(self) -> Path | None:
-        """Return the most-recently-modified real workspace dir, or None.
-
-        A "real" workspace has at least one piece of research evidence:
-        a final report, a summary index, or any `doc_*.md` summary file.
-        Used to avoid creating `runs/api/` when there is already a workspace
-        to land on at boot, or to resolve frontend requests for the
-        "default" workspace to something concrete.
-        """
-        if not self.output_root.exists():
-            return None
-        candidates: list[Path] = []
-        try:
-            for path in self.output_root.iterdir():
-                if not path.is_dir():
-                    continue
-                name = path.name
-                if name in {"api", "__pycache__"} or name.startswith("_"):
-                    continue
-                summary_dir = path / "summary"
-                has_final = (path / "final.md").exists()
-                has_index = (summary_dir / "index.json").exists()
-                has_summaries = summary_dir.exists() and any(summary_dir.glob("doc_*.md"))
-                if has_final or has_index or has_summaries:
-                    candidates.append(path)
-        except Exception as e:
-            print(f"[workspace][discover][warn] {e}")
-            return None
-        if not candidates:
-            return None
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        return candidates[0]
+        return workspace_paths.discover_initial_workspace(self.output_root)
 
     def _cleanup_empty_api_dir(self) -> None:
-        """Remove `runs/api/` if it has no meaningful research data.
-
-        Called at boot (to clear a stale `api/` from a prior session) and
-        whenever we transition off the default workspace, so the directory
-        never sticks around as a phantom side-effect of initialization.
-        """
-        api_dir = self.output_root / "api"
-        if not api_dir.exists() or not api_dir.is_dir():
-            return
-        summary_dir = api_dir / "summary"
-        has_final = (api_dir / "final.md").exists()
-        has_index = (summary_dir / "index.json").exists()
-        has_summaries = summary_dir.exists() and any(summary_dir.glob("doc_*.md"))
-        if has_final or has_index or has_summaries:
-            return
-        # Only chromadb/corpus skeletons remain — safe to remove.
-        try:
-            shutil.rmtree(api_dir)
-        except Exception as e:
-            print(f"[workspace][cleanup][warn] could not remove {api_dir}: {e}")
+        workspace_paths.cleanup_empty_api_dir(self.output_root)
 
     def _ensure_rag_index(self, *, require_documents: bool) -> None:
         if self.rag_service.get_document_count() > 0:
@@ -646,154 +551,24 @@ class AgentRuntime:
             )
         return documents
 
-    def _reset_research_progress(
-        self,
-        *,
-        job_id: str | None,
-        instruction: str,
-    ) -> None:
-        from datetime import datetime, timezone
-
-        with self._research_progress_lock:
-            self._research_progress.clear()
-            self._research_progress_seq = 0
-            self._research_active_job = {
-                "jobId": job_id,
-                "workspaceId": self.workspace_id,
-                "instruction": instruction,
-                "startedAt": datetime.now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-                "status": "running",
-            }
-
-    def _emit_research_progress(
-        self,
-        stage: str,
-        message: str,
-        *,
-        detail: dict[str, Any] | None = None,
-        final: bool = False,
-    ) -> None:
-        from datetime import datetime, timezone
-
-        message_text = " ".join(str(message or "").split()).strip()[:280]
-        with self._research_progress_lock:
-            self._research_progress_seq += 1
-            seq = self._research_progress_seq
-            event = {
-                "seq": seq,
-                "stage": str(stage or "").strip() or "info",
-                "message": message_text,
-                "detail": detail or {},
-                "timestamp": datetime.now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-            }
-            self._research_progress.append(event)
-            if self._research_active_job is not None and final:
-                self._research_active_job["status"] = "completed"
-
     def get_research_progress(self, since: int, limit: int) -> dict[str, Any]:
-        if limit <= 0:
-            limit = 50
-        limit = min(limit, RESEARCH_PROGRESS_BUFFER_MAX)
-        with self._research_progress_lock:
-            latest_seq = self._research_progress_seq
-            events = [
-                event
-                for event in self._research_progress
-                if int(event.get("seq", 0)) > since
-            ]
-            job_snapshot = dict(self._research_active_job or {})
-        events.sort(key=lambda item: int(item.get("seq", 0)))
-        events = events[:limit]
-        next_cursor = events[-1]["seq"] if events else since
-        return {
-            "items": events,
-            "nextCursor": next_cursor,
-            "latestSeq": latest_seq,
-            "activeJob": job_snapshot or None,
-        }
+        """Public read API for the research progress stream.
+
+        Thin facade over :class:`ProgressBuffer.get_since`; kept on the
+        runtime so route handlers (``api/api_routes/research.py``) have one
+        well-known callable instead of digging into ``_research_progress``.
+        """
+        return self._research_progress.get_since(since=since, limit=limit)
 
     # ------------------------------------------------------------------ verify
-    # The verification layer (services/verification) reuses the research-style
-    # progress pattern: ring buffer + cursor + lock + active-job snapshot. Two
-    # parallel streams (one for research, one for verify) so the frontend can
-    # show the two pages live without their events colliding in one buffer.
-
-    def _reset_verify_progress(
-        self,
-        *,
-        job_id: str | None,
-        workspace_id: str,
-    ) -> None:
-        from datetime import datetime, timezone
-
-        with self._verify_progress_lock:
-            self._verify_progress.clear()
-            self._verify_progress_seq = 0
-            self._verify_active_job = {
-                "jobId": job_id,
-                "workspaceId": workspace_id,
-                "startedAt": datetime.now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-                "status": "running",
-            }
-
-    def _emit_verify_progress(
-        self,
-        stage: str,
-        message: str,
-        *,
-        detail: dict[str, Any] | None = None,
-        final: bool = False,
-    ) -> None:
-        from datetime import datetime, timezone
-
-        message_text = " ".join(str(message or "").split()).strip()[:280]
-        with self._verify_progress_lock:
-            self._verify_progress_seq += 1
-            seq = self._verify_progress_seq
-            event = {
-                "seq": seq,
-                "stage": str(stage or "").strip() or "info",
-                "message": message_text,
-                "detail": detail or {},
-                "timestamp": datetime.now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-            }
-            self._verify_progress.append(event)
-            if self._verify_active_job is not None and final:
-                # ``stage=='failed'`` lets the frontend distinguish a graceful
-                # completion from a thrown failure that emitted a final event.
-                self._verify_active_job["status"] = (
-                    "failed" if str(stage) == "failed" else "completed"
-                )
+    # Verify reuses the same :class:`ProgressBuffer` class as research — two
+    # instances so the frontend's two pages can poll their own streams
+    # without events colliding.
 
     def get_verify_progress(self, *, since: int, limit: int) -> dict[str, Any]:
-        if limit <= 0:
-            limit = 50
-        limit = min(limit, RESEARCH_PROGRESS_BUFFER_MAX)
-        with self._verify_progress_lock:
-            latest_seq = self._verify_progress_seq
-            events = [
-                event
-                for event in self._verify_progress
-                if int(event.get("seq", 0)) > since
-            ]
-            job_snapshot = dict(self._verify_active_job or {})
-        events.sort(key=lambda item: int(item.get("seq", 0)))
-        events = events[:limit]
-        next_cursor = events[-1]["seq"] if events else since
-        return {
-            "items": events,
-            "nextCursor": next_cursor,
-            "latestSeq": latest_seq,
-            "activeJob": job_snapshot or None,
-        }
+        """Public read API for the verify progress stream — facade like
+        :meth:`get_research_progress`."""
+        return self._verify_progress.get_since(since=since, limit=limit)
 
     def run_verification(
         self,
@@ -818,7 +593,7 @@ class AgentRuntime:
             VerificationPersistence,
             VerificationService,
         )
-        from services.verification.service import ALL_TASKS, _KNOWN_TASKS
+        from services.verification.service import ALL_TASKS
 
         resolved_workspace = (workspace_id or "").strip() or self.workspace_id
         if resolved_workspace == "default":
@@ -845,15 +620,15 @@ class AgentRuntime:
                 detail="이 워크스페이스에는 인덱스(chromadb)가 없어 검증할 수 없습니다.",
             )
 
-        # Honour explicitly-passed legacy tasks (e.g. ``["intent"]``) too —
-        # the dispatcher knows about them even when they are no longer in
-        # the default set.
-        selected_tasks = [task for task in (tasks or ALL_TASKS) if task in _KNOWN_TASKS]
+        selected_tasks = [task for task in (tasks or ALL_TASKS) if task in ALL_TASKS]
         if not selected_tasks:
             selected_tasks = list(ALL_TASKS)
 
-        self._reset_verify_progress(job_id=job_id, workspace_id=resolved_workspace)
-        self._emit_verify_progress(
+        self._verify_progress.reset(
+            jobId=job_id,
+            workspaceId=resolved_workspace,
+        )
+        self._verify_progress.emit(
             "queued",
             f"검증 시작 · 워크스페이스 {resolved_workspace}",
             detail={"tasks": list(selected_tasks)},
@@ -874,12 +649,12 @@ class AgentRuntime:
         try:
             artifacts = service.run(
                 tasks=selected_tasks,
-                progress_callback=self._emit_verify_progress,
+                progress_callback=self._verify_progress.emit,
             )
         except HTTPException:
             raise
         except Exception as exc:
-            self._emit_verify_progress("failed", f"검증 실패: {exc}", final=True)
+            self._verify_progress.emit("failed", f"검증 실패: {exc}", final=True)
             raise HTTPException(
                 status_code=502,
                 detail=f"verification pipeline failed: {exc}",
@@ -891,9 +666,6 @@ class AgentRuntime:
             "configHash": artifacts.config_hash,
             "sectionCount": (
                 len(artifacts.sections.sections) if artifacts.sections else 0
-            ),
-            "facetCount": (
-                len(artifacts.intent.facets) if artifacts.intent else 0
             ),
             "conceptClusterCount": (
                 len(artifacts.consensus.concept_clusters) if artifacts.consensus else 0
@@ -909,167 +681,32 @@ class AgentRuntime:
             "documentCount": len(service.docs),
         }
 
+    # -------------------------------------------------------------- screen
+    # Thin facades over :class:`ScreenMonitor`. The route handlers in
+    # ``api/services/screen_monitoring_service.py`` keep calling these on
+    # the runtime so the public surface is unchanged; the controller owns
+    # the state.
+
     def start_screen_monitoring(self) -> dict[str, Any]:
-        """Start proactive screen monitoring on the active ChatAgent.
-
-        Captured screen interventions are converted into assistant answers and
-        appended to an in-memory event buffer that the frontend can poll.
-        """
-        with self._workspace_lock:
-            if not self.chat_agent.has_screen_context():
-                raise HTTPException(
-                    status_code=409,
-                    detail="screen_context tool is not registered. Enable VERITAS_ENABLE_SCREEN_CONTEXT before starting the API.",
-                )
-            started = self.chat_agent.start_screen_monitoring(
-                on_answer=self._on_screen_assist_answer,
-                stream=False,
-            )
-            if not started:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Failed to start screen monitoring. Check screen_context tool status and capture logs.",
-                )
-            if self._screen_monitoring_started_at is None:
-                from datetime import datetime, timezone
-
-                self._screen_monitoring_started_at = (
-                    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-                )
-            return self.screen_monitoring_status()
+        """Start the screen poller; record assistant answers into the buffer."""
+        return self._screen_monitor.start(
+            on_answer=lambda answer, intervention: self._screen_monitor.record_assist_answer(
+                answer, intervention, workspace_id=self.workspace_id
+            ),
+        )
 
     def stop_screen_monitoring(self) -> dict[str, Any]:
-        with self._workspace_lock:
-            if self.chat_agent.has_screen_context():
-                self.chat_agent.stop_screen_monitoring()
-            self._screen_monitoring_started_at = None
-            return self.screen_monitoring_status()
+        return self._screen_monitor.stop()
 
     def screen_monitoring_status(self) -> dict[str, Any]:
-        registered = bool(
-            self.registry is not None and self.registry.has("screen_context")
+        return self._screen_monitor.status(workspace_id=self.workspace_id)
+
+    def get_screen_events_since(self, *, since: int, limit: int) -> dict[str, Any]:
+        return self._screen_monitor.get_events_since(
+            since=since,
+            limit=limit,
+            workspace_id=self.workspace_id,
         )
-        polling = False
-        last_poll_error: str | None = None
-        latest_event_id: str | None = None
-        latest_captured_at: str | None = None
-        latest_diagnostics: dict[str, Any] = {}
-        pending_intervention_count = 0
-        capture_log_path: str | None = None
-        if registered:
-            try:
-                result = self.registry.call("screen_context", action="status")
-            except Exception as e:
-                last_poll_error = f"status call failed: {e}"
-                result = None
-            if result is not None and getattr(result, "success", False):
-                data = result.data if isinstance(result.data, dict) else {}
-                polling = bool(data.get("polling"))
-                last_poll_error = data.get("last_poll_error")
-                latest_event_id = data.get("latest_event_id")
-                latest_captured_at = data.get("latest_captured_at")
-                diagnostics = data.get("latest_diagnostics") or {}
-                if isinstance(diagnostics, dict):
-                    latest_diagnostics = diagnostics
-                pending_intervention_count = int(
-                    data.get("pending_intervention_count") or 0
-                )
-                capture_log_path = data.get("capture_log_path")
-            elif result is not None:
-                last_poll_error = getattr(result, "error", None) or last_poll_error
-
-        with self._screen_event_lock:
-            latest_seq = self._screen_event_seq
-            event_buffer_size = len(self._screen_events)
-
-        return {
-            "registered": registered,
-            "polling": polling,
-            "monitoringStartedAt": self._screen_monitoring_started_at,
-            "workspaceId": self.workspace_id,
-            "lastPollError": last_poll_error,
-            "latestCaptureEventId": latest_event_id,
-            "latestCapturedAt": latest_captured_at,
-            "latestDiagnostics": latest_diagnostics,
-            "pendingInterventionCount": pending_intervention_count,
-            "captureLogPath": capture_log_path,
-            "eventBufferSize": event_buffer_size,
-            "latestEventSeq": latest_seq,
-        }
-
-    def get_screen_events_since(
-        self,
-        *,
-        since: int,
-        limit: int,
-    ) -> dict[str, Any]:
-        if limit <= 0:
-            limit = 20
-        limit = min(limit, SCREEN_EVENT_BUFFER_MAX)
-        with self._screen_event_lock:
-            latest_seq = self._screen_event_seq
-            events = [
-                event for event in self._screen_events if int(event.get("seq", 0)) > since
-            ]
-        events.sort(key=lambda item: int(item.get("seq", 0)))
-        events = events[:limit]
-        next_cursor = events[-1]["seq"] if events else since
-        return {
-            "items": events,
-            "nextCursor": next_cursor,
-            "latestSeq": latest_seq,
-            "workspaceId": self.workspace_id,
-        }
-
-    def _on_screen_assist_answer(
-        self,
-        answer: str,
-        intervention: dict[str, Any],
-    ) -> None:
-        from datetime import datetime, timezone
-
-        text = str(answer or "").strip()
-        if not text:
-            return
-        with self._screen_event_lock:
-            self._screen_event_seq += 1
-            seq = self._screen_event_seq
-            workspace_id = self.workspace_id
-        writing_context = intervention.get("writing_context") if isinstance(intervention, dict) else {}
-        if not isinstance(writing_context, dict):
-            writing_context = {}
-        app_context = intervention.get("app_context") if isinstance(intervention, dict) else {}
-        if not isinstance(app_context, dict):
-            app_context = {}
-        focused = " ".join(str(writing_context.get("focused_sentence") or "").split()).strip()
-        recent = " ".join(str(writing_context.get("recent_sentences") or "").split()).strip()
-        trigger_text = focused or recent
-        event = {
-            "seq": seq,
-            "eventId": str(intervention.get("event_id") or "") or f"proactive_{seq}",
-            "workspaceId": workspace_id,
-            "answer": text,
-            "category": "proactive",
-            "tone": "working",
-            "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "capturedAt": intervention.get("captured_at"),
-            "triggerText": trigger_text,
-            "appContext": {
-                "title": app_context.get("title") or app_context.get("window_title"),
-                "processName": app_context.get("process_name"),
-                "activeAppType": app_context.get("active_app_type")
-                or writing_context.get("active_app_type"),
-            },
-            "writingContext": {
-                "focusedSentence": focused,
-                "recentSentences": recent,
-                "paragraphSource": writing_context.get("paragraph_source"),
-                "fullTextChars": writing_context.get("full_text_chars"),
-                "confidence": writing_context.get("confidence"),
-            },
-        }
-        with self._screen_event_lock:
-            self._screen_events.append(event)
 
     def _compact_workflow_result(self, result: Any) -> dict[str, Any]:
         if not isinstance(result, dict):

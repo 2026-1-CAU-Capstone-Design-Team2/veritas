@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from core.models import DocRecord
+from core.models import IndexedDocRecord
+
+from .config import AutoSurveyConfig
 
 
 ProgressCallback = Callable[..., None]
@@ -17,16 +19,20 @@ class AutoSurveyWorkflow:
         registry,
         run_store_service,
         *,
-        max_docs: int = 15,
-        collect_batch_size: int = 5,
-        scout_docs: int = 3,
+        config: AutoSurveyConfig | None = None,
         progress_callback: ProgressCallback | None = None,
     ):
         self.registry = registry
         self.run_store_service = run_store_service
-        self.max_docs = max(1, int(max_docs))
-        self.collect_batch_size = max(1, int(collect_batch_size))
-        self.scout_docs = max(1, min(int(scout_docs), self.max_docs))
+        # ``AutoSurveyConfig`` clamps every knob in ``__post_init__`` (so
+        # ``max_docs=0`` or ``scout_docs > max_docs`` is corrected at
+        # construction). We expose the resulting values as plain attrs so
+        # existing call sites (`workflow.max_docs`, etc.) keep working
+        # without going through ``self._config.max_docs``.
+        self._config = config or AutoSurveyConfig()
+        self.max_docs = self._config.max_docs
+        self.collect_batch_size = self._config.collect_batch_size
+        self.scout_docs = self._config.scout_docs
         self._progress_callback = progress_callback
 
     def _emit_progress(
@@ -785,7 +791,7 @@ class AutoSurveyWorkflow:
             "failed_documents": failed_documents,
         }
 
-    def _already_seen_url(self, records: list[DocRecord], url: str) -> bool:
+    def _already_seen_url(self, records: list[IndexedDocRecord], url: str) -> bool:
         canonical_url = self._canonicalize_url(url)
         return any(
             self._canonicalize_url(r.final_url) == canonical_url
