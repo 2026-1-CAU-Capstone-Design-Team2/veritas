@@ -304,6 +304,15 @@ def judge_documents(
     documents (``ParsedDocRecord.is_duplicate``) are *not* sent to the LLM — the
     pipeline above inherits their verdict from the source instead. Batch
     size and per-doc caps come from ``cfg``.
+
+    Batches are independent (the prompt forbids cross-batch ranking), so they
+    fan out through :meth:`LLMClient.map_parallel` — the same single knob
+    (``max_parallel`` / ``VERITAS_LLM_PARALLEL`` / 설정 > 병렬 디코딩) used by the
+    AutoSurvey cleanup / summarize loops. With ``max_parallel == 1`` this is the
+    original sequential loop. Reliability prompts carry only compact per-doc
+    signals (summary / key points / notes — not full bodies), so concurrent
+    batches stay well within the context window. Results are returned in input
+    order; the caller sorts by ``doc_id`` regardless.
     """
     if not docs:
         return []
@@ -311,10 +320,20 @@ def judge_documents(
         logger.warning("reliability: no LLM provided; emitting neutral verdicts")
         return _fallback_batch(docs, "LLM 클라이언트가 주입되지 않았습니다")
 
-    verdicts: list[ReliabilityVerdict] = []
     batch_size = max(1, int(cfg.reliability_batch_size))
-    for start in range(0, len(docs), batch_size):
-        batch = docs[start : start + batch_size]
+    indexed_batches = [
+        (start // batch_size + 1, docs[start : start + batch_size])
+        for start in range(0, len(docs), batch_size)
+    ]
+
+    def _judge_one_batch(
+        item: tuple[int, list[ParsedDocRecord]],
+    ) -> list[ReliabilityVerdict]:
+        """Judge one independent batch. Never raises — any LLM / parse failure
+        degrades to a neutral fallback verdict so verify always finishes (the
+        module-level contract), which also makes it safe to run on a worker
+        thread."""
+        batch_no, batch = item
         prompt = _build_user_prompt(
             batch, mentions_by_doc, request_text=request_text, cfg=cfg
         )
@@ -325,18 +344,27 @@ def judge_documents(
                 reasoning=False,
                 max_retries=2,
                 stream=False,
-                stream_label=f"reliability:{start // batch_size + 1:03d}",
+                stream_label=f"reliability:{batch_no:03d}",
             )
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning(
-                "reliability: judge LLM call failed (start=%d size=%d): %s",
-                start,
+                "reliability: judge LLM call failed (batch=%d size=%d): %s",
+                batch_no,
                 len(batch),
                 exc,
             )
-            verdicts.extend(_fallback_batch(batch, str(exc)))
-            continue
-        verdicts.extend(_verdicts_from_response(response, batch))
+            return _fallback_batch(batch, str(exc))
+        return _verdicts_from_response(response, batch)
+
+    mapper = getattr(llm, "map_parallel", None)
+    if callable(mapper):
+        batch_results = mapper(indexed_batches, _judge_one_batch, label="reliability")
+    else:
+        batch_results = [_judge_one_batch(item) for item in indexed_batches]
+
+    verdicts: list[ReliabilityVerdict] = []
+    for batch_verdicts in batch_results:
+        verdicts.extend(batch_verdicts)
     return verdicts
 
 
