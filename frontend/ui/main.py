@@ -3,10 +3,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from ..api_common import API_BASE_URL, load_bootstrap_state
-from ..backend_server import ensure_api_server
+from ..api_connection import ApiUnavailableError, ensure_api_connection
 from .main_window import MainWindow
 
 
@@ -26,13 +26,24 @@ def _reconcile_workspaces_with_runs() -> None:
 
 def main() -> None:
 	_reconcile_workspaces_with_runs()
-	ensure_api_server(API_BASE_URL)
+
+	# Create the QApplication first so we can show a real error dialog if the
+	# API server is unreachable, instead of silently spinning up a hidden
+	# in-process backend (the old behavior, which masked port mismatches).
+	app = QApplication([])
+	app.setApplicationName("VERITAS")
+
+	try:
+		ensure_api_connection(API_BASE_URL)
+	except ApiUnavailableError as exc:
+		print(f"[api][error] {exc}")
+		QMessageBox.critical(None, "API 서버에 연결할 수 없습니다", str(exc))
+		return
+
 	try:
 		load_bootstrap_state()
 	except Exception:
 		pass
-	app = QApplication([])
-	app.setApplicationName("VERITAS")
 
 	window = MainWindow()
 	window.show()
