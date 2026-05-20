@@ -80,6 +80,13 @@ class SettingsResearchMethodRequest(BaseModel):
     planCount: int = Field(default=5, ge=1, le=9999)
 
 
+class SettingsLlmParallelRequest(BaseModel):
+    # 병렬 디코딩 동시 요청 수 (LLMClient.max_parallel). Matches llama-server's
+    # -np slot count. 1 = serial. Hard-bounded 1..5 to match the settings UI
+    # stepper and to keep low-spec machines from oversubscribing the server.
+    value: int = Field(default=1, ge=1, le=5)
+
+
 class TypingContextRequest(BaseModel):
     sessionId: str
     workspaceId: str

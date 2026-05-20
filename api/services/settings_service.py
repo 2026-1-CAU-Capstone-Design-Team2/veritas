@@ -27,3 +27,26 @@ def update_document_tools(custom_tools: list[dict[str, Any]]) -> dict[str, Any]:
 def update_research_method(sample_count: int, plan_count: int) -> dict[str, Any]:
     research = repo.set_research_method_settings(sample_count, plan_count)
     return {"research": research, "updated": True}
+
+
+def update_llm_parallel(value: int) -> dict[str, Any]:
+    """Persist the parallel-decoding concurrency and apply it to the live
+    shared LLM client.
+
+    ``LLMClient.map_parallel`` reads ``max_parallel`` at call time, so updating
+    the attribute on the already-constructed runtime client takes effect on the
+    next batch (cleanup / summarize / embeddings) without a restart. The live
+    apply is best-effort: if the runtime has not been built yet the persisted
+    STATE value is what matters, and a runtime built later still starts from the
+    env default (the UI re-applies on the next save).
+    """
+    parallel = repo.set_llm_parallel_settings(value)
+    try:
+        # Lazy import to avoid a circular import at module load
+        # (agent_runtime imports a large dependency graph).
+        from .agent_runtime import get_runtime
+
+        get_runtime().llm.max_parallel = parallel
+    except Exception:
+        pass
+    return {"llmParallel": parallel, "updated": True}

@@ -130,6 +130,13 @@ DEFAULT_RESEARCH_PLAN_COUNT = 5
 MIN_RESEARCH_PLAN_COUNT = 5
 MAX_RESEARCH_PLAN_COUNT = 9999
 
+# 병렬 디코딩 — concurrent LLM requests for per-doc cleanup/summary + embeddings
+# (LLMClient.max_parallel / llama-server -np). Hard-bounded 1~5: 1 = serial,
+# 5 caps how hard a low-spec local server is pushed.
+DEFAULT_LLM_PARALLEL = 1
+MIN_LLM_PARALLEL = 1
+MAX_LLM_PARALLEL = 5
+
 
 class _CollapsibleHeader(QPushButton):
 	"""Flat, full-width header for a CollapsibleSection.
@@ -240,6 +247,7 @@ class SettingsPage(QWidget):
 		research_defaults = self._settings.setdefault("research", {})
 		research_defaults.setdefault("sampleCount", DEFAULT_RESEARCH_SAMPLE_COUNT)
 		research_defaults.setdefault("planCount", DEFAULT_RESEARCH_PLAN_COUNT)
+		self._settings.setdefault("llmParallel", DEFAULT_LLM_PARALLEL)
 		self._model_buttons: dict[str, QPushButton] = {}
 
 		root = QVBoxLayout(self)
@@ -338,6 +346,8 @@ class SettingsPage(QWidget):
 		section.add_widget(self._build_document_tools_section())
 		section.add_widget(self._divider())
 		section.add_widget(self._build_research_method_section())
+		section.add_widget(self._divider())
+		section.add_widget(self._build_llm_parallel_section())
 		return section
 
 	def _build_document_tools_section(self) -> QWidget:
@@ -512,6 +522,57 @@ class SettingsPage(QWidget):
 		layout.addWidget(self.research_method_status)
 
 		self._load_research_method_settings()
+		return section
+
+	def _build_llm_parallel_section(self) -> QWidget:
+		section = QWidget()
+		layout = QVBoxLayout(section)
+		layout.setContentsMargins(0, 0, 0, 0)
+		layout.setSpacing(12)
+
+		layout.addWidget(self._subsection_title("병렬 디코딩"))
+
+		subtitle = QLabel(
+			"문서 정제·요약 등 LLM 호출을 동시에 몇 개까지 처리할지 설정합니다. "
+			"값을 올리면 자료조사 속도가 빨라지지만 로컬 LLM 서버 메모리를 더 사용합니다. "
+			"LLM 서버의 병렬 슬롯 수(-np)와 맞추는 것이 좋습니다."
+		)
+		subtitle.setObjectName("PageSubtitle")
+		subtitle.setWordWrap(True)
+		layout.addWidget(subtitle)
+
+		# Same −/＋ stepper the 조사 페이지 / 조사 진행 방식 use, bounded 1~5.
+		self.llm_parallel_input = DocCountStepper(
+			MIN_LLM_PARALLEL,
+			MAX_LLM_PARALLEL,
+			DEFAULT_LLM_PARALLEL,
+		)
+		layout.addWidget(
+			self._research_param_row(
+				"동시 처리 개수",
+				f"동시에 실행할 LLM 요청 수입니다. "
+				f"({MIN_LLM_PARALLEL}~{MAX_LLM_PARALLEL}, 기본값 {DEFAULT_LLM_PARALLEL} = 순차 처리)",
+				self.llm_parallel_input,
+			)
+		)
+
+		action_row = QHBoxLayout()
+		action_row.setSpacing(8)
+		action_row.addStretch(1)
+		reset_button = AppButton("기본값", variant="ghost")
+		reset_button.clicked.connect(self._reset_llm_parallel_settings)
+		save_button = AppButton("병렬 설정 저장")
+		save_button.clicked.connect(self._save_llm_parallel_settings)
+		action_row.addWidget(reset_button)
+		action_row.addWidget(save_button)
+		layout.addLayout(action_row)
+
+		self.llm_parallel_status = QLabel()
+		self.llm_parallel_status.setObjectName("SettingsStatus")
+		self.llm_parallel_status.setWordWrap(True)
+		layout.addWidget(self.llm_parallel_status)
+
+		self._load_llm_parallel_settings()
 		return section
 
 	def _research_param_row(self, title: str, hint: str, field: QWidget) -> QFrame:
@@ -754,6 +815,37 @@ class SettingsPage(QWidget):
 			f"{lead}최초 샘플링 {self.research_sample_input.value()}개 · "
 			f"플랜당 {self.research_plan_input.value()}개"
 		)
+
+	def _load_llm_parallel_settings(self) -> None:
+		value = self._settings.get("llmParallel", DEFAULT_LLM_PARALLEL)
+		try:
+			self.llm_parallel_input.setValue(int(value))
+		except (TypeError, ValueError):
+			self.llm_parallel_input.setValue(DEFAULT_LLM_PARALLEL)
+		self._update_llm_parallel_status()
+
+	def _reset_llm_parallel_settings(self) -> None:
+		self.llm_parallel_input.setValue(DEFAULT_LLM_PARALLEL)
+		self._save_llm_parallel_settings()
+
+	def _save_llm_parallel_settings(self) -> None:
+		value = self.llm_parallel_input.value()
+		self._settings["llmParallel"] = value
+		# Persist to the backend so the value survives load_bootstrap_state()
+		# (which replaces STATE["settings"] wholesale) and is applied live to
+		# the shared LLM client's max_parallel.
+		try:
+			AgentController().update_llm_parallel(value)
+		except Exception as e:
+			self._update_llm_parallel_status(f"저장 중 오류가 발생했습니다: {e}")
+			return
+		self._update_llm_parallel_status("병렬 디코딩 설정이 저장되었습니다.")
+
+	def _update_llm_parallel_status(self, prefix: str | None = None) -> None:
+		lead = f"{prefix} · " if prefix else ""
+		value = self.llm_parallel_input.value()
+		mode = "순차 처리" if value <= 1 else f"동시 {value}개"
+		self.llm_parallel_status.setText(f"{lead}{mode}")
 
 	def set_default_workspace_by_name(self, _workspace_name: str) -> None:
 		return

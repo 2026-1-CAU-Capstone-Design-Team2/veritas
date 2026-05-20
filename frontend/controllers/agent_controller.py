@@ -116,6 +116,12 @@ class AgentController:
 			{"sampleCount": int(sample_count), "planCount": int(plan_count)},
 		)
 
+	def update_llm_parallel(self, value: int) -> dict[str, Any]:
+		return api_client.put(
+			"/api/v1/settings/llm-parallel",
+			{"value": int(value)},
+		)
+
 	def get_document_summary(self, workspace_id: str) -> str:
 		response = api_client.get(f"/api/v1/documents/{workspace_id}/summary")
 		return str(response.get("summary") or "")
