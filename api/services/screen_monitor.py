@@ -97,7 +97,7 @@ class ScreenMonitor:
                 )
             started = self._chat_agent.start_screen_monitoring(
                 on_answer=on_answer,
-                stream=False,
+                stream=True,
             )
             if not started:
                 raise HTTPException(
@@ -213,6 +213,7 @@ class ScreenMonitor:
         intervention: dict[str, Any],
         *,
         workspace_id: str,
+        done: bool = True,
     ) -> None:
         """Append one assistant answer to the buffer (called by chat agent's
         on-answer callback).
@@ -223,6 +224,13 @@ class ScreenMonitor:
         """
         text = str(answer or "").strip()
         if not text:
+            return
+        event_id = ""
+        if isinstance(intervention, dict):
+            event_id = str(intervention.get("event_id") or "").strip()
+        # Without a stable event_id, partial updates cannot be matched to a
+        # single card, so skip mid-stream calls and only record the final answer.
+        if not event_id and not done:
             return
         writing_context = (
             intervention.get("writing_context")
@@ -248,33 +256,44 @@ class ScreenMonitor:
         with self._event_lock:
             self._seq += 1
             seq = self._seq
-        event = {
-            "seq": seq,
-            "eventId": str(intervention.get("event_id") or "")
-            or f"proactive_{seq}",
-            "workspaceId": workspace_id,
-            "answer": text,
-            "category": "proactive",
-            "tone": "working",
-            "createdAt": _now_iso(),
-            "capturedAt": intervention.get("captured_at"),
-            "triggerText": trigger_text,
-            "appContext": {
-                "title": app_context.get("title") or app_context.get("window_title"),
-                "processName": app_context.get("process_name"),
-                "activeAppType": app_context.get("active_app_type")
-                or writing_context.get("active_app_type"),
-            },
-            "writingContext": {
-                "focusedSentence": focused,
-                "recentSentences": recent,
-                "paragraphSource": writing_context.get("paragraph_source"),
-                "fullTextChars": writing_context.get("full_text_chars"),
-                "confidence": writing_context.get("confidence"),
-            },
-        }
-        with self._event_lock:
-            self._events.append(event)
+            existing = None
+            if event_id:
+                for candidate in self._events:
+                    if candidate.get("eventId") == event_id:
+                        existing = candidate
+                        break
+            # Mid-stream update: refresh the same event's text in place and
+            # bump its seq so the cursor poller re-delivers the growing answer.
+            if existing is not None:
+                existing["answer"] = text
+                existing["partial"] = not done
+                existing["seq"] = seq
+                return
+            self._events.append({
+                "seq": seq,
+                "eventId": event_id or f"proactive_{seq}",
+                "workspaceId": workspace_id,
+                "answer": text,
+                "partial": not done,
+                "category": "proactive",
+                "tone": "working",
+                "createdAt": _now_iso(),
+                "capturedAt": intervention.get("captured_at"),
+                "triggerText": trigger_text,
+                "appContext": {
+                    "title": app_context.get("title") or app_context.get("window_title"),
+                    "processName": app_context.get("process_name"),
+                    "activeAppType": app_context.get("active_app_type")
+                    or writing_context.get("active_app_type"),
+                },
+                "writingContext": {
+                    "focusedSentence": focused,
+                    "recentSentences": recent,
+                    "paragraphSource": writing_context.get("paragraph_source"),
+                    "fullTextChars": writing_context.get("full_text_chars"),
+                    "confidence": writing_context.get("confidence"),
+                },
+            })
 
     def get_events_since(
         self,

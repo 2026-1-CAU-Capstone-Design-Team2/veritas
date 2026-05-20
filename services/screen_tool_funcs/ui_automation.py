@@ -355,7 +355,12 @@ class UiAutomationReader:
         if process_name == "winword.exe" and class_name == "_wwg":
             return "primary", None
 
-        if process_name == "notepad.exe" and "edit" in control_type and len(text) >= 20:
+        if process_name == "notepad.exe" and "edit" in control_type:
+            # A focused Notepad edit control is authoritative document text even
+            # when short (the user just started typing). Don't apply the generic
+            # "too_short_for_document_context" downgrade here — that would push a
+            # 1-19 char Notepad doc onto the OCR fallback, which reads the app
+            # chrome as noise. (Empty docs are caught earlier as empty_text.)
             return "primary", None
 
         if process_name == "code.exe" and any(token in focused_name for token in ("terminal", "debug console")):

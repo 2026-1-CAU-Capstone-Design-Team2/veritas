@@ -909,7 +909,7 @@ class BlankDocumentStartScenario(ScenarioType):
         *,
         max_document_chars: int = 30,
         min_blank_captures: int = 3,
-        cooldown_min_seconds: float = 600.0,
+        cooldown_min_seconds: float = 200.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:

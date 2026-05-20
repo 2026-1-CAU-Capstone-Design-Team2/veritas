@@ -58,7 +58,7 @@ class ScreenContextService:
         self,
         root: str | Path,
         *,
-        interval_sec: float = 5.0,
+        interval_sec: float = 3.0,
         ocr_language: str = "ko-KR",
         ocr_scale: float = 2.0,
         crop_left: int = 0,
@@ -157,6 +157,15 @@ class ScreenContextService:
             ocr = OcrResult(
                 language=self.ocr_engine.language,
                 error="skipped: UI Automation text extraction succeeded.",
+            )
+        elif ui_automation.reject_reason == "empty_text":
+            # UIA found and read the focused editor control but it is genuinely
+            # empty (reject_reason="empty_text"). Do NOT fall back to OCR: OCR
+            # would just read the app's menus/toolbars as noise. Treat it as an
+            # empty document so BlankDocumentStartScenario handles it instead.
+            ocr = OcrResult(
+                language=self.ocr_engine.language,
+                error="skipped: UIA read an empty editor (authoritative; no OCR fallback).",
             )
         else:
             image = self.screen_capture.capture_window(window)
