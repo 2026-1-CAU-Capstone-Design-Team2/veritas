@@ -193,11 +193,15 @@ INTERVENTION ROUTING HINT:
 SCENARIO GUIDANCE:
 {scenario_guidance}
 
+USER WRITING STYLE:
+{style_guidance}
+
 KNOWLEDGE BASE CONTEXT:
 {knowledge_context}
 
 Write the assistant message that should appear in the chat for this screen context now.
-Language rule: answer in the dominant language of SCREEN WRITING CONTEXT. If SCREEN WRITING CONTEXT is Korean, answer in Korean."""
+Language rule: answer in the dominant language of SCREEN WRITING CONTEXT. If SCREEN WRITING CONTEXT is Korean, answer in Korean.
+Style rule: follow USER WRITING STYLE so the reply matches the user's register and sentence endings."""
 
 
 # Per-scenario guidance injected into ``SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE``

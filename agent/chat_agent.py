@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from datetime import datetime
 from typing import Any, Callable, Iterator
@@ -16,6 +17,49 @@ from core.prompts import (
     TOOL_CHAT_USER_PROMPT_TEMPLATE,
 )
 from tools.llm_tooling import build_llm_tooling
+
+
+_STYLE_GUIDANCE_BY_REGISTER = {
+    "합쇼체": "사용자는 격식체(합쇼체, '~습니다/~ㅂ니다')로 작성합니다. 답변도 동일한 합쇼체 격식 문장으로 작성하세요.",
+    "해요체": "사용자는 해요체('~요')로 작성합니다. 답변도 친근하고 정중한 해요체로 작성하세요.",
+    "음슴체": "사용자는 개조식·음슴체('~음/~함/~됨')로 작성합니다. 답변도 간결한 개조식 음슴체 종결로 작성하세요.",
+    "평서체": "사용자는 문어체 평서문('~다/~이다/~한다')으로 작성합니다. 답변도 동일한 '~다' 평서체 문어체로, 객관적·학술적 어조를 유지하세요.",
+    "반말체": "사용자는 반말체로 작성합니다. 답변도 편한 반말로 작성하세요.",
+}
+
+
+def detect_korean_style(text: str) -> str:
+    """문서의 종결어미를 휴리스틱으로 분석해 문체 지시문을 반환.
+
+    문장 종결부의 어미를 합쇼체/해요체/음슴체/평서체/반말체로 분류해 최빈
+    register를 고른다. 한국어 종결 단서가 2문장 미만으로 부족하면 빈 문자열을
+    반환해 호출자가 주입을 생략하도록 한다.
+    """
+    counts = {"합쇼체": 0, "해요체": 0, "음슴체": 0, "평서체": 0, "반말체": 0}
+    for segment in re.split(r"[.!?\n\r·]+", str(text or "")):
+        words = segment.strip().rstrip("\"'”’」』)]》").split()
+        if not words:
+            continue
+        last = words[-1]
+        if re.search(r"(니다|니까|십시오)$", last):
+            counts["합쇼체"] += 1
+        elif re.search(r"(에요|예요|아요|어요|세요|해요|네요|죠|요)$", last):
+            counts["해요체"] += 1
+        elif re.search(r"(음|함|됨|임|슴|봄|옴|짐|킴)$", last):
+            counts["음슴체"] += 1
+        elif re.search(
+            r"(이다|한다|된다|었다|았다|였다|는다|린다|진다|난다|싶다|없다|있다|단다|온다|간다|다)$",
+            last,
+        ):
+            counts["평서체"] += 1
+        elif re.search(r"(거든|구나|군|네|지|야|어|걸)$", last):
+            counts["반말체"] += 1
+    if sum(counts.values()) < 2:
+        return ""
+    register = max(counts, key=lambda key: counts[key])
+    if counts[register] == 0:
+        return ""
+    return _STYLE_GUIDANCE_BY_REGISTER[register]
 
 
 class ChatAgent:
@@ -516,6 +560,7 @@ class ChatAgent:
                 ),
                 routing_hint=self._pretty_payload(intervention.get("tool_routing_hint") or {}),
                 scenario_guidance=scenario_guidance,
+                style_guidance=self._screen_style_guidance(intervention),
                 knowledge_context=knowledge_context,
             )
             try:
@@ -808,6 +853,18 @@ class ChatAgent:
             "confidence": writing.get("confidence", 0.0),
             "scope_note": "Only the latest 1-2 sentences are provided for this intervention.",
         }
+
+    def _screen_style_guidance(self, intervention: dict[str, Any]) -> str:
+        """사용자 문서 원문에서 문체를 감지해 프롬프트용 지시문을 만든다.
+        full_text(전체 문서)는 리뷰 시나리오의 지시문 오버라이드에 오염되지 않으므로
+        문체 분석 소스로 가장 안전하다. 단서가 부족하면 일반 지침으로 폴백."""
+        writing = intervention.get("writing_context") if isinstance(intervention, dict) else {}
+        if not isinstance(writing, dict):
+            writing = {}
+        sample = str(writing.get("full_text") or writing.get("current_paragraph") or "")
+        return detect_korean_style(sample[:3000]) or (
+            "뚜렷한 문체 단서가 없으면 화면 텍스트의 언어와 어조를 그대로 따르세요."
+        )
 
     def _screen_history_question(self, intervention: dict[str, Any]) -> str:
         app = intervention.get("app_context") or intervention.get("app") or {}
