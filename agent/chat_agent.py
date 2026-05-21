@@ -10,8 +10,7 @@ from typing import Any, Callable, Iterator
 from core.prompts import (
     ASSIST_GROUNDED_USER_TEMPLATE,
     ASSIST_SYSTEM_PROMPTS,
-    CHAT_SOURCES_BLOCK_TEMPLATE,
-    CHAT_SYSTEM_TEMPLATE,
+    CHAT_DOCUMENT_BLOCK_TEMPLATE,
     REFERENCE_BLOCK_TEMPLATE,
     SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE,
     SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE,
@@ -193,7 +192,7 @@ class ChatAgent:
             self._append_history(command_text, answer)
             return answer
 
-    def ask_auto_iter(self, question: str) -> Iterator[str]:
+    def ask_auto_iter(self, question: str, doc_context: str = "") -> Iterator[str]:
         """Generator variant of ask_auto. Tool decision runs non-streaming,
         the final answer is streamed as chunks, and history is updated when
         the stream completes.
@@ -217,6 +216,7 @@ class ChatAgent:
                     question=question_text,
                     tool_outputs=tool_outputs,
                     history_question=question,
+                    doc_context=doc_context,
                 )
                 return
 
@@ -225,9 +225,12 @@ class ChatAgent:
                 question=question,
                 tool_outputs=tool_outputs,
                 history_question=question,
+                doc_context=doc_context,
             )
 
-    def ask_explicit_tool_iter(self, command: str, question: str) -> Iterator[str]:
+    def ask_explicit_tool_iter(
+        self, command: str, question: str, doc_context: str = ""
+    ) -> Iterator[str]:
         normalized_command = str(command or "").strip().lower()
         if normalized_command not in {"autosurvey", "rag"}:
             raise ValueError(f"Unsupported explicit chat tool: {command}")
@@ -242,6 +245,7 @@ class ChatAgent:
                 question=command_text,
                 tool_outputs=tool_outputs,
                 history_question=command_text,
+                doc_context=doc_context,
             )
 
     def ask_rag_iter(self, question: str) -> Iterator[str]:
@@ -419,49 +423,26 @@ class ChatAgent:
             stream_label=f"editor-{action}",
         )
 
-    def iter_editor_chat(
-        self,
-        message: str,
-        doc_text: str = "",
-        *,
-        use_workspace: bool = True,
-    ) -> Iterator[str]:
-        """Stream a document-grounded chat reply. RAG is additive — the current
-        document is always in the prompt; workspace sources are appended when
-        available."""
-        msg = (message or "").strip()
-        if not msg:
-            return
-        doc = (doc_text or "")[:4000]
-        system_prompt = CHAT_SYSTEM_TEMPLATE.format(doc=doc or "(빈 문서)")
-        if use_workspace:
-            context = self._editor_context(msg)
-            if context:
-                system_prompt += CHAT_SOURCES_BLOCK_TEMPLATE.format(context=context)
-        yield from self.llm.iter_ask(
-            system_prompt,
-            msg,
-            reasoning=False,
-            sampling_params={"temperature": 0.6, "top_p": 0.9, "max_tokens": 512},
-            stream_label="editor-chat",
-        )
-
     def _stream_final_answer(
         self,
         *,
         question: str,
         tool_outputs: list[dict[str, str]],
         history_question: str,
+        doc_context: str = "",
     ) -> Iterator[str]:
         prompt = TOOL_CHAT_FINAL_PROMPT_TEMPLATE.format(
             history=self._format_recent_history(),
             question=question,
             tool_results=self._format_tool_results(tool_outputs),
         )
+        system_prompt = self._chat_system_prompt()
+        if doc_context:
+            system_prompt += CHAT_DOCUMENT_BLOCK_TEMPLATE.format(doc=doc_context)
         collected: list[str] = []
         try:
             for chunk in self.llm.iter_ask(
-                self._chat_system_prompt(),
+                system_prompt,
                 prompt,
                 reasoning=False,
                 stream_label="chat:final" if tool_outputs else "chat",

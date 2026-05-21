@@ -56,6 +56,11 @@ class ChatMessageRequest(BaseModel):
     workspaceId: str
     message: str
     mode: Literal["research", "autosurvey", "rag"] = "research"
+    # Optional editor-surface extras. Defaults keep the main chat request
+    # unchanged; the editor's 문서 대화 sends the open document as additive
+    # context and tags its turns so both surfaces share one chat log.
+    docText: str = ""
+    source: str = "chat"
 
 
 class FeedbackAnalyzeRequest(BaseModel):
@@ -119,13 +124,6 @@ class EditorAssistRequest(BaseModel):
     action: Literal["rewrite", "summarize", "polish", "grammar", "continue"]
     text: str = ""
     maxTokens: int = Field(default=400, ge=16, le=1024)
-    useWorkspace: bool = True
-
-
-class EditorChatRequest(BaseModel):
-    workspaceId: str
-    message: str
-    docText: str = ""
     useWorkspace: bool = True
 
 

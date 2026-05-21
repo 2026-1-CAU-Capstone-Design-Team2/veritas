@@ -80,7 +80,11 @@ def chat_send(payload: ChatMessageRequest) -> dict[str, str]:
 async def chat_send_stream(payload: ChatMessageRequest) -> StreamingResponse:
     return StreamingResponse(
         draft_chat_service.send_chat_message_stream(
-            payload.workspaceId, payload.message, payload.mode
+            payload.workspaceId,
+            payload.message,
+            payload.mode,
+            doc_text=payload.docText,
+            source=payload.source,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
