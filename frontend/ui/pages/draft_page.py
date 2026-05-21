@@ -21,14 +21,17 @@ from PySide6.QtWidgets import (
 	QSizePolicy,
 	QStackedWidget,
 	QTextEdit,
+	QToolButton,
 	QVBoxLayout,
 	QWidget,
 )
 
 from ...api_common import current_workspace_id
+from ...components.badges import Badge
 from ...components.buttons import AppButton
 from ...controllers import AgentController, JobCategory, get_job_manager
 from ..markdown_view import apply_markdown
+from .verify_page import VerifyDetailDialog, _tone_for_level
 
 __all__ = ["DraftPage"]
 
@@ -95,12 +98,10 @@ CATEGORY_EYEBROWS = {
 TONES = ["격식체", "중립", "캐주얼"]
 LENGTHS = ["짧게", "보통", "길게"]
 
-_TONE_GUIDE = {"격식체": "격식 있고 공식적인 문체", "중립": "중립적이고 명료한 문체", "캐주얼": "부드럽고 친근한 문체"}
-_LENGTH_GUIDE = {"짧게": "핵심 위주로 간결하게", "보통": "보통 수준의 분량으로", "길게": "충분히 상세하게"}
-
-# 양식 파일 경로에도 "작성 옵션" 단계를 추가 → 직접 구성과 동일하게 톤/분량/대상/핵심을 받는다.
-FILE_STEPS = ["소스", "양식 분석", "작성 옵션", "목차 확정", "초안"]
-CUSTOM_STEPS = ["소스", "대분류", "소분류", "구성", "목차 확정", "초안"]
+# 두 경로 모두 "자료 선택" 단계를 거친다 → 검증에서 평가된 자료 중 초안에 반영할
+# 문서를 고른다. 양식 경로는 업로드·분석 직후, 직접 구성은 대분류 선택 직전에 둔다.
+FILE_STEPS = ["소스", "양식 분석", "자료 선택", "작성 옵션", "목차 확정", "초안"]
+CUSTOM_STEPS = ["소스", "자료 선택", "대분류", "소분류", "구성", "목차 확정", "초안"]
 
 FILE_FILTER = "문서 (*.docx *.pdf *.md *.txt *.pptx *.ppt *.hwp *.hwpx);;모든 파일 (*.*)"
 _TEXT_SUFFIXES = {".md", ".markdown", ".txt", ".rst", ".log"}
@@ -257,6 +258,25 @@ QTextEdit#DraftOutput {
 	selection-background-color: #BFDBFE; selection-color: #0F172A;
 }
 QLabel#SettingsNote { color: #94A3B8; font-size: 12px; }
+
+/* 자료 선택 — 등급 드롭다운 */
+QLabel#DocSelectEmpty {
+	color: #6B7280; background-color: #F8FAFC; border: 1px dashed #CBD5E1;
+	border-radius: 10px; padding: 16px; font-size: 13px;
+}
+QFrame#DocGroup { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 12px; }
+QFrame#DocGroupHeader { background-color: #F8FAFC; border: none; border-bottom: 1px solid #EEF0F3; border-top-left-radius: 12px; border-top-right-radius: 12px; }
+QFrame#DocGroupBody { background: transparent; border: none; }
+QToolButton#DocGroupToggle {
+	color: #64748B; background: transparent; border: none;
+	font-size: 13px; font-weight: 800; padding: 0 2px;
+}
+QToolButton#DocGroupToggle:hover { color: #4F46E5; }
+QLabel#DocGroupCount { color: #94A3B8; font-size: 12px; font-weight: 700; }
+QFrame#DocRow { background-color: #F8FAFC; border: 1px solid #EEF0F3; border-radius: 8px; }
+QFrame#DocRow:hover { border-color: #C7D2FE; }
+QLabel#DocRowTitle { color: #0F172A; font-size: 13px; font-weight: 600; }
+QLabel#DocRowMeta { color: #6B7280; font-size: 11px; }
 """
 
 
@@ -477,6 +497,279 @@ class WritingOptions(QWidget):
 		self._keypoints.clear()
 
 
+# ------------------------------------------------------------------- 자료 선택
+class DocumentSelector(QWidget):
+	"""검증 결과를 등급(높음/중간/낮음)별 드롭다운으로 묶어, 초안에 반영할 자료를
+	고르게 하는 위젯.
+
+	- 각 등급 그룹은 접을 수 있고, 그룹 체크박스로 하위 문서를 일괄 토글한다
+	  (부모 체크박스는 tri-state — 일부만 선택되면 부분 체크로 표시).
+	- 문서 행마다 '상세 보기' 버튼이 검증 탭의 '자료별 검증 결과'와 동일한
+	  :class:`VerifyDetailDialog` 를 띄운다.
+	- 기본은 모든 문서가 선택된 상태이며, 체크 해제된 문서는 초안 grounding 에서
+	  빠진다.
+
+	검증 결과가 없으면(아직 미검증) 안내만 보여주고 :meth:`is_active` 가 False 가
+	되어, 초안 생성 시 자료 필터를 보내지 않는다(전체 지식베이스로 생성)."""
+
+	_LEVELS = ("높음", "중간", "낮음")
+
+	def __init__(self, controller: AgentController, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self._controller = controller
+		self._workspace_id = ""
+		self._items: list[dict] = []
+		# docId -> {"cb": QCheckBox, "item": dict, "level": str}
+		self._rows: dict[str, dict] = {}
+		# level -> {"group_cb", "doc_ids", "body", "caret", "count"}
+		self._groups: dict[str, dict] = {}
+		# Guard so bulk (un)checking children doesn't recurse into the parent.
+		self._suppress = False
+
+		root = QVBoxLayout(self)
+		root.setContentsMargins(0, 0, 0, 0)
+		root.setSpacing(10)
+
+		self._empty = QLabel("")
+		self._empty.setObjectName("DocSelectEmpty")
+		self._empty.setWordWrap(True)
+		self._empty.setVisible(False)
+		root.addWidget(self._empty)
+
+		self._groups_box = QVBoxLayout()
+		self._groups_box.setSpacing(10)
+		root.addLayout(self._groups_box)
+
+	# -- 외부 API -------------------------------------------------------------
+	def load(self, workspace_id: str) -> None:
+		"""현재 워크스페이스의 검증 결과를 읽어 그룹을 다시 그린다.
+
+		검증 결과는 파일시스템 읽기(LLM·임베딩 없음)라 검증 페이지와 동일하게
+		UI 스레드에서 동기로 불러온다. 매 진입마다 '모두 선택' 기본값으로 초기화."""
+		self._workspace_id = (workspace_id or "").strip()
+		try:
+			response = self._controller.list_verify_results(
+				workspace_id=self._workspace_id, page=1, page_size=200
+			)
+		except Exception:
+			response = {}
+		items = response.get("items") if isinstance(response, dict) else []
+		self._items = (
+			[it for it in items if isinstance(it, dict) and it.get("docId")]
+			if isinstance(items, list)
+			else []
+		)
+		self._rebuild()
+
+	def is_active(self) -> bool:
+		"""고를 수 있는 검증 자료가 하나라도 있으면 True."""
+		return bool(self._rows)
+
+	def selected_doc_ids(self) -> list[str]:
+		return [doc_id for doc_id, row in self._rows.items() if row["cb"].isChecked()]
+
+	def selected_count(self) -> int:
+		return len(self.selected_doc_ids())
+
+	# -- 구성 -----------------------------------------------------------------
+	def _rebuild(self) -> None:
+		while self._groups_box.count():
+			item = self._groups_box.takeAt(0)
+			widget = item.widget()
+			if widget is not None:
+				widget.setParent(None)
+				widget.deleteLater()
+		self._rows = {}
+		self._groups = {}
+
+		if not self._items:
+			self._empty.setText(
+				"이 워크스페이스에는 아직 검증 결과가 없습니다. 검증을 먼저 진행하면 "
+				"자료를 등급별로 골라 초안에 반영할 수 있어요. 지금은 그대로 진행할 수 "
+				"있으며, 이 경우 전체 지식베이스를 사용해 초안을 생성합니다."
+			)
+			self._empty.setVisible(True)
+			return
+		self._empty.setVisible(False)
+
+		by_level: dict[str, list[dict]] = {lv: [] for lv in self._LEVELS}
+		leftover: list[dict] = []
+		for it in self._items:
+			level = str(it.get("level") or "")
+			if level in by_level:
+				by_level[level].append(it)
+			else:
+				leftover.append(it)
+
+		for level in self._LEVELS:
+			docs = by_level.get(level) or []
+			if docs:
+				self._groups_box.addWidget(self._build_group(level, docs))
+		if leftover:
+			self._groups_box.addWidget(self._build_group("기타", leftover))
+
+	def _build_group(self, level: str, docs: list[dict]) -> QWidget:
+		frame = QFrame()
+		frame.setObjectName("DocGroup")
+		outer = QVBoxLayout(frame)
+		outer.setContentsMargins(0, 0, 0, 0)
+		outer.setSpacing(0)
+
+		header = QFrame()
+		header.setObjectName("DocGroupHeader")
+		hrow = QHBoxLayout(header)
+		hrow.setContentsMargins(12, 10, 12, 10)
+		hrow.setSpacing(10)
+
+		group_cb = QCheckBox()
+		group_cb.setObjectName("DocGroupCheck")
+		group_cb.setTristate(True)
+		group_cb.setChecked(True)
+		group_cb.setCursor(Qt.PointingHandCursor)
+		group_cb.clicked.connect(lambda _checked=False, lv=level: self._on_group_clicked(lv))
+		hrow.addWidget(group_cb, 0)
+
+		caret = QToolButton()
+		caret.setObjectName("DocGroupToggle")
+		caret.setCursor(Qt.PointingHandCursor)
+		caret.setText("▾")
+		caret.clicked.connect(lambda _checked=False, lv=level: self._toggle_group(lv))
+		hrow.addWidget(caret, 0)
+
+		badge = Badge(level, _tone_for_level(level))
+		hrow.addWidget(badge, 0)
+
+		count = QLabel("")
+		count.setObjectName("DocGroupCount")
+		hrow.addWidget(count, 0)
+		hrow.addStretch(1)
+
+		body = QFrame()
+		body.setObjectName("DocGroupBody")
+		body_layout = QVBoxLayout(body)
+		body_layout.setContentsMargins(8, 4, 8, 8)
+		body_layout.setSpacing(6)
+
+		doc_ids: list[str] = []
+		for item in docs:
+			doc_id = str(item.get("docId") or "").strip()
+			if not doc_id:
+				continue
+			body_layout.addWidget(self._build_doc_row(item, level, doc_id))
+			doc_ids.append(doc_id)
+
+		outer.addWidget(header)
+		outer.addWidget(body)
+
+		self._groups[level] = {
+			"group_cb": group_cb,
+			"doc_ids": doc_ids,
+			"body": body,
+			"caret": caret,
+			"count": count,
+		}
+		self._update_group_state(level)
+		return frame
+
+	def _build_doc_row(self, item: dict, level: str, doc_id: str) -> QWidget:
+		row = QFrame()
+		row.setObjectName("DocRow")
+		hrow = QHBoxLayout(row)
+		hrow.setContentsMargins(12, 8, 10, 8)
+		hrow.setSpacing(10)
+
+		checkbox = QCheckBox()
+		checkbox.setChecked(True)
+		checkbox.setCursor(Qt.PointingHandCursor)
+		checkbox.stateChanged.connect(lambda _state, lv=level: self._on_child_changed(lv))
+		hrow.addWidget(checkbox, 0, Qt.AlignTop)
+
+		cell = QVBoxLayout()
+		cell.setContentsMargins(0, 0, 0, 0)
+		cell.setSpacing(2)
+		title = QLabel(str(item.get("title") or doc_id or "문서"))
+		title.setObjectName("DocRowTitle")
+		title.setWordWrap(True)
+		cell.addWidget(title)
+		meta_text = str(item.get("matchRate") or "").strip()
+		if meta_text:
+			meta = QLabel(meta_text)
+			meta.setObjectName("DocRowMeta")
+			meta.setWordWrap(True)
+			cell.addWidget(meta)
+		hrow.addLayout(cell, 1)
+
+		detail = AppButton("상세 보기", variant="ghost")
+		detail.setFixedHeight(28)
+		detail.clicked.connect(lambda _checked=False, it=item: self._show_detail(it))
+		hrow.addWidget(detail, 0, Qt.AlignTop)
+
+		self._rows[doc_id] = {"cb": checkbox, "item": item, "level": level}
+		return row
+
+	# -- 상호작용 -------------------------------------------------------------
+	def _toggle_group(self, level: str) -> None:
+		group = self._groups.get(level)
+		if not group:
+			return
+		expanded = not group["body"].isVisible()
+		group["body"].setVisible(expanded)
+		group["caret"].setText("▾" if expanded else "▸")
+
+	def _on_group_clicked(self, level: str) -> None:
+		group = self._groups.get(level)
+		if not group:
+			return
+		doc_ids = group["doc_ids"]
+		# Binary intent from the user's perspective: if everything is currently
+		# checked, clear the group; otherwise select all of it. (The parent's own
+		# tristate cycling is corrected by _update_group_state afterward.)
+		all_checked = all(self._rows[d]["cb"].isChecked() for d in doc_ids)
+		target = not all_checked
+		self._suppress = True
+		for doc_id in doc_ids:
+			self._rows[doc_id]["cb"].setChecked(target)
+		self._suppress = False
+		self._update_group_state(level)
+
+	def _on_child_changed(self, level: str) -> None:
+		if self._suppress:
+			return
+		self._update_group_state(level)
+
+	def _update_group_state(self, level: str) -> None:
+		group = self._groups.get(level)
+		if not group:
+			return
+		doc_ids = group["doc_ids"]
+		total = len(doc_ids)
+		checked = sum(1 for d in doc_ids if self._rows[d]["cb"].isChecked())
+		group_cb = group["group_cb"]
+		group_cb.blockSignals(True)
+		if checked == 0:
+			group_cb.setCheckState(Qt.Unchecked)
+		elif checked == total:
+			group_cb.setCheckState(Qt.Checked)
+		else:
+			group_cb.setCheckState(Qt.PartiallyChecked)
+		group_cb.blockSignals(False)
+		group["count"].setText(f"전체 {total} · 선택 {checked}")
+
+	def _show_detail(self, item: dict) -> None:
+		"""검증 탭과 동일하게 상세 페이로드를 받아 VerifyDetailDialog 를 연다."""
+		doc_id = str(item.get("docId") or "").strip()
+		if not doc_id:
+			return
+		try:
+			payload = self._controller.get_verify_detail(doc_id, self._workspace_id)
+		except Exception as exc:  # noqa: BLE001 — 실패해도 행 데이터로 다이얼로그를 연다
+			payload = dict(item)
+			payload["_error"] = str(exc)
+		if not isinstance(payload, dict):
+			payload = dict(item)
+		VerifyDetailDialog(payload, parent=self).exec()
+
+
 # --------------------------------------------------------------------- 점 스테퍼
 class DotStepper(QWidget):
 	"""번호형 점 + 라벨. 메인 창과 공유하는 WorkflowStepper 대신 초안 페이지 전용."""
@@ -546,6 +839,8 @@ class DraftPage(QWidget):
 		self._category: dict | None = None
 		self._subtype: dict | None = None
 		self._uploaded_path: Path | None = None
+		# 업로드 양식에서 추출한 마크다운 템플릿(양식 경로 grounding 에 사용).
+		self._form_markdown = ""
 		self._section_rows: list[dict] = []
 		self._outline_items: list[str] = []
 		self._outline_edits: list[QLineEdit] = []
@@ -581,6 +876,7 @@ class DraftPage(QWidget):
 		self._idx: dict[str, int] = {}
 		self._add_step("source", self._build_source_page())
 		self._add_step("upload", self._build_upload_page())
+		self._add_step("doc_select", self._build_doc_select_page())
 		self._add_step("file_options", self._build_file_options_page())
 		self._add_step("category", self._build_category_page())
 		self._add_step("subtype", self._build_subtype_page())
@@ -694,14 +990,14 @@ class DraftPage(QWidget):
 			"file",
 			"양식 파일 사용",
 			"기존 양식(docx · pdf · md 등)을 업로드하면 그 구조를 분석해 같은 형식으로 초안을 생성합니다.",
-			"4 단계",
+			"5 단계",
 			lambda: self._choose_source("file"),
 		))
 		choices.addWidget(self._choice_tile(
 			"compose",
 			"직접 구성",
 			"카테고리와 세부 유형을 따라 단계별로 문서 구성을 직접 만듭니다. 자유롭게 짜고 싶을 때 적합해요.",
-			"6 단계",
+			"7 단계",
 			lambda: self._choose_source("custom"),
 		))
 		body.addLayout(choices)
@@ -778,6 +1074,24 @@ class DraftPage(QWidget):
 		body.addWidget(self._helper_note(
 			"· .md / .txt 양식은 제목 구조를 자동으로 읽어 목차로 채웁니다.<br>"
 			"· 그 외 포맷은 기본 골격을 제시하니 <b>목차 확정</b> 단계에서 직접 편집하세요."
+		))
+		col.addWidget(card)
+		col.addStretch(1)
+		return page
+
+	# ------------------------------------------------------ 공통: 자료 선택
+	def _build_doc_select_page(self) -> QWidget:
+		page, col = self._new_step()
+		card, body = self._card(
+			title="자료 선택",
+			subtitle="검증에서 평가된 자료를 등급별로 펼쳐 확인하고, 초안에 반영할 자료를 고르세요. "
+			"기본은 모두 선택이며, 체크를 해제하면 그 자료는 초안 작성에서 제외됩니다.",
+		)
+		self._doc_selector = DocumentSelector(self._controller)
+		body.addWidget(self._doc_selector)
+		body.addWidget(self._helper_note(
+			"· 등급 헤더의 체크박스를 끄면 그 등급의 자료가 한 번에 제외됩니다.<br>"
+			"· <b>상세 보기</b> 는 검증 탭의 '자료별 검증 결과'와 동일한 상세 창을 엽니다."
 		))
 		col.addWidget(card)
 		col.addStretch(1)
@@ -1260,21 +1574,36 @@ class DraftPage(QWidget):
 			next=("양식 분석", self._analyze_format, self._uploaded_path is not None),
 		)
 
+	def _show_doc_select(self) -> None:
+		# 진입 시마다 현재 워크스페이스의 검증 결과로 자료 목록을 새로 불러온다.
+		self._current = "doc_select"
+		self._doc_selector.load(current_workspace_id())
+		if self._source == "file":
+			self._set_steps(FILE_STEPS, 2)
+			back = ("이전", self._show_upload)
+			nxt = ("다음", self._show_file_options)
+		else:
+			self._set_steps(CUSTOM_STEPS, 1)
+			back = ("이전", self._show_source)
+			nxt = ("다음", self._show_category)
+		self.stack.setCurrentIndex(self._idx["doc_select"])
+		self._set_nav(back=back, next=nxt, hint="초안에 반영할 자료를 고르고 다음으로 진행하세요.")
+
 	def _show_file_options(self) -> None:
 		self._current = "file_options"
-		self._set_steps(FILE_STEPS, 2)
+		self._set_steps(FILE_STEPS, 3)
 		self.stack.setCurrentIndex(self._idx["file_options"])
 		self._set_nav(
-			back=("이전", self._show_upload),
+			back=("이전", self._show_doc_select),
 			next=("목차 만들기", self._show_outline),
 		)
 
 	def _show_category(self) -> None:
 		self._current = "category"
-		self._set_steps(CUSTOM_STEPS, 1)
+		self._set_steps(CUSTOM_STEPS, 2)
 		self.stack.setCurrentIndex(self._idx["category"])
 		self._set_nav(
-			back=("이전", self._show_source),
+			back=("이전", self._show_doc_select),
 			next=("다음", self._show_subtype, self._category is not None),
 		)
 
@@ -1285,7 +1614,7 @@ class DraftPage(QWidget):
 		self._rebuild_subtypes()
 		if self._subtype_crumbs is not None:
 			self._subtype_crumbs.setText(f"{self._category['label']} › 세부 유형")
-		self._set_steps(CUSTOM_STEPS, 2)
+		self._set_steps(CUSTOM_STEPS, 3)
 		self.stack.setCurrentIndex(self._idx["subtype"])
 		self._set_nav(
 			back=("이전", self._show_category),
@@ -1294,7 +1623,7 @@ class DraftPage(QWidget):
 
 	def _show_customize(self) -> None:
 		self._current = "customize"
-		self._set_steps(CUSTOM_STEPS, 3)
+		self._set_steps(CUSTOM_STEPS, 4)
 		self.stack.setCurrentIndex(self._idx["customize"])
 		self._set_nav(
 			back=("이전", self._show_subtype),
@@ -1305,9 +1634,9 @@ class DraftPage(QWidget):
 		self._current = "outline"
 		self._refresh_outline_stats()
 		if self._source == "file":
-			self._set_steps(FILE_STEPS, 3)
+			self._set_steps(FILE_STEPS, 4)
 		else:
-			self._set_steps(CUSTOM_STEPS, 4)
+			self._set_steps(CUSTOM_STEPS, 5)
 		self.stack.setCurrentIndex(self._idx["outline"])
 		self._set_nav(
 			back=("이전", self._outline_back),
@@ -1317,9 +1646,9 @@ class DraftPage(QWidget):
 	def _show_result(self) -> None:
 		self._current = "result"
 		if self._source == "file":
-			self._set_steps(FILE_STEPS, 4)
+			self._set_steps(FILE_STEPS, 5)
 		else:
-			self._set_steps(CUSTOM_STEPS, 5)
+			self._set_steps(CUSTOM_STEPS, 6)
 		self.stack.setCurrentIndex(self._idx["result"])
 		self._set_nav(back=("목차로 돌아가기", self._show_outline))
 
@@ -1337,7 +1666,7 @@ class DraftPage(QWidget):
 			self._show_upload()
 		else:
 			self._mode_pill.setText("직접 구성 모드")
-			self._show_category()
+			self._show_doc_select()
 
 	def _pick_file(self) -> None:
 		path_str, _ = QFileDialog.getOpenFileName(self, "양식 파일 선택", "", FILE_FILTER)
@@ -1389,8 +1718,8 @@ class DraftPage(QWidget):
 			if note:
 				label += f"  ({note})"
 			self.file_label.setText(label)
-		# 추출 후에는 FILE_STEPS 2단계(작성 옵션)로 진행 (실패 경로와 동일).
-		self._show_file_options()
+		# 업로드·분석 직후에는 '자료 선택' 단계로 진행 (실패 경로와 동일).
+		self._show_doc_select()
 
 	def _on_form_analyze_failed(self, message: str) -> None:
 		# 백엔드 분석 실패 → 로컬 헤딩 파싱(텍스트 계열) 또는 기본 골격으로 폴백.
@@ -1405,7 +1734,7 @@ class DraftPage(QWidget):
 		if not sections:
 			sections = ["제목", "개요", "본문", "결론"]
 		self._set_outline(sections)
-		self._show_file_options()
+		self._show_doc_select()
 
 	@staticmethod
 	def _parse_headings(text: str) -> list[str]:
@@ -1518,50 +1847,41 @@ class DraftPage(QWidget):
 		return [name for name in self._outline_items if name]
 
 	# -- 생성 -----------------------------------------------------------------
-	def _compose_prompt(self) -> str:
-		sections = self._outline_sections()
-		doc_type = f"업로드 양식 기반 ({self._uploaded_path.name})" if self._uploaded_path else "업로드 양식 기반"
-		options = getattr(self, "file_options", None)
-		tone = options.tone() if options else "중립"
-		length = options.length() if options else "보통"
-		audience = options.audience() if options else ""
-		key_points = options.keypoints() if options else ""
-
-		outline_text = "\n".join(f"{i}. {name}" for i, name in enumerate(sections, start=1))
-		lines = [
-			"다음 구성을 따라 바로 사용할 수 있는 한국어 초안을 작성해 주세요.",
-			"",
-			f"[문서 유형] {doc_type}",
-			f"[톤] {_TONE_GUIDE.get(tone, tone)}",
-			f"[분량] {_LENGTH_GUIDE.get(length, length)}",
-		]
-		if audience:
-			lines.append(f"[대상 독자] {audience}")
-		if key_points:
-			lines.append("[핵심 내용]")
-			lines.append(key_points)
-		lines += [
-			"",
-			"[목차]",
-			outline_text,
-			"",
-			"각 목차 항목을 마크다운 제목(##)으로 두고 그 아래에 내용을 채워 주세요.",
-		]
-		return "\n".join(lines)
-
 	def _compose_settings(self) -> dict:
-		"""직접 구성 초안의 구조화 설정. 백엔드가 톤을 샘플링 전략으로 매핑하고
-		drafts/draft_<n>_settings.json 으로 저장한다."""
-		options = self.custom_options
+		"""초안 생성용 구조화 설정. 백엔드(generate_builtin_draft)가 톤을 샘플링
+		전략으로 매핑하고, 선택 자료로 grounding 을 제한하며,
+		drafts/draft_<n>_settings.json 으로 저장한다.
+
+		양식 파일 경로와 직접 구성 경로가 같은 설정 형태를 공유한다 — 차이는
+		source / formMarkdown(양식) 와 category·subtype(직접 구성)뿐이다."""
+		if self._source == "file":
+			options = getattr(self, "file_options", None)
+			category = None
+			subtype = None
+			form_markdown = self._form_markdown
+			source = "file"
+		else:
+			options = getattr(self, "custom_options", None)
+			category = {"key": self._category["key"], "label": self._category["label"]} if self._category else None
+			subtype = {"key": self._subtype["key"], "label": self._subtype["label"]} if self._subtype else None
+			form_markdown = ""
+			source = "custom"
+		# 자료 선택 단계가 활성(검증 자료 존재)일 때만 필터를 전달한다. 비활성이면
+		# None → 백엔드가 전체 지식베이스로 grounding (자료 선택 건너뜀).
+		selected_doc_ids = (
+			self._doc_selector.selected_doc_ids() if self._doc_selector.is_active() else None
+		)
 		return {
-			"source": "custom",
-			"category": {"key": self._category["key"], "label": self._category["label"]} if self._category else None,
-			"subtype": {"key": self._subtype["key"], "label": self._subtype["label"]} if self._subtype else None,
+			"source": source,
+			"category": category,
+			"subtype": subtype,
 			"outline": self._outline_sections(),
-			"tone": options.tone(),
-			"length": options.length(),
-			"audience": options.audience(),
-			"keyPoints": options.keypoints(),
+			"tone": options.tone() if options else "중립",
+			"length": options.length() if options else "보통",
+			"audience": options.audience() if options else "",
+			"keyPoints": options.keypoints() if options else "",
+			"formMarkdown": form_markdown,
+			"selectedDocIds": selected_doc_ids,
 		}
 
 	def _generate_draft(self) -> None:
@@ -1570,26 +1890,16 @@ class DraftPage(QWidget):
 			self._show_result()
 			return
 		self._workspace_id = current_workspace_id()
-		# 직접 구성 → 구조화된 설정으로 톤별 샘플링·지식베이스 종합·설정 저장까지 수행.
-		# 업로드 양식(file)은 평문 프롬프트 경로(작성 옵션을 프롬프트에 반영).
-		if self._source == "custom":
-			started = get_job_manager().submit(
-				JobCategory.DRAFT,
-				self._controller.generate_builtin_draft,
-				self._workspace_id,
-				self._compose_settings(),
-				on_success=self._on_draft_generated,
-				on_error=self._on_draft_failed,
-			)
-		else:
-			started = get_job_manager().submit(
-				JobCategory.DRAFT,
-				self._controller.generate_draft,
-				self._workspace_id,
-				self._compose_prompt(),
-				on_success=self._on_draft_generated,
-				on_error=self._on_draft_failed,
-			)
+		# 두 경로 모두 구조화 설정으로 통합 → 톤별 샘플링·디스크 지식베이스 grounding·
+		# 설정 저장(재생성 가능). 자료 선택이 활성이면 체크된 문서만 grounding 에 쓰인다.
+		started = get_job_manager().submit(
+			JobCategory.DRAFT,
+			self._controller.generate_builtin_draft,
+			self._workspace_id,
+			self._compose_settings(),
+			on_success=self._on_draft_generated,
+			on_error=self._on_draft_failed,
+		)
 		if not started:
 			return
 		self.settings_note.setText("")
@@ -1608,6 +1918,9 @@ class DraftPage(QWidget):
 		if options is not None:
 			parts.append(f"{options.tone()} · {options.length()}")
 		parts.append(f"{len(self._outline_sections())}개 섹션")
+		# 자료 선택이 활성이면 grounding 에 쓰일 자료 수를 함께 보여준다.
+		if self._doc_selector.is_active():
+			parts.append(f"자료 {self._doc_selector.selected_count()}건")
 		return "  ·  ".join(parts)
 
 	def _regenerate_draft(self) -> None:
@@ -1678,6 +1991,7 @@ class DraftPage(QWidget):
 		self._category = None
 		self._subtype = None
 		self._uploaded_path = None
+		self._form_markdown = ""
 		for entry in list(self._section_rows):
 			entry["row"].setParent(None)
 			entry["row"].deleteLater()
