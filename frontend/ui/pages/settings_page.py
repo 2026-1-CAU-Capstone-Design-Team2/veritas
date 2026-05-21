@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QObject, QPoint, QRect, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
 	QButtonGroup,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 	QLineEdit,
 	QListWidget,
 	QListWidgetItem,
+	QProgressBar,
 	QPushButton,
 	QSizePolicy,
 	QVBoxLayout,
@@ -226,6 +227,25 @@ class CollapsibleSection(CardWidget):
 		self._body.setVisible(checked)
 
 
+class _ModelSwitchWorker(QObject):
+	"""Runs the (possibly multi-minute, download-bearing) model switch off the
+	UI thread so the settings window never freezes. Emits ``done(success,
+	message)`` when the API call returns."""
+
+	done = Signal(bool, str)
+
+	def __init__(self, model_id: str) -> None:
+		super().__init__()
+		self._model_id = model_id
+
+	def run(self) -> None:
+		try:
+			AgentController().update_model(self._model_id)
+			self.done.emit(True, "")
+		except Exception as exc:  # surfaced on the settings status line
+			self.done.emit(False, str(exc))
+
+
 class SettingsPage(QWidget):
 	defaultWorkspaceChanged = Signal(str)
 
@@ -298,15 +318,31 @@ class SettingsPage(QWidget):
 		self.model_status.setWordWrap(True)
 		card.layout.addWidget(self.model_status)
 
+		# Hidden until a switch starts; reflects the download/restart progress
+		# streamed from /api/v1/settings/model/progress.
+		self.model_progress = QProgressBar()
+		self.model_progress.setRange(0, 100)
+		self.model_progress.setValue(0)
+		self.model_progress.setVisible(False)
+		card.layout.addWidget(self.model_progress)
+
 		action_row = QHBoxLayout()
 		action_row.addStretch(1)
-		reset_button = AppButton("기본값", variant="ghost")
-		reset_button.clicked.connect(self._reset_model_settings)
-		save_button = AppButton("모델 저장")
-		save_button.clicked.connect(self._save_model_settings)
-		action_row.addWidget(reset_button)
-		action_row.addWidget(save_button)
+		self._model_reset_button = AppButton("기본값", variant="ghost")
+		self._model_reset_button.clicked.connect(self._reset_model_settings)
+		self._model_save_button = AppButton("모델 저장")
+		self._model_save_button.clicked.connect(self._save_model_settings)
+		action_row.addWidget(self._model_reset_button)
+		action_row.addWidget(self._model_save_button)
 		card.layout.addLayout(action_row)
+
+		# Live model-switch worker + progress poller state.
+		self._model_switch_thread: QThread | None = None
+		self._model_switch_worker: _ModelSwitchWorker | None = None
+		self._model_progress_cursor = 0
+		self._model_progress_timer = QTimer(self)
+		self._model_progress_timer.setInterval(700)
+		self._model_progress_timer.timeout.connect(self._poll_model_progress)
 
 		self._load_model_settings()
 		return card
@@ -665,17 +701,73 @@ class SettingsPage(QWidget):
 		self._save_model_settings()
 
 	def _save_model_settings(self) -> None:
-		model_id = self._selected_model()
-		self._settings["model"] = {
-			"modelId": model_id,
-			"modelName": MODEL_LABELS.get(model_id, model_id),
-		}
-		try:
-			AgentController().update_model(model_id)
-		except Exception as e:
-			self._update_model_status(f"???以??ㅻ쪟媛 諛쒖깮?덉뒿?덈떎: {e}")
+		# Live switch: a model change downloads (if needed) + restarts the
+		# llama-server, which can take minutes. Run it on a worker thread and
+		# stream progress so the settings window stays responsive. Guard against
+		# overlapping switches.
+		if self._model_switch_thread is not None:
 			return
-		self._update_model_status("모델 설정이 저장되었습니다.")
+		model_id = self._selected_model()
+		self._set_model_controls_enabled(False)
+		self.model_progress.setVisible(True)
+		self.model_progress.setRange(0, 0)
+		self.model_progress.setValue(0)
+		self._model_progress_cursor = 0
+		self.model_status.setText("모델 전환을 시작합니다...")
+		self._model_switch_thread = QThread(self)
+		self._model_switch_worker = _ModelSwitchWorker(model_id)
+		self._model_switch_worker.moveToThread(self._model_switch_thread)
+		self._model_switch_thread.started.connect(self._model_switch_worker.run)
+		self._model_switch_worker.done.connect(self._on_model_switch_done)
+		self._model_switch_thread.start()
+		self._model_progress_timer.start()
+
+	def _poll_model_progress(self) -> None:
+		try:
+			payload = AgentController().get_model_switch_progress(
+				since=self._model_progress_cursor
+			)
+		except Exception:
+			return
+		for event in payload.get("items", []):
+			self._model_progress_cursor = max(
+				self._model_progress_cursor, int(event.get("seq", 0))
+			)
+			message = str(event.get("message") or "").strip()
+			if message:
+				self.model_status.setText(message)
+			pct = (event.get("detail") or {}).get("pct")
+			if isinstance(pct, int):
+				self.model_progress.setRange(0, 100)
+				self.model_progress.setValue(max(0, min(100, pct)))
+
+	def _on_model_switch_done(self, success: bool, message: str) -> None:
+		self._model_progress_timer.stop()
+		self._poll_model_progress()
+		thread = self._model_switch_thread
+		self._model_switch_thread = None
+		self._model_switch_worker = None
+		if thread is not None:
+			thread.quit()
+			thread.wait(2000)
+		self.model_progress.setRange(0, 100)
+		self.model_progress.setVisible(False)
+		self._set_model_controls_enabled(True)
+		if success:
+			model_id = self._selected_model()
+			self._settings["model"] = {
+				"modelId": model_id,
+				"modelName": MODEL_LABELS.get(model_id, model_id),
+			}
+			self._update_model_status("모델이 전환되었습니다.")
+		else:
+			self._update_model_status(f"모델 전환 실패: {message}")
+
+	def _set_model_controls_enabled(self, enabled: bool) -> None:
+		self._model_save_button.setEnabled(enabled)
+		self._model_reset_button.setEnabled(enabled)
+		for button in self._model_buttons.values():
+			button.setEnabled(enabled)
 
 	def _browse_local_folder(self) -> None:
 		folder_path = QFileDialog.getExistingDirectory(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from ..api_models import (
     SettingsDocumentToolsRequest,
@@ -23,8 +23,20 @@ async def settings_get() -> dict[str, Any]:
 
 
 @router.put("/api/v1/settings/model")
-async def settings_model_update(payload: SettingsModelRequest) -> dict[str, Any]:
+def settings_model_update(payload: SettingsModelRequest) -> dict[str, Any]:
+    # Plain `def` (not `async`): a live model switch may download a multi-GB
+    # GGUF and restart llama-server, so FastAPI must run it on its thread pool
+    # instead of blocking the event loop (the frontend issues it on a worker
+    # thread and polls /settings/model/progress).
     return settings_service.update_model(payload.modelId, payload.modelName)
+
+
+@router.get("/api/v1/settings/model/progress")
+async def settings_model_progress(
+    since: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict[str, Any]:
+    return settings_service.get_model_switch_progress(since=since, limit=limit)
 
 
 @router.put("/api/v1/settings/embedding-model")
