@@ -13,6 +13,7 @@ from .api_routes import (
     document_assist_router,
     documents_router,
     draft_chat_router,
+    editor_router,
     feedback_router,
     frontend_router,
     research_router,
@@ -74,6 +75,7 @@ app.include_router(research_router)
 app.include_router(settings_router)
 app.include_router(verify_router)
 app.include_router(draft_chat_router)
+app.include_router(editor_router)
 app.include_router(documents_router)
 app.include_router(feedback_router)
 app.include_router(write_router)

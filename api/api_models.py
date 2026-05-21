@@ -55,6 +55,30 @@ class DocumentAssistChatRequest(BaseModel):
     mode: Literal["research", "autosurvey", "rag"] = "research"
 
 
+class EditorSuggestRequest(BaseModel):
+    # Inline ghost-writing context. `prefix` is the ~500 chars before the
+    # cursor, `suffix` a little after; the suggestion continues at the cursor.
+    workspaceId: str
+    prefix: str = ""
+    suffix: str = ""
+    maxTokens: int = Field(default=64, ge=8, le=256)
+
+
+class EditorSaveRequest(BaseModel):
+    workspaceId: str
+    docId: str
+    content: str
+    title: str | None = None
+
+
+class EditorExportRequest(BaseModel):
+    workspaceId: str
+    docId: str | None = None
+    content: str
+    format: Literal["docx", "pdf", "html", "md"]
+    outputPath: str
+
+
 class SettingsModelRequest(BaseModel):
     modelName: Literal["0.8B", "9B"]
 
