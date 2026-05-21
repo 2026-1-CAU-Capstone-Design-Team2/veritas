@@ -41,6 +41,10 @@ class DraftBuiltinGenerateRequest(BaseModel):
     length: str = "보통"
     audience: str = ""
     keyPoints: str = ""
+    # Extracted Markdown template from an uploaded form file (source="file").
+    # When present, generation follows this structure (headings / tables) rather
+    # than the outline alone. Empty for the built-in form path.
+    formMarkdown: str = ""
 
 
 class DraftBuiltinRegenerateRequest(BaseModel):

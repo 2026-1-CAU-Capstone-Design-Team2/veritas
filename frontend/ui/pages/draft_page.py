@@ -1350,13 +1350,57 @@ class DraftPage(QWidget):
 			self._nav_next.setEnabled(True)
 
 	def _analyze_format(self) -> None:
-		"""양식 파일에서 목차 골격을 도출. .md/.txt는 헤딩 파싱, 그 외는 기본 골격."""
+		"""업로드한 양식 파일을 백엔드에서 분석해 구조(제목·목록·표)를 추출한다.
+
+		.docx/.doc/.hwp/.hwpx/.pdf는 백엔드가 본문을 제거하고 구조만 md 템플릿으로
+		변환한다. 네트워크 호출이므로 워커 스레드에서 수행하고, 실패 시 로컬 휴리스틱
+		(헤딩 파싱)으로 폴백한다.
+		"""
+		path = self._uploaded_path
+		if path is None:
+			return
+		self.analyze_button.setEnabled(False)
+		self.file_label.setText(f"{path.name} — 양식 분석 중...")
+		controller = self._controller
+
+		def _work():
+			return controller.import_draft_form(path)
+
+		get_job_manager().run_detached(
+			_work,
+			on_success=self._on_form_analyzed,
+			on_error=self._on_form_analyze_failed,
+		)
+
+	def _on_form_analyzed(self, response) -> None:
+		outline: list[str] = []
+		markdown = ""
+		note = ""
+		if isinstance(response, dict):
+			outline = [str(s).strip() for s in (response.get("outline") or []) if str(s).strip()]
+			markdown = str(response.get("markdown") or "")
+			note = str(response.get("note") or "")
+		self._form_markdown = markdown
+		self.analyze_button.setEnabled(True)
+		if not outline:
+			outline = ["제목", "개요", "본문", "결론"]
+		self._set_outline(outline)
+		if self._uploaded_path is not None:
+			label = self._uploaded_path.name
+			if note:
+				label += f"  ({note})"
+			self.file_label.setText(label)
+		self._show_outline()
+
+	def _on_form_analyze_failed(self, message: str) -> None:
+		# 백엔드 분석 실패 → 로컬 헤딩 파싱(텍스트 계열) 또는 기본 골격으로 폴백.
+		self.analyze_button.setEnabled(True)
+		self._form_markdown = ""
 		sections: list[str] = []
 		path = self._uploaded_path
 		if path is not None and path.suffix.lower() in _TEXT_SUFFIXES:
 			try:
-				text = path.read_text(encoding="utf-8", errors="ignore")
-				sections = self._parse_headings(text)
+				sections = self._parse_headings(path.read_text(encoding="utf-8", errors="ignore"))
 			except Exception:
 				sections = []
 		if not sections:

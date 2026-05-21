@@ -30,15 +30,45 @@ import urllib.request
 from pathlib import Path
 
 
-# llama-server flag profile (single source of truth; launcher imports these).
-LLAMA_COMMON_ARGS = [
-    "-ngl", "99",
-    "-ub", "2048",
-    "-b", "2048",
-    "-np", "5",
-    "--cont-batching",
-    "-c", "90000",
-]
+# llama-server flag profile. The hardware-adaptable knobs (-ngl / -c / -np) are
+# read from env at spawn time so a machine without an NVIDIA GPU or with little
+# memory can recover without a code change.
+_DEFAULT_NGL = "99"
+_DEFAULT_CTX = "90000"
+_DEFAULT_NP = "5"
+
+
+def _flag(env_name: str, default: str) -> str:
+    value = os.getenv(env_name)
+    return value if value and value.strip() else default
+
+
+def _common_args() -> list[str]:
+    """Common llama-server flags, with per-machine overrides read from env:
+
+      VERITAS_LLAMA_NGL → -ngl  GPU layers to offload (0 = CPU-only)  [99]
+      VERITAS_LLAMA_CTX → -c    total context window                 [90000]
+      VERITAS_LLAMA_NP  → -np   parallel decode slots                [5]
+
+    ``-ngl 99`` (full GPU offload) + a 90k context are fine defaults on a GPU
+    box, but can make llama-server *exit on load* on a machine with no NVIDIA
+    GPU / little memory. The env overrides let such a machine fall back (e.g.
+    ``VERITAS_LLAMA_NGL=0`` for CPU-only, ``VERITAS_LLAMA_CTX=8192`` for low
+    memory) without touching code. Read at spawn time so they apply per launch.
+    """
+    return [
+        "-ngl", _flag("VERITAS_LLAMA_NGL", _DEFAULT_NGL),
+        "-ub", "2048",
+        "-b", "2048",
+        "-np", _flag("VERITAS_LLAMA_NP", _DEFAULT_NP),
+        "--cont-batching",
+        "-c", _flag("VERITAS_LLAMA_CTX", _DEFAULT_CTX),
+    ]
+
+
+# Default snapshot kept for importers/tests; the live spawn path (``_args``)
+# calls ``_common_args()`` so env overrides take effect at runtime.
+LLAMA_COMMON_ARGS = _common_args()
 LLAMA_LLM_EXTRA_ARGS = ["-ctk", "q8_0", "-ctv", "q4_0"]
 LLAMA_EMBEDDING_EXTRA_ARGS = ["--embeddings"]
 
@@ -152,7 +182,7 @@ class LlamaServer:
             "-m", str(model_path),
             "--host", self.host,
             "--port", str(self.port),
-            *LLAMA_COMMON_ARGS,
+            *_common_args(),
         ]
         args += LLAMA_LLM_EXTRA_ARGS if self.kind == "llm" else LLAMA_EMBEDDING_EXTRA_ARGS
         return args
