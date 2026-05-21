@@ -12,7 +12,8 @@ from core.prompts import (
     CHAT_SOURCES_BLOCK_TEMPLATE,
     CHAT_SYSTEM_TEMPLATE,
     REFERENCE_BLOCK_TEMPLATE,
-    SCREEN_INTERVENTION_SYSTEM_PROMPT,
+    SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE,
+    SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE,
     SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE,
     SCREEN_SCENARIO_GUIDANCE,
     SCREEN_SCENARIO_GUIDANCE_DEFAULT,
@@ -106,6 +107,7 @@ class ChatAgent:
         max_history_turns: int = 3,
         max_tool_calls: int = 1,
         screen_debug: bool = False,
+        screen_document_type: str = SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE,
     ) -> None:
         self.llm = llm
         self.rag_service = rag_service
@@ -114,6 +116,10 @@ class ChatAgent:
         self.max_history_turns = max_history_turns
         self.max_tool_calls = max(1, int(max_tool_calls))
         self.screen_debug = screen_debug
+        # Default document type the screen-intervention prompts assume the user is
+        # writing. Filled into SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE; can be
+        # overridden per intervention via the payload's "document_type" field.
+        self.screen_document_type = screen_document_type or SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE
         self.chat_history: list[tuple[str, str]] = []
         self._conversation_lock = threading.RLock()
         self._screen_stop_event = threading.Event()
@@ -698,12 +704,15 @@ class ChatAgent:
                 style_guidance=self._screen_style_guidance(intervention),
                 knowledge_context=knowledge_context,
             )
+            system_prompt = SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE.format(
+                document_type=self._screen_document_type(intervention)
+            )
             try:
                 if stream:
-                    answer = self._stream_screen_answer(prompt, intervention)
+                    answer = self._stream_screen_answer(prompt, intervention, system_prompt)
                 else:
                     answer = self.llm.ask(
-                        SCREEN_INTERVENTION_SYSTEM_PROMPT,
+                        system_prompt,
                         prompt,
                         reasoning=False,
                         stream=False,
@@ -720,7 +729,9 @@ class ChatAgent:
             self._append_history(history_question, answer)
             return answer.strip()
 
-    def _stream_screen_answer(self, prompt: str, intervention: dict[str, Any]) -> str:
+    def _stream_screen_answer(
+        self, prompt: str, intervention: dict[str, Any], system_prompt: str
+    ) -> str:
         """Consume the screen-intervention answer as a token stream, pushing
         cumulative partial text to the answer callback (done=False) so the UI
         renders it incrementally. Returns the full accumulated text; the loop
@@ -730,7 +741,7 @@ class ChatAgent:
         last_emit_len = 0
         min_emit_chars = 12
         for chunk in self.llm.iter_ask(
-            SCREEN_INTERVENTION_SYSTEM_PROMPT,
+            system_prompt,
             prompt,
             reasoning=False,
             stream_label="screen_context",
@@ -988,6 +999,16 @@ class ChatAgent:
             "confidence": writing.get("confidence", 0.0),
             "scope_note": "Only the latest 1-2 sentences are provided for this intervention.",
         }
+
+    def _screen_document_type(self, intervention: dict[str, Any]) -> str:
+        """Resolve the document type the intervention prompt should assume.
+        Prefers a per-intervention ``document_type`` from the payload, else the
+        agent default (``self.screen_document_type``)."""
+        if isinstance(intervention, dict):
+            payload_type = str(intervention.get("document_type") or "").strip()
+            if payload_type:
+                return payload_type
+        return self.screen_document_type
 
     def _screen_style_guidance(self, intervention: dict[str, Any]) -> str:
         """사용자 문서 원문에서 문체를 감지해 프롬프트용 지시문을 만든다.
