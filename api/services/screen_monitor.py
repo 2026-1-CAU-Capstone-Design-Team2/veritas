@@ -302,7 +302,16 @@ class ScreenMonitor:
         limit: int,
         workspace_id: str,
     ) -> dict[str, Any]:
-        """Cursor-style read of the intervention event ring buffer."""
+        """Cursor-style read of the intervention event ring buffer.
+
+        Scoped to ``workspace_id``: the ring buffer is shared across workspaces
+        (one ScreenMonitor for the whole runtime), and every poller restart —
+        including the one a workspace switch triggers — begins at cursor 0. Without
+        this filter a switch to a new workspace would re-deliver the previous
+        workspace's buffered assist answers, so they'd reappear in the assist
+        window's suggestion list. Each event is tagged with its origin workspace
+        at record time, so we return only the active workspace's events.
+        """
         if limit <= 0:
             limit = 20
         limit = min(limit, SCREEN_EVENT_BUFFER_MAX)
@@ -312,6 +321,7 @@ class ScreenMonitor:
                 event
                 for event in self._events
                 if int(event.get("seq", 0)) > since
+                and (not workspace_id or event.get("workspaceId") == workspace_id)
             ]
         events.sort(key=lambda item: int(item.get("seq", 0)))
         events = events[:limit]
