@@ -136,12 +136,6 @@ class AgentController:
 	def get_feedback_result(self, file_id: str) -> dict[str, Any]:
 		return api_client.get(f"/api/v1/feedback/results/{file_id}")
 
-	def update_document_tools(self, custom_tools: list[dict[str, str]]) -> dict[str, Any]:
-		return api_client.put(
-			"/api/v1/settings/document-tools",
-			{"customTools": custom_tools},
-		)
-
 	def update_model(self, model_id: str) -> dict[str, Any]:
 		return api_client.put(
 			"/api/v1/settings/model",
