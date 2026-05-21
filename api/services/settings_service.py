@@ -12,6 +12,14 @@ def get_settings() -> dict[str, Any]:
 
 
 def update_model(model_id: str | None, legacy_name: str | None = None) -> dict[str, Any]:
+    """Live-switch the chat LLM: download if missing → restart server → re-detect.
+
+    Delegates to :func:`model_service.switch_model`, which streams progress to a
+    buffer the frontend polls and persists the selection only after the server
+    actually restarts (so a failed switch never leaves a selected-but-unapplied
+    model). The route is a plain ``def`` so this (possibly multi-minute, with a
+    download) runs on FastAPI's thread pool, not the event loop.
+    """
     legacy_map = {
         "0.8B": "qwen35-0.8b-q8_0",
         "2B": "qwen35-2b-q8_0",
@@ -19,8 +27,16 @@ def update_model(model_id: str | None, legacy_name: str | None = None) -> dict[s
         "9B": "qwen35-9b-q4",
     }
     resolved_model_id = model_id or legacy_map.get(str(legacy_name or ""), DEFAULT_LLM_MODEL_ID)
-    model = repo.set_model_settings(resolved_model_id)
-    return {"model": model, "updated": True}
+    # Lazy import: model_service pulls in agent_runtime's heavy dependency graph.
+    from .model_service import switch_model
+
+    return switch_model(resolved_model_id)
+
+
+def get_model_switch_progress(*, since: int, limit: int) -> dict[str, Any]:
+    from .model_service import get_switch_progress
+
+    return get_switch_progress(since=since, limit=limit)
 
 
 def update_embedding_model(model_id: str) -> dict[str, Any]:
