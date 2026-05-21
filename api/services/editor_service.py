@@ -17,8 +17,9 @@ coupling). This service owns:
    never grounds against the wrong workspace's index.
 3. Connected-sources count + export (pandoc, via :mod:`export_service`).
 
-Ghost-writing uses *forced* RAG (no index → no suggestion); quick actions and
-chat use *additive* RAG (they run on the given text, grounding when available).
+Ghost-writing fires on a continuation-moment heuristic (decided in the
+ChatAgent) and uses *additive* RAG — like quick actions and chat, it grounds in
+the workspace index when available but never hard-gates on similarity.
 """
 
 from __future__ import annotations
@@ -210,7 +211,8 @@ def suggest_stream(
     use_workspace: bool = True,
 ) -> Iterator[bytes]:
     """Stream a ghost-writing continuation as SSE. Generation lives on the
-    ChatAgent; ``use_workspace`` forces RAG grounding (no index → no suggestion).
+    ChatAgent, which decides whether the cursor is at a continuation moment;
+    ``use_workspace`` enables *additive* RAG grounding when the index is active.
     """
     prefix = (prefix or "")[-2000:]
     suffix = (suffix or "")[:500]
@@ -225,12 +227,11 @@ def suggest_stream(
     collected: list[str] = []
     try:
         runtime = get_runtime()
+        # Additive RAG: ground only when this editor's workspace is the active
+        # index (so we never ground against the wrong one); otherwise still offer
+        # an ungrounded continuation. Whether to suggest at all is the agent's
+        # continuation-moment decision, not a grounding gate.
         grounded = bool(use_workspace) and _workspace_is_active(workspace_id)
-        if use_workspace and not grounded:
-            # Forced RAG but this workspace is not the active index → no
-            # suggestion (rather than an ungrounded one against the wrong index).
-            yield _sse("done", {"suggestionId": suggestion_id, "text": ""})
-            return
         for chunk in runtime.ghostwrite_iter(
             prefix, suffix, max_tokens=max_tokens, use_workspace=grounded
         ):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 from datetime import datetime
@@ -266,32 +267,80 @@ class ChatAgent:
 
     _EDITOR_RAG_ACTIONS = ("rewrite", "summarize", "polish", "continue")
     _EDITOR_CONTEXT_MAX_CHARS = 1200
+    # Window of the user's recent text used to retrieve additive grounding.
+    _EDITOR_RAG_QUERY_CHARS = 300
+    # Ghost-writing fires on a writing-situation heuristic (a natural
+    # continuation moment), NOT on an embedding-similarity gate. This
+    # multilingual embedder's cosine floor is too high (~0.8 even for unrelated
+    # Korean) to separate on- from off-topic reliably, so RAG is used
+    # *additively* — workspace context is added when present, never used to
+    # hard-block. This is the minimum recent context (normalized chars) required
+    # at the writing frontier before suggesting.
+    _EDITOR_MIN_CONTINUATION_CHARS = 8
+    # Diagnostic logging defaults ON so the ghost decision (and, when grounding,
+    # the retrieved similarity) is visible in the API console; set
+    # VERITAS_EDITOR_RAG_DEBUG=0 to silence.
+    _EDITOR_RAG_DEBUG = os.getenv("VERITAS_EDITOR_RAG_DEBUG", "1") not in ("0", "false", "False")
 
     def _editor_context(self, query: str) -> str | None:
-        """Retrieve grounding context from the workspace RAG index, or ``None``
-        when unavailable (no service, empty index, or retrieval failure).
-        Cached on the query tail so ghost-firing on consecutive pauses with the
-        same context doesn't re-embed each time."""
+        """Retrieve *additive* grounding context from the workspace RAG index, or
+        ``None`` when unavailable / empty. All editor surfaces (ghost-writing,
+        quick actions, chat) ground additively — there is no similarity hard-gate
+        (this multilingual embedder's cosine floor is too high to separate
+        on/off-topic reliably); workspace context is simply added when present.
+        Cached on the query tail so consecutive typing pauses don't re-embed."""
         query = (query or "").strip()
         if not query or self.rag_service is None:
             return None
-        cache_key = query[-200:]
-        if self._editor_ctx_cache.get("key") == cache_key:
-            return self._editor_ctx_cache.get("context")
+        cache_key = query[-self._EDITOR_RAG_QUERY_CHARS:]
+        cached = self._editor_ctx_cache
+        if cached.get("key") == cache_key:
+            return cached.get("context")
+        context: str | None = None
         try:
-            if self.rag_service.get_document_count() <= 0:
-                context: str | None = None
-            else:
+            if self.rag_service.get_document_count() > 0:
                 # use_history=False → embed the query directly (no extra LLM call
                 # for history-aware rewriting; the editor must stay fast).
-                documents = self.rag_service.retrieve(query[-300:], use_history=False)
-                formatted = (self.rag_service.format_retrieved_documents(documents) or "").strip()
-                context = formatted[: self._EDITOR_CONTEXT_MAX_CHARS] or None
+                documents = self.rag_service.retrieve(
+                    query[-self._EDITOR_RAG_QUERY_CHARS:], use_history=False
+                ) or []
+                if documents and self._EDITOR_RAG_DEBUG:
+                    # ChromaDB cosine space → distance = 1 - cosine_similarity.
+                    best_distance = min(float(d.get("distance", 1.0)) for d in documents)
+                    print(f"[editor][rag] best_similarity={1.0 - best_distance:.3f} (additive grounding)")
+                if documents:
+                    formatted = (self.rag_service.format_retrieved_documents(documents) or "").strip()
+                    context = formatted[: self._EDITOR_CONTEXT_MAX_CHARS] or None
         except Exception as e:  # noqa: BLE001 — grounding is best-effort
             print(f"[editor][rag][warn] retrieval failed: {e}")
             context = None
         self._editor_ctx_cache = {"key": cache_key, "context": context}
         return context
+
+    def _is_continuation_moment(self, prefix: str, suffix: str) -> bool:
+        """Cheap, text-based "is now a good moment to continue?" gate, mirroring
+        the continuation-type screen scenarios (idle_after_writing / heading /
+        outline) without the screen-capture pipeline. The typing pause itself is
+        already handled by the editor's debounce; here we require the cursor to
+        sit at the writing frontier — the end of its line, with enough recent
+        context — and stay silent mid-line, where an inline ghost is intrusive."""
+        line_tail = (suffix or "").split("\n", 1)[0]
+        if line_tail.strip():
+            return False  # cursor is mid-line → not a continuation point
+        norm_prefix = " ".join((prefix or "").split())
+        return len(norm_prefix) >= self._EDITOR_MIN_CONTINUATION_CHARS
+
+    def _is_no_action_suggestion(self, text: str) -> bool:
+        """True when the ghost LLM declined: empty output, or the NO_SUGGESTION
+        sentinel it is told to emit (in SUGGEST_SYSTEM_PROMPT) when the workspace
+        references are off-topic for what the user is writing, or there is nothing
+        natural to add. Letters-only compare so brackets/underscores/spacing
+        around the sentinel don't matter."""
+        stripped = (text or "").strip()
+        if not stripped:
+            return True
+        compact = "".join(ch for ch in stripped.upper() if ch.isalpha())
+        return compact.startswith("NOSUGGESTION")
 
     def iter_ghostwrite(
         self,
@@ -301,30 +350,46 @@ class ChatAgent:
         max_tokens: int = 64,
         use_workspace: bool = True,
     ) -> Iterator[str]:
-        """Stream an inline continuation. When ``use_workspace`` is set this is
-        *forced* RAG: if the workspace has no usable context, nothing is
-        produced (no ungrounded fallback)."""
+        """Stream an inline continuation. Fires only at a natural continuation
+        moment (the writing frontier with enough recent context); RAG is
+        *additive* — workspace grounding is added when available (and
+        ``use_workspace`` is set), never used as a hard on/off-topic gate."""
         prefix = (prefix or "")[-2000:]
         suffix = (suffix or "")[:500]
-        if not prefix.strip() and not suffix.strip():
+        if not self._is_continuation_moment(prefix, suffix):
+            if self._EDITOR_RAG_DEBUG:
+                print("[editor][ghost] no suggestion - not a continuation moment")
             return
-        reference = ""
-        if use_workspace:
-            context = self._editor_context(prefix)
-            if context is None:
-                return  # forced RAG: no grounding → no suggestion
-            reference = REFERENCE_BLOCK_TEMPLATE.format(context=context)
+        # Additive grounding: add workspace context when present; otherwise still
+        # offer a plain continuation (no hard gate).
+        context = self._editor_context(prefix) if use_workspace else None
+        reference = REFERENCE_BLOCK_TEMPLATE.format(context=context) if context else ""
+        if self._EDITOR_RAG_DEBUG:
+            print(f"[editor][ghost] suggestion (grounded={bool(context)})")
         suffix_block = SUGGEST_SUFFIX_BLOCK_TEMPLATE.format(suffix=suffix) if suffix.strip() else ""
         user_prompt = SUGGEST_USER_TEMPLATE.format(
             reference=reference, prefix=prefix, suffix_block=suffix_block
         )
-        yield from self.llm.iter_ask(
+        # Stream into a buffer, then honor the NO_SUGGESTION decline: the model is
+        # told (SUGGEST_SYSTEM_PROMPT) to emit it when the workspace context is
+        # off-topic for what the user is writing, or there is nothing natural to
+        # add. Ghost output is short, so buffering costs nothing perceptible and
+        # guarantees the sentinel is never shown as a suggestion.
+        buffer: list[str] = []
+        for chunk in self.llm.iter_ask(
             SUGGEST_SYSTEM_PROMPT,
             user_prompt,
             reasoning=False,
             sampling_params={"temperature": 0.3, "top_p": 0.9, "max_tokens": max(8, min(256, int(max_tokens)))},
             stream_label="editor-suggest",
-        )
+        ):
+            buffer.append(chunk)
+        text = "".join(buffer)
+        if self._is_no_action_suggestion(text):
+            if self._EDITOR_RAG_DEBUG:
+                print("[editor][ghost] declined (NO_SUGGESTION / off-topic)")
+            return
+        yield text
 
     def iter_editor_assist(
         self,

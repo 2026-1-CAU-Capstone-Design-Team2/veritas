@@ -32,6 +32,7 @@ from .pages.dashboard_page import DashboardPage
 from .pages.document_page import DocumentPage
 from .pages.draft_page import DraftPage
 from .pages.feedback_page import FeedbackPage
+from .pages.guide_page import GuidePage
 from .pages.research_page import ResearchPage
 from .pages.settings_page import SettingsPage
 from .pages.writing_page import DocumentAssistPage
@@ -227,6 +228,8 @@ class MainWindow(QMainWindow):
 		self.verify_page = VerifyPage()
 		self._add_page("verify", self.verify_page)
 		self.draft_page = DraftPage()
+		# 초안 결과의 "에디터로 보내기" → 생성된 초안을 에디터 창에 시드해서 연다.
+		self.draft_page.openEditorRequested.connect(self._open_editor_from_draft)
 		self._add_page("draft", self.draft_page)
 		self._add_page("document_assist", DocumentAssistPage())
 		self.write_page = WritePage()
@@ -238,6 +241,7 @@ class MainWindow(QMainWindow):
 		self.settings_page.defaultWorkspaceChanged.connect(self.sidebar.set_current_workspace)
 		self.sidebar.workspaceChanged.connect(self._on_workspace_changed)
 		self._add_page("settings", self.settings_page)
+		self._add_page("guide", GuidePage())
 
 		center_layout.addWidget(top_hero)
 		center_layout.addWidget(self.stepper)
@@ -301,6 +305,12 @@ class MainWindow(QMainWindow):
 	def _open_editor_from_research(self, workspace_id: str) -> None:
 		"""Open the editor seeded from a workspace's final.md ("이 보고서로 글쓰기")."""
 		self.editor_window.open_document(workspace_id or current_workspace_id(), source="final")
+
+	def _open_editor_from_draft(self, workspace_id: str, markdown: str) -> None:
+		"""Open the editor seeded with a generated draft ("에디터로 보내기")."""
+		self.editor_window.open_document(
+			workspace_id or current_workspace_id(), source="draft", seed_markdown=markdown
+		)
 
 	def _start_screen_monitoring(self) -> None:
 		if self._screen_monitor_active:
@@ -591,6 +601,7 @@ class MainWindow(QMainWindow):
 			"document": ("요약", "최종 보고서 요약본을 확인합니다."),
 			"feedback": ("문서 피드백", "약한 주장과 저신뢰 문장을 우선 교정합니다."),
 			"settings": ("설정", "모델명과 로컬 접근 폴더를 구성합니다."),
+			"guide": ("가이드", "VERITAS 사용법을 단계별로 안내합니다."),
 		}
 		title, desc = section_map.get(route, ("대시보드", ""))
 		self.section_title.setText(title)
