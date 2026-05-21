@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..models import FilteredScreenContext
+from ..core.models import FilteredScreenContext
 from ._shared import _ACRONYM_RE, _TODO_MARKER_RE
 from .base import ScenarioContext, ScenarioEvaluation, ScenarioType
 
@@ -26,7 +26,7 @@ class AcronymIntroducedScenario(ScenarioType):
         self,
         *,
         max_acronyms: int = 5,
-        cooldown_min_seconds: float = 300.0,
+        cooldown_min_seconds: float = 75.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -101,7 +101,7 @@ class TodoMarkerPresentScenario(ScenarioType):
         self,
         *,
         max_markers: int = 10,
-        cooldown_min_seconds: float = 600.0,
+        cooldown_min_seconds: float = 150.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -183,7 +183,7 @@ class ManyQuestionMarksScenario(ScenarioType):
         self,
         *,
         min_question_marks: int = 3,
-        cooldown_min_seconds: float = 240.0,
+        cooldown_min_seconds: float = 60.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:

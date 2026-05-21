@@ -4,7 +4,7 @@ import asyncio
 import io
 from typing import Any, cast
 
-from .models import OcrResult
+from ..core.models import OcrResult
 
 
 class OcrEngine:

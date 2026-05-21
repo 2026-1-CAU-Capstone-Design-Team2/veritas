@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..models import FilteredScreenContext, WindowContext
+from ..core.models import FilteredScreenContext, WindowContext
 
 
 @dataclass

@@ -250,24 +250,25 @@ class SuggestionCard(QFrame):
 		copy_button.setObjectName("AssistCopyButton")
 		copy_button.setFixedSize(46, 28)
 		copy_button.setCursor(Qt.PointingHandCursor)
-		copy_button.clicked.connect(lambda: self._copy_text(text))
+		self._copy_value = text
+		copy_button.clicked.connect(lambda: self._copy_text(self._copy_value))
 
 		header.addWidget(badge, 0, Qt.AlignTop)
 		header.addStretch(1)
 		header.addWidget(copy_button)
 
-		body = QLabel(add_text_breakpoints(text))
-		body.setObjectName("SuggestionText")
-		body.setWordWrap(True)
-		body.setTextFormat(Qt.PlainText)
-		body.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
-		body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+		self._body = QLabel(add_text_breakpoints(text))
+		self._body.setObjectName("SuggestionText")
+		self._body.setWordWrap(True)
+		self._body.setTextFormat(Qt.PlainText)
+		self._body.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+		self._body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 		# Keep the text pinned to the top: the last card may be stretched to
 		# fill the panel, and its text should not float to the middle.
-		body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+		self._body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
 		layout.addLayout(header)
-		layout.addWidget(body)
+		layout.addWidget(self._body)
 
 	def set_card_width(self, width: int) -> None:
 		self.setMinimumWidth(width)
@@ -278,6 +279,11 @@ class SuggestionCard(QFrame):
 		app = QApplication.instance()
 		if app is not None:
 			app.clipboard().setText(text)
+
+	def set_text(self, text: str) -> None:
+		"""Replace the card body text in place (used for streaming updates)."""
+		self._copy_value = text
+		self._body.setText(add_text_breakpoints(text))
 
 
 class SuggestionList(QFrame):
@@ -298,6 +304,7 @@ class SuggestionList(QFrame):
 			self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 		self._suggestions: list[dict[str, str]] = []
 		self._cards: list[SuggestionCard] = []
+		self._cards_by_id: dict[str, SuggestionCard] = {}
 
 		self._root = QVBoxLayout(self)
 		self._root.setContentsMargins(12, 12, 12, 12)
@@ -342,6 +349,7 @@ class SuggestionList(QFrame):
 		self._suggestions = [dict(item) for item in suggestions]
 		self._clear()
 		self._cards = []
+		self._cards_by_id = {}
 		if not self._suggestions:
 			self.layout.addWidget(self.empty)
 			self.empty.show()
@@ -361,6 +369,9 @@ class SuggestionList(QFrame):
 			)
 			card.set_card_width(self._content_width())
 			self._cards.append(card)
+			item_id = str(item.get("id") or "")
+			if item_id:
+				self._cards_by_id[item_id] = card
 			# The last card carries the stretch factor so it grows down to the
 			# bottom of the panel — no blank gap trails the list. Earlier cards
 			# keep their natural height. In hug_content mode the frame is sized
@@ -373,14 +384,16 @@ class SuggestionList(QFrame):
 		if self._hug_content:
 			self.updateGeometry()
 
-	def add_suggestion(self, category: str, text: str, tone: str = "working") -> None:
+	def add_suggestion(self, category: str, text: str, tone: str = "working", *, event_id: str = "") -> None:
 		"""Append a single suggestion card.
 
 		Unlike :meth:`set_suggestions`, this does not tear down and rebuild every
 		existing card. The screen-monitoring poller feeds suggestions in one at a
 		time, so a full rebuild per event would be O(n²) as the list grows.
 		"""
-		item = {"category": category, "text": text, "tone": tone}
+		item: dict[str, str] = {"category": category, "text": text, "tone": tone}
+		if event_id:
+			item["id"] = event_id
 		if not self._cards:
 			# Leaving the empty state: drop the placeholder + its trailing stretch.
 			self._clear()
@@ -395,11 +408,31 @@ class SuggestionList(QFrame):
 		card = SuggestionCard(item["category"], item["text"], item["tone"])
 		card.set_card_width(self._content_width())
 		self._cards.append(card)
+		if event_id:
+			self._cards_by_id[event_id] = card
 		self.layout.addWidget(card, 1)
 
 		self.count_label.setText(f"{len(self._suggestions)}개")
 		self.schedule_width_update()
 		self.schedule_scroll_to_bottom()
+
+	def upsert_suggestion(self, event_id: str, category: str, text: str, tone: str = "working") -> None:
+		"""Update an existing card's text by ``event_id``, or add a new card.
+
+		Streaming screen-intervention answers arrive as the same ``event_id``
+		with growing text; updating in place avoids spawning a duplicate card
+		on every poll.
+		"""
+		card = self._cards_by_id.get(event_id) if event_id else None
+		if card is not None:
+			card.set_text(text)
+			for item in self._suggestions:
+				if item.get("id") == event_id:
+					item["text"] = text
+					break
+			self.schedule_scroll_to_bottom()
+			return
+		self.add_suggestion(category, text, tone, event_id=event_id)
 		if self._hug_content:
 			self.updateGeometry()
 
@@ -1252,7 +1285,7 @@ class DocumentAssistWindow(QWidget):
 			if formatted is None:
 				continue
 			category, text, tone = formatted
-			suggestions.append({"category": category, "text": text, "tone": tone})
+			suggestions.append({"id": str(item.get("eventId") or ""), "category": category, "text": text, "tone": tone})
 		self.suggestion_list.set_suggestions(suggestions)
 
 	def _on_screen_events_appended(self, items: list) -> None:
@@ -1265,7 +1298,8 @@ class DocumentAssistWindow(QWidget):
 			formatted = format_screen_event(item)
 			if formatted is None:
 				continue
-			self.suggestion_list.add_suggestion(*formatted)
+			category, text, tone = formatted
+			self.suggestion_list.upsert_suggestion(str(item.get("eventId") or ""), category, text, tone)
 
 	def _apply_stylesheet(self) -> None:
 		self.setStyleSheet(

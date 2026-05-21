@@ -38,13 +38,27 @@ class ScreenEventStore(QObject):
 		self._history: list[dict[str, Any]] = []
 
 	def append(self, items: list) -> None:
-		"""items를 history에 누적 + eventsAppended emit. dict 아닌 항목은 무시."""
+		"""items를 history에 누적/갱신 + eventsAppended emit.
+
+		eventId가 같은 항목이 이미 있으면 교체(스트리밍 부분 갱신), 없으면 추가.
+		dict 아닌 항목은 무시.
+		"""
 		if not items:
 			return
 		valid = [item for item in items if isinstance(item, dict)]
 		if not valid:
 			return
-		self._history.extend(valid)
+		for item in valid:
+			event_id = str(item.get("eventId") or "")
+			replaced = False
+			if event_id:
+				for index, existing in enumerate(self._history):
+					if str(existing.get("eventId") or "") == event_id:
+						self._history[index] = item
+						replaced = True
+						break
+			if not replaced:
+				self._history.append(item)
 		self.eventsAppended.emit(valid)
 
 	def get_history(self) -> list[dict[str, Any]]:

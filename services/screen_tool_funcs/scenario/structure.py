@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..models import FilteredScreenContext
+from ..core.models import FilteredScreenContext
 from ._shared import (
     _BULLET_LINE_RE,
     _CODE_FENCE_RE,
@@ -36,7 +36,7 @@ class OutlinePhaseScenario(ScenarioType):
         max_avg_line_chars: float = 60.0,
         min_lines: int = 5,
         min_short_line_ratio: float = 0.5,
-        cooldown_min_seconds: float = 180.0,
+        cooldown_min_seconds: float = 45.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -126,7 +126,7 @@ class HeadingAddedScenario(ScenarioType):
         self,
         *,
         max_headings: int = 3,
-        cooldown_min_seconds: float = 240.0,
+        cooldown_min_seconds: float = 60.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -201,7 +201,7 @@ class LongParagraphWrittenScenario(ScenarioType):
         self,
         *,
         min_paragraph_chars: int = 500,
-        cooldown_min_seconds: float = 240.0,
+        cooldown_min_seconds: float = 60.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -272,7 +272,7 @@ class NumberedListGrowthScenario(ScenarioType):
         self,
         *,
         min_items: int = 3,
-        cooldown_min_seconds: float = 180.0,
+        cooldown_min_seconds: float = 45.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -345,7 +345,7 @@ class CodeBlockPresentScenario(ScenarioType):
         self,
         *,
         min_fences: int = 1,
-        cooldown_min_seconds: float = 300.0,
+        cooldown_min_seconds: float = 75.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:

@@ -52,6 +52,20 @@ def _persist_settings() -> None:
     write_json(SETTINGS_STATE_KEY, STATE["settings"])
 
 
+def reload_settings() -> dict[str, Any]:
+    """Force-reload the settings cache from SQLite.
+
+    The settings store is shared with ``llm.model_settings`` (same app_state
+    ``"settings"`` key). When a live model switch persists through that path,
+    this re-syncs the in-memory ``STATE["settings"]`` cache so ``get_settings``
+    (the ``GET /api/v1/settings`` source) reflects the change without a restart.
+    """
+    global _settings_loaded
+    _settings_loaded = False
+    _ensure_settings_loaded()
+    return STATE["settings"]
+
+
 def get_dashboard_summary() -> dict[str, int]:
     return dict(STATE["dashboard_summary"])
 

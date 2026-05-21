@@ -5,9 +5,9 @@ import re
 import time
 from typing import Any
 
-from .models import FilteredScreenContext, InterventionDecision, WindowContext
+from ..core.models import FilteredScreenContext, InterventionDecision, WindowContext
 from .scenario_scheduler import ScenarioScheduler, ScenarioWeights
-from .scenario import (
+from ..scenario import (
     IdleAfterWritingScenario,
     ScenarioContext,
     ScenarioEvaluation,

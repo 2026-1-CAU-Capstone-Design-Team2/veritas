@@ -32,7 +32,7 @@ from ..models import (
     SentenceUnit,
     VerificationConfig,
 )
-from ..tokenization import HybridTokenizer
+from ..tokenization import HybridTokenizer, create_kiwi
 from .flow_planner import plan_report_flow
 from .sentence_retrieval import assign_sentences_to_sections
 from .sentence_splitter import split_docs_to_sentences
@@ -66,7 +66,7 @@ def run_section_pipeline(
         return SectionResult(flow_source="empty")
 
     tokenizer = tokenizer or HybridTokenizer()
-    kiwi = kiwi or Kiwi()
+    kiwi = kiwi or create_kiwi()
 
     # 1. Sentence decomposition.
     sentences: list[SentenceUnit] = split_docs_to_sentences(docs, cfg, kiwi=kiwi)

@@ -63,16 +63,12 @@ class LLMClient:
     ):
         # Chat completions client
         self.chat_base_url = f"http://{host}:{port}/v1"
+        self._chat_host = host
+        self._chat_port = port
         self.client = OpenAI(base_url=self.chat_base_url, api_key="sk-no-key-required")
-        models = self.client.models.list().data
-        if not models:
-            raise RuntimeError("No models available from llama-server.")
-        self.model = models[0].id
-
-        # Detect the server's context window so downstream tools can size their
-        # input budgets to the model instead of guessing with a fixed default.
-        self.n_ctx = self._detect_n_ctx(host, port)
-        print(f"[llm] model={self.model} n_ctx={self.n_ctx}")
+        # Detect the served model id + the server's context window so downstream
+        # tools can size their input budgets to the model instead of guessing.
+        self.refresh_model_info()
 
         # Embedding client. If only one embedding endpoint arg is provided,
         # inherit the missing value from chat endpoint.
@@ -112,6 +108,22 @@ class LLMClient:
             except ValueError:
                 max_parallel = 1
         self.max_parallel = max(1, int(max_parallel))
+
+    def refresh_model_info(self) -> None:
+        """(Re)detect the served model id + context window from the server.
+
+        Called at construction and again after a live model swap (the
+        llama-server was restarted with a different GGUF on the same
+        host:port). Mutating in place keeps this client's object identity
+        stable, so every tool / service already holding a reference picks up
+        the new model + n_ctx without any rewiring.
+        """
+        models = self.client.models.list().data
+        if not models:
+            raise RuntimeError("No models available from llama-server.")
+        self.model = models[0].id
+        self.n_ctx = self._detect_n_ctx(self._chat_host, self._chat_port)
+        print(f"[llm] model={self.model} n_ctx={self.n_ctx}")
 
     def map_parallel(
         self,

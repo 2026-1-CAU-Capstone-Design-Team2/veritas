@@ -5,8 +5,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .scenario import ScenarioType
-from .store import ScreenContextStore
+from ..core.store import ScreenContextStore
+from ..scenario import ScenarioType
 
 
 @dataclass
@@ -98,7 +98,7 @@ class ScenarioScheduler:
         reset_idle_sec: float = 3600.0,
         reset_interval_sec: float = 7200.0,
         max_documents: int = 50,
-        min_global_fire_interval_sec: float = 10.0,
+        min_global_fire_interval_sec: float = 5.0,
         console_log: bool = False,
     ) -> None:
         if scenarios is not None and weights is not None:

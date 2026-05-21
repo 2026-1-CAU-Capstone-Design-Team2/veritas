@@ -30,7 +30,7 @@ class ScatteredEditsScenario(ScenarioType):
         window: int = 5,
         min_changed_captures: int = 3,
         max_capture_delta: int = 30,
-        cooldown_min_seconds: float = 300.0,
+        cooldown_min_seconds: float = 75.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -118,7 +118,7 @@ class LargeDeletionScenario(ScenarioType):
         self,
         *,
         min_deletion_chars: int = 100,
-        cooldown_min_seconds: float = 180.0,
+        cooldown_min_seconds: float = 45.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -187,7 +187,7 @@ class CopyPasteGrowthScenario(ScenarioType):
         self,
         *,
         min_growth_chars: int = 200,
-        cooldown_min_seconds: float = 240.0,
+        cooldown_min_seconds: float = 60.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -256,7 +256,7 @@ class UndoCycleDetectedScenario(ScenarioType):
         self,
         *,
         similarity_threshold: float = 0.98,
-        cooldown_min_seconds: float = 240.0,
+        cooldown_min_seconds: float = 60.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
