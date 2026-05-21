@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import json
-<<<<<<< HEAD
 import os
-=======
 import re
->>>>>>> 7fab1b7561f9d81ecec927d32fdf8efe67cde344
 import threading
 from datetime import datetime
 from typing import Any, Callable, Iterator
