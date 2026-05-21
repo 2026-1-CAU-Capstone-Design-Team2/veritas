@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from llm.model_catalog import DEFAULT_LLM_MODEL_ID
+
 from ..repositories import state_repository as repo
 
 
@@ -9,9 +11,21 @@ def get_settings() -> dict[str, Any]:
     return repo.get_settings()
 
 
-def update_model(model_name: str) -> dict[str, Any]:
-    model = repo.set_model_settings(model_name)
+def update_model(model_id: str | None, legacy_name: str | None = None) -> dict[str, Any]:
+    legacy_map = {
+        "0.8B": "qwen35-0.8b-q8_0",
+        "2B": "qwen35-2b-q8_0",
+        "4B": "qwen35-4b-q4",
+        "9B": "qwen35-9b-q4",
+    }
+    resolved_model_id = model_id or legacy_map.get(str(legacy_name or ""), DEFAULT_LLM_MODEL_ID)
+    model = repo.set_model_settings(resolved_model_id)
     return {"model": model, "updated": True}
+
+
+def update_embedding_model(model_id: str) -> dict[str, Any]:
+    embedding_model = repo.set_embedding_model_settings(model_id)
+    return {"embeddingModel": embedding_model, "updated": True}
 
 
 def update_local_access(folder_paths: list[str]) -> dict[str, Any]:

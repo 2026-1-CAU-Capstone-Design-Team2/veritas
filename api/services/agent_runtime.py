@@ -660,6 +660,15 @@ class AgentRuntime:
         )
 
         try:
+            self.llm.check_embedding_endpoint()
+        except Exception as exc:
+            self._verify_progress.emit("failed", f"寃利??ㅽ뙣: {exc}", final=True)
+            raise HTTPException(
+                status_code=503,
+                detail=str(exc),
+            ) from exc
+
+        try:
             artifacts = service.run(
                 tasks=selected_tasks,
                 progress_callback=self._verify_progress.emit,
