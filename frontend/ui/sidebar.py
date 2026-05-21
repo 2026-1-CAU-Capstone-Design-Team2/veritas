@@ -192,7 +192,7 @@ class Sidebar(QFrame):
 			pixmap = QPixmap(str(logo_path)).scaled(26, 26, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 			logo.setPixmap(pixmap)
 
-		subtitle = QLabel("AI 워크플로우 스튜디오")
+		subtitle = QLabel("AI 문서 보조 어시스턴트")
 		subtitle.setObjectName("BrandSubLabel")
 		self._subtitle = subtitle
 
