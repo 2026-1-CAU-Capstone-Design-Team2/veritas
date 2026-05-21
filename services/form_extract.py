@@ -332,7 +332,12 @@ def _classify(text: str) -> tuple[str, int, str]:
 
     match = _KO_CHAPTER.match(text)
     if match:
-        level = {"편": 1, "장": 1, "절": 2, "관": 3, "조": 3, "항": 3}.get(match.group(1), 2)
+        # Recognize Korean division markers as headings, but only as a coarse
+        # major/minor split (편·장 → 1, else → 2). Mapping each legal marker to a
+        # distinct depth doesn't generalize across document conventions; the
+        # *general* level signals — markdown ``#`` depth and decimal numbering
+        # (``1.2.3``) — do the real work, and the user edits the outline anyway.
+        level = 1 if match.group(1) in ("편", "장") else 2
         return "heading", level, text
 
     match = _NUM_HEADING.match(text)
