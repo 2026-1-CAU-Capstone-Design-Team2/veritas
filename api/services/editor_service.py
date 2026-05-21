@@ -249,7 +249,13 @@ def suggest_stream(
         yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
         return
 
-    yield _sse("done", {"suggestionId": suggestion_id, "text": "".join(collected).strip()})
+    # Preserve a single leading space (the model is told to prefix one when the
+    # continuation starts a new word) so the suggestion never glues onto the
+    # prefix; only trailing/newline padding is trimmed.
+    text = "".join(collected).strip("\n").rstrip()
+    if text[:1].isspace():
+        text = " " + text.lstrip()
+    yield _sse("done", {"suggestionId": suggestion_id, "text": text})
 
 
 # ---------------------------------------------------- assist (quick actions)
@@ -258,7 +264,7 @@ def assist_stream(
     workspace_id: str,
     action: str,
     text: str,
-    max_tokens: int = 400,
+    max_tokens: int = 800,
     use_workspace: bool = True,
 ) -> Iterator[bytes]:
     """Stream a quick-action transform as SSE.
