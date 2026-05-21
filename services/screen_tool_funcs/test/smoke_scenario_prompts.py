@@ -373,6 +373,7 @@ def build_prompt(intervention_type: str) -> str:
         writing_context=pretty(writing_context),
         routing_hint=pretty(routing_hint),
         scenario_guidance=guidance,
+        style_guidance="(smoke test — 화면 텍스트의 어조를 따르세요.)",
         knowledge_context="(no knowledge base context — smoke test)",
     )
 
