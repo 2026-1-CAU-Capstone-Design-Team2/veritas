@@ -382,7 +382,14 @@ SCREEN_SCENARIO_GUIDANCE = {
 }
 
 
+# Appended to the tool-chat system prompt when an editor surface sends the
+# document currently open in the writer, so 문서 대화 sees the live draft while
+# running the exact same tool/history pipeline as the main chat.
+CHAT_DOCUMENT_BLOCK_TEMPLATE = "\n\n[현재 작성 중인 문서]\n{doc}"
+
+
 __all__ = [
+    "CHAT_DOCUMENT_BLOCK_TEMPLATE",
     "QUERY_REWRITE_PROMPT",
     "QUERY_REWRITE_SYSTEM_PROMPT",
     "RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE",

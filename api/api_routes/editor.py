@@ -7,7 +7,6 @@ from fastapi.responses import StreamingResponse
 
 from ..api_models import (
     EditorAssistRequest,
-    EditorChatRequest,
     EditorExportRequest,
     EditorSaveRequest,
     EditorSuggestRequest,
@@ -55,15 +54,6 @@ async def editor_assist(payload: EditorAssistRequest) -> StreamingResponse:
         editor_service.assist_stream(
             payload.workspaceId, payload.action, payload.text, payload.maxTokens, payload.useWorkspace
         ),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-@router.post("/api/v1/editor/chat")
-async def editor_chat(payload: EditorChatRequest) -> StreamingResponse:
-    return StreamingResponse(
-        editor_service.chat_stream(payload.workspaceId, payload.message, payload.docText, payload.useWorkspace),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

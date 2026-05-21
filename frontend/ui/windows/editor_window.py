@@ -57,14 +57,15 @@ from PySide6.QtWidgets import (
 
 from ...api_common import api_client, current_workspace_id
 from ...controllers import (
+    AgentController,
     EditorAssistWorker,
-    EditorChatWorker,
     EditorSuggestWorker,
     JobCategory,
+    get_chat_bus,
     get_job_manager,
 )
 from ..markdown_view import render_markdown_html
-from .document_assist_window import ChatInputEdit, ChatPanel
+from .document_assist_window import ChatInputBar, ChatPanel, render_history_html
 
 
 GHOST_COLOR = "#9AA0A6"
@@ -398,9 +399,11 @@ class QuickActionsTab(QWidget):
 
 
 class ChatTab(QWidget):
-    """대화: a document-grounded chat, reusing the assist window's ChatPanel."""
-
-    messageSubmitted = Signal(str)
+    """대화: a shared chat surface. Reuses the assist window's ChatPanel +
+    ChatInputBar so the editor's 문서 대화 is the *same* conversation as the main
+    채팅 page — routed through the app-wide ChatBus (mode toggle included), while
+    the open document rides along as additive context.
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -409,29 +412,9 @@ class ChatTab(QWidget):
         layout.setSpacing(8)
 
         self.panel = ChatPanel("문서 대화")
+        self.input_bar = ChatInputBar()
         layout.addWidget(self.panel, 1)
-
-        input_row = QHBoxLayout()
-        input_row.setSpacing(6)
-        self.input = ChatInputEdit()
-        self.input.setObjectName("AssistChatInput")
-        self.input.setPlaceholderText("현재 문서에 대해 물어보기…")
-        self.input.setFixedHeight(44)
-        self.input.sendRequested.connect(self._submit)
-        send = QPushButton("보내기")
-        send.setObjectName("PrimaryButton")
-        send.setCursor(Qt.PointingHandCursor)
-        send.clicked.connect(self._submit)
-        input_row.addWidget(self.input, 1)
-        input_row.addWidget(send)
-        layout.addLayout(input_row)
-
-    def _submit(self) -> None:
-        text = self.input.toPlainText().strip()
-        if not text:
-            return
-        self.input.clear()
-        self.messageSubmitted.emit(text)
+        layout.addWidget(self.input_bar)
 
 
 class AssistPanel(QFrame):
@@ -579,9 +562,17 @@ class EditorWindow(QWidget):
         self._suggest_anchor = 0
         self._suggest_worker: EditorSuggestWorker | None = None
         self._assist_worker: EditorAssistWorker | None = None
-        self._chat_worker: EditorChatWorker | None = None
         # Quick-action target: (start, end, is_insert) — where 본문에 대치 writes.
         self._assist_target: tuple[int, int, bool] | None = None
+
+        # 문서 대화 shares the main chat's conversation through the app-wide
+        # ChatBus + the persisted workspace chat history; mode mirrors the 채팅
+        # page (rag/research). The open document is sent as additive context.
+        self._chat_bus = get_chat_bus()
+        self._chat_controller = AgentController()
+        self._chat_mode = "rag"
+        self._chat_streaming = False
+        self._chat_history_token = 0
 
         self._resize_margin = 7
         self._resize_edges: set[str] = set()
@@ -596,6 +587,8 @@ class EditorWindow(QWidget):
 
         get_job_manager().busy_changed.connect(self._sync_autocomplete_state)
         self._sync_autocomplete_state()
+
+        self._connect_chat_bus()
 
     # ------------------------------------------------------------------ build
 
@@ -831,7 +824,8 @@ class EditorWindow(QWidget):
         self.assist_panel.quick_tab.actionRequested.connect(self.run_quick_action)
         self.assist_panel.quick_tab.applyRequested.connect(self._apply_assist_result)
         self.assist_panel.quick_tab.copyRequested.connect(self._copy_assist_result)
-        self.assist_panel.chat_tab.messageSubmitted.connect(self._send_chat)
+        self.assist_panel.chat_tab.input_bar.sendRequested.connect(self._send_chat)
+        self.assist_panel.chat_tab.input_bar.modeChanged.connect(self._set_chat_mode)
 
         self.main_split.addWidget(self.outline_panel)
         self.main_split.addWidget(canvas)
@@ -931,6 +925,7 @@ class EditorWindow(QWidget):
             title = self._title_from_markdown(seed_markdown)
             self._apply_loaded_document({"content": seed_markdown, "title": title, "source": "draft"})
             self._refresh_sources()
+            self._refresh_chat_history()
             self.show()
             self.raise_()
             self.activateWindow()
@@ -952,6 +947,7 @@ class EditorWindow(QWidget):
         self.status_save.setText("● 불러오는 중…")
         get_job_manager().run_detached(_load, on_success=_ok, on_error=_fail)
         self._refresh_sources()
+        self._refresh_chat_history()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -1167,21 +1163,117 @@ class EditorWindow(QWidget):
 
     # ------------------------------------------------------------- doc chat
 
+    def _connect_chat_bus(self) -> None:
+        bus = self._chat_bus
+        bus.userMessageQueued.connect(self._on_chat_user_queued)
+        bus.assistantStreamStarted.connect(self._on_chat_stream_started)
+        bus.assistantChunk.connect(self._on_chat_stream_chunk)
+        bus.assistantCompleted.connect(self._on_chat_stream_completed)
+        bus.assistantFailed.connect(self._on_chat_stream_failed)
+        get_job_manager().busy_changed.connect(self._sync_chat_busy_state)
+        self._sync_chat_busy_state()
+
+    def _sync_chat_busy_state(self) -> None:
+        blocked = get_job_manager().is_blocked(JobCategory.CHAT)
+        bar = self.assist_panel.chat_tab.input_bar
+        bar.setEnabled(not blocked)
+        if blocked:
+            bar.input.setPlaceholderText("다른 작업이 진행 중입니다. 잠시만 기다려 주세요...")
+        else:
+            bar.set_mode(self._chat_mode, emit=False)
+
+    def _set_chat_mode(self, mode: str) -> None:
+        self._chat_mode = "rag" if mode == "rag" else "research"
+
     def _send_chat(self, message: str) -> None:
-        if get_job_manager().is_blocked(JobCategory.EDITOR):
-            self.assist_panel.chat_tab.panel.add_message("VERITAS", "AutoSurvey 진행 중에는 대화를 사용할 수 없습니다.", False)
+        text = (message or "").rstrip("\n").strip()
+        if not text:
             return
-        panel = self.assist_panel.chat_tab.panel
-        panel.add_message("나", message, True)
-        panel.start_streaming_assistant("VERITAS")
+        # The conversation is workspace-scoped and shared with the main 채팅
+        # page; send through the ChatBus with the open document as additive
+        # context and tag the turn as coming from the editor surface.
+        self._workspace_id = current_workspace_id()
         doc_text = self.editor.toPlainText()
-        worker = EditorChatWorker(self._workspace_id, message, doc_text, self._use_workspace_rag, self)
-        worker.delta.connect(panel.append_streaming_chunk)
-        worker.completed.connect(panel.finalize_streaming_assistant)
-        worker.failed.connect(panel.cancel_streaming_assistant)
-        worker.finished.connect(worker.deleteLater)
-        self._chat_worker = worker
-        worker.start()
+        if not self._chat_bus.send(
+            self._workspace_id, text, self._chat_mode, doc_text=doc_text, source="editor"
+        ):
+            self.assist_panel.chat_tab.panel.add_message(
+                "VERITAS", "이미 답변을 생성하고 있어요. 잠시만 기다려 주세요.", False
+            )
+
+    def _on_chat_user_queued(self, _workspace_id: str, text: str) -> None:
+        self.assist_panel.chat_tab.panel.add_message("사용자", text, True)
+
+    def _on_chat_stream_started(self) -> None:
+        self._chat_streaming = True
+        self.assist_panel.chat_tab.panel.start_streaming_assistant("VERITAS")
+
+    def _on_chat_stream_chunk(self, chunk: str) -> None:
+        if not self._chat_streaming:
+            return
+        self.assist_panel.chat_tab.panel.append_streaming_chunk(chunk)
+
+    def _on_chat_stream_completed(self, text: str) -> None:
+        if not self._chat_streaming:
+            return
+        self._chat_streaming = False
+        self.assist_panel.chat_tab.panel.finalize_streaming_assistant(text)
+
+    def _on_chat_stream_failed(self, error: str) -> None:
+        if not self._chat_streaming:
+            return
+        self._chat_streaming = False
+        self.assist_panel.chat_tab.panel.cancel_streaming_assistant(error)
+
+    def _refresh_chat_history(self) -> None:
+        panel = self.assist_panel.chat_tab.panel
+        self._chat_streaming = False
+        panel.clear_messages()
+        panel.add_message("VERITAS", "채팅 기록을 불러오는 중입니다...", False)
+        self._chat_history_token += 1
+        token = self._chat_history_token
+        workspace_id = self._workspace_id
+        controller = self._chat_controller
+
+        def _load() -> list:
+            history = controller.get_chat_history(workspace_id)
+            return render_history_html(history if isinstance(history, list) else [])
+
+        def _apply(prepared: object) -> None:
+            if token != self._chat_history_token:
+                return
+            self._render_chat_history(prepared if isinstance(prepared, list) else [])
+
+        def _failed(_message: str) -> None:
+            if token != self._chat_history_token:
+                return
+            self._render_chat_history([])
+
+        get_job_manager().run_detached(_load, on_success=_apply, on_error=_failed)
+
+    def _render_chat_history(self, prepared: list) -> None:
+        panel = self.assist_panel.chat_tab.panel
+        panel.clear_messages()
+        if not prepared:
+            panel.add_message(
+                "VERITAS",
+                "메시지를 입력하면 현재 워크스페이스의 대화가 메인 채팅과 공유됩니다.",
+                False,
+            )
+            return
+        for spec in prepared:
+            if not isinstance(spec, dict):
+                continue
+            text = str(spec.get("text") or "")
+            if not text:
+                continue
+            is_user = bool(spec.get("is_user"))
+            panel.add_message(
+                "사용자" if is_user else "VERITAS",
+                text,
+                is_user,
+                rendered_html=spec.get("html") or None,
+            )
 
     # ------------------------------------------------------------- autosave
 

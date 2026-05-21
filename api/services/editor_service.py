@@ -7,19 +7,20 @@ coupling). This service owns:
    so they sit alongside the workspace's research artifacts and survive an API
    restart. Loading can also seed from the workspace's ``final.md`` without ever
    overwriting it.
-2. SSE plumbing for ghost-writing / quick actions / chat. The actual generation
+2. SSE plumbing for ghost-writing / quick actions. The actual generation
    (and workspace RAG grounding) lives on the **ChatAgent** — same agent and
    workspace-bound ``rag_service`` the chat / document-assist pages use — reached
-   through the runtime facades ``ghostwrite_iter`` / ``editor_assist_iter`` /
-   ``editor_chat_iter``. Prompt text lives in :mod:`core.prompts.editor`. This
-   service only frames the stream (start / delta / done / error) and enforces the
-   "editor workspace must be the active one to ground" guard so a stale editor
-   never grounds against the wrong workspace's index.
+   through the runtime facades ``ghostwrite_iter`` / ``editor_assist_iter``.
+   Prompt text lives in :mod:`core.prompts.editor`. This service only frames the
+   stream (start / delta / done / error) and enforces the "editor workspace must
+   be the active one to ground" guard so a stale editor never grounds against the
+   wrong workspace's index. The editor's 문서 대화 now shares the main chat
+   pipeline (``/api/v1/chat/messages/stream``) through the ChatBus.
 3. Connected-sources count + export (pandoc, via :mod:`export_service`).
 
 Ghost-writing fires on a continuation-moment heuristic (decided in the
-ChatAgent) and uses *additive* RAG — like quick actions and chat, it grounds in
-the workspace index when available but never hard-gates on similarity.
+ChatAgent) and uses *additive* RAG — like quick actions, it grounds in the
+workspace index when available but never hard-gates on similarity.
 """
 
 from __future__ import annotations
@@ -281,38 +282,6 @@ def assist_stream(
         return
 
     yield _sse("done", {"assistId": assist_id, "text": "".join(collected).strip()})
-
-
-# ----------------------------------------------------------- document chat
-
-def chat_stream(
-    workspace_id: str,
-    message: str,
-    doc_text: str = "",
-    use_workspace: bool = True,
-) -> Iterator[bytes]:
-    """Stream a document-grounded chat reply as SSE. Additive RAG (the document
-    is always in the prompt; workspace sources are appended when available)."""
-    chat_id = new_id("ec")
-    yield _sse("start", {"chatId": chat_id})
-
-    if not (message or "").strip():
-        yield _sse("done", {"chatId": chat_id, "text": ""})
-        return
-
-    collected: list[str] = []
-    try:
-        grounded = bool(use_workspace) and _workspace_is_active(workspace_id)
-        for chunk in get_runtime().editor_chat_iter(message, doc_text, use_workspace=grounded):
-            if not chunk:
-                continue
-            collected.append(chunk)
-            yield _sse("delta", {"text": chunk})
-    except Exception as e:  # noqa: BLE001 — surfaced as SSE error
-        yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
-        return
-
-    yield _sse("done", {"chatId": chat_id, "text": "".join(collected).strip()})
 
 
 # --------------------------------------------------------- connected sources

@@ -95,7 +95,15 @@
       "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _smoke_editor.py)",
       "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" -c \"import os; os.environ['QT_QPA_PLATFORM']='offscreen']\")",
       "Bash('C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe' -c 'import os; os.environ['\\\\''QT_QPA_PLATFORM'\\\\'']='\\\\''offscreen'\\\\'' *)",
-      "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _render_icons.py)"
+      "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _render_icons.py)",
+      "Bash(python -c \"import os; from db.db import get_db_path, init_db; print\\('LOCALAPPDATA =', os.environ.get\\('LOCALAPPDATA'\\)\\); print\\('DB PATH      =', get_db_path\\(\\)\\); print\\('CREATED AT   =', init_db\\(\\)\\); print\\('EXISTS       =', get_db_path\\(\\).exists\\(\\)\\)\")",
+      "Bash(xargs grep -l \"api_client\\\\|stream_post_sse\")",
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(grep \".py$\")",
+      "Read(//c/Users/user/AppData/Local/VERITAS/**)",
+      "Read(//c/Users/user/AppData/Local/VERITAS/models/**)",
+      "Bash(env)",
+      "PowerShell(& \"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _verify_chat_doc.py)"
     ]
   }
 }

@@ -309,14 +309,20 @@ class AgentRuntime:
             return self.chat_agent.ask_rag_iter(message)
         return self.chat_agent.ask_auto_iter(message)
 
-    def answer_chat_selection_iter(self, message: str, mode: str) -> Iterator[str]:
+    def answer_chat_selection_iter(
+        self, message: str, mode: str, doc_context: str = ""
+    ) -> Iterator[str]:
         normalized_mode = str(mode or "research").strip().lower()
         if normalized_mode in {"research", "autosurvey"}:
-            return self.chat_agent.ask_explicit_tool_iter("autosurvey", message)
+            return self.chat_agent.ask_explicit_tool_iter(
+                "autosurvey", message, doc_context=doc_context
+            )
         if normalized_mode == "rag":
             self._ensure_rag_index(require_documents=False)
-            return self.chat_agent.ask_explicit_tool_iter("rag", message)
-        return self.chat_agent.ask_auto_iter(message)
+            return self.chat_agent.ask_explicit_tool_iter(
+                "rag", message, doc_context=doc_context
+            )
+        return self.chat_agent.ask_auto_iter(message, doc_context=doc_context)
 
     # -- editor (standalone writer) surfaces ----------------------------------
     # Thin facades over the ChatAgent so the editor window's three AI surfaces
@@ -336,11 +342,6 @@ class AgentRuntime:
         return self.chat_agent.iter_editor_assist(
             action, text, max_tokens=max_tokens, use_workspace=use_workspace
         )
-
-    def editor_chat_iter(
-        self, message: str, doc_text: str = "", *, use_workspace: bool = True
-    ) -> Iterator[str]:
-        return self.chat_agent.iter_editor_chat(message, doc_text, use_workspace=use_workspace)
 
     def persist_chat_turn(self, message: str, assistant_text: str) -> None:
         """Persist a (user, assistant) turn into the workspace chat_history.json
