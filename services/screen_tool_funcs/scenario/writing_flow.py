@@ -37,7 +37,7 @@ class IdleAfterWritingScenario(ScenarioType):
         min_idle_captures: int = 2,
         idle_similarity_threshold: float = 0.985,
         cooldown_events: int = 3,
-        cooldown_min_seconds: float = 30.0,
+        cooldown_min_seconds: float = 15.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -273,7 +273,7 @@ class WholeDocumentReviewScenario(ScenarioType):
         sustained_min_active_captures: int = 4,
         idle_after_sustained_captures: int = 2,
         idle_similarity_threshold: float = 0.97,
-        cooldown_min_seconds: float = 150.0,
+        cooldown_min_seconds: float = 75.0,
         cooldown_min_added_chars: int = 200,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
@@ -557,10 +557,10 @@ class LongStaticReviewScenario(ScenarioType):
     def __init__(
         self,
         *,
-        min_static_captures: int = 3,
-        min_document_chars: int = 200,
+        min_static_captures: int = 2,
+        min_document_chars: int = 60,
         idle_similarity_threshold: float = 0.99,
-        cooldown_min_seconds: float = 120.0,
+        cooldown_min_seconds: float = 60.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -747,7 +747,7 @@ class ParagraphChurnScenario(ScenarioType):
         max_capture_delta: int = 15,
         max_net_change: int = 25,
         min_paragraph_chars: int = 20,
-        cooldown_min_seconds: float = 75.0,
+        cooldown_min_seconds: float = 37.5,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -909,7 +909,7 @@ class BlankDocumentStartScenario(ScenarioType):
         *,
         max_document_chars: int = 30,
         min_blank_captures: int = 3,
-        cooldown_min_seconds: float = 100.0,
+        cooldown_min_seconds: float = 50.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:

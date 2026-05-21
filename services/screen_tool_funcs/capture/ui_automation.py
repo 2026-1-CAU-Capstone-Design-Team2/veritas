@@ -332,18 +332,6 @@ class UiAutomationReader:
         if class_name == "xterm-helper-textarea":
             return "rejected", "vscode_terminal_helper"
 
-        terminal_markers = (
-            "terminal",
-            "터미널",
-            "screen reader",
-            "화면 읽기",
-            "accessibility",
-            "접근성",
-            "alt+f1",
-        )
-        if any(marker in text_lower for marker in terminal_markers):
-            return "rejected", "accessibility_or_terminal_helper_text"
-
         non_text_controls = (
             "button",
             "menu",
@@ -360,6 +348,10 @@ class UiAutomationReader:
         if self._is_code_editor_non_editor_focus(process_name, focused_name):
             return "rejected", "code_editor_non_editor_focus"
 
+        # Trusted editors with real structured text are authoritative — decide
+        # before the terminal/accessibility heuristic below, which only exists
+        # to guess on *unknown* windows and false-positives on ordinary prose
+        # (e.g. "경제적 접근성" matching the "접근성" helper-text marker).
         if process_name == "winword.exe" and class_name == "_wwg":
             return "primary", None
 
@@ -368,6 +360,18 @@ class UiAutomationReader:
             # text/value patterns, even for short text. OCR should stay a
             # fallback for cases where structured text is unavailable.
             return "primary", None
+
+        terminal_markers = (
+            "terminal",
+            "터미널",
+            "screen reader",
+            "화면 읽기",
+            "accessibility",
+            "접근성",
+            "alt+f1",
+        )
+        if any(marker in text_lower for marker in terminal_markers):
+            return "rejected", "accessibility_or_terminal_helper_text"
 
         if result.current_paragraph_text and len(text) >= 20:
             return "usable", None
