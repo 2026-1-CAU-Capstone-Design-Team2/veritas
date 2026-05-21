@@ -5,10 +5,39 @@ from typing import Any
 from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
 
-from ..api_models import ChatMessageRequest, DraftGenerateRequest, DraftRegenerateRequest
-from ..services import draft_chat_service
+from ..api_models import (
+    ChatMessageRequest,
+    DraftBuiltinGenerateRequest,
+    DraftBuiltinRegenerateRequest,
+    DraftGenerateRequest,
+    DraftRegenerateRequest,
+)
+from ..services import draft_chat_service, draft_service
 
 router = APIRouter()
+
+
+@router.get("/api/v1/draft/forms")
+def draft_forms() -> dict[str, Any]:
+    """Built-in form catalog + tone/length options the draft wizard renders."""
+    return draft_service.list_forms()
+
+
+@router.post("/api/v1/draft/builtin/generate")
+def draft_builtin_generate(payload: DraftBuiltinGenerateRequest) -> dict[str, Any]:
+    # Sync LLM call (tone-driven sampling) — plain `def` runs in the FastAPI
+    # threadpool so the event loop stays responsive.
+    return draft_service.generate_builtin_draft(payload.workspaceId, payload.model_dump())
+
+
+@router.post("/api/v1/draft/builtin/regenerate")
+def draft_builtin_regenerate(payload: DraftBuiltinRegenerateRequest) -> dict[str, Any]:
+    return draft_service.regenerate_builtin_draft(payload.workspaceId, payload.draftNumber)
+
+
+@router.get("/api/v1/draft/builtin/list")
+def draft_builtin_list(workspaceId: str = Query(...)) -> dict[str, Any]:
+    return draft_service.list_drafts(workspaceId)
 
 
 @router.post("/api/v1/draft/generate")

@@ -8,6 +8,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from core.stdio_utf8 import force_utf8_stdio
+
 from .api_common import new_id
 from .api_routes import (
     dashboard_router,
@@ -25,6 +27,12 @@ from .api_routes import (
     workspaces_router,
     write_router,
 )
+
+# This is the worker process that runs AutoSurvey document cleanup, whose logs
+# include web-scraped text (em-dashes, smart quotes). On Korean Windows the
+# server's piped stdout defaults to cp949, where such a print raises
+# UnicodeEncodeError — force UTF-8 before uvicorn handles any request.
+force_utf8_stdio()
 
 app = FastAPI(title="VERITAS API", version="1.0.0")
 app.add_middleware(

@@ -18,6 +18,36 @@ class DraftRegenerateRequest(BaseModel):
     prompt: str
 
 
+class DraftFormSelection(BaseModel):
+    key: str = ""
+    label: str = ""
+
+
+class DraftBuiltinGenerateRequest(BaseModel):
+    """Structured settings for a built-in form draft ("이 구성으로 초안 생성").
+
+    Unlike ``DraftGenerateRequest`` (a flat text prompt), this carries the full
+    wizard configuration so the backend can map the tone to a sampling strategy
+    and persist the settings for later regeneration. ``source`` is "custom" for
+    a built-in form; "file" is reserved for the uploaded-form mode.
+    """
+
+    workspaceId: str
+    source: Literal["custom", "file"] = "custom"
+    category: DraftFormSelection | None = None
+    subtype: DraftFormSelection | None = None
+    outline: list[str] = Field(default_factory=list)
+    tone: str = "중립"
+    length: str = "보통"
+    audience: str = ""
+    keyPoints: str = ""
+
+
+class DraftBuiltinRegenerateRequest(BaseModel):
+    workspaceId: str
+    draftNumber: int = Field(ge=1)
+
+
 class ChatMessageRequest(BaseModel):
     workspaceId: str
     message: str
