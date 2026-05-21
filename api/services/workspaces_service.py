@@ -130,6 +130,11 @@ def _scan_run_workspaces() -> list[dict[str, Any]]:
     if not root.exists():
         return []
 
+    # User-assigned display names live in the local DB. The directory name is
+    # only a fallback for workspaces that have never been renamed — otherwise
+    # the sync would clobber a rename on every refresh.
+    stored_names = _load_stored_workspace_names()
+
     workspaces: list[dict[str, Any]] = []
     for path in sorted(root.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
         if not path.is_dir() or path.name.startswith("_") or path.name == "__pycache__":
@@ -156,7 +161,7 @@ def _scan_run_workspaces() -> list[dict[str, Any]]:
         workspaces.append(
             {
                 "workspaceId": path.name,
-                "name": path.name,
+                "name": stored_names.get(path.name) or path.name,
                 "detail": f"documents {document_count} · {path}",
                 "status": "completed" if final_path.exists() else "running",
                 "lastWorkedAt": _mtime_iso(final_path if final_path.exists() else path),
@@ -213,6 +218,28 @@ def _mtime_iso(path: Path) -> str:
     from datetime import datetime, timezone
 
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _load_stored_workspace_names() -> dict[str, str]:
+    """Return ``{workspace_id: name}`` for rows already in the local DB.
+
+    Lets the run-directory scan preserve a user's renamed workspace instead of
+    resetting the display name back to the directory name on every sync.
+    """
+    try:
+        init_db()
+        conn = get_connection()
+        try:
+            rows = conn.execute("SELECT id, name FROM workspaces").fetchall()
+            return {
+                str(row["id"]): str(row["name"])
+                for row in rows
+                if row["id"] and row["name"]
+            }
+        finally:
+            conn.close()
+    except Exception:
+        return {}
 
 
 def _load_current_workspace_id() -> str | None:

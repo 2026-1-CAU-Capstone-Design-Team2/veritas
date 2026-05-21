@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 	QScrollArea,
 	QSizeGrip,
 	QSizePolicy,
+	QSplitter,
 	QTextBrowser,
 	QTextEdit,
 	QVBoxLayout,
@@ -1527,18 +1528,27 @@ class DocumentAssistWindow(QWidget):
 		content_layout.setContentsMargins(12, 10, 12, 8)
 		content_layout.setSpacing(10)
 
-		self.suggestion_list = SuggestionList(hug_content=True)
+		# A draggable divider lets the user trade height between the suggestion
+		# list and the chat, so neither caps the other at a fixed ratio.
+		self.suggestion_list = SuggestionList()
+		self.suggestion_list.setMinimumHeight(120)
 		self.chat_panel = ChatPanel()
-		# Keep the chat usable even when a long suggestion list claims its cap.
 		self.chat_panel.setMinimumHeight(160)
 		self.input_bar = ChatInputBar()
 		self.input_bar.sendRequested.connect(self.on_message_submitted)
 		self.input_bar.modeChanged.connect(self._on_mode_changed)
 
-		# suggestion_list sizes itself to its content (stretch 0); the chat
-		# panel absorbs all remaining space so no blank gap trails the list.
-		content_layout.addWidget(self.suggestion_list, 0)
-		content_layout.addWidget(self.chat_panel, 1)
+		self.content_split = QSplitter(Qt.Vertical)
+		self.content_split.setObjectName("AssistContentSplit")
+		self.content_split.setChildrenCollapsible(False)
+		self.content_split.setHandleWidth(10)
+		self.content_split.addWidget(self.suggestion_list)
+		self.content_split.addWidget(self.chat_panel)
+		self.content_split.setStretchFactor(0, 0)
+		self.content_split.setStretchFactor(1, 1)
+		self.content_split.setSizes([220, 380])
+
+		content_layout.addWidget(self.content_split, 1)
 		content_layout.addWidget(self.input_bar)
 
 		grip_row = QHBoxLayout()
@@ -1599,6 +1609,18 @@ class DocumentAssistWindow(QWidget):
 				background-color: #F8FAFC;
 				border-bottom-left-radius: 16px;
 				border-bottom-right-radius: 16px;
+			}
+			QSplitter#AssistContentSplit {
+				background-color: transparent;
+			}
+			QSplitter#AssistContentSplit::handle:vertical {
+				background-color: #E5E7EB;
+				height: 3px;
+				margin: 3px 40px;
+				border-radius: 1px;
+			}
+			QSplitter#AssistContentSplit::handle:vertical:hover {
+				background-color: #94A3B8;
 			}
 			QLabel#AssistWindowTitle {
 				color: #111827;

@@ -18,15 +18,20 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QColor,
+    QFont,
     QFontMetrics,
+    QIcon,
     QKeyEvent,
     QKeySequence,
     QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
     QShortcut,
     QTextCharFormat,
     QTextCursor,
@@ -108,6 +113,119 @@ def _normalise_selection(text: str) -> str:
     return text.replace(PARAGRAPH_SEP, "\n").replace(LINE_SEP, "\n")
 
 
+def editor_tool_icon(kind: str, size: int = 18, color: str = "#3c4043") -> QIcon:
+    """Crisp painter-drawn line icons for the editor toolbar — no asset files or
+    font glyphs (which rendered as tofu / inconsistently before)."""
+    scale = 2
+    phys = size * scale
+    pixmap = QPixmap(phys, phys)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    qcolor = QColor(color)
+    pen = QPen(qcolor)
+    pen.setWidthF(1.7 * scale)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+
+    def pt(fx: float, fy: float) -> QPointF:
+        return QPointF(fx * phys, fy * phys)
+
+    def line(x1, y1, x2, y2) -> None:
+        painter.drawLine(pt(x1, y1), pt(x2, y2))
+
+    def poly(points) -> None:
+        painter.drawPolyline([pt(x, y) for x, y in points])
+
+    def dot(cx, cy, r=0.06) -> None:
+        painter.save()
+        painter.setBrush(qcolor)
+        painter.drawEllipse(pt(cx, cy), r * phys, r * phys)
+        painter.restore()
+
+    if kind == "undo":
+        path = QPainterPath()
+        path.moveTo(pt(0.40, 0.30))
+        path.cubicTo(pt(0.78, 0.30), pt(0.80, 0.72), pt(0.50, 0.74))
+        painter.drawPath(path)
+        poly([(0.40, 0.18), (0.26, 0.30), (0.40, 0.42)])
+    elif kind == "redo":
+        path = QPainterPath()
+        path.moveTo(pt(0.60, 0.30))
+        path.cubicTo(pt(0.22, 0.30), pt(0.20, 0.72), pt(0.50, 0.74))
+        painter.drawPath(path)
+        poly([(0.60, 0.18), (0.74, 0.30), (0.60, 0.42)])
+    elif kind == "quote":
+        painter.fillRect(QRectF(pt(0.24, 0.26), pt(0.31, 0.74)), qcolor)
+        line(0.42, 0.36, 0.78, 0.36)
+        line(0.42, 0.52, 0.70, 0.52)
+        line(0.42, 0.68, 0.78, 0.68)
+    elif kind == "ul":
+        for yy in (0.30, 0.50, 0.70):
+            dot(0.24, yy)
+            line(0.40, yy, 0.80, yy)
+    elif kind == "ol":
+        painter.save()
+        num_font = QFont(painter.font())
+        num_font.setPixelSize(int(0.30 * phys))
+        num_font.setBold(True)
+        painter.setFont(num_font)
+        for digit, yy in (("1", 0.30), ("2", 0.50), ("3", 0.70)):
+            painter.drawText(QRectF(pt(0.12, yy - 0.13), pt(0.32, yy + 0.13)), Qt.AlignCenter, digit)
+        painter.restore()
+        for yy in (0.30, 0.50, 0.70):
+            line(0.40, yy, 0.80, yy)
+    elif kind == "task":
+        painter.drawRoundedRect(QRectF(pt(0.18, 0.20), pt(0.40, 0.42)), 2 * scale, 2 * scale)
+        poly([(0.22, 0.31), (0.28, 0.38), (0.38, 0.24)])
+        line(0.50, 0.31, 0.82, 0.31)
+        for yy in (0.58, 0.78):
+            painter.drawRoundedRect(QRectF(pt(0.18, yy - 0.11), pt(0.40, yy + 0.11)), 2 * scale, 2 * scale)
+            line(0.50, yy, 0.82, yy)
+    elif kind == "link":
+        painter.save()
+        painter.translate(pt(0.50, 0.50))
+        painter.rotate(-45)
+        rw, rh = 0.30 * phys, 0.20 * phys
+        painter.drawRoundedRect(QRectF(-rw, -rh / 2, rw, rh), rh / 2, rh / 2)
+        painter.drawRoundedRect(QRectF(0.0, -rh / 2, rw, rh), rh / 2, rh / 2)
+        painter.restore()
+        line(0.40, 0.50, 0.60, 0.50)
+    elif kind == "image":
+        painter.drawRoundedRect(QRectF(pt(0.18, 0.24), pt(0.82, 0.76)), 3 * scale, 3 * scale)
+        dot(0.36, 0.40, 0.05)
+        poly([(0.24, 0.70), (0.42, 0.52), (0.56, 0.64), (0.66, 0.54), (0.78, 0.70)])
+    elif kind == "table":
+        painter.drawRoundedRect(QRectF(pt(0.18, 0.24), pt(0.82, 0.76)), 2 * scale, 2 * scale)
+        line(0.18, 0.42, 0.82, 0.42)
+        line(0.18, 0.59, 0.82, 0.59)
+        line(0.44, 0.24, 0.44, 0.76)
+        line(0.62, 0.24, 0.62, 0.76)
+    elif kind == "code":
+        poly([(0.38, 0.30), (0.22, 0.50), (0.38, 0.70)])
+        poly([(0.62, 0.30), (0.78, 0.50), (0.62, 0.70)])
+    elif kind == "hr":
+        line(0.18, 0.50, 0.82, 0.50)
+    elif kind == "footnote":
+        path = QPainterPath()
+        path.moveTo(pt(0.28, 0.16))
+        path.lineTo(pt(0.56, 0.16))
+        path.lineTo(pt(0.70, 0.30))
+        path.lineTo(pt(0.70, 0.84))
+        path.lineTo(pt(0.28, 0.84))
+        path.closeSubpath()
+        painter.drawPath(path)
+        poly([(0.56, 0.16), (0.56, 0.30), (0.70, 0.30)])
+        line(0.36, 0.52, 0.56, 0.52)
+        line(0.36, 0.66, 0.62, 0.66)
+
+    painter.end()
+    pixmap.setDevicePixelRatio(scale)
+    return QIcon(pixmap)
+
+
 class MarkdownSourceEdit(QTextEdit):
     """Markdown source editor with an inline ghost-writing suggestion + chip.
 
@@ -134,6 +252,7 @@ class MarkdownSourceEdit(QTextEdit):
         self.setTabChangesFocus(False)
         self._ghost_text = ""
         self._ghost_anchor = -1  # caret position the suggestion is anchored at
+        self._ghost_final = False  # True once streaming is done → show accept chip
         self._composing = False
         self._mutating = False  # guards self-inflicted ghost edits from reactions
         self._generating = False
@@ -222,11 +341,15 @@ class MarkdownSourceEdit(QTextEdit):
         first tokens. Anchors the suggestion at the current caret."""
         self._remove_ghost_run()
         self._generating = True
+        self._ghost_final = False
         self._ghost_anchor = self.textCursor().position()
         self._chip.hide()
         self._position_gen_chip()
 
-    def set_ghost(self, text: str) -> None:
+    def set_ghost(self, text: str, *, final: bool = False) -> None:
+        """Insert / grow the grey suggestion. While streaming (``final=False``)
+        only the "작성 중" indicator trails the text; the Tab 수락 / Esc 거부 chip
+        is shown only once the suggestion is complete (``final=True``)."""
         text = text or ""
         if not text:
             self.clear_ghost()
@@ -253,14 +376,21 @@ class MarkdownSourceEdit(QTextEdit):
             self._mutating = False
         self._ghost_text = text
         self._ghost_anchor = anchor
-        self._generating = False
-        self._hide_gen_chip()
-        self._position_chip()
+        self._ghost_final = final
+        if final:
+            self._generating = False
+            self._hide_gen_chip()
+            self._position_chip()  # accept/reject chip at the end
+        else:
+            # Still streaming: keep the trailing "작성 중" indicator, no chip yet.
+            self._chip.hide()
+            self._position_gen_chip(at_end=True)
 
     def _reset_ghost(self) -> None:
         self._remove_ghost_run()
         self._ghost_text = ""
         self._ghost_anchor = -1
+        self._ghost_final = False
         self._generating = False
         self._chip.hide()
         self._hide_gen_chip()
@@ -289,6 +419,7 @@ class MarkdownSourceEdit(QTextEdit):
         self._remove_ghost_run()
         self._ghost_text = ""
         self._ghost_anchor = -1
+        self._ghost_final = False
         self._generating = False
         self._chip.hide()
         self._hide_gen_chip()
@@ -317,8 +448,13 @@ class MarkdownSourceEdit(QTextEdit):
         self._chip.show()
         self._chip.raise_()
 
-    def _position_gen_chip(self) -> None:
-        rect = self.cursorRect(self.textCursor())
+    def _position_gen_chip(self, at_end: bool = False) -> None:
+        if at_end and self._ghost_text:
+            cursor = self.textCursor()
+            cursor.setPosition(min(self._ghost_anchor + len(self._ghost_text), len(self.toPlainText())))
+            rect = self.cursorRect(cursor)
+        else:
+            rect = self.cursorRect(self.textCursor())
         self._gen_chip.adjustSize()
         x = min(rect.left(), max(0, self.viewport().width() - self._gen_chip.width() - 4))
         y = rect.bottom() + 4
@@ -366,10 +502,10 @@ class MarkdownSourceEdit(QTextEdit):
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
-        if self._ghost_text:
+        if self._ghost_text and self._ghost_final:
             self._position_chip()
-        elif self._generating:
-            self._position_gen_chip()
+        elif self._ghost_text or self._generating:
+            self._position_gen_chip(at_end=bool(self._ghost_text))
 
 
 class OutlinePanel(QFrame):
@@ -784,21 +920,32 @@ class EditorWindow(QWidget):
         layout.setContentsMargins(10, 5, 10, 5)
         layout.setSpacing(4)
 
-        def add_button(label: str, tooltip: str, kind: str) -> None:
-            button = QPushButton(label)
-            button.setObjectName("EditorToolButton")
-            button.setCursor(Qt.PointingHandCursor)
-            button.setToolTip(tooltip)
-            button.setFixedHeight(28)
-            button.clicked.connect(lambda checked=False, k=kind: self.insert_markdown(k))
-            layout.addWidget(button)
-
         def add_sep() -> None:
             sep = QFrame()
             sep.setObjectName("EditorToolSep")
             sep.setFixedWidth(1)
             sep.setFixedHeight(18)
             layout.addWidget(sep)
+
+        def add_text_button(label: str, tooltip: str, kind: str) -> None:
+            button = QPushButton(label)
+            button.setObjectName("EditorToolButton")
+            button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip(tooltip)
+            button.setFixedSize(30, 28)
+            button.clicked.connect(lambda checked=False, k=kind: self.insert_markdown(k))
+            layout.addWidget(button)
+
+        def add_icon_button(icon_kind: str, tooltip: str, handler) -> None:
+            button = QPushButton()
+            button.setObjectName("EditorIconButton")
+            button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip(tooltip)
+            button.setFixedSize(30, 28)
+            button.setIcon(editor_tool_icon(icon_kind))
+            button.setIconSize(QSize(18, 18))
+            button.clicked.connect(lambda checked=False, h=handler: h())
+            layout.addWidget(button)
 
         # Left-panel (문서 개요) show/hide toggle, mirroring its position.
         self.outline_toggle_btn = QPushButton("◧ 개요")
@@ -812,25 +959,41 @@ class EditorWindow(QWidget):
         layout.addWidget(self.outline_toggle_btn)
         add_sep()
 
-        for label, tip, kind in (
-            ("H1", "제목 1", "h1"), ("H2", "제목 2", "h2"), ("H3", "제목 3", "h3"),
-        ):
-            add_button(label, tip, kind)
+        # 실행 취소 / 다시 실행 (self.editor is built later → call lazily)
+        add_icon_button("undo", "실행 취소 (Ctrl+Z)", lambda: self.editor.undo())
+        add_icon_button("redo", "다시 실행 (Ctrl+Y)", lambda: self.editor.redo())
         add_sep()
-        for label, tip, kind in (
-            ("B", "굵게", "bold"), ("I", "기울임", "italic"), ("S", "취소선", "strike"), ("〃", "인용", "quote"),
-        ):
-            add_button(label, tip, kind)
+
+        # 단락 스타일 드롭다운
+        style_button = QToolButton()
+        style_button.setText("본문  ⌄")
+        style_button.setObjectName("EditorStyleButton")
+        style_button.setCursor(Qt.PointingHandCursor)
+        style_button.setPopupMode(QToolButton.InstantPopup)
+        style_menu = QMenu(style_button)
+        for label, kind in (("제목 1", "h1"), ("제목 2", "h2"), ("제목 3", "h3"), ("인용구", "quote")):
+            style_menu.addAction(label, lambda checked=False, k=kind: self.insert_markdown(k))
+        style_button.setMenu(style_menu)
+        layout.addWidget(style_button)
         add_sep()
-        for label, tip, kind in (
-            ("•", "글머리 목록", "ul"), ("1.", "번호 목록", "ol"), ("☑", "체크리스트", "task"),
-        ):
-            add_button(label, tip, kind)
+
+        for label, tip, kind in (("H1", "제목 1", "h1"), ("H2", "제목 2", "h2"), ("H3", "제목 3", "h3")):
+            add_text_button(label, tip, kind)
         add_sep()
-        for label, tip, kind in (
-            ("<>", "인라인 코드", "code"), ("🔗", "링크", "link"), ("⊞", "표", "table"), ("―", "구분선", "hr"),
-        ):
-            add_button(label, tip, kind)
+        for label, tip, kind in (("B", "굵게", "bold"), ("I", "기울임", "italic"), ("S", "취소선", "strike")):
+            add_text_button(label, tip, kind)
+        add_sep()
+        add_icon_button("quote", "인용", lambda: self.insert_markdown("quote"))
+        add_icon_button("ul", "글머리 목록", lambda: self.insert_markdown("ul"))
+        add_icon_button("ol", "번호 목록", lambda: self.insert_markdown("ol"))
+        add_icon_button("task", "체크리스트", lambda: self.insert_markdown("task"))
+        add_sep()
+        add_icon_button("link", "링크", lambda: self.insert_markdown("link"))
+        add_icon_button("image", "이미지", lambda: self.insert_markdown("image"))
+        add_icon_button("table", "표", lambda: self.insert_markdown("table"))
+        add_icon_button("code", "인라인 코드", lambda: self.insert_markdown("code"))
+        add_icon_button("hr", "구분선", lambda: self.insert_markdown("hr"))
+        add_icon_button("footnote", "각주", lambda: self.insert_markdown("footnote"))
 
         layout.addStretch(1)
 
@@ -1168,7 +1331,7 @@ class EditorWindow(QWidget):
                 return
             cleaned = (full or "").strip("\n")
             if cleaned.strip():
-                self.editor.set_ghost(cleaned)
+                self.editor.set_ghost(cleaned, final=True)
             else:
                 self.editor.clear_ghost()
 
@@ -1726,6 +1889,16 @@ class EditorWindow(QWidget):
                 padding: 0px 9px; font-weight: 700; min-width: 22px;
             }
             QPushButton#EditorToolButton:hover { background-color: #f1f3f4; border-color: #dadce0; }
+            QPushButton#EditorIconButton {
+                background-color: #ffffff; border: 1px solid #e8eaed; border-radius: 6px; padding: 0px;
+            }
+            QPushButton#EditorIconButton:hover { background-color: #f1f3f4; border-color: #dadce0; }
+            QToolButton#EditorStyleButton {
+                background-color: #ffffff; color: #3c4043; border: 1px solid #e8eaed; border-radius: 6px;
+                padding: 3px 10px; font-weight: 600;
+            }
+            QToolButton#EditorStyleButton:hover { background-color: #f1f3f4; border-color: #dadce0; }
+            QToolButton#EditorStyleButton::menu-indicator { image: none; width: 0; }
             QFrame#EditorToolSep { background-color: #e8eaed; }
             QPushButton#ViewToggleButton {
                 background-color: #ffffff; color: #5f6368; border: 1px solid #dadce0; border-radius: 6px;
