@@ -280,6 +280,40 @@ class ScenarioScheduler:
             trace["selected_vruntime_after"] = round(new_vruntime, 4)
             return selected
 
+    def is_globally_throttled(self, document_key: str, *, now: float | None = None) -> bool:
+        """Cheap anti-spam reflex, decoupled from vruntime selection: True when a
+        fire happened within ``min_global_fire_interval_sec``. Used by the LLM
+        router path, which does selection itself but still wants the throttle."""
+        if self.min_global_fire_interval_sec <= 0:
+            return False
+        now = now if now is not None else time.time()
+        with self._lock:
+            state = self.get_state(document_key, now=now)
+            if state.last_global_fire_at <= 0:
+                return False
+            return (now - state.last_global_fire_at) < self.min_global_fire_interval_sec
+
+    def record_fire(
+        self,
+        document_key: str,
+        name: str,
+        *,
+        now: float | None = None,
+        doc_chars: int | None = None,
+    ) -> None:
+        """Record that ``name`` fired: updates recency (last_fired_at) + the global
+        throttle anchor, WITHOUT charging vruntime. The router, not vruntime, owns
+        selection, so per-scenario cooldown gates and the throttle still work while
+        the fairness machinery stays dormant."""
+        now = now if now is not None else time.time()
+        with self._lock:
+            state = self.get_state(document_key, now=now)
+            state.last_fired_at[name] = now
+            state.last_global_fire_at = now
+            state.last_activity_at = now
+            if doc_chars is not None:
+                state.last_fired_doc_chars[name] = doc_chars
+
     def snapshot(self, document_key: str, *, now: float | None = None) -> dict[str, Any]:
         state = self.get_state(document_key, now=now)
         return {

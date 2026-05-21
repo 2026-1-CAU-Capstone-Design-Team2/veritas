@@ -96,6 +96,8 @@
       "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" -c \"import os; os.environ['QT_QPA_PLATFORM']='offscreen']\")",
       "Bash('C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe' -c 'import os; os.environ['\\\\''QT_QPA_PLATFORM'\\\\'']='\\\\''offscreen'\\\\'' *)",
       "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _render_icons.py)",
+      "Bash(python -c \"import ast,sys; [ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\) or print\\('OK',f\\) for f in ['services/screen_tool_funcs/core/store.py','tools/screen_context_tool/screen_context_tool.py','api/services/agent_runtime.py','api/services/screen_monitor.py','api/services/screen_monitoring_service.py','api/api_models.py','api/api_routes/screen_monitoring.py']]\")",
+      "Bash(venv/Scripts/python.exe -c ' *)"
       "Bash(python -c \"import os; from db.db import get_db_path, init_db; print\\('LOCALAPPDATA =', os.environ.get\\('LOCALAPPDATA'\\)\\); print\\('DB PATH      =', get_db_path\\(\\)\\); print\\('CREATED AT   =', init_db\\(\\)\\); print\\('EXISTS       =', get_db_path\\(\\).exists\\(\\)\\)\")",
       "Bash(xargs grep -l \"api_client\\\\|stream_post_sse\")",
       "Bash(grep -E \"\\\\.py$\")",

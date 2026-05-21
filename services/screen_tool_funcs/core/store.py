@@ -19,6 +19,8 @@ class ScreenContextStore:
     EVENTS_ROTATE_KEEP = 5
     INTERVENTION_LOG_ROTATE_MAX_BYTES = 5 * 1024 * 1024
     INTERVENTION_LOG_ROTATE_KEEP = 5
+    INTERVENTION_FEEDBACK_ROTATE_MAX_BYTES = 5 * 1024 * 1024
+    INTERVENTION_FEEDBACK_ROTATE_KEEP = 5
     CAPTURE_LOG_ROTATE_MAX_BYTES = 10 * 1024 * 1024
     CAPTURE_LOG_ROTATE_KEEP = 3
     CAPTURE_LOG_SESSION_RETENTION = 20
@@ -29,6 +31,11 @@ class ScreenContextStore:
         self.events_path = self.screen_dir / "events.jsonl"
         self.latest_path = self.screen_dir / "latest.json"
         self.intervention_log_path = self.screen_dir / "interventions.jsonl"
+        # Append-only reward log: one line per user reaction to a shown
+        # intervention. Joins to interventions.jsonl on event_id (and carries a
+        # denormalized intervention_type) to form the (context, scenario, reward)
+        # dataset a future contextual bandit learns the selection policy from.
+        self.intervention_feedback_path = self.screen_dir / "intervention_feedback.jsonl"
         self.intervention_queue_path = self.screen_dir / "intervention_queue.json"
         self.latest_intervention_path = self.screen_dir / "latest_intervention.json"
         # debug 모드면 capture log를 capture_logs/ 대신 debug/에 기록
@@ -62,6 +69,16 @@ class ScreenContextStore:
                 self.capture_log_path,
                 max_bytes=self.CAPTURE_LOG_ROTATE_MAX_BYTES,
                 keep=self.CAPTURE_LOG_ROTATE_KEEP,
+            )
+
+    def append_intervention_feedback(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            with self.intervention_feedback_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._maybe_rotate(
+                self.intervention_feedback_path,
+                max_bytes=self.INTERVENTION_FEEDBACK_ROTATE_MAX_BYTES,
+                keep=self.INTERVENTION_FEEDBACK_ROTATE_KEEP,
             )
 
     def load_latest(self) -> dict[str, Any] | None:

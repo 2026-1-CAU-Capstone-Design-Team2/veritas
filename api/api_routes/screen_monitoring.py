@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, Query
 
-from ..api_models import ScreenMonitoringStartRequest
+from ..api_models import ScreenFeedbackRequest, ScreenMonitoringStartRequest
 from ..services import screen_monitoring_service
 
 router = APIRouter()
@@ -34,3 +34,12 @@ async def screen_monitoring_events(
     limit: int = Query(default=20, ge=1, le=100),
 ) -> dict[str, Any]:
     return screen_monitoring_service.get_events(since=since, limit=limit)
+
+
+@router.post("/api/v1/screen-monitoring/feedback")
+def screen_monitoring_feedback(payload: ScreenFeedbackRequest) -> dict[str, Any]:
+    return screen_monitoring_service.record_feedback(
+        event_id=payload.eventId,
+        intervention_type=payload.interventionType or "none",
+        action=payload.action,
+    )
