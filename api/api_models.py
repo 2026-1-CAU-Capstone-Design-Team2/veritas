@@ -80,7 +80,14 @@ class EditorExportRequest(BaseModel):
 
 
 class SettingsModelRequest(BaseModel):
-    modelName: Literal["0.8B", "9B"]
+    modelId: str | None = None
+    # Kept for old frontend payloads. New settings store selected GGUF models
+    # by stable catalog id, not by display text.
+    modelName: str | None = None
+
+
+class SettingsEmbeddingModelRequest(BaseModel):
+    modelId: str
 
 
 class SettingsLocalAccessRequest(BaseModel):

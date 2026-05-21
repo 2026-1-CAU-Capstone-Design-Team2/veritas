@@ -6,6 +6,7 @@ from fastapi import APIRouter
 
 from ..api_models import (
     SettingsDocumentToolsRequest,
+    SettingsEmbeddingModelRequest,
     SettingsLlmParallelRequest,
     SettingsLocalAccessRequest,
     SettingsModelRequest,
@@ -23,7 +24,12 @@ async def settings_get() -> dict[str, Any]:
 
 @router.put("/api/v1/settings/model")
 async def settings_model_update(payload: SettingsModelRequest) -> dict[str, Any]:
-    return settings_service.update_model(payload.modelName)
+    return settings_service.update_model(payload.modelId, payload.modelName)
+
+
+@router.put("/api/v1/settings/embedding-model")
+async def settings_embedding_model_update(payload: SettingsEmbeddingModelRequest) -> dict[str, Any]:
+    return settings_service.update_embedding_model(payload.modelId)
 
 
 @router.put("/api/v1/settings/local-access")

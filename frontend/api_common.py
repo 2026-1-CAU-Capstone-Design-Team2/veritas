@@ -30,7 +30,15 @@ STATE: dict[str, object] = {
     },
     "settings": {
         "model": {
-            "modelName": "0.8B",
+            "modelId": "qwen35-0.8b-q8_0",
+            "modelName": "Qwen3.5 0.8B 8-bit",
+        },
+        "embeddingModel": {
+            "modelId": "granite-embedding-97m-r2-q8_0",
+            "modelName": "Granite Embedding 97M Multilingual R2 8-bit",
+        },
+        "launcher": {
+            "initialModelSelected": False,
         },
         "localAccess": {
             "folderPaths": [],
@@ -46,6 +54,7 @@ STATE: dict[str, object] = {
             "sampleCount": 3,
             "planCount": 5,
         },
+        "llmParallel": 1,
     },
 }
 
