@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .models import BoundingBox, UiAutomationResult, WindowContext
+from .text_extraction_targets import is_text_extraction_target
 
 
 class UiAutomationReader:
@@ -57,7 +58,11 @@ class UiAutomationReader:
                 mouse_position=hover["mouse_position"],
                 browser_url=browser_url,
             )
-            if not text.strip() and not current_text.strip():
+            if self._is_control_name_only_empty_editor(result, window):
+                result.text = ""
+                result.text_source = ""
+
+            if not result.text.strip() and not current_text.strip():
                 result.reject_reason = "empty_text"
                 result.error = "Focused control has no readable text."
                 return result
@@ -352,19 +357,17 @@ class UiAutomationReader:
         if any(token in control_type for token in non_text_controls):
             return "rejected", "non_text_control"
 
+        if self._is_code_editor_non_editor_focus(process_name, focused_name):
+            return "rejected", "code_editor_non_editor_focus"
+
         if process_name == "winword.exe" and class_name == "_wwg":
             return "primary", None
 
-        if process_name == "notepad.exe" and "edit" in control_type:
-            # A focused Notepad edit control is authoritative document text even
-            # when short (the user just started typing). Don't apply the generic
-            # "too_short_for_document_context" downgrade here — that would push a
-            # 1-19 char Notepad doc onto the OCR fallback, which reads the app
-            # chrome as noise. (Empty docs are caught earlier as empty_text.)
+        if is_text_extraction_target(window) and self._has_structured_text_source(result):
+            # Registered editing apps are authoritative when UIA exposes real
+            # text/value patterns, even for short text. OCR should stay a
+            # fallback for cases where structured text is unavailable.
             return "primary", None
-
-        if process_name == "code.exe" and any(token in focused_name for token in ("terminal", "debug console")):
-            return "rejected", "vscode_non_editor_focus"
 
         if result.current_paragraph_text and len(text) >= 20:
             return "usable", None
@@ -377,3 +380,61 @@ class UiAutomationReader:
             return "usable", None
 
         return "weak", "not_enough_document_like_text"
+
+    def _has_structured_text_source(self, result: UiAutomationResult) -> bool:
+        if (result.text_source or "").lower() in {"text_pattern", "value_pattern"}:
+            return bool((result.text or result.current_paragraph_text or "").strip())
+        return False
+
+    def _is_control_name_only_empty_editor(
+        self,
+        result: UiAutomationResult,
+        window: WindowContext,
+    ) -> bool:
+        if not is_text_extraction_target(window):
+            return False
+        if (result.text_source or "").lower() != "control_name":
+            return False
+        if (result.current_paragraph_text or "").strip():
+            return False
+
+        focused_name = " ".join((result.focused_name or "").lower().split())
+        text = " ".join((result.text or "").lower().split())
+        if text != focused_name:
+            return False
+        if focused_name not in {
+            "text editor",
+            "editor",
+            "document",
+            "텍스트 편집기",
+            "편집기",
+            "문서",
+        }:
+            return False
+
+        return self._is_editor_control_shape(result)
+
+    def _is_editor_control_shape(self, result: UiAutomationResult) -> bool:
+        control_type = (result.control_type or "").lower()
+        class_name = (result.class_name or "").lower()
+        focused_name = (result.focused_name or "").lower()
+        if "edit" in control_type or "document" in control_type:
+            return True
+        if any(
+            token in class_name
+            for token in ("richedit", "scintilla", "textview", "editor")
+        ):
+            return True
+        return focused_name in {"text editor", "텍스트 편집기"}
+
+    def _is_code_editor_non_editor_focus(
+        self,
+        process_name: str,
+        focused_name: str,
+    ) -> bool:
+        if process_name not in {"code.exe", "devenv.exe", "pycharm64.exe"}:
+            return False
+        return any(
+            token in focused_name
+            for token in ("terminal", "debug console", "python console")
+        )

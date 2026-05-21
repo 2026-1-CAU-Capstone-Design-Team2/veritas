@@ -39,6 +39,7 @@ from .scenario import (
 )
 from .screen_capture import ScreenCapture
 from .store import ScreenContextStore
+from .text_extraction_targets import is_text_extraction_target
 from .ui_automation import UiAutomationReader
 from .window_context import WindowContextReader
 
@@ -594,25 +595,7 @@ class ScreenContextService:
 
     # foreground 앱이 텍스트 추출 대상인지(프로세스명·확장자) 판별
     def _is_text_extraction_target(self, window) -> bool:
-        process_name = (window.process_name or "").lower()
-        if process_name in {
-            "notepad.exe",
-            "winword.exe",
-            "excel.exe",
-            "powerpnt.exe",
-            "docs.exe",
-            "notepad++.exe",
-            "notion.exe",
-            "word.exe",
-            "hwp.exe",
-            "code.exe",
-            "devenv.exe",
-            "pycharm64.exe",
-        }:
-            return True
-
-        title = (window.window_title or "").lower()
-        return any(title.endswith(ext) or ext in title for ext in (".txt", ".md", ".doc", ".hwp", ".ppt", ".pptx"))
+        return is_text_extraction_target(window)
 
     # UI Automation 결과가 쓸 만한지(텍스트 존재 + 품질) 판별
     def _is_usable_text_source(self, result: UiAutomationResult) -> bool:
