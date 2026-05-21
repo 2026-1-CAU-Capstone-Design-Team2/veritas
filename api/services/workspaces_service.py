@@ -130,6 +130,13 @@ def _scan_run_workspaces() -> list[dict[str, Any]]:
     if not root.exists():
         return []
 
+    # The on-disk folder name is only the *initial* display name. A user can
+    # rename a workspace (dashboard → 이름 변경), which persists to the
+    # workspaces.name column; re-syncing from disk must preserve that rather
+    # than reset it to the folder name. Seed the scan with the saved names and
+    # fall back to the folder name only for workspaces not yet in the DB.
+    persisted_names = _load_persisted_workspace_names()
+
     workspaces: list[dict[str, Any]] = []
     for path in sorted(root.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
         if not path.is_dir() or path.name.startswith("_") or path.name == "__pycache__":
@@ -156,7 +163,7 @@ def _scan_run_workspaces() -> list[dict[str, Any]]:
         workspaces.append(
             {
                 "workspaceId": path.name,
-                "name": path.name,
+                "name": persisted_names.get(path.name) or path.name,
                 "detail": f"documents {document_count} · {path}",
                 "status": "completed" if final_path.exists() else "running",
                 "lastWorkedAt": _mtime_iso(final_path if final_path.exists() else path),
@@ -215,6 +222,29 @@ def _mtime_iso(path: Path) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _load_persisted_workspace_names() -> dict[str, str]:
+    """Display names already saved in SQLite, keyed by workspace id.
+
+    Used by :func:`_scan_run_workspaces` so a user's rename survives a disk
+    re-sync. Read-only and best-effort — any failure yields an empty map, in
+    which case the scan falls back to folder names (the pre-rename behavior).
+    """
+    try:
+        init_db()
+        conn = get_connection()
+        try:
+            rows = conn.execute("SELECT id, name FROM workspaces").fetchall()
+            return {
+                str(row["id"]): str(row["name"])
+                for row in rows
+                if row["id"] is not None and str(row["name"] or "").strip()
+            }
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+
 def _load_current_workspace_id() -> str | None:
     try:
         init_db()
@@ -261,12 +291,15 @@ def _persist_workspace_catalog(workspaces: list[dict[str, Any]]) -> None:
                 workspace_id = str(workspace.get("workspaceId") or "").strip()
                 if not workspace_id:
                     continue
+                # name is intentionally NOT in the DO UPDATE clause: it is set
+                # once on first insert (folder name) and thereafter owned by the
+                # user (dashboard rename). Updating it from excluded.name here
+                # would clobber a rename on every disk re-sync.
                 conn.execute(
                     """
                     INSERT INTO workspaces (id, name, path, status, created_at, updated_at, last_worked_at)
                     VALUES (?, ?, ?, ?, datetime('now'), datetime('now'), ?)
                     ON CONFLICT(id) DO UPDATE SET
-                        name = excluded.name,
                         path = excluded.path,
                         status = excluded.status,
                         updated_at = excluded.updated_at,

@@ -252,8 +252,11 @@ class MainWindow(QMainWindow):
 		shell.addWidget(self.sidebar)
 		shell.addWidget(center_panel, 1)
 
-		self.document_assist_window = DocumentAssistWindow(self)
-		self.editor_window = EditorWindow(self)
+		# Independent top-level windows (no parent) so each gets its own taskbar
+		# button and minimises ('-') on its own; MainWindow.closeEvent closes them
+		# so the app still exits cleanly when the main window is closed.
+		self.document_assist_window = DocumentAssistWindow()
+		self.editor_window = EditorWindow()
 		self._agent_controller = AgentController()
 		self._chat_bus = get_chat_bus()
 		self.document_assist_window.messageSubmitted.connect(self._send_assist_window_message)
@@ -288,6 +291,15 @@ class MainWindow(QMainWindow):
 
 		self._enable_text_selection(container)
 		self._navigate("dashboard")
+
+	def closeEvent(self, event) -> None:  # type: ignore[override]
+		# The editor/assist windows are now parent-less top-levels, so closing the
+		# main window no longer auto-destroys them (and the app would stay alive on
+		# their taskbar buttons). Close them explicitly so the app exits.
+		for window in (getattr(self, "editor_window", None), getattr(self, "document_assist_window", None)):
+			if window is not None:
+				window.close()
+		super().closeEvent(event)
 
 	def show_document_assist_window(self) -> None:
 		self.document_assist_window.show()

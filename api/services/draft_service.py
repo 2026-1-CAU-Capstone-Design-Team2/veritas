@@ -151,10 +151,14 @@ def list_drafts(workspace_id: str) -> dict[str, Any]:
 def _render_and_persist(workspace_id: str, number: int, record: dict[str, Any]) -> dict[str, Any]:
     runtime = get_runtime()
     budget = _knowledge_budget(runtime)
-    knowledge = _gather_knowledge(workspace_id, char_budget=budget)
+    selected_doc_ids = record.get("selectedDocIds")
+    knowledge = _gather_knowledge(
+        workspace_id, char_budget=budget, selected_doc_ids=selected_doc_ids
+    )
     print(
         f"[draft] workspace={workspace_id} draft={number} "
-        f"knowledge_chars={len(knowledge)} budget={budget}"
+        f"knowledge_chars={len(knowledge)} budget={budget} "
+        f"selected_docs={'all' if selected_doc_ids is None else len(selected_doc_ids)}"
     )
     user_prompt = _compose_user_prompt(record, knowledge)
     sampling = record.get("sampling") or {}
@@ -242,14 +246,34 @@ def _compose_user_prompt(record: dict[str, Any], knowledge: str) -> str:
     )
 
 
-def _gather_knowledge(workspace_id: str, *, char_budget: int) -> str:
-    """Read the consolidated knowledge base for ``workspace_id`` from disk.
+def _gather_knowledge(
+    workspace_id: str,
+    *,
+    char_budget: int,
+    selected_doc_ids: list[str] | None = None,
+) -> str:
+    """Read the knowledge base for ``workspace_id`` from disk.
 
-    Order of inclusion (most consolidated first): the batch summaries — which
-    already merge per-document findings and carry ``[doc_*]`` citations — then
-    ``final.md`` as additional consolidated context. Both are read by path so
-    this never depends on which workspace the runtime is currently attached to.
+    Two grounding modes:
+
+    * **Consolidated** (default / ``selected_doc_ids`` is ``None`` or covers
+      every document): the batch summaries — which already merge per-document
+      findings and carry ``[doc_*]`` citations — followed by ``final.md`` as
+      additional consolidated context. This is the richest material and is what
+      "all documents kept" uses.
+    * **Filtered** (``selected_doc_ids`` is a strict subset chosen in the draft
+      wizard's "자료 선택" step): ground *only* on those documents' per-doc
+      summaries (``summary/doc_<id>.md``), so the draft can never lean on a
+      document the user unchecked. An empty selection means every document was
+      unchecked → no knowledge at all.
+
+    Everything is read by path so this never depends on which workspace the
+    runtime is currently attached to.
     """
+    selected = _resolve_doc_filter(workspace_id, selected_doc_ids)
+    if selected is not None:
+        return _gather_selected_doc_summaries(workspace_id, selected, char_budget=char_budget)
+
     ws_dir = _workspace_dir(workspace_id)
     parts: list[str] = []
     used = 0
@@ -291,6 +315,94 @@ def _append_within_budget(parts: list[str], block: str, used: int, budget: int) 
     return budget
 
 
+def _resolve_doc_filter(
+    workspace_id: str, selected_doc_ids: list[str] | None
+) -> list[str] | None:
+    """Decide whether to filter the knowledge base, and to which documents.
+
+    Returns ``None`` to mean *no filter* — the caller should use the rich
+    consolidated path (batch summaries + ``final.md``). Returns a list (in
+    ``index.json`` order) to mean *ground only on these docs*; an empty list is
+    a legitimate "user unchecked everything" selection.
+
+    A selection that turns out to cover every known document collapses to
+    ``None`` so the common "kept all" case keeps the richest grounding. A
+    workspace with no ``index.json`` also collapses to ``None`` — there is
+    nothing to filter against, so falling back to the consolidated path is safer
+    than silently producing an empty knowledge base.
+    """
+    if selected_doc_ids is None:
+        return None
+    records = _read_index_records(workspace_id)
+    all_ids = [doc_id for doc_id, _ in records]
+    if not all_ids:
+        return None
+    selected_set = {str(doc_id).strip() for doc_id in selected_doc_ids if str(doc_id).strip()}
+    kept = [doc_id for doc_id in all_ids if doc_id in selected_set]
+    if len(kept) == len(all_ids):
+        return None
+    return kept
+
+
+def _gather_selected_doc_summaries(
+    workspace_id: str, doc_ids: list[str], *, char_budget: int
+) -> str:
+    """Concatenate the per-doc ``summary/doc_<id>.md`` files for ``doc_ids``.
+
+    These are the same per-document summaries the verification layer parses, so
+    the draft grounds on exactly the documents the user kept checked — nothing
+    from an unchecked source leaks in. Titles are pulled from ``index.json`` so
+    each block is labelled like the consolidated path's ``=== ... ===`` headers.
+    """
+    summary_dir = _workspace_dir(workspace_id) / "summary"
+    titles = dict(_read_index_records(workspace_id))
+    parts: list[str] = []
+    used = 0
+    for doc_id in doc_ids:
+        if used >= char_budget:
+            break
+        text = _read_text(_doc_summary_path(summary_dir, doc_id))
+        if not text:
+            continue
+        title = titles.get(doc_id, "")
+        header = f"=== doc_{doc_id} · {title} ===" if title else f"=== doc_{doc_id} ==="
+        used = _append_within_budget(parts, f"{header}\n{text}", used, char_budget)
+    return "\n\n".join(parts).strip()
+
+
+def _doc_summary_path(summary_dir: Path, doc_id: str) -> Path:
+    """Per-doc summary path, mirroring the run-store's zero-padded naming.
+
+    Digit ids map to ``doc_<3-digit>.md`` (e.g. ``doc_007.md``); any other id is
+    used verbatim — the same rule the verification artifact loader applies.
+    """
+    doc_id = str(doc_id).strip()
+    name = f"doc_{int(doc_id):03d}.md" if doc_id.isdigit() else f"doc_{doc_id}.md"
+    return summary_dir / name
+
+
+def _read_index_records(workspace_id: str) -> list[tuple[str, str]]:
+    """``(doc_id, title)`` for each non-duplicate ``index.json`` record, in order."""
+    index_path = _workspace_dir(workspace_id) / "summary" / "index.json"
+    try:
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - missing/corrupt index -> no filterable docs
+        return []
+    records = data.get("records") if isinstance(data, dict) else None
+    if not isinstance(records, list):
+        return []
+    out: list[tuple[str, str]] = []
+    for record in records:
+        if not isinstance(record, dict) or record.get("duplicate_of"):
+            continue
+        doc_id = str(record.get("doc_id") or "").strip()
+        if not doc_id:
+            continue
+        title = str(record.get("title") or record.get("url") or f"문서 {doc_id}").strip()
+        out.append((doc_id, title))
+    return out
+
+
 def _knowledge_budget(runtime: Any) -> int:
     """Char budget for the knowledge block, sized to the model's context window.
 
@@ -319,6 +431,15 @@ def _normalize_settings(workspace_id: str, payload: dict[str, Any]) -> dict[str,
     # any stray value for the built-in path so it can't alter that prompt.
     form_markdown = str(payload.get("formMarkdown") or "").strip() if source == "file" else ""
 
+    # ``None`` (key absent / step skipped) stays None → no doc filter. A list —
+    # even empty — is an explicit selection that filters grounding.
+    raw_selection = payload.get("selectedDocIds")
+    selected_doc_ids = (
+        None
+        if raw_selection is None
+        else [str(doc_id).strip() for doc_id in raw_selection if str(doc_id).strip()]
+    )
+
     return {
         "source": source,
         "category": category,
@@ -330,6 +451,7 @@ def _normalize_settings(workspace_id: str, payload: dict[str, Any]) -> dict[str,
         "keyPoints": str(payload.get("keyPoints") or "").strip(),
         "docType": _doc_type(source, category, subtype),
         "formMarkdown": form_markdown,
+        "selectedDocIds": selected_doc_ids,
     }
 
 
@@ -361,6 +483,7 @@ def _build_settings_record(
         "audience": settings["audience"],
         "keyPoints": settings["keyPoints"],
         "formMarkdown": settings.get("formMarkdown", ""),
+        "selectedDocIds": settings.get("selectedDocIds"),
         "sampling": {
             "samplingParams": profile["samplingParams"],
             "extraSamplingParams": profile["extraSamplingParams"],

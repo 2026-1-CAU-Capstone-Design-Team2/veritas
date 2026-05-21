@@ -73,6 +73,8 @@ def send_chat_message_stream(
     workspace_id: str,
     message: str,
     mode: str = "research",
+    doc_text: str = "",
+    source: str = "chat",
 ) -> Iterator[bytes]:
     """Stream the assistant response as SSE events.
 
@@ -81,16 +83,21 @@ def send_chat_message_stream(
         event: delta  data: {"text": "<chunk>"}
         event: done   data: {"messageId": "...", "assistant": "<full>", "mode": "..."}
         event: error  data: {"error": "..."}
+
+    ``doc_text`` (the editor's open document) rides along as additive agent
+    context; ``source`` tags both turns so the main chat page and the editor's
+    문서 대화 render one shared log while marking which surface spoke.
     """
     message_text = message.strip()
     if not message_text:
         yield _sse("error", {"error": "message must not be empty"})
         return
 
+    doc_context = (doc_text or "")[:4000].strip()
     message_id = new_id("msg")
     session_id = f"session_{workspace_id}"
     history = _get_workspace_chat_history(workspace_id, session_id)
-    history.append({"role": "user", "text": message})
+    history.append({"role": "user", "text": message, "source": source})
 
     runtime = get_runtime()
     runtime.set_workspace(workspace_id)
@@ -102,7 +109,9 @@ def send_chat_message_stream(
 
     collected: list[str] = []
     try:
-        for chunk in runtime.answer_chat_selection_iter(message_text, mode):
+        for chunk in runtime.answer_chat_selection_iter(
+            message_text, mode, doc_context=doc_context
+        ):
             if not chunk:
                 continue
             collected.append(chunk)
@@ -113,7 +122,7 @@ def send_chat_message_stream(
         yield _sse("error", {"error": str(e)})
 
     assistant_text = "".join(collected)
-    history.append({"role": "assistant", "text": assistant_text})
+    history.append({"role": "assistant", "text": assistant_text, "source": source})
     _save_workspace_chat_history(workspace_id, history)
     yield _sse(
         "done",
