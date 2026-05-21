@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QSize, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
 	QApplication,
@@ -259,22 +259,23 @@ QTextEdit#DraftOutput {
 }
 QLabel#SettingsNote { color: #94A3B8; font-size: 12px; }
 
-/* 자료 선택 — 등급 드롭다운 */
+/* 자료 선택 — 등급 드롭다운 (연한 보라 배경 + 선택 시 보라 강조) */
 QLabel#DocSelectEmpty {
 	color: #6B7280; background-color: #F8FAFC; border: 1px dashed #CBD5E1;
 	border-radius: 10px; padding: 16px; font-size: 13px;
 }
-QFrame#DocGroup { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 12px; }
-QFrame#DocGroupHeader { background-color: #F8FAFC; border: none; border-bottom: 1px solid #EEF0F3; border-top-left-radius: 12px; border-top-right-radius: 12px; }
+QFrame#DocGroup { background-color: #EEF2FF; border: 1px solid #C7D2FE; border-radius: 12px; }
+QFrame#DocGroupHeader { background-color: #E0E7FF; border: none; border-bottom: 1px solid #C7D2FE; border-top-left-radius: 12px; border-top-right-radius: 12px; }
 QFrame#DocGroupBody { background: transparent; border: none; }
 QToolButton#DocGroupToggle {
-	color: #64748B; background: transparent; border: none;
-	font-size: 13px; font-weight: 800; padding: 0 2px;
+	color: #4F46E5; background: transparent; border: none;
+	font-size: 15px; font-weight: 800; padding: 0 4px;
 }
-QToolButton#DocGroupToggle:hover { color: #4F46E5; }
-QLabel#DocGroupCount { color: #94A3B8; font-size: 12px; font-weight: 700; }
-QFrame#DocRow { background-color: #F8FAFC; border: 1px solid #EEF0F3; border-radius: 8px; }
-QFrame#DocRow:hover { border-color: #C7D2FE; }
+QToolButton#DocGroupToggle:hover { color: #3730A3; }
+QLabel#DocGroupCount { color: #6366F1; font-size: 12px; font-weight: 700; }
+QFrame#DocRow { background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; }
+QFrame#DocRow:hover { border-color: #818CF8; }
+QFrame#DocRow[checked="true"] { border: 1px solid #4F46E5; }
 QLabel#DocRowTitle { color: #0F172A; font-size: 13px; font-weight: 600; }
 QLabel#DocRowMeta { color: #6B7280; font-size: 11px; }
 """
@@ -498,6 +499,49 @@ class WritingOptions(QWidget):
 
 
 # ------------------------------------------------------------------- 자료 선택
+class _StyledCheckBox(QCheckBox):
+	"""텍스트 없는 체크박스 — 인디케이터를 직접 그린다.
+
+	선택 시 진한 보라(#4F46E5) 배경에 흰색 체크, 부분 선택(그룹)은 흰색 대시로
+	표시한다. 네이티브 체크박스 렌더링 대신 그려서 플랫폼과 무관하게 같은 모양을
+	보장한다. (자료 선택 위젯 전용 — 라벨이 없어 인디케이터만 그리면 된다.)"""
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self.setCursor(Qt.PointingHandCursor)
+		self.setFixedSize(20, 20)
+
+	def paintEvent(self, event) -> None:  # type: ignore[override]
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.Antialiasing, True)
+		box = QRectF(self.rect()).adjusted(2, 2, -2, -2)
+		state = self.checkState()
+		if state == Qt.Unchecked:
+			painter.setPen(QPen(QColor("#CBD5E1"), 1.5))
+			painter.setBrush(QColor("#FFFFFF"))
+			painter.drawRoundedRect(box, 5, 5)
+			return
+		painter.setPen(QPen(QColor("#4F46E5"), 1.5))
+		painter.setBrush(QColor("#4F46E5"))
+		painter.drawRoundedRect(box, 5, 5)
+		mark = QPen(QColor("#FFFFFF"), 2.0)
+		mark.setCapStyle(Qt.RoundCap)
+		mark.setJoinStyle(Qt.RoundJoin)
+		painter.setPen(mark)
+		w, h = box.width(), box.height()
+		if state == Qt.PartiallyChecked:
+			y = box.center().y()
+			painter.drawLine(
+				QPointF(box.left() + w * 0.26, y), QPointF(box.right() - w * 0.26, y)
+			)
+		else:
+			path = QPainterPath()
+			path.moveTo(box.left() + w * 0.26, box.top() + h * 0.52)
+			path.lineTo(box.left() + w * 0.43, box.top() + h * 0.70)
+			path.lineTo(box.left() + w * 0.76, box.top() + h * 0.30)
+			painter.drawPath(path)
+
+
 class DocumentSelector(QWidget):
 	"""검증 결과를 등급(높음/중간/낮음)별 드롭다운으로 묶어, 초안에 반영할 자료를
 	고르게 하는 위젯.
@@ -621,20 +665,12 @@ class DocumentSelector(QWidget):
 		hrow.setContentsMargins(12, 10, 12, 10)
 		hrow.setSpacing(10)
 
-		group_cb = QCheckBox()
+		group_cb = _StyledCheckBox()
 		group_cb.setObjectName("DocGroupCheck")
 		group_cb.setTristate(True)
 		group_cb.setChecked(True)
-		group_cb.setCursor(Qt.PointingHandCursor)
 		group_cb.clicked.connect(lambda _checked=False, lv=level: self._on_group_clicked(lv))
 		hrow.addWidget(group_cb, 0)
-
-		caret = QToolButton()
-		caret.setObjectName("DocGroupToggle")
-		caret.setCursor(Qt.PointingHandCursor)
-		caret.setText("▾")
-		caret.clicked.connect(lambda _checked=False, lv=level: self._toggle_group(lv))
-		hrow.addWidget(caret, 0)
 
 		badge = Badge(level, _tone_for_level(level))
 		hrow.addWidget(badge, 0)
@@ -643,6 +679,14 @@ class DocumentSelector(QWidget):
 		count.setObjectName("DocGroupCount")
 		hrow.addWidget(count, 0)
 		hrow.addStretch(1)
+
+		# 펼침/접힘 토글은 시인성을 위해 헤더 맨 오른쪽에 둔다.
+		caret = QToolButton()
+		caret.setObjectName("DocGroupToggle")
+		caret.setCursor(Qt.PointingHandCursor)
+		caret.setText("▾")
+		caret.clicked.connect(lambda _checked=False, lv=level: self._toggle_group(lv))
+		hrow.addWidget(caret, 0)
 
 		body = QFrame()
 		body.setObjectName("DocGroupBody")
@@ -674,14 +718,16 @@ class DocumentSelector(QWidget):
 	def _build_doc_row(self, item: dict, level: str, doc_id: str) -> QWidget:
 		row = QFrame()
 		row.setObjectName("DocRow")
+		# 기본은 선택 상태 → 보라 테두리(QSS QFrame#DocRow[checked="true"]).
+		row.setProperty("checked", True)
 		hrow = QHBoxLayout(row)
 		hrow.setContentsMargins(12, 8, 10, 8)
 		hrow.setSpacing(10)
 
-		checkbox = QCheckBox()
+		checkbox = _StyledCheckBox()
 		checkbox.setChecked(True)
-		checkbox.setCursor(Qt.PointingHandCursor)
 		checkbox.stateChanged.connect(lambda _state, lv=level: self._on_child_changed(lv))
+		checkbox.toggled.connect(lambda checked, r=row: self._apply_row_checked(r, checked))
 		hrow.addWidget(checkbox, 0, Qt.AlignTop)
 
 		cell = QVBoxLayout()
@@ -708,6 +754,12 @@ class DocumentSelector(QWidget):
 		return row
 
 	# -- 상호작용 -------------------------------------------------------------
+	def _apply_row_checked(self, row: QWidget, checked: bool) -> None:
+		"""행의 선택 여부를 동적 프로퍼티로 반영 → QSS 가 테두리를 보라/회색으로 전환."""
+		row.setProperty("checked", bool(checked))
+		row.style().unpolish(row)
+		row.style().polish(row)
+
 	def _toggle_group(self, level: str) -> None:
 		group = self._groups.get(level)
 		if not group:
