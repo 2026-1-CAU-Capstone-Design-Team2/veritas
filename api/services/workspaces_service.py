@@ -130,12 +130,10 @@ def _scan_run_workspaces() -> list[dict[str, Any]]:
     if not root.exists():
         return []
 
-    # The on-disk folder name is only the *initial* display name. A user can
-    # rename a workspace (dashboard → 이름 변경), which persists to the
-    # workspaces.name column; re-syncing from disk must preserve that rather
-    # than reset it to the folder name. Seed the scan with the saved names and
-    # fall back to the folder name only for workspaces not yet in the DB.
-    persisted_names = _load_persisted_workspace_names()
+    # User-assigned display names live in the local DB. The directory name is
+    # only a fallback for workspaces that have never been renamed — otherwise
+    # the sync would clobber a rename on every refresh.
+    stored_names = _load_stored_workspace_names()
 
     workspaces: list[dict[str, Any]] = []
     for path in sorted(root.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
@@ -163,7 +161,7 @@ def _scan_run_workspaces() -> list[dict[str, Any]]:
         workspaces.append(
             {
                 "workspaceId": path.name,
-                "name": persisted_names.get(path.name) or path.name,
+                "name": stored_names.get(path.name) or path.name,
                 "detail": f"documents {document_count} · {path}",
                 "status": "completed" if final_path.exists() else "running",
                 "lastWorkedAt": _mtime_iso(final_path if final_path.exists() else path),
@@ -222,12 +220,11 @@ def _mtime_iso(path: Path) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _load_persisted_workspace_names() -> dict[str, str]:
-    """Display names already saved in SQLite, keyed by workspace id.
+def _load_stored_workspace_names() -> dict[str, str]:
+    """Return ``{workspace_id: name}`` for rows already in the local DB.
 
-    Used by :func:`_scan_run_workspaces` so a user's rename survives a disk
-    re-sync. Read-only and best-effort — any failure yields an empty map, in
-    which case the scan falls back to folder names (the pre-rename behavior).
+    Lets the run-directory scan preserve a user's renamed workspace instead of
+    resetting the display name back to the directory name on every sync.
     """
     try:
         init_db()
@@ -237,7 +234,7 @@ def _load_persisted_workspace_names() -> dict[str, str]:
             return {
                 str(row["id"]): str(row["name"])
                 for row in rows
-                if row["id"] is not None and str(row["name"] or "").strip()
+                if row["id"] and row["name"]
             }
         finally:
             conn.close()
@@ -291,15 +288,12 @@ def _persist_workspace_catalog(workspaces: list[dict[str, Any]]) -> None:
                 workspace_id = str(workspace.get("workspaceId") or "").strip()
                 if not workspace_id:
                     continue
-                # name is intentionally NOT in the DO UPDATE clause: it is set
-                # once on first insert (folder name) and thereafter owned by the
-                # user (dashboard rename). Updating it from excluded.name here
-                # would clobber a rename on every disk re-sync.
                 conn.execute(
                     """
                     INSERT INTO workspaces (id, name, path, status, created_at, updated_at, last_worked_at)
                     VALUES (?, ?, ?, ?, datetime('now'), datetime('now'), ?)
                     ON CONFLICT(id) DO UPDATE SET
+                        name = excluded.name,
                         path = excluded.path,
                         status = excluded.status,
                         updated_at = excluded.updated_at,
