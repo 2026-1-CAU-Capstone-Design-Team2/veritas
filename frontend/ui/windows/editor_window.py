@@ -892,6 +892,7 @@ class EditorWindow(QWidget):
             assist_menu.addAction(label, lambda checked=False, a=action: self.run_quick_action(a))
         assist_menu.addSeparator()
         assist_menu.addAction("자료조사 결과 불러오기", self.load_final_report)
+        assist_menu.addAction("초안 불러오기", self.load_generated_draft)
 
         help_btn, help_menu = self._menu_button("도움말")
         help_menu.addAction("키보드 단축키", self._show_shortcuts)
@@ -1609,6 +1610,31 @@ class EditorWindow(QWidget):
 
     def load_final_report(self) -> None:
         self.open_document(self._workspace_id, source="final")
+
+    def load_generated_draft(self) -> None:
+        """초안 페이지에서 생성된 초안(drafts/draft_<n>.md) 중 가장 최근 것을 바로 불러온다.
+        생성된 초안이 하나도 없으면 알림만 띄운다."""
+        workspace_id = self._workspace_id
+
+        def _load() -> dict:
+            return api_client.get("/api/v1/editor/documents", {"workspaceId": workspace_id})
+
+        def _ok(data: object) -> None:
+            items = (data or {}).get("items", []) if isinstance(data, dict) else []
+            drafts = [
+                item
+                for item in (items if isinstance(items, list) else [])
+                if isinstance(item, dict) and re.fullmatch(r"draft_\d+", str(item.get("docId") or ""))
+            ]
+            if not drafts:
+                QMessageBox.information(self, "초안 없음", "이미 생성된 초안이 없습니다.")
+                return
+            self.open_document(self._workspace_id, source="draft", doc_id=str(drafts[0].get("docId")))
+
+        def _fail(message: str) -> None:
+            QMessageBox.warning(self, "초안 불러오기 실패", f"초안을 불러오지 못했습니다.\n{message}")
+
+        get_job_manager().run_detached(_load, on_success=_ok, on_error=_fail)
 
     def open_draft_dialog(self) -> None:
         workspace_id = self._workspace_id

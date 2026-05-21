@@ -117,7 +117,10 @@
       "Bash(python -m py_compile api/services/workspaces_service.py)",
       "PowerShell($body = '{\"workspaceId\":\"이정재-4\",\"action\":\"rewrite\",\"text\":\"인공지능은 빠르게 발전하고 있다.\",\"maxTokens\":120,\"useWorkspace\":false}'; $bytes = [System.Text.Encoding]::UTF8.GetBytes\\($body\\); try { $r = Invoke-WebRequest -Uri \"http://127.0.0.1:8000/api/v1/editor/assist\" -Method Post -Body $bytes -ContentType \"application/json; charset=utf-8\" -TimeoutSec 60; [System.Text.Encoding]::UTF8.GetString\\($r.RawContentStream.ToArray\\(\\)\\) } catch { \"ERR: $\\($_.Exception.Message\\)\" })",
       "Bash(printf '{\"workspaceId\":\"이정재-4\",\"action\":\"rewrite\",\"text\":\"인공지능은 빠르게 발전하고 있다.\",\"maxTokens\":120,\"useWorkspace\":false}')",
-      "Bash(curl -s -N --max-time 60 -X POST \"http://127.0.0.1:8000/api/v1/editor/assist\" -H \"Content-Type: application/json; charset=utf-8\" --data-binary @/tmp/assist.json)"
+      "Bash(curl -s -N --max-time 60 -X POST \"http://127.0.0.1:8000/api/v1/editor/assist\" -H \"Content-Type: application/json; charset=utf-8\" --data-binary @/tmp/assist.json)",
+      "Bash(printf '{\"workspaceId\":\"__no_such_ws__\",\"action\":\"rewrite\",\"text\":\"인공지능은 빠르게 발전하고 있다.\",\"maxTokens\":80,\"useWorkspace\":true}')",
+      "Bash(curl -s -N --max-time 60 -X POST \"http://127.0.0.1:8000/api/v1/editor/assist\" -H \"Content-Type: application/json; charset=utf-8\" --data-binary @/tmp/assist2.json)",
+      "Bash(python -m py_compile frontend/ui/windows/editor_window.py)"
     ]
   }
 }
