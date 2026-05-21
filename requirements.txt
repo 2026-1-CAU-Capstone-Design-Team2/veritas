@@ -27,3 +27,4 @@ networkx>=3.2
 rank-bm25>=0.2.2
 scikit-learn>=1.4
 kiwipiepy>=0.17
+kiwipiepy_model>=0.17

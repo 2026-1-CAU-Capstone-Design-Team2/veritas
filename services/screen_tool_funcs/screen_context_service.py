@@ -5,13 +5,18 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .content_filter import ContentFilter
-from .intervention_detector import InterventionDetector
-from .intervention_dispatcher import InterventionDispatcher
-from .models import AppTextResult, OcrResult, ScreenContextEvent, UiAutomationResult
-from .ocr_engine import OcrEngine
-from .powerpoint_com import PowerPointComReader
-from .scenario_scheduler import ScenarioScheduler
+from .capture.ocr_engine import OcrEngine
+from .capture.powerpoint_com import PowerPointComReader
+from .capture.screen_capture import ScreenCapture
+from .capture.text_extraction_targets import is_text_extraction_target
+from .capture.ui_automation import UiAutomationReader
+from .capture.window_context import WindowContextReader
+from .core.content_filter import ContentFilter
+from .core.models import AppTextResult, OcrResult, ScreenContextEvent, UiAutomationResult
+from .core.store import ScreenContextStore
+from .intervention.intervention_detector import InterventionDetector
+from .intervention.intervention_dispatcher import InterventionDispatcher
+from .intervention.scenario_scheduler import ScenarioScheduler
 from .scenario import (
     AcronymIntroducedScenario,
     BlankDocumentStartScenario,
@@ -37,10 +42,6 @@ from .scenario import (
     WeakModifierOveruseScenario,
     WholeDocumentReviewScenario,
 )
-from .screen_capture import ScreenCapture
-from .store import ScreenContextStore
-from .ui_automation import UiAutomationReader
-from .window_context import WindowContextReader
 
 
 """
@@ -58,7 +59,7 @@ class ScreenContextService:
         self,
         root: str | Path,
         *,
-        interval_sec: float = 5.0,
+        interval_sec: float = 3.0,
         ocr_language: str = "ko-KR",
         ocr_scale: float = 2.0,
         crop_left: int = 0,
@@ -157,6 +158,15 @@ class ScreenContextService:
             ocr = OcrResult(
                 language=self.ocr_engine.language,
                 error="skipped: UI Automation text extraction succeeded.",
+            )
+        elif ui_automation.reject_reason == "empty_text":
+            # UIA found and read the focused editor control but it is genuinely
+            # empty (reject_reason="empty_text"). Do NOT fall back to OCR: OCR
+            # would just read the app's menus/toolbars as noise. Treat it as an
+            # empty document so BlankDocumentStartScenario handles it instead.
+            ocr = OcrResult(
+                language=self.ocr_engine.language,
+                error="skipped: UIA read an empty editor (authoritative; no OCR fallback).",
             )
         else:
             image = self.screen_capture.capture_window(window)
@@ -585,25 +595,7 @@ class ScreenContextService:
 
     # foreground 앱이 텍스트 추출 대상인지(프로세스명·확장자) 판별
     def _is_text_extraction_target(self, window) -> bool:
-        process_name = (window.process_name or "").lower()
-        if process_name in {
-            "notepad.exe",
-            "winword.exe",
-            "excel.exe",
-            "powerpnt.exe",
-            "docs.exe",
-            "notepad++.exe",
-            "notion.exe",
-            "word.exe",
-            "hwp.exe",
-            "code.exe",
-            "devenv.exe",
-            "pycharm64.exe",
-        }:
-            return True
-
-        title = (window.window_title or "").lower()
-        return any(title.endswith(ext) or ext in title for ext in (".txt", ".md", ".doc", ".hwp", ".ppt", ".pptx"))
+        return is_text_extraction_target(window)
 
     # UI Automation 결과가 쓸 만한지(텍스트 존재 + 품질) 판별
     def _is_usable_text_source(self, result: UiAutomationResult) -> bool:

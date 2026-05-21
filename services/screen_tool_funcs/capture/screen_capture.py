@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .models import WindowContext
+from ..core.models import WindowContext
 
 
 class ScreenCapture:

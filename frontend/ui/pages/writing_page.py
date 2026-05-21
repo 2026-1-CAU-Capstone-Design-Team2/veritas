@@ -44,7 +44,7 @@ class DocumentAssistPage(QWidget):
 			if formatted is None:
 				continue
 			category, text, tone = formatted
-			suggestions.append({"category": category, "text": text, "tone": tone})
+			suggestions.append({"id": str(item.get("eventId") or ""), "category": category, "text": text, "tone": tone})
 		self.suggestion_list.set_suggestions(suggestions)
 
 	def _on_screen_events_appended(self, items: list) -> None:
@@ -57,7 +57,8 @@ class DocumentAssistPage(QWidget):
 			formatted = format_screen_event(item)
 			if formatted is None:
 				continue
-			self.suggestion_list.add_suggestion(*formatted)
+			category, text, tone = formatted
+			self.suggestion_list.upsert_suggestion(str(item.get("eventId") or ""), category, text, tone)
 
 	def showEvent(self, event) -> None:  # type: ignore[override]
 		super().showEvent(event)

@@ -55,7 +55,12 @@ class ScreenEventPollWorker(QThread):
 		self._agent = agent_controller
 		self._cursor = 0
 		self._stop = False
-		self._sleep_seconds = 3.0
+		# Poll fast even when idle: a short streamed answer can finish inside a
+		# single slow idle window, so a 3s interval would show it as one lump.
+		# Catching the stream start within ~0.3s keeps short answers streaming.
+		self._sleep_seconds = 0.3
+		# While an answer is mid-stream, poll a touch faster for smoother growth.
+		self._fast_seconds = 0.15
 
 	def request_stop(self) -> None:
 		self._stop = True
@@ -65,18 +70,25 @@ class ScreenEventPollWorker(QThread):
 
 	def run(self) -> None:  # type: ignore[override]
 		while not self._stop:
+			streaming = False
 			try:
 				response = self._agent.get_screen_monitoring_events(since=self._cursor, limit=20)
 				items = response.get("items", []) if isinstance(response, dict) else []
 				if isinstance(items, list) and items:
 					self._cursor = int(response.get("nextCursor") or self._cursor)
 					self.eventsReceived.emit(items)
+					# A partial event means an answer is mid-stream; keep polling
+					# fast until it completes so the card fills in smoothly.
+					streaming = any(
+						isinstance(it, dict) and it.get("partial") for it in items
+					)
 			except Exception as e:
 				self.pollError.emit(str(e))
-			for _ in range(int(self._sleep_seconds * 10)):
+			delay = self._fast_seconds if streaming else self._sleep_seconds
+			for _ in range(max(1, int(delay * 20))):
 				if self._stop:
 					return
-				self.msleep(100)
+				self.msleep(50)
 
 
 class AnimatedStackedWidget(QStackedWidget):

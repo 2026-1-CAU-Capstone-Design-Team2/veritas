@@ -66,7 +66,7 @@ class ChatAgent:
         self._conversation_lock = threading.RLock()
         self._screen_stop_event = threading.Event()
         self._screen_monitor_thread: threading.Thread | None = None
-        self._screen_answer_callback: Callable[[str, dict[str, Any]], None] | None = None
+        self._screen_answer_callback: Callable[[str, dict[str, Any], bool], None] | None = None
         self._last_handled_screen_event_id = ""
 
     def ask_rag(self, question: str, *, stream: bool = False) -> str:
@@ -456,7 +456,7 @@ class ChatAgent:
     def start_screen_monitoring(
         self,
         *,
-        on_answer: Callable[[str, dict[str, Any]], None] | None = None,
+        on_answer: Callable[[str, dict[str, Any], bool], None] | None = None,
         stream: bool = False,
     ) -> bool:
         """Start screen polling and proactive intervention consumption."""
@@ -519,14 +519,17 @@ class ChatAgent:
                 knowledge_context=knowledge_context,
             )
             try:
-                answer = self.llm.ask(
-                    SCREEN_INTERVENTION_SYSTEM_PROMPT,
-                    prompt,
-                    reasoning=False,
-                    stream=stream,
-                    stream_label="screen_context",
-                    timeout_sec=self.SCREEN_INTERVENTION_TIMEOUT_SEC,
-                )
+                if stream:
+                    answer = self._stream_screen_answer(prompt, intervention)
+                else:
+                    answer = self.llm.ask(
+                        SCREEN_INTERVENTION_SYSTEM_PROMPT,
+                        prompt,
+                        reasoning=False,
+                        stream=False,
+                        stream_label="screen_context",
+                        timeout_sec=self.SCREEN_INTERVENTION_TIMEOUT_SEC,
+                    )
             except Exception as e:
                 answer = f"[screen_context][error] failed to generate answer: {e}"
                 print(answer)
@@ -536,6 +539,37 @@ class ChatAgent:
             history_question = self._screen_history_question(intervention)
             self._append_history(history_question, answer)
             return answer.strip()
+
+    def _stream_screen_answer(self, prompt: str, intervention: dict[str, Any]) -> str:
+        """Consume the screen-intervention answer as a token stream, pushing
+        cumulative partial text to the answer callback (done=False) so the UI
+        renders it incrementally. Returns the full accumulated text; the loop
+        emits the final done=True update. Partial emits are throttled by char
+        count so the event buffer is not hammered per token."""
+        chunks: list[str] = []
+        last_emit_len = 0
+        min_emit_chars = 12
+        for chunk in self.llm.iter_ask(
+            SCREEN_INTERVENTION_SYSTEM_PROMPT,
+            prompt,
+            reasoning=False,
+            stream_label="screen_context",
+            timeout_sec=self.SCREEN_INTERVENTION_TIMEOUT_SEC,
+        ):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            accumulated = "".join(chunks)
+            if (
+                self._screen_answer_callback is not None
+                and len(accumulated) - last_emit_len >= min_emit_chars
+            ):
+                last_emit_len = len(accumulated)
+                try:
+                    self._screen_answer_callback(accumulated, intervention, False)
+                except Exception as e:
+                    print(f"[screen_context][assist][warn] partial emit failed: {e}")
+        return "".join(chunks)
 
     
     #single queue version with peek + separate consume
@@ -564,7 +598,7 @@ class ChatAgent:
                             f"event={event_id} answer_chars={len(answer)}"
                         )
                     if self._screen_answer_callback is not None:
-                        self._screen_answer_callback(answer, intervention)
+                        self._screen_answer_callback(answer, intervention, True)
                     else:
                         print("\n[Screen Assist]")
                         print(answer)

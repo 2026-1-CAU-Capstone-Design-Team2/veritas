@@ -47,7 +47,8 @@
       "Bash(python _mathtest.py)",
       "Bash(python -m py_compile frontend/api_common.py)",
       "Bash(python -c \"import httpx; print\\('httpx', httpx.__version__\\)\")",
-      "Bash(python -c \"import frontend.api_common as a; print\\('api_common imports OK'\\)\")"
+      "Bash(python -c \"import frontend.api_common as a; print\\('api_common imports OK'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)"
     ]
   }
 }

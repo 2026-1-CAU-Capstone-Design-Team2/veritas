@@ -712,8 +712,8 @@ class AgentRuntime:
     def start_screen_monitoring(self) -> dict[str, Any]:
         """Start the screen poller; record assistant answers into the buffer."""
         return self._screen_monitor.start(
-            on_answer=lambda answer, intervention: self._screen_monitor.record_assist_answer(
-                answer, intervention, workspace_id=self.workspace_id
+            on_answer=lambda answer, intervention, done=True: self._screen_monitor.record_assist_answer(
+                answer, intervention, workspace_id=self.workspace_id, done=done
             ),
         )
 

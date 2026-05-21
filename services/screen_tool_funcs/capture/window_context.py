@@ -4,7 +4,7 @@ import ctypes
 from ctypes import wintypes
 from pathlib import Path
 
-from .models import BoundingBox, WindowContext
+from ..core.models import BoundingBox, WindowContext
 
 
 class WindowContextReader:

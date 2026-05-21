@@ -25,6 +25,7 @@ from kiwipiepy import Kiwi
 from core.models import ParsedDocRecord
 
 from ..models import SentenceUnit, VerificationConfig
+from ..tokenization import create_kiwi
 
 # Lines we never want as sentence content. Markdown headings, horizontal
 # rules, table rows, code fences, blockquote markers and pure-link lines.
@@ -201,7 +202,7 @@ def split_docs_to_sentences(
     for retrieval rankings. Duplicate docs (``is_duplicate=True``) have empty
     clean_md and are skipped here even if they slipped through the loader.
     """
-    kiwi = kiwi or Kiwi()
+    kiwi = kiwi or create_kiwi()
     ctx = _SplitContext(
         min_chars=int(cfg.section_sentence_min_chars),
         max_chars=int(cfg.section_sentence_max_chars),
