@@ -42,6 +42,22 @@ def switch_workspace(workspace_id: str) -> dict[str, str]:
 
     repo.set_current_workspace(workspace["workspaceId"])
     _save_current_workspace_id(workspace["workspaceId"])
+    # Switch the live runtime too, not just the persisted "current workspace".
+    # Without this the runtime stays attached to the previous workspace until the
+    # next chat message happens to call set_workspace, so every piece of
+    # workspace-scoped runtime state keeps serving the OLD workspace: the RAG
+    # store, the screen monitor, and the proactive screen-assist event buffer
+    # (get_events_since filters by runtime.workspace_id). That stale id is why
+    # the previous workspace's 실시간 보조 cards lingered in the 문서 보조 list
+    # after switching. set_workspace is a no-op when already on this workspace.
+    try:
+        from .agent_runtime import get_runtime
+
+        get_runtime().set_workspace(workspace["workspaceId"])
+    except HTTPException:
+        # Runtime unavailable (e.g. llama-server down): the persisted switch
+        # above still stands and the runtime adopts it on next use.
+        pass
     return {"workspaceId": workspace["workspaceId"], "name": workspace["name"]}
 
 
