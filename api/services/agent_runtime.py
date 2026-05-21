@@ -121,6 +121,19 @@ class AgentRuntime:
             registry=self.registry,
         )
 
+    def set_llm_parallel(self, value: int) -> int:
+        """Apply the parallel-decoding concurrency to the shared LLM client.
+
+        Encapsulates the ``self.llm.max_parallel`` mutation so callers (e.g. the
+        settings service) don't reach through the runtime into the LLM client.
+        Clamped to 1..5 to match the settings contract; returns the applied
+        value. Takes effect on the next batch since ``LLMClient.map_parallel``
+        reads ``max_parallel`` at call time.
+        """
+        applied = max(1, min(5, int(value)))
+        self.llm.max_parallel = applied
+        return applied
+
     def set_workspace(self, workspace_id: str) -> None:
         workspace_id = str(workspace_id or "").strip()
         if not workspace_id:
