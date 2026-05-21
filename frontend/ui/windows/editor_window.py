@@ -754,6 +754,7 @@ class EditorWindow(QWidget):
         self._suggest_token = 0
         self._load_token = 0
         self._suggest_anchor = 0
+        self._suggest_prev_char = ""  # char immediately before the cursor
         self._suggest_worker: EditorSuggestWorker | None = None
         self._assist_worker: EditorAssistWorker | None = None
         # Quick-action target: (start, end, is_insert) — where 본문에 대치 writes.
@@ -1285,6 +1286,31 @@ class EditorWindow(QWidget):
     def _invalidate_suggestion(self) -> None:
         self._suggest_token += 1
 
+    # Chars after which a continuation must always be space-separated.
+    _SPACE_AFTER_PREV = set(".!?…,;:)]}\"'”’」』")
+
+    def _join_suggestion(self, text: str) -> str:
+        """Normalize a ghost suggestion so it never glues onto the prefix.
+
+        The model is told to prefix its own single space when it starts a new
+        word (vs. completing the prior one — the only case it must NOT space, and
+        the only thing that can distinguish completion from a new word). We honor
+        that leading space and only collapse leading newlines. As a safety net we
+        force one space when the char before the cursor is sentence/clause
+        punctuation, where a space is always correct regardless of the model."""
+        body = (text or "").lstrip("\n")
+        if not body.strip():
+            return ""
+        prev = self._suggest_prev_char
+        if (
+            prev
+            and not prev.isspace()
+            and body[:1] not in (" ", "\t")
+            and prev in self._SPACE_AFTER_PREV
+        ):
+            body = " " + body
+        return body
+
     def _fire_suggestion(self) -> None:
         if not self._autocomplete_enabled or self.editor.is_composing():
             return
@@ -1297,14 +1323,15 @@ class EditorWindow(QWidget):
             return  # a suggestion is already showing — don't stack another
         text = self.editor.document_text()
         pos = cursor.position()
-        prefix = text[:pos][-500:]
-        suffix = text[pos:][:200]
+        prefix = text[:pos][-1500:]
+        suffix = text[pos:][:300]
         if not prefix.strip():
             return
 
         self._suggest_token += 1
         token = self._suggest_token
         self._suggest_anchor = pos
+        self._suggest_prev_char = prefix[-1] if prefix else ""
         partial: list[str] = []
         worker = EditorSuggestWorker(self._workspace_id, prefix, suffix, 64, self._use_workspace_rag, self)
 
@@ -1319,7 +1346,7 @@ class EditorWindow(QWidget):
             if self.editor.textCursor().position() != self._suggest_anchor:
                 return
             partial.append(chunk)
-            self.editor.set_ghost("".join(partial).lstrip("\n"))
+            self.editor.set_ghost(self._join_suggestion("".join(partial)))
 
         def on_completed(full: str) -> None:
             if token != self._suggest_token:
@@ -1327,7 +1354,7 @@ class EditorWindow(QWidget):
             if self.editor.textCursor().position() != self._suggest_anchor:
                 self.editor.clear_ghost()
                 return
-            cleaned = (full or "").strip("\n")
+            cleaned = self._join_suggestion(full or "")
             if cleaned.strip():
                 self.editor.set_ghost(cleaned, final=True)
             else:
@@ -1374,7 +1401,7 @@ class EditorWindow(QWidget):
         label = next((lbl for lbl, act, _ in QUICK_ACTIONS if act == action), action)
         self.assist_panel.quick_tab.begin(action)
 
-        worker = EditorAssistWorker(self._workspace_id, action, text, 400, self._use_workspace_rag, self)
+        worker = EditorAssistWorker(self._workspace_id, action, text, 800, self._use_workspace_rag, self)
         worker.delta.connect(self.assist_panel.quick_tab.append)
         worker.completed.connect(lambda _full, lbl=label: self._on_assist_done(lbl))
         worker.failed.connect(self.assist_panel.quick_tab.fail)

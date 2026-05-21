@@ -6,6 +6,8 @@ import time
 from typing import Any
 
 from ..core.models import FilteredScreenContext, InterventionDecision, WindowContext
+from ..trace import screen_trace
+from .llm_router import ScenarioRouter
 from .scenario_scheduler import ScenarioScheduler, ScenarioWeights
 from ..scenario import (
     IdleAfterWritingScenario,
@@ -32,6 +34,8 @@ class InterventionDetector:
     """
 
     EDITING_APP_TYPES = {"document", "presentation", "spreadsheet", "code_editor"}
+    # Below this router confidence, decline rather than surface a weak intervention.
+    ROUTER_MIN_CONFIDENCE = 0.5
 
     def __init__(
         self,
@@ -43,6 +47,7 @@ class InterventionDetector:
         min_ocr_paragraph_chars: int = 40,
         scenarios: list[ScenarioType] | None = None,
         scheduler: ScenarioScheduler | None = None,
+        router: ScenarioRouter | None = None,
     ) -> None:
         self.history_window = history_window
         self.min_history_count = min_history_count
@@ -55,6 +60,7 @@ class InterventionDetector:
             WholeDocumentReviewScenario(),
         ]
         self.scheduler = scheduler
+        self.router = router
 
     @property
     def scenario_weights(self) -> dict[str, ScenarioWeights]:
@@ -213,13 +219,27 @@ class InterventionDetector:
             # 발동 시점의 정규화 문서 길이 — 글자수 기반 cooldown 판정용
             doc_chars = len(" ".join((filtered.active_editor_text or "").split()))
             scheduler_trace = {}
-            selected_name = self.scheduler.select_and_charge(
-                current_snapshot["document_key"],
-                ready_names,
-                now=now,
-                doc_chars=doc_chars,
-                trace_out=scheduler_trace,
-            )
+            if self.router is not None and ScenarioRouter.enabled():
+                # LLM router owns selection; CFS keeps only its cheap reflexes
+                # (global throttle + recency) around it.
+                selected_name = self._route_with_llm(
+                    document_key=current_snapshot["document_key"],
+                    ready_names=ready_names,
+                    scenario_results=scenario_results,
+                    filtered=filtered,
+                    last_fired_at=last_fired_at,
+                    now=now,
+                    doc_chars=doc_chars,
+                    trace_out=scheduler_trace,
+                )
+            else:
+                selected_name = self.scheduler.select_and_charge(
+                    current_snapshot["document_key"],
+                    ready_names,
+                    now=now,
+                    doc_chars=doc_chars,
+                    trace_out=scheduler_trace,
+                )
             scheduler_snapshot = self.scheduler.snapshot(
                 current_snapshot["document_key"], now=now
             )
@@ -238,6 +258,19 @@ class InterventionDetector:
             }
             for name, ev in scenario_results.items()
         }
+
+        # Decision-level trace (only when a scenario actually became a candidate,
+        # so idle captures stay silent). Shows the ready set with scores and the
+        # selection outcome — selected scenario or why nothing fired.
+        if ready_names:
+            candidates = ", ".join(
+                f"{name}({scenario_results[name].score:.2f})" for name in ready_names
+            )
+            if selected_name is not None:
+                screen_trace(f"candidates=[{candidates}] -> selected={selected_name}")
+            else:
+                reason = (scheduler_trace or {}).get("rejected_reason") or "not_selected"
+                screen_trace(f"candidates=[{candidates}] -> none ({reason})")
 
         if selected_name is None:
             blockers = [f"scenario:{name}:not_ready" for name in scenario_results if not scenario_results[name].ready]
@@ -278,6 +311,56 @@ class InterventionDetector:
                 "scheduler_trace": scheduler_trace,
             },
         )
+
+    def _route_with_llm(
+        self,
+        *,
+        document_key: str,
+        ready_names: list[str],
+        scenario_results: dict[str, ScenarioEvaluation],
+        filtered: FilteredScreenContext,
+        last_fired_at: dict[str, float],
+        now: float,
+        doc_chars: int,
+        trace_out: dict[str, Any],
+    ) -> str | None:
+        """Pick one ready scenario via the LLM router (or decline). The global
+        throttle still gates (anti-spam); a fire is recorded for recency."""
+        if self.scheduler is not None and self.scheduler.is_globally_throttled(document_key, now=now):
+            trace_out["rejected_reason"] = "global_throttle"
+            trace_out["router"] = None
+            screen_trace("router: skipped (global throttle)")
+            return None
+        candidates = [(name, list(scenario_results[name].reasons)) for name in ready_names]
+        recent_text = " ".join(
+            (filtered.current_paragraph_text or filtered.active_editor_text or "").split()
+        )[:1500]
+        focused_text = " ".join(
+            (filtered.changed_text or filtered.current_paragraph_text or "").split()
+        )[:400]
+        decision = self.router.route(
+            document_type="the user's working document",
+            recent_text=recent_text,
+            focused_text=focused_text,
+            candidates=candidates,
+            recent_fired=dict(last_fired_at),
+            now=now,
+        )
+        trace_out["router"] = {
+            "scenario": decision.scenario,
+            "confidence": round(decision.confidence, 3),
+            "reason": decision.reason,
+        }
+        screen_trace(
+            f"router: pick={decision.scenario or 'none'} "
+            f"conf={decision.confidence:.2f} ({decision.reason})"
+        )
+        if decision.scenario and decision.confidence >= self.ROUTER_MIN_CONFIDENCE:
+            if self.scheduler is not None:
+                self.scheduler.record_fire(document_key, decision.scenario, now=now, doc_chars=doc_chars)
+            return decision.scenario
+        trace_out.setdefault("rejected_reason", "router_declined")
+        return None
 
     def _snapshot(self, *, window: WindowContext, filtered: FilteredScreenContext) -> dict[str, Any]:
         paragraph = filtered.current_paragraph_text or ""

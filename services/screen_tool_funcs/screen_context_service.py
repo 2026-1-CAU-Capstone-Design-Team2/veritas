@@ -16,6 +16,7 @@ from .core.models import AppTextResult, OcrResult, ScreenContextEvent, UiAutomat
 from .core.store import ScreenContextStore
 from .intervention.intervention_detector import InterventionDetector
 from .intervention.intervention_dispatcher import InterventionDispatcher
+from .intervention.llm_router import ScenarioRouter
 from .intervention.scenario_scheduler import ScenarioScheduler
 from .scenario import (
     AcronymIntroducedScenario,
@@ -67,9 +68,11 @@ class ScreenContextService:
         crop_right: int = 0,
         crop_bottom: int = 0,
         console_log: bool = False,
+        llm=None,
     ) -> None:
         self.interval_sec = interval_sec
         self.console_log = console_log
+        self.llm = llm
         self.window_reader = WindowContextReader()
         self.screen_capture = ScreenCapture(
             crop_left=crop_left,
@@ -124,9 +127,13 @@ class ScreenContextService:
             scenarios=scenarios,
             console_log=console_log,
         )
+        # LLM-backed selection (replaces CFS vruntime ranking when enabled). Built
+        # only when an llm is available; the detector falls back to CFS otherwise.
+        self.scenario_router = ScenarioRouter(llm) if llm is not None else None
         self.intervention_detector = InterventionDetector(
             scenarios=scenarios,
             scheduler=self.scenario_scheduler,
+            router=self.scenario_router,
         )
         self.intervention_dispatcher = InterventionDispatcher(
             self.store,

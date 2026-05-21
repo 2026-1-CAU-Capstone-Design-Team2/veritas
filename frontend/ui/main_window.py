@@ -74,7 +74,9 @@ class ScreenEventPollWorker(QThread):
 		while not self._stop:
 			streaming = False
 			try:
-				response = self._agent.get_screen_monitoring_events(since=self._cursor, limit=20)
+				response = self._agent.get_screen_monitoring_events(
+					since=self._cursor, limit=20, workspace_id=current_workspace_id()
+				)
 				items = response.get("items", []) if isinstance(response, dict) else []
 				if isinstance(items, list) and items:
 					self._cursor = int(response.get("nextCursor") or self._cursor)

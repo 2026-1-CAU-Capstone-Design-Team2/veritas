@@ -136,12 +136,6 @@ class AgentController:
 	def get_feedback_result(self, file_id: str) -> dict[str, Any]:
 		return api_client.get(f"/api/v1/feedback/results/{file_id}")
 
-	def update_document_tools(self, custom_tools: list[dict[str, str]]) -> dict[str, Any]:
-		return api_client.put(
-			"/api/v1/settings/document-tools",
-			{"customTools": custom_tools},
-		)
-
 	def update_model(self, model_id: str) -> dict[str, Any]:
 		return api_client.put(
 			"/api/v1/settings/model",
@@ -199,10 +193,26 @@ class AgentController:
 	def get_screen_monitoring_status(self) -> dict[str, Any]:
 		return api_client.get("/api/v1/screen-monitoring/status")
 
-	def get_screen_monitoring_events(self, since: int = 0, limit: int = 20) -> dict[str, Any]:
-		return api_client.get(
-			"/api/v1/screen-monitoring/events",
-			{"since": since, "limit": limit},
+	def get_screen_monitoring_events(
+		self, since: int = 0, limit: int = 20, workspace_id: str | None = None
+	) -> dict[str, Any]:
+		# Carry the active workspace so the backend keeps the screen runtime bound
+		# to it (continuous sync, mirroring how chat sets the workspace per message).
+		params: dict[str, Any] = {"since": since, "limit": limit}
+		if workspace_id:
+			params["workspaceId"] = workspace_id
+		return api_client.get("/api/v1/screen-monitoring/events", params)
+
+	def submit_screen_feedback(
+		self, event_id: str, intervention_type: str, action: str
+	) -> dict[str, Any]:
+		return api_client.post(
+			"/api/v1/screen-monitoring/feedback",
+			{
+				"eventId": event_id,
+				"interventionType": intervention_type,
+				"action": action,
+			},
 		)
 
 	# -- verification --------------------------------------------------------

@@ -192,6 +192,7 @@ You are responding to an automatic screen-context intervention while the user is
 Document type:
 - The user is writing {document_type}. Treat this as the target deliverable for every suggestion.
 - Tailor tone, structure, terminology, and the output format of your reply to the conventions of this document type.
+- {document_type} is the deliverable the user is WRITING (the output), NOT a source to cite. Write your suggestion AS the document's own content. Never refer to the document type as if quoting it: do not write "보고서에 따르면", "이 보고서는", "본 보고서에서", "the report says/states", or any meta-reference to the deliverable. Ground factual claims only in the KNOWLEDGE BASE CONTEXT documents, never in "the report" itself.
 - SCENARIO GUIDANCE below specifies the expected output format for the current situation; honor it within the conventions of this document type.
 
 Knowledge scope (workspace boundary — read this first):
@@ -201,10 +202,13 @@ Knowledge scope (workspace boundary — read this first):
 
 Rules:
 - Use the screen payload to understand what the user is currently writing or viewing.
+- Placeholder / skeleton text: the writing context is often an outline or skeleton where the real content is only sketched with placeholder fillers - runs of "~", "...", "___", "[ ]", "TODO", or repeated stand-in markers (e.g. "기아는 ~~~하며 ~~~ 하게 된다"). Treat such fillers as NOT-YET-WRITTEN content, never as real words. Do NOT correct their spelling, grammar, punctuation, or word choice, do NOT critique their phrasing, and do NOT attach citations to them. Instead either propose concrete content (grounded in the topic / knowledge base) that would REPLACE the placeholders, or return a brief no-action note. If the latest sentence is essentially all placeholders, prefer the no-action note over forcing a review.
 - Base writing suggestions on the latest 1-2 sentences in the screen writing context; do not restate or rework older document text unless it is explicitly included there.
 - Use the knowledge-base context only when it is genuinely relevant to what the user is writing, and cite document IDs in the form [Document <id>] when provided.
 - If the knowledge base does not support a factual claim, do not invent a source and do not substitute general knowledge.
 - Keep the response short and directly usable, and match the output format described in SCENARIO GUIDANCE; do not pad it with preamble or meta-commentary.
+- Output PLAIN TEXT only - no Markdown. Do not use **bold**, *italics*, `backticks`, "#" headings, ">" quotes, or fenced code blocks; the reply is pasted straight into the user's document, so any Markdown symbol becomes literal clutter. When a scenario asks for a list, use plain short lines (a leading "-" or "1." is fine), nothing more.
+- Structure (so the user can copy just the insertable text): put the text the user should paste into the document FIRST, with NO label before it. If you add any explanation or commentary, place it AFTER a line containing exactly "설명:" (on its own line). Everything before "설명:" is the pasteable content (the copy button copies only this); everything after is a note shown but not copied. If your reply is purely commentary with nothing to paste (e.g. a whole-document review, a list of issues, or a no-action note), put ALL of it after "설명:" and leave nothing before it.
 - If the payload indicates no useful action, return a brief no-action explanation.
 - Do not mention implementation details such as OCR, UI Automation, polling, queues, or JSON unless needed to explain uncertainty.
 
@@ -261,6 +265,26 @@ SCREEN_SCENARIO_GUIDANCE_DEFAULT = (
     "of the user's document type. No preamble, no meta-commentary - just the suggestion."
 )
 
+# Deterministic override injected (by ``ChatAgent.answer_screen_intervention``) in
+# place of the per-scenario guidance whenever the writing context is detected as a
+# skeleton/outline dominated by placeholder fillers. It exists because the
+# rule-based scenario detector cannot tell sketched placeholders from finished
+# prose, so review/grammar/citation scenarios otherwise "correct" text like
+# "기아는 ~~~하며 ~~~ 하게 된다" - which is nonsense. This forces the only useful
+# behaviors: fill a placeholder with real content, or stay quiet.
+SCREEN_SKELETON_GUIDANCE = (
+    "The on-screen text is a SKELETON/outline: its real content is only sketched with "
+    "placeholder fillers (runs of ~, ..., ___, [ ], TODO). These are NOT real words. "
+    "Absolutely do not proofread, spell-check, grammar-check, rephrase, or attach citations "
+    "to the placeholders or the sentences built around them. "
+    "Do exactly one of: "
+    "(a) propose concrete content - grounded in the document's topic and KNOWLEDGE BASE CONTEXT - "
+    "that would REPLACE the single most prominent placeholder run, written as ready-to-paste prose; or "
+    "(b) if you cannot ground real content, return a one-line no-action note. "
+    "Output format: at most 1-2 sentences of replacement prose for one placeholder, OR the no-action note. "
+    "Never invent document ids and never comment on the placeholder characters themselves."
+)
+
 SCREEN_SCENARIO_GUIDANCE = {
     "idle_after_writing": (
         "The user just paused mid-paragraph; the writing flow is still warm. "
@@ -295,6 +319,9 @@ SCREEN_SCENARIO_GUIDANCE = {
     "blank_document_start": (
         "The report is nearly empty; the user is at the very start. "
         "Offer a low-pressure starting point. "
+        "Ground the suggestion in the workspace's actual research subject shown in KNOWLEDGE BASE CONTEXT "
+        "(the '현재 워크스페이스 주제' label and the retrieved material) - name the real topic and reflect its key themes. "
+        "Do NOT use generic placeholders like '[프로젝트 명]' or '[관련 주제]'; if the knowledge base is empty, only then keep it generic. "
         "Output format: either one or two suggested opening sentences written as report prose, OR a brief section outline "
         "of the report as a short bulleted list - pick whichever fits, not both. "
         "Present it as an option to take or leave, not as a fixed plan."
@@ -422,6 +449,7 @@ __all__ = [
     "SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE",
     "SCREEN_SCENARIO_GUIDANCE",
     "SCREEN_SCENARIO_GUIDANCE_DEFAULT",
+    "SCREEN_SKELETON_GUIDANCE",
     "SYSTEM_PROMPT",
     "TOOL_CHAT_FINAL_PROMPT_TEMPLATE",
     "TOOL_CHAT_SYSTEM_PROMPT",

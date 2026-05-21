@@ -207,6 +207,28 @@ class ScreenMonitor:
 
     # ---------------------------------------------------------- event flow
 
+    def record_feedback(
+        self, *, event_id: str, intervention_type: str, action: str, reward: float
+    ) -> dict[str, Any]:
+        """Persist one user reaction to a shown intervention via the screen tool.
+
+        The reward shaping itself lives at the API service boundary; here we only
+        forward the resolved record to the tool/store so the reward log stays the
+        single source of truth for a future selection policy."""
+        if self._registry is None or not self._registry.has("screen_context"):
+            return {"ok": False, "error": "screen_context tool is not registered"}
+        result = self._registry.call(
+            "screen_context",
+            action="record_feedback",
+            event_id=event_id,
+            intervention_type=intervention_type,
+            feedback_action=action,
+            reward=reward,
+        )
+        if not getattr(result, "success", False):
+            return {"ok": False, "error": getattr(result, "error", "record_feedback failed")}
+        return {"ok": True, "record": result.data}
+
     def record_assist_answer(
         self,
         answer: str,
@@ -276,6 +298,11 @@ class ScreenMonitor:
                 "answer": text,
                 "partial": not done,
                 "category": "proactive",
+                "interventionType": (
+                    str(intervention.get("intervention_type") or "none").strip()
+                    if isinstance(intervention, dict)
+                    else "none"
+                ),
                 "tone": "working",
                 "createdAt": _now_iso(),
                 "capturedAt": intervention.get("captured_at"),

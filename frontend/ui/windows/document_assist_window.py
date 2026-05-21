@@ -48,7 +48,12 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
-from ...controllers import format_screen_event, get_screen_event_store
+from ...controllers import (
+	AgentController,
+	format_screen_event,
+	get_job_manager,
+	get_screen_event_store,
+)
 from ..markdown_view import render_markdown_html
 
 
@@ -451,11 +456,50 @@ class CustomTitleBar(QFrame):
 		super().mouseReleaseEvent(event)
 
 
+# Rating chips are styled inline (not via an ancestor stylesheet): the card
+# renders in two hosts — the floating DocumentAssistWindow and the main-window
+# DocumentAssistPage — and only the former carries the assist stylesheet, so an
+# objectName rule there left the chips falling back to a dark global QPushButton
+# style with text clipped. Inline QSS travels with the widget and wins over the
+# ancestor sheet everywhere.
+_RATE_CHIP_BASE = (
+	"QPushButton{{background:#FFFFFF;color:#4B5563;border:1px solid #D1D5DB;"
+	"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}}"
+	"QPushButton:hover{{background:{hbg};color:{hfg};border-color:{hbd};}}"
+)
+_LIKE_CHIP_QSS = _RATE_CHIP_BASE.format(hbg="#ECFDF5", hfg="#047857", hbd="#6EE7B7")
+_DISLIKE_CHIP_QSS = _RATE_CHIP_BASE.format(hbg="#FEF2F2", hfg="#B91C1C", hbd="#FCA5A5")
+_LIKE_CHIP_CHOSEN_QSS = (
+	"QPushButton{background:#D1FAE5;color:#047857;border:1px solid #6EE7B7;"
+	"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}"
+)
+_DISLIKE_CHIP_CHOSEN_QSS = (
+	"QPushButton{background:#FEE2E2;color:#B91C1C;border:1px solid #FCA5A5;"
+	"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}"
+)
+
+
 class SuggestionCard(QFrame):
-	def __init__(self, category: str, text: str, tone: str = "working", parent: QWidget | None = None) -> None:
+	# (event_id, intervention_type, action) — action ∈ {"like","dislike","copy"}.
+	# Re-emitted up through SuggestionList so the host page can POST the reward.
+	feedbackSubmitted = Signal(str, str, str)
+
+	def __init__(
+		self,
+		category: str,
+		text: str,
+		tone: str = "working",
+		parent: QWidget | None = None,
+		*,
+		event_id: str = "",
+		intervention_type: str = "",
+	) -> None:
 		super().__init__(parent)
 		self.setObjectName("SuggestionCard")
 		self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+		self._event_id = event_id
+		self._intervention_type = intervention_type
+		self._rated = False
 
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(12, 11, 12, 11)
@@ -469,14 +513,17 @@ class SuggestionCard(QFrame):
 		copy_button.setObjectName("AssistCopyButton")
 		copy_button.setFixedSize(46, 28)
 		copy_button.setCursor(Qt.PointingHandCursor)
-		self._copy_value = text
-		copy_button.clicked.connect(lambda: self._copy_text(self._copy_value))
+		self._copy_value = ""
+		self._copy_button = copy_button
+		copy_button.clicked.connect(self._on_copy)
 
 		header.addWidget(badge, 0, Qt.AlignTop)
 		header.addStretch(1)
 		header.addWidget(copy_button)
 
-		self._body = QLabel(add_text_breakpoints(text))
+		# Body holds ONLY the pasteable content (everything before a "설명:" line);
+		# the copy button copies just this.
+		self._body = QLabel()
 		self._body.setObjectName("SuggestionText")
 		self._body.setWordWrap(True)
 		self._body.setTextFormat(Qt.PlainText)
@@ -484,8 +531,49 @@ class SuggestionCard(QFrame):
 		self._body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 		self._body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
+		# Commentary after "설명:" renders here, muted, and is NOT copied.
+		self._note = QLabel()
+		self._note.setObjectName("SuggestionNote")
+		self._note.setWordWrap(True)
+		self._note.setTextFormat(Qt.PlainText)
+		self._note.setTextInteractionFlags(Qt.TextSelectableByMouse)
+		self._note.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+		self._note.setStyleSheet("color:#6B7280; font-size:12px;")
+		self._note.setVisible(False)
+
 		layout.addLayout(header)
 		layout.addWidget(self._body)
+		layout.addWidget(self._note)
+		self._apply_parsed(text)
+
+		# Like/dislike live on their own footer row, not in the header: a screen
+		# intervention card can be narrow, and crowding badge + copy + two rating
+		# chips into one row overflowed/clipped them. Only screen interventions
+		# (which carry an event_id) get rated; manual editor suggestions do not.
+		if event_id:
+			footer = QHBoxLayout()
+			footer.setSpacing(6)
+			footer.addStretch(1)
+			self._like_button = QPushButton("도움됨")
+			self._like_button.setObjectName("AssistLikeButton")
+			self._like_button.setStyleSheet(_LIKE_CHIP_QSS)
+			self._like_button.setFixedHeight(30)
+			self._like_button.setMinimumWidth(60)
+			self._like_button.setCursor(Qt.PointingHandCursor)
+			self._like_button.clicked.connect(lambda: self._on_rate("like"))
+			self._dislike_button = QPushButton("아쉬움")
+			self._dislike_button.setObjectName("AssistDislikeButton")
+			self._dislike_button.setStyleSheet(_DISLIKE_CHIP_QSS)
+			self._dislike_button.setFixedHeight(30)
+			self._dislike_button.setMinimumWidth(60)
+			self._dislike_button.setCursor(Qt.PointingHandCursor)
+			self._dislike_button.clicked.connect(lambda: self._on_rate("dislike"))
+			footer.addWidget(self._like_button)
+			footer.addWidget(self._dislike_button)
+			layout.addLayout(footer)
+		else:
+			self._like_button = None
+			self._dislike_button = None
 
 	def set_card_width(self, width: int) -> None:
 		self._card_width = width
@@ -514,12 +602,116 @@ class SuggestionCard(QFrame):
 		if app is not None:
 			app.clipboard().setText(text)
 
+	def _on_copy(self) -> None:
+		self._copy_text(self._copy_value)
+		# Copy is a weak positive signal: the user took the suggestion even if
+		# they never click 도움됨. Only report it for real screen interventions.
+		if self._event_id:
+			self.feedbackSubmitted.emit(self._event_id, self._intervention_type, "copy")
+
+	def _on_rate(self, action: str) -> None:
+		# One explicit rating per card; lock the pair after the first click so a
+		# single intervention contributes one clean like/dislike reward.
+		if self._rated or not self._event_id:
+			return
+		self._rated = True
+		for button in (self._like_button, self._dislike_button):
+			if button is not None:
+				button.setEnabled(False)
+		if action == "like" and self._like_button is not None:
+			self._like_button.setStyleSheet(_LIKE_CHIP_CHOSEN_QSS)
+		elif action == "dislike" and self._dislike_button is not None:
+			self._dislike_button.setStyleSheet(_DISLIKE_CHIP_CHOSEN_QSS)
+		self.feedbackSubmitted.emit(self._event_id, self._intervention_type, action)
+
 	def set_text(self, text: str) -> None:
-		"""Replace the card body text in place (used for streaming updates)."""
-		self._copy_value = text
-		self._body.setText(add_text_breakpoints(text))
-		# Streaming text grows the body; re-pin so the card tracks it.
-		self._sync_height()
+		"""Replace the card text in place (used for streaming updates)."""
+		self._apply_parsed(text)
+
+	@staticmethod
+	def _strip_markdown(text: str) -> str:
+		"""Strip the Markdown the local model emits despite the plain-text rule
+		(headings, bold, bullets, backticks, the '→' arrow) so pasted text is
+		clean. Conservative: leaves '_' (identifiers) and '-' lists alone."""
+		out = []
+		for line in (text or "").replace("\r\n", "\n").split("\n"):
+			s = re.sub(r"^\s*#{1,6}\s+", "", line)   # headings
+			s = re.sub(r"^\s*>\s+", "", s)            # blockquote
+			s = re.sub(r"^\s*→\s*", "", s)            # trigger/continuation arrow
+			s = re.sub(r"^(\s*)\*\s+", r"\1- ", s)    # "* item" -> "- item"
+			out.append(s)
+		joined = "\n".join(out)
+		joined = joined.replace("**", "").replace("`", "")
+		joined = re.sub(r"(?<!\*)\*(?!\*)([^*\n]+)\*(?!\*)", r"\1", joined)  # *italic* -> italic
+		return joined
+
+	@staticmethod
+	def _split_content_note(text: str) -> tuple[str, str]:
+		"""Split a screen reply into (pasteable content, commentary note).
+
+		Markdown is stripped first (the local model ignores the plain-text rule).
+		Preferred split is an explicit "설명:" line; when the model omits it (it
+		usually does), trailing document-citation commentary ("[Document 017]
+		참조로, ...") is peeled off as the note so the copy button still takes only
+		the prose the user would paste. No markers at all -> all content (e.g.
+		manual editor cards)."""
+		raw = SuggestionCard._strip_markdown(text or "").strip()
+		lines = raw.split("\n")
+		# Match "설명:" as a line PREFIX, not an exact line — the model usually
+		# writes the note inline ("설명: 해당 문맥은 ...") rather than on its own line.
+		note_prefixes = ("설명:", "설명 :", "[설명]", "[설명]:", "참고:", "Note:", "note:")
+		note_idx = None
+		note_inline = ""
+		for i, ln in enumerate(lines):
+			stripped = ln.strip()
+			matched = next((p for p in note_prefixes if stripped.startswith(p)), None)
+			if matched is not None:
+				note_idx = i
+				note_inline = stripped[len(matched):].strip()
+				break
+		if note_idx is not None:
+			content = "\n".join(lines[:note_idx]).strip()
+			rest = "\n".join(lines[note_idx + 1:]).strip()
+			note = (note_inline + ("\n" + rest if rest else "")).strip()
+		else:
+			content, note = SuggestionCard._peel_citation_commentary(raw)
+		# Drop a stray leading "제안:" label if the model added one anyway.
+		clines = content.split("\n")
+		if clines and clines[0].strip() in ("제안:", "제안", "[제안]", "Suggestion:"):
+			content = "\n".join(clines[1:]).strip()
+		return content.strip(), note.strip()
+
+	@staticmethod
+	def _peel_citation_commentary(text: str) -> tuple[str, str]:
+		"""Move trailing paragraphs that BEGIN with a "[Document ...]" citation
+		(the model's meta-advice, not insertable prose) into the note; keep the
+		leading prose as content. Inline citations mid-paragraph are left in the
+		content since only paragraph-leading markers signal commentary."""
+		paragraphs = re.split(r"\n\s*\n", text)
+		content_paras: list[str] = []
+		note_paras: list[str] = []
+		in_note = False
+		for para in paragraphs:
+			if not in_note and re.match(r"^\s*\[Document\b", para):
+				in_note = True
+			(note_paras if in_note else content_paras).append(para)
+		return "\n\n".join(content_paras).strip(), "\n\n".join(note_paras).strip()
+
+	def _apply_parsed(self, raw: str) -> None:
+		content, note = self._split_content_note(raw)
+		self._copy_value = content
+		if content:
+			self._body.setText(add_text_breakpoints(content))
+			self._note.setText(add_text_breakpoints(note))
+			self._note.setVisible(bool(note))
+			self._copy_button.setVisible(True)
+		else:
+			# Pure-commentary reply (e.g. a review): nothing to paste — show the
+			# note as the body and hide the copy button.
+			self._body.setText(add_text_breakpoints(note))
+			self._note.setText("")
+			self._note.setVisible(False)
+			self._copy_button.setVisible(False)
 
 
 class SuggestionList(QFrame):
@@ -530,6 +722,9 @@ class SuggestionList(QFrame):
 	# no trailing gap). Left off, the card keeps the default fill behaviour for
 	# callers that give it a whole panel (e.g. DocumentAssistPage).
 	MAX_HEIGHT_RATIO = 0.55
+
+	# Bubbles each card's (event_id, intervention_type, action) up to the host.
+	feedbackSubmitted = Signal(str, str, str)
 
 	def __init__(self, parent: QWidget | None = None, *, hug_content: bool = False) -> None:
 		super().__init__(parent)
@@ -596,15 +791,19 @@ class SuggestionList(QFrame):
 				self.updateGeometry()
 			return
 
-		for item in self._suggestions:
+		last_index = len(self._suggestions) - 1
+		for index, item in enumerate(self._suggestions):
+			item_id = str(item.get("id") or "")
 			card = SuggestionCard(
 				item.get("category", "수정"),
 				item.get("text", item.get("description", "")),
 				item.get("tone", "working"),
+				event_id=item_id,
+				intervention_type=str(item.get("interventionType") or ""),
 			)
+			card.feedbackSubmitted.connect(self.feedbackSubmitted)
 			card.set_card_width(self._content_width())
 			self._cards.append(card)
-			item_id = str(item.get("id") or "")
 			if item_id:
 				self._cards_by_id[item_id] = card
 			# Every card keeps its natural height so the text box hugs its text.
@@ -620,7 +819,15 @@ class SuggestionList(QFrame):
 		if self._hug_content:
 			self.updateGeometry()
 
-	def add_suggestion(self, category: str, text: str, tone: str = "working", *, event_id: str = "") -> None:
+	def add_suggestion(
+		self,
+		category: str,
+		text: str,
+		tone: str = "working",
+		*,
+		event_id: str = "",
+		intervention_type: str = "",
+	) -> None:
 		"""Append a single suggestion card.
 
 		Unlike :meth:`set_suggestions`, this does not tear down and rebuild every
@@ -630,6 +837,8 @@ class SuggestionList(QFrame):
 		item: dict[str, str] = {"category": category, "text": text, "tone": tone}
 		if event_id:
 			item["id"] = event_id
+		if intervention_type:
+			item["interventionType"] = intervention_type
 		if not self._cards:
 			# Leaving the empty state: drop the placeholder + its trailing stretch.
 			self._clear()
@@ -639,7 +848,14 @@ class SuggestionList(QFrame):
 			self._drop_trailing_stretch()
 
 		self._suggestions.append(item)
-		card = SuggestionCard(item["category"], item["text"], item["tone"])
+		card = SuggestionCard(
+			item["category"],
+			item["text"],
+			item["tone"],
+			event_id=event_id,
+			intervention_type=intervention_type,
+		)
+		card.feedbackSubmitted.connect(self.feedbackSubmitted)
 		card.set_card_width(self._content_width())
 		self._cards.append(card)
 		if event_id:
@@ -651,7 +867,15 @@ class SuggestionList(QFrame):
 		self.schedule_width_update()
 		self.schedule_scroll_to_bottom()
 
-	def upsert_suggestion(self, event_id: str, category: str, text: str, tone: str = "working") -> None:
+	def upsert_suggestion(
+		self,
+		event_id: str,
+		category: str,
+		text: str,
+		tone: str = "working",
+		*,
+		intervention_type: str = "",
+	) -> None:
 		"""Update an existing card's text by ``event_id``, or add a new card.
 
 		Streaming screen-intervention answers arrive as the same ``event_id``
@@ -667,7 +891,7 @@ class SuggestionList(QFrame):
 					break
 			self.schedule_scroll_to_bottom()
 			return
-		self.add_suggestion(category, text, tone, event_id=event_id)
+		self.add_suggestion(category, text, tone, event_id=event_id, intervention_type=intervention_type)
 		if self._hug_content:
 			self.updateGeometry()
 
@@ -1481,6 +1705,7 @@ class DocumentAssistWindow(QWidget):
 		self._screen_store.eventsAppended.connect(self._on_screen_events_appended)
 		# 워크스페이스 전환 시 store.clear() → cleared emit → hydrate로 위젯 reset.
 		self._screen_store.cleared.connect(self._hydrate_screen_suggestions)
+		self.suggestion_list.feedbackSubmitted.connect(self._on_screen_feedback)
 		self._hydrate_screen_suggestions()
 
 	def _install_chat_zoom_shortcuts(self) -> None:
@@ -1570,7 +1795,13 @@ class DocumentAssistWindow(QWidget):
 			if formatted is None:
 				continue
 			category, text, tone = formatted
-			suggestions.append({"id": str(item.get("eventId") or ""), "category": category, "text": text, "tone": tone})
+			suggestions.append({
+				"id": str(item.get("eventId") or ""),
+				"category": category,
+				"text": text,
+				"tone": tone,
+				"interventionType": str(item.get("interventionType") or ""),
+			})
 		self.suggestion_list.set_suggestions(suggestions)
 
 	def _on_screen_events_appended(self, items: list) -> None:
@@ -1584,7 +1815,25 @@ class DocumentAssistWindow(QWidget):
 			if formatted is None:
 				continue
 			category, text, tone = formatted
-			self.suggestion_list.upsert_suggestion(str(item.get("eventId") or ""), category, text, tone)
+			self.suggestion_list.upsert_suggestion(
+				str(item.get("eventId") or ""),
+				category,
+				text,
+				tone,
+				intervention_type=str(item.get("interventionType") or ""),
+			)
+
+	def _on_screen_feedback(self, event_id: str, intervention_type: str, action: str) -> None:
+		"""사용자의 좋아요/싫어요/복사를 보상 로그로 비동기 전송 (UI 스레드 비차단)."""
+		if not event_id:
+			return
+		get_job_manager().run_detached(
+			AgentController().submit_screen_feedback,
+			event_id,
+			intervention_type,
+			action,
+			on_error=lambda err: print(f"[screen_feedback][warn] {err}"),
+		)
 
 	def _apply_stylesheet(self) -> None:
 		self.setStyleSheet(
