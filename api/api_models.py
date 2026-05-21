@@ -62,6 +62,7 @@ class EditorSuggestRequest(BaseModel):
     prefix: str = ""
     suffix: str = ""
     maxTokens: int = Field(default=64, ge=8, le=256)
+    useWorkspace: bool = True
 
 
 class EditorSaveRequest(BaseModel):
@@ -77,6 +78,21 @@ class EditorExportRequest(BaseModel):
     content: str
     format: Literal["docx", "pdf", "html", "md"]
     outputPath: str
+
+
+class EditorAssistRequest(BaseModel):
+    workspaceId: str
+    action: Literal["rewrite", "summarize", "polish", "grammar", "continue"]
+    text: str = ""
+    maxTokens: int = Field(default=400, ge=16, le=1024)
+    useWorkspace: bool = True
+
+
+class EditorChatRequest(BaseModel):
+    workspaceId: str
+    message: str
+    docText: str = ""
+    useWorkspace: bool = True
 
 
 class SettingsModelRequest(BaseModel):

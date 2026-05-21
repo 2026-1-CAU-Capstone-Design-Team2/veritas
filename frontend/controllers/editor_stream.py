@@ -1,66 +1,53 @@
 from __future__ import annotations
 
+from typing import Any
+
 from PySide6.QtCore import QObject, QThread, Signal
 
 from ..api_common import ApiError, api_client
 
 
-class EditorSuggestWorker(QThread):
-    """Runs one inline ghost-writing request on a background thread.
+class _EditorStreamWorker(QThread):
+    """Base SSE worker for the editor's streaming endpoints.
 
-    A near-clone of :class:`~frontend.controllers.chat_bus.ChatStreamWorker`,
-    pointed at ``POST /api/v1/editor/suggest``. It emits each streamed chunk for
-    a live preview of the suggestion and a ``completed`` signal with the full
-    text when the stream closes.
-
-    Unlike the chat worker this does *not* touch the JobManager: ghost
-    suggestions re-trigger on every keystroke, so the editor window simply keeps
-    a single live worker and gates new triggers on ``is_blocked(EDITOR)`` (which
-    is what suppresses suggestions while AutoSurvey runs).
+    All editor streams share the chat SSE shape (start / delta / done / error),
+    so one base consumes the stream and re-emits Qt signals; subclasses only
+    supply the path + JSON payload. Unlike ``ChatStreamWorker`` this does not
+    touch the JobManager — editor streams re-trigger freely and the window keeps
+    a single live worker per surface.
     """
 
-    started_stream = Signal(str)  # suggestionId
+    started_stream = Signal(str)  # start-event id (suggestionId / assistId / chatId)
     delta = Signal(str)
-    completed = Signal(str)  # full suggestion text
+    completed = Signal(str)  # full text
     failed = Signal(str)
 
-    def __init__(
-        self,
-        workspace_id: str,
-        prefix: str,
-        suffix: str,
-        max_tokens: int = 64,
-        parent: QObject | None = None,
-    ) -> None:
+    _START_ID_KEYS = ("suggestionId", "assistId", "chatId")
+
+    def __init__(self, path: str, payload: dict[str, Any], parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self._workspace_id = workspace_id
-        self._prefix = prefix
-        self._suffix = suffix
-        self._max_tokens = max_tokens
+        self._path = path
+        self._payload = payload
 
     def run(self) -> None:  # type: ignore[override]
         buffer: list[str] = []
         try:
-            stream = api_client.stream_post_sse(
-                "/api/v1/editor/suggest",
-                {
-                    "workspaceId": self._workspace_id,
-                    "prefix": self._prefix,
-                    "suffix": self._suffix,
-                    "maxTokens": self._max_tokens,
-                },
-            )
+            stream = api_client.stream_post_sse(self._path, self._payload)
             for event_name, data in stream:
                 if event_name == "start":
-                    self.started_stream.emit(str(data.get("suggestionId") or ""))
+                    start_id = ""
+                    for key in self._START_ID_KEYS:
+                        if data.get(key):
+                            start_id = str(data.get(key))
+                            break
+                    self.started_stream.emit(start_id)
                 elif event_name == "delta":
                     chunk = str(data.get("text") or "")
                     if chunk:
                         buffer.append(chunk)
                         self.delta.emit(chunk)
                 elif event_name == "done":
-                    final_text = str(data.get("text") or "".join(buffer))
-                    self.completed.emit(final_text)
+                    self.completed.emit(str(data.get("text") or "".join(buffer)))
                     return
                 elif event_name == "error":
                     self.failed.emit(str(data.get("error") or "stream error"))
@@ -71,5 +58,82 @@ class EditorSuggestWorker(QThread):
         except Exception as e:  # noqa: BLE001 — surfaced to the UI as a failure
             self.failed.emit(f"{type(e).__name__}: {e}")
             return
-        # Stream closed without an explicit done — surface what we have.
         self.completed.emit("".join(buffer))
+
+
+class EditorSuggestWorker(_EditorStreamWorker):
+    """Inline ghost-writing continuation (``POST /api/v1/editor/suggest``).
+
+    ``use_workspace`` asks the backend to ground the suggestion in the active
+    workspace's RAG index (embedding retrieval); it falls back to ungrounded
+    continuation when grounding is unavailable.
+    """
+
+    def __init__(
+        self,
+        workspace_id: str,
+        prefix: str,
+        suffix: str,
+        max_tokens: int = 64,
+        use_workspace: bool = True,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(
+            "/api/v1/editor/suggest",
+            {
+                "workspaceId": workspace_id,
+                "prefix": prefix,
+                "suffix": suffix,
+                "maxTokens": max_tokens,
+                "useWorkspace": use_workspace,
+            },
+            parent,
+        )
+
+
+class EditorAssistWorker(_EditorStreamWorker):
+    """Quick-action transform (``POST /api/v1/editor/assist``)."""
+
+    def __init__(
+        self,
+        workspace_id: str,
+        action: str,
+        text: str,
+        max_tokens: int = 400,
+        use_workspace: bool = True,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(
+            "/api/v1/editor/assist",
+            {
+                "workspaceId": workspace_id,
+                "action": action,
+                "text": text,
+                "maxTokens": max_tokens,
+                "useWorkspace": use_workspace,
+            },
+            parent,
+        )
+
+
+class EditorChatWorker(_EditorStreamWorker):
+    """Document-grounded chat reply (``POST /api/v1/editor/chat``)."""
+
+    def __init__(
+        self,
+        workspace_id: str,
+        message: str,
+        doc_text: str = "",
+        use_workspace: bool = True,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(
+            "/api/v1/editor/chat",
+            {
+                "workspaceId": workspace_id,
+                "message": message,
+                "docText": doc_text,
+                "useWorkspace": use_workspace,
+            },
+            parent,
+        )

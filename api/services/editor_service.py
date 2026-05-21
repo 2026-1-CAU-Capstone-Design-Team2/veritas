@@ -1,22 +1,24 @@
-"""Editor document store + inline ghost-writing suggestion stream.
+"""Editor document store + SSE wiring for the editor's AI surfaces.
 
 The standalone editor window talks to the backend only over HTTP/SSE (no Qt
-coupling). This service owns three concerns:
+coupling). This service owns:
 
 1. Document CRUD on disk — drafts live at ``runs/<workspace>/drafts/<doc_id>.md``
    so they sit alongside the workspace's research artifacts and survive an API
-   restart. Loading can also seed from the workspace's ``final.md`` (the
-   "이 보고서로 글쓰기" entry point) without ever overwriting it.
-2. Inline ghost-writing — a short streaming continuation of whatever the user
-   is typing. Unlike the chat/document-assist streams it deliberately bypasses
-   the RAG / tool-routing ChatAgent and calls ``LLMClient.iter_ask`` directly
-   with a tiny ``max_tokens`` budget, because a ghost suggestion must be fast
-   and is only a local continuation of the cursor context (no retrieval).
-3. Export — delegated to :mod:`export_service` (pandoc wrapper).
+   restart. Loading can also seed from the workspace's ``final.md`` without ever
+   overwriting it.
+2. SSE plumbing for ghost-writing / quick actions / chat. The actual generation
+   (and workspace RAG grounding) lives on the **ChatAgent** — same agent and
+   workspace-bound ``rag_service`` the chat / document-assist pages use — reached
+   through the runtime facades ``ghostwrite_iter`` / ``editor_assist_iter`` /
+   ``editor_chat_iter``. Prompt text lives in :mod:`core.prompts.editor`. This
+   service only frames the stream (start / delta / done / error) and enforces the
+   "editor workspace must be the active one to ground" guard so a stale editor
+   never grounds against the wrong workspace's index.
+3. Connected-sources count + export (pandoc, via :mod:`export_service`).
 
-SSE event shape mirrors :func:`draft_chat_service.send_chat_message_stream`
-(start / delta / done / error) so the frontend worker can be a near-clone of
-``ChatStreamWorker``.
+Ghost-writing uses *forced* RAG (no index → no suggestion); quick actions and
+chat use *additive* RAG (they run on the given text, grounding when available).
 """
 
 from __future__ import annotations
@@ -41,12 +43,6 @@ def _output_root() -> Path:
 
 
 def _workspace_dir(workspace_id: str) -> Path:
-    """Resolve a workspace id to its run directory.
-
-    Mirrors the mapping the rest of the API uses: a real workspace is
-    ``runs/<id>/`` while the ``"default"`` placeholder (no workspace selected
-    yet) maps to ``runs/api/``.
-    """
     workspace_id = str(workspace_id or "default").strip() or "default"
     root = _output_root()
     return root / workspace_id if workspace_id != "default" else root / "api"
@@ -57,13 +53,11 @@ def _drafts_dir(workspace_id: str) -> Path:
 
 
 def _draft_path(workspace_id: str, doc_id: str) -> Path:
-    safe = _safe_doc_id(doc_id)
-    return _drafts_dir(workspace_id) / f"{safe}.md"
+    return _drafts_dir(workspace_id) / f"{_safe_doc_id(doc_id)}.md"
 
 
 def _safe_doc_id(doc_id: str) -> str:
-    """Keep a doc id to a flat, filesystem-safe token so it can never escape
-    the drafts directory via ``..`` or path separators."""
+    """Flat, filesystem-safe token so a doc id can never escape the drafts dir."""
     token = re.sub(r"[^A-Za-z0-9_-]+", "", str(doc_id or "").strip())
     if not token:
         raise HTTPException(status_code=422, detail="docId must not be empty")
@@ -71,8 +65,6 @@ def _safe_doc_id(doc_id: str) -> str:
 
 
 def _title_from_content(content: str) -> str:
-    """Best-effort document title: the first markdown heading, else the first
-    non-empty line, capped — used for the 열기 list and the window title."""
     for line in (content or "").splitlines():
         stripped = line.strip()
         if not stripped:
@@ -81,6 +73,20 @@ def _title_from_content(content: str) -> str:
         text = heading.group(1).strip() if heading else stripped
         return text[:80] if text else "제목 없음"
     return "제목 없음"
+
+
+def _workspace_is_active(workspace_id: str) -> bool:
+    """True when the editor's workspace is the runtime's active one.
+
+    Grounding reuses the ChatAgent's ``rag_service``, which is bound to the
+    active workspace. If the editor was opened on a different workspace (e.g. the
+    main app switched away), we must not ground against the wrong index.
+    """
+    try:
+        runtime = get_runtime()
+    except Exception:
+        return False
+    return str(workspace_id or "") == str(getattr(runtime, "workspace_id", ""))
 
 
 # ----------------------------------------------------------------- documents
@@ -100,14 +106,6 @@ def load_document(
     source: str = "new",
     doc_id: str | None = None,
 ) -> dict[str, Any]:
-    """Load editor content.
-
-    ``source`` is one of:
-      * ``"new"``   — a blank document with a fresh id.
-      * ``"final"`` — seed from the workspace ``final.md``; a *new* draft id is
-        minted so saving never clobbers the canonical report.
-      * ``"draft"`` — an existing ``drafts/<doc_id>.md`` (404 if missing).
-    """
     source = (source or "new").strip().lower()
 
     if source == "new":
@@ -148,7 +146,6 @@ def load_document(
 
 
 def list_documents(workspace_id: str) -> dict[str, Any]:
-    """List saved drafts for the 열기 menu, newest first."""
     drafts_dir = _drafts_dir(workspace_id)
     items: list[dict[str, Any]] = []
     if drafts_dir.exists():
@@ -178,11 +175,6 @@ def save_document(
     content: str,
     title: str | None = None,
 ) -> dict[str, Any]:
-    """Persist a draft to ``runs/<workspace>/drafts/<doc_id>.md``.
-
-    Title is intentionally not stored in a sidecar — it is derived from the
-    content's first heading on read, so the file is the single source of truth.
-    """
     path = _draft_path(workspace_id, doc_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     body = content or ""
@@ -204,41 +196,22 @@ def export_document(
     output_path: str,
     doc_id: str | None = None,
 ) -> dict[str, Any]:
-    _ = (workspace_id, doc_id)  # reserved for future per-workspace export rules
+    _ = (workspace_id, doc_id)
     return export_service.export(content, fmt, output_path)
 
 
 # ------------------------------------------------------------ ghost-writing
-
-_SUGGEST_SYSTEM_PROMPT = (
-    "당신은 한국어 문서 작성 보조기입니다. 사용자가 작성 중인 글의 커서 위치에서 "
-    "자연스럽게 이어질 다음 텍스트만 출력하세요. 설명, 따옴표, 코드펜스(```), 머리말 없이 "
-    "이어질 본문만 1~2문장 이내로 간결하게 작성합니다. 이미 작성된 문장을 반복하지 말고, "
-    "문맥의 말투와 문체를 그대로 유지하세요."
-)
-
 
 def suggest_stream(
     workspace_id: str,
     prefix: str,
     suffix: str = "",
     max_tokens: int = 64,
+    use_workspace: bool = True,
 ) -> Iterator[bytes]:
-    """Stream a short ghost-writing continuation as SSE.
-
-    Events:
-        event: start  data: {"suggestionId": "...", "workspaceId": "..."}
-        event: delta  data: {"text": "<chunk>"}
-        event: done   data: {"suggestionId": "...", "text": "<full>"}
-        event: error  data: {"error": "..."}
-
-    Calls ``LLMClient.iter_ask`` directly (no RAG / tools) with a tiny token
-    budget so the suggestion is fast. The cursor context is the only input:
-    the frontend sends ~500 chars before the cursor as ``prefix`` and a little
-    after as ``suffix``.
+    """Stream a ghost-writing continuation as SSE. Generation lives on the
+    ChatAgent; ``use_workspace`` forces RAG grounding (no index → no suggestion).
     """
-    # Defensive caps so a runaway client payload can't blow the prompt up; the
-    # frontend already trims to ~500 chars of prefix.
     prefix = (prefix or "")[-2000:]
     suffix = (suffix or "")[:500]
     suggestion_id = new_id("sg")
@@ -246,39 +219,120 @@ def suggest_stream(
     yield _sse("start", {"suggestionId": suggestion_id, "workspaceId": workspace_id})
 
     if not prefix.strip() and not suffix.strip():
-        # Nothing to continue from — emit an empty, successful suggestion.
         yield _sse("done", {"suggestionId": suggestion_id, "text": ""})
         return
-
-    user_prompt = f"[작성 중인 내용]\n{prefix}"
-    if suffix.strip():
-        user_prompt += f"\n\n[커서 뒤 내용]\n{suffix}"
-    user_prompt += "\n\n[커서 위치에 이어서 작성할 텍스트만 출력]"
 
     collected: list[str] = []
     try:
         runtime = get_runtime()
-        for chunk in runtime.llm.iter_ask(
-            _SUGGEST_SYSTEM_PROMPT,
-            user_prompt,
-            reasoning=False,
-            sampling_params={
-                "temperature": 0.3,
-                "top_p": 0.9,
-                "max_tokens": max(8, min(256, int(max_tokens))),
-            },
-            stream_label="editor-suggest",
+        grounded = bool(use_workspace) and _workspace_is_active(workspace_id)
+        if use_workspace and not grounded:
+            # Forced RAG but this workspace is not the active index → no
+            # suggestion (rather than an ungrounded one against the wrong index).
+            yield _sse("done", {"suggestionId": suggestion_id, "text": ""})
+            return
+        for chunk in runtime.ghostwrite_iter(
+            prefix, suffix, max_tokens=max_tokens, use_workspace=grounded
         ):
             if not chunk:
                 continue
             collected.append(chunk)
             yield _sse("delta", {"text": chunk})
-    except Exception as e:  # noqa: BLE001 — surfaced to the client as an SSE error
+    except Exception as e:  # noqa: BLE001 — surfaced as SSE error
         yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
         return
 
-    text = "".join(collected).strip()
-    yield _sse("done", {"suggestionId": suggestion_id, "text": text})
+    yield _sse("done", {"suggestionId": suggestion_id, "text": "".join(collected).strip()})
+
+
+# ---------------------------------------------------- assist (quick actions)
+
+def assist_stream(
+    workspace_id: str,
+    action: str,
+    text: str,
+    max_tokens: int = 400,
+    use_workspace: bool = True,
+) -> Iterator[bytes]:
+    """Stream a quick-action transform as SSE. Additive RAG (runs on the given
+    text; grounds when the workspace index is available and active)."""
+    action = (action or "").strip().lower()
+    assist_id = new_id("as")
+    yield _sse("start", {"assistId": assist_id, "action": action})
+
+    body = (text or "").strip()
+    if not body and action != "continue":
+        yield _sse("done", {"assistId": assist_id, "text": ""})
+        return
+
+    collected: list[str] = []
+    try:
+        grounded = bool(use_workspace) and _workspace_is_active(workspace_id)
+        for chunk in get_runtime().editor_assist_iter(
+            action, body, max_tokens=max_tokens, use_workspace=grounded
+        ):
+            if not chunk:
+                continue
+            collected.append(chunk)
+            yield _sse("delta", {"text": chunk})
+    except Exception as e:  # noqa: BLE001 — surfaced as SSE error
+        yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
+        return
+
+    yield _sse("done", {"assistId": assist_id, "text": "".join(collected).strip()})
+
+
+# ----------------------------------------------------------- document chat
+
+def chat_stream(
+    workspace_id: str,
+    message: str,
+    doc_text: str = "",
+    use_workspace: bool = True,
+) -> Iterator[bytes]:
+    """Stream a document-grounded chat reply as SSE. Additive RAG (the document
+    is always in the prompt; workspace sources are appended when available)."""
+    chat_id = new_id("ec")
+    yield _sse("start", {"chatId": chat_id})
+
+    if not (message or "").strip():
+        yield _sse("done", {"chatId": chat_id, "text": ""})
+        return
+
+    collected: list[str] = []
+    try:
+        grounded = bool(use_workspace) and _workspace_is_active(workspace_id)
+        for chunk in get_runtime().editor_chat_iter(message, doc_text, use_workspace=grounded):
+            if not chunk:
+                continue
+            collected.append(chunk)
+            yield _sse("delta", {"text": chunk})
+    except Exception as e:  # noqa: BLE001 — surfaced as SSE error
+        yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
+        return
+
+    yield _sse("done", {"chatId": chat_id, "text": "".join(collected).strip()})
+
+
+# --------------------------------------------------------- connected sources
+
+def get_sources(workspace_id: str) -> dict[str, Any]:
+    """Connected research sources for the 자료 panel — read from the workspace's
+    ``summary/index.json`` (duplicates excluded)."""
+    index_path = _workspace_dir(workspace_id) / "summary" / "index.json"
+    items: list[dict[str, str]] = []
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+        records = payload.get("records", []) if isinstance(payload, dict) else []
+        for record in records:
+            if not isinstance(record, dict) or record.get("duplicate_of"):
+                continue
+            url = str(record.get("final_url") or record.get("url") or "")
+            title = str(record.get("title") or url or record.get("doc_id") or "Untitled")
+            items.append({"title": title, "url": url})
+    except Exception:
+        pass
+    return {"workspaceId": workspace_id, "count": len(items), "items": items}
 
 
 # ---------------------------------------------------------------- internals

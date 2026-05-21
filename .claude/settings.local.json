@@ -55,7 +55,17 @@
       "Bash(conda env *)",
       "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -c \"import PySide6, markdown; print\\('PySide6', PySide6.__version__, '| markdown ok'\\)\")",
       "Bash(C:/Users/user/miniconda3/envs/agent/python.exe _frontend_smoke.py)",
-      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -m py_compile api/services/editor_service.py api/services/export_service.py api/api_routes/editor.py api/api_models.py api/api_routes/__init__.py api/api.py frontend/controllers/job_manager.py frontend/controllers/editor_stream.py frontend/controllers/__init__.py frontend/ui/windows/editor_window.py frontend/ui/main_window.py frontend/ui/pages/research_page.py)"
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -m py_compile api/services/editor_service.py api/services/export_service.py api/api_routes/editor.py api/api_models.py api/api_routes/__init__.py api/api.py frontend/controllers/job_manager.py frontend/controllers/editor_stream.py frontend/controllers/__init__.py frontend/ui/windows/editor_window.py frontend/ui/main_window.py frontend/ui/pages/research_page.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe _be_smoke2.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe _fe_smoke2.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -m py_compile api/services/editor_service.py api/services/export_service.py api/api_routes/editor.py api/api_models.py api/api.py api/api_routes/__init__.py frontend/controllers/editor_stream.py frontend/controllers/__init__.py frontend/controllers/job_manager.py frontend/ui/windows/editor_window.py frontend/ui/main_window.py frontend/ui/pages/research_page.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe _rag_be.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe _rag_fe.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -m py_compile api/services/editor_service.py api/api_models.py api/api_routes/editor.py frontend/controllers/editor_stream.py frontend/controllers/__init__.py frontend/ui/windows/editor_window.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe _prompt_smoke.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -m py_compile core/prompts/editor.py core/prompts/__init__.py api/services/editor_service.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe _agent_smoke.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -m py_compile agent/chat_agent.py api/services/agent_runtime.py api/services/editor_service.py core/prompts/editor.py core/prompts/__init__.py)"
     ]
   }
 }

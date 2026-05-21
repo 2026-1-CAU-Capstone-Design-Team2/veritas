@@ -199,6 +199,30 @@ class AgentRuntime:
             return self.chat_agent.ask_explicit_tool_iter("rag", message)
         return self.chat_agent.ask_auto_iter(message)
 
+    # -- editor (standalone writer) surfaces ----------------------------------
+    # Thin facades over the ChatAgent so the editor window's three AI surfaces
+    # run through the same agent (and its workspace-bound rag_service) as the
+    # chat / document-assist pages, instead of calling the LLM directly.
+
+    def ghostwrite_iter(
+        self, prefix: str, suffix: str = "", *, max_tokens: int = 64, use_workspace: bool = True
+    ) -> Iterator[str]:
+        return self.chat_agent.iter_ghostwrite(
+            prefix, suffix, max_tokens=max_tokens, use_workspace=use_workspace
+        )
+
+    def editor_assist_iter(
+        self, action: str, text: str, *, max_tokens: int = 400, use_workspace: bool = True
+    ) -> Iterator[str]:
+        return self.chat_agent.iter_editor_assist(
+            action, text, max_tokens=max_tokens, use_workspace=use_workspace
+        )
+
+    def editor_chat_iter(
+        self, message: str, doc_text: str = "", *, use_workspace: bool = True
+    ) -> Iterator[str]:
+        return self.chat_agent.iter_editor_chat(message, doc_text, use_workspace=use_workspace)
+
     def persist_chat_turn(self, message: str, assistant_text: str) -> None:
         """Persist a (user, assistant) turn into the workspace chat_history.json
         file so any chat panel (write/document-assist) can render the same log.
