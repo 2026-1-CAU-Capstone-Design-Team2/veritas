@@ -62,6 +62,30 @@ class AgentController:
 			{"workspaceId": workspace_id, "prompt": prompt},
 		)
 
+	def get_draft_forms(self) -> dict[str, Any]:
+		return api_client.get("/api/v1/draft/forms")
+
+	def generate_builtin_draft(self, workspace_id: str, settings: dict[str, Any]) -> dict[str, Any]:
+		"""Generate a built-in form draft from structured wizard settings.
+
+		The backend maps ``tone`` to a sampling strategy, grounds on the
+		workspace knowledge base, and persists the settings as
+		``drafts/draft_<n>_settings.json`` for later regeneration.
+		"""
+		return api_client.post(
+			"/api/v1/draft/builtin/generate",
+			{**settings, "workspaceId": workspace_id},
+		)
+
+	def regenerate_builtin_draft(self, workspace_id: str, draft_number: int) -> dict[str, Any]:
+		return api_client.post(
+			"/api/v1/draft/builtin/regenerate",
+			{"workspaceId": workspace_id, "draftNumber": int(draft_number)},
+		)
+
+	def list_builtin_drafts(self, workspace_id: str) -> dict[str, Any]:
+		return api_client.get("/api/v1/draft/builtin/list", {"workspaceId": workspace_id})
+
 	def run_research(
 		self,
 		workspace_id: str,

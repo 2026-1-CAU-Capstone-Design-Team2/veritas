@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.request
 
+from core.stdio_utf8 import force_utf8_stdio
 from db.db import get_app_data_dir
 from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtWidgets import (
@@ -372,6 +373,13 @@ def _popen_logged(
     command = args if not shell else " ".join(args)
     process_env = dict(os.environ if env is None else env)
     process_env.setdefault("PYTHONUNBUFFERED", "1")
+    # Make spawned Python children (api, ui) use UTF-8 for stdout/stderr +
+    # file I/O from byte zero. Without this, a child whose stdout is a pipe
+    # falls back to the locale code page (cp949 on Korean Windows) and any
+    # print of em-dashes / smart quotes (common in web-scraped text) raises
+    # UnicodeEncodeError. Matches the parent's encoding="utf-8" pipe decode.
+    process_env.setdefault("PYTHONUTF8", "1")
+    process_env.setdefault("PYTHONIOENCODING", "utf-8")
     path = log_path(name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"$ {' '.join(args) if isinstance(args, list) else args}\n\n", encoding="utf-8")
@@ -624,6 +632,10 @@ def _install_kill_on_close_job() -> None:
 
 
 def main() -> int:
+    # The log-relay thread re-prints child stdout (which carries web-scraped
+    # text with em-dashes) to the launcher's own console; force UTF-8 so that
+    # re-print can't crash on a cp949 console.
+    force_utf8_stdio()
     configure_console_logs_from_argv()
     # Guarantee no orphaned llama-server/API/UI even on a hard launcher kill.
     _install_kill_on_close_job()

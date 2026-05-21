@@ -5,6 +5,8 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from core.stdio_utf8 import force_utf8_stdio
+
 from ..api_common import API_BASE_URL, load_bootstrap_state
 from ..api_connection import ApiUnavailableError, ensure_api_connection
 from .main_window import MainWindow
@@ -25,6 +27,9 @@ def _reconcile_workspaces_with_runs() -> None:
 
 
 def main() -> None:
+	# Korean Windows defaults piped stdout/stderr to cp949; force UTF-8 so any
+	# console log (incl. web-scraped text with em-dashes) cannot crash a print.
+	force_utf8_stdio()
 	_reconcile_workspaces_with_runs()
 
 	# Create the QApplication first so we can show a real error dialog if the

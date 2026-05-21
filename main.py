@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from agent import ChatAgent
+from core.stdio_utf8 import force_utf8_stdio
 from llm.llama_server_llm import LLMClient
 from services.rag_service import RAGService
 from tools.loader import build_registry, load_schema
@@ -176,6 +177,10 @@ def register_chat_workflow_tools(*, registry, workflow, rag_service, run_store_s
 
 
 def main() -> None:
+    # AutoSurvey document cleanup logs web-scraped text (em-dashes, smart
+    # quotes); on Korean Windows a piped stdout defaults to cp949 and such a
+    # print raises UnicodeEncodeError. Force UTF-8 before any output.
+    force_utf8_stdio()
     args = parse_args()
 
     output_dir = Path(args.output_dir).expanduser().resolve()

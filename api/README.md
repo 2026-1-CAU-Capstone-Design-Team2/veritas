@@ -577,9 +577,35 @@ data: { "error": "..." }
 
 ### Draft
 
+초안(deliverable 문서)은 `final.md`(조사 결과를 사용자에게 *보고*하는 형식)와 **별개 산출물**입니다. 빌트인 양식 경로는 워크스페이스의 지식베이스(`summary/batch_*.md` + `final.md`)를 근거로, 선택한 양식·목차·톤에 맞춰 실제 문서를 생성합니다. 생성물과 설정은 `runs/<workspace>/drafts/` 아래에 `draft_<n>.md` / `draft_<n>_settings.json` 으로 저장됩니다 (`draft_<n>` 는 에디터 docId 로도 사용 가능).
+
+#### `GET /api/v1/draft/forms`
+
+빌트인 양식 카탈로그(5 대분류 × 3 소분류 + 기본 섹션)와 톤/분량 옵션. 위저드가 렌더링하는 단일 소스.
+응답 `{ categories: [...], tones: [{key,label}], defaultTone, lengths: [...], defaultLength }`
+
+#### `POST /api/v1/draft/builtin/generate`
+
+**비동기**: 평문 `def`. 톤(`격식체`/`중립`/`캐주얼`)을 샘플링 전략(temperature/top_p/top_k …)으로 매핑해 생성.
+
+요청 `{ workspaceId, source: "custom"|"file", category?: {key,label}, subtype?: {key,label}, outline: [string], tone, length, audience, keyPoints }`
+응답 `{ draftId, draftNumber, title, content, tone, hasKnowledgeBase, settingsFileName, settingsPath, draftFileName, draftPath }`. `outline` 가 비면 `422`.
+
+#### `POST /api/v1/draft/builtin/regenerate`
+
+**비동기**: 평문 `def`. 저장된 `draft_<n>_settings.json` 을 다시 읽어 동일 설정으로 같은 번호 위에 재생성.
+
+요청 `{ workspaceId, draftNumber }`
+응답 `{ draftId, draftNumber, title, content, ... }` (generate 와 동일). 설정 파일이 없으면 `404`.
+
+#### `GET /api/v1/draft/builtin/list?workspaceId=...`
+
+워크스페이스에 저장된 빌트인 초안(설정 파일) 목록을 번호 내림차순으로 반환.
+응답 `{ workspaceId, items: [{ draftNumber, draftId, title, docType, tone, length, updatedAt, settingsFileName }] }`
+
 #### `POST /api/v1/draft/generate`
 
-**비동기**: 평문 `def`.
+**비동기**: 평문 `def`. 평문 프롬프트 경로(업로드 양식 폴백).
 
 요청 `{ workspaceId, prompt }`
 응답 `{ draftId, title, content }`
