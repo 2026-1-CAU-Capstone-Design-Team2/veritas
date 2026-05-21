@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from db import activity_repository as activity
 from db.db import get_connection, init_db
 from db.workspace_sync import delete_workspace as _delete_workspace_from_db
 
@@ -42,6 +43,11 @@ def switch_workspace(workspace_id: str) -> dict[str, str]:
 
     repo.set_current_workspace(workspace["workspaceId"])
     _save_current_workspace_id(workspace["workspaceId"])
+    activity.log_activity(
+        workspace["workspaceId"],
+        "workspace_opened",
+        f"{workspace['name']} 워크스페이스 열림",
+    )
     return {"workspaceId": workspace["workspaceId"], "name": workspace["name"]}
 
 

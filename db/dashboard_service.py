@@ -3,6 +3,7 @@ from __future__ import annotations
 from .dashboard_repository import (
 	get_dashboard_summary as fetch_dashboard_summary,
 	get_recent_activities,
+	get_recent_drafts,
 	get_recent_workspaces,
 )
 
@@ -19,5 +20,6 @@ def get_dashboard_summary() -> dict[str, object]:
 		"feedback_rate": feedback_rate,
 		"recent_workspaces": get_recent_workspaces(limit=5),
 		"recent_activities": get_recent_activities(limit=5),
+		"recent_drafts": get_recent_drafts(limit=5),
 	}
 
