@@ -407,11 +407,20 @@ class ChatAgent:
         user_prompt = SUGGEST_USER_TEMPLATE.format(
             reference=reference, prefix=prefix, suffix_block=suffix_block
         )
+        # presence_penalty=0 (vs the client default 1.5): a continuation must pick
+        # up the user's own vocabulary/flow, and penalizing reused tokens makes the
+        # suggestion read as a tonal break rather than a continuation.
         stream = self.llm.iter_ask(
             SUGGEST_SYSTEM_PROMPT,
             user_prompt,
             reasoning=False,
-            sampling_params={"temperature": 0.3, "top_p": 0.9, "max_tokens": max(8, min(256, int(max_tokens)))},
+            sampling_params={
+                "temperature": 0.3,
+                "top_p": 0.9,
+                "presence_penalty": 0.0,
+                "max_tokens": max(8, min(256, int(max_tokens))),
+            },
+            extra_sampling_params={"repeat_penalty": 1.1},
             stream_label="editor-suggest",
         )
         buffer: list[str] = []
@@ -477,11 +486,21 @@ class ChatAgent:
             user_content = ASSIST_GROUNDED_USER_TEMPLATE.format(context=context, text=target)
         else:
             user_content = ASSIST_PLAIN_USER_TEMPLATE.format(text=target)
+        # Transforms (요약/다듬기/문법/rewrite) must REUSE the input's wording, so
+        # override the client's default presence_penalty=1.5 — that default fights
+        # word reuse and, on this small quantized model, drifts into off-topic /
+        # garbled output. A light repeat_penalty still curbs literal loops.
         yield from self.llm.iter_ask(
             system_prompt,
             user_content,
             reasoning=False,
-            sampling_params={"temperature": 0.4, "top_p": 0.9, "max_tokens": max(16, min(1024, int(max_tokens)))},
+            sampling_params={
+                "temperature": 0.4,
+                "top_p": 0.9,
+                "presence_penalty": 0.0,
+                "max_tokens": max(16, min(1024, int(max_tokens))),
+            },
+            extra_sampling_params={"repeat_penalty": 1.1},
             stream_label=f"editor-{action}",
         )
 
