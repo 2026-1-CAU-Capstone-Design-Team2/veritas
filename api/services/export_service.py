@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -22,6 +23,46 @@ from fastapi import HTTPException
 
 _PANDOC_FORMATS = {"docx", "pdf", "html"}
 _PANDOC_TIMEOUT_SEC = 120
+# PDF engines pandoc can drive, in preference order.
+_PDF_ENGINES = ("wkhtmltopdf", "xelatex", "pdflatex", "lualatex", "tectonic", "weasyprint")
+
+
+def _env_bin_dirs() -> list[Path]:
+    """Binary dirs of the conda/venv this Python runs in.
+
+    The API may be launched via ``envs/<name>/python.exe`` directly (without
+    ``conda activate``), so a conda-installed pandoc lives under the env but is
+    NOT on ``PATH``. Resolving against ``sys.prefix`` makes export work
+    regardless of how the process was started.
+    """
+    prefix = Path(sys.prefix)
+    return [prefix / "Library" / "bin", prefix / "Scripts", prefix / "bin", prefix]
+
+
+def _find_executable(*names: str) -> str | None:
+    """Locate a CLI tool on PATH, then in this Python env's binary dirs, and
+    (for pandoc) finally via a pip-installed ``pypandoc-binary`` bundle."""
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+    for directory in _env_bin_dirs():
+        for name in names:
+            for candidate in (directory / name, directory / f"{name}.exe"):
+                if candidate.is_file():
+                    return str(candidate)
+    if "pandoc" in names:
+        # `pypandoc-binary` (requirements.txt) ships the pandoc executable inside
+        # the package rather than on PATH; ask it where that is.
+        try:
+            import pypandoc  # noqa: PLC0415 — optional, imported lazily
+
+            path = pypandoc.get_pandoc_path()
+            if path and Path(path).is_file():
+                return str(path)
+        except Exception:
+            pass
+    return None
 
 
 def export(content: str, fmt: str, output_path: str) -> dict[str, object]:
@@ -56,7 +97,7 @@ def export(content: str, fmt: str, output_path: str) -> dict[str, object]:
     if fmt not in _PANDOC_FORMATS:
         raise HTTPException(status_code=422, detail=f"지원하지 않는 내보내기 형식입니다: {fmt}")
 
-    pandoc = shutil.which("pandoc")
+    pandoc = _find_executable("pandoc")
     if pandoc is None:
         raise HTTPException(
             status_code=422,
@@ -74,6 +115,19 @@ def export(content: str, fmt: str, output_path: str) -> dict[str, object]:
         cmd = [pandoc, str(src), "-f", "markdown", "-o", str(out)]
         if fmt == "html":
             cmd += ["-t", "html5", "-s"]
+        elif fmt == "pdf":
+            engine = _find_executable(*_PDF_ENGINES)
+            if engine is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "PDF로 내보내려면 PDF 엔진이 추가로 필요합니다. "
+                        "wkhtmltopdf 또는 TeX(xelatex/pdflatex)를 설치하거나"
+                        "(예: conda install -c conda-forge wkhtmltopdf), "
+                        "DOCX/HTML/MD 형식으로 내보내 주세요."
+                    ),
+                )
+            cmd += ["--pdf-engine", engine]
 
         try:
             result = subprocess.run(

@@ -2,6 +2,7 @@ from .dashboard_page import *
 from .document_page import *
 from .draft_page import *
 from .feedback_page import *
+from .guide_page import *
 from .research_page import *
 from .verify_page import *
 from .write_page import *

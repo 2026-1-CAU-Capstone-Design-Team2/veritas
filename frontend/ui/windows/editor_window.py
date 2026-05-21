@@ -913,12 +913,29 @@ class EditorWindow(QWidget):
 
     # ----------------------------------------------------------- public open
 
-    def open_document(self, workspace_id: str | None = None, source: str = "new", doc_id: str | None = None) -> None:
+    def open_document(
+        self,
+        workspace_id: str | None = None,
+        source: str = "new",
+        doc_id: str | None = None,
+        seed_markdown: str | None = None,
+    ) -> None:
         self._workspace_id = workspace_id or current_workspace_id()
         self._invalidate_suggestion()
         self.editor.clear_ghost()
         self._load_token += 1
         token = self._load_token
+
+        # 초안 페이지의 "에디터로 보내기" — 백엔드 호출 없이 전달받은 마크다운으로 바로 시드.
+        if seed_markdown is not None:
+            title = self._title_from_markdown(seed_markdown)
+            self._apply_loaded_document({"content": seed_markdown, "title": title, "source": "draft"})
+            self._refresh_sources()
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            return
+
         params = {"workspaceId": self._workspace_id, "source": source, "docId": doc_id}
 
         def _load() -> dict:
@@ -953,6 +970,14 @@ class EditorWindow(QWidget):
         self._update_counts()
         source = str(data.get("source") or "")
         self._set_save_status("새 문서" if source == "new" else "불러옴")
+
+    @staticmethod
+    def _title_from_markdown(markdown: str) -> str:
+        for line in markdown.splitlines():
+            stripped = line.strip().lstrip("#").strip()
+            if stripped:
+                return stripped[:80]
+        return "초안"
 
     def _refresh_sources(self) -> None:
         workspace_id = self._workspace_id

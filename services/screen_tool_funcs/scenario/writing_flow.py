@@ -562,7 +562,7 @@ class LongStaticReviewScenario(ScenarioType):
         min_static_captures: int = 2,
         min_document_chars: int = 60,
         idle_similarity_threshold: float = 0.99,
-        cooldown_min_seconds: float = 240.0,
+        cooldown_min_seconds: float = 60.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
