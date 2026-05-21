@@ -48,6 +48,22 @@ def switch_workspace(workspace_id: str) -> dict[str, str]:
         "workspace_opened",
         f"{workspace['name']} 워크스페이스 열림",
     )
+    # Switch the live runtime too, not just the persisted "current workspace".
+    # Without this the runtime stays attached to the previous workspace until the
+    # next chat message happens to call set_workspace, so every piece of
+    # workspace-scoped runtime state keeps serving the OLD workspace: the RAG
+    # store, the screen monitor, and the proactive screen-assist event buffer
+    # (get_events_since filters by runtime.workspace_id). That stale id is why
+    # the previous workspace's 실시간 보조 cards lingered in the 문서 보조 list
+    # after switching. set_workspace is a no-op when already on this workspace.
+    try:
+        from .agent_runtime import get_runtime
+
+        get_runtime().set_workspace(workspace["workspaceId"])
+    except HTTPException:
+        # Runtime unavailable (e.g. llama-server down): the persisted switch
+        # above still stands and the runtime adopts it on next use.
+        pass
     return {"workspaceId": workspace["workspaceId"], "name": workspace["name"]}
 
 
@@ -297,15 +313,12 @@ def _persist_workspace_catalog(workspaces: list[dict[str, Any]]) -> None:
                 workspace_id = str(workspace.get("workspaceId") or "").strip()
                 if not workspace_id:
                     continue
-                # name is intentionally NOT in the DO UPDATE clause: it is set
-                # once on first insert (folder name) and thereafter owned by the
-                # user (dashboard rename). Updating it from excluded.name here
-                # would clobber a rename on every disk re-sync.
                 conn.execute(
                     """
                     INSERT INTO workspaces (id, name, path, status, created_at, updated_at, last_worked_at)
                     VALUES (?, ?, ?, ?, datetime('now'), datetime('now'), ?)
                     ON CONFLICT(id) DO UPDATE SET
+                        name = excluded.name,
                         path = excluded.path,
                         status = excluded.status,
                         updated_at = excluded.updated_at,

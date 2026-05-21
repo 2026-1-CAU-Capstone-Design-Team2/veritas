@@ -178,10 +178,19 @@ class ChatAgent:
         # on the same paragraph re-issue the same query, so cache on the query tail.
         self._screen_ctx_cache: dict[str, Any] = {"key": "", "context": None}
 
-    def ask_rag(self, question: str, *, stream: bool = False) -> str:
-        """Strict document-grounded Q&A mode for explicit --phase rag sessions."""
+    def ask_rag(self, question: str, *, stream: bool = False, doc_context: str = "") -> str:
+        """Strict document-grounded Q&A mode.
+
+        Backs both the CLI ``--phase rag`` session and the frontend "RAG" chat
+        mode. Grounding is enforced by ``RAGService.answer`` (RAG_SYSTEM_PROMPT):
+        when the workspace index has nothing relevant to the question — e.g. the
+        question is about another workspace's topic — the model is told to say so
+        instead of answering from general knowledge.
+        """
         with self._conversation_lock:
-            answer = self.rag_service.answer(question, stream=stream, use_history=True)
+            answer = self.rag_service.answer(
+                question, stream=stream, use_history=True, doc_context=doc_context
+            )
             self._append_history(question, answer)
             return answer
 
@@ -195,6 +204,15 @@ class ChatAgent:
                     answer = self._run_screen_debug_command()
                     self._append_history(question, answer)
                     return answer
+                if command == "rag" and self.rag_service is not None:
+                    # Strict grounded RAG — same path as the frontend RAG mode.
+                    # Avoids the permissive tool-synthesis answer that would fill
+                    # off-corpus questions with general knowledge.
+                    if not command_text:
+                        answer = "RAG 질문을 입력해 주세요. 예: /rag <질문>"
+                        self._append_history(question, answer)
+                        return answer
+                    return self.ask_rag(command_text, stream=stream)
                 tool_outputs = self._run_explicit_tool_command(
                     command=command,
                     command_text=command_text,
@@ -255,6 +273,15 @@ class ChatAgent:
                     if answer:
                         yield answer
                     return
+                if command == "rag" and self.rag_service is not None:
+                    # Strict grounded RAG — same path as the frontend RAG mode.
+                    if not command_text:
+                        msg = "RAG 질문을 입력해 주세요. 예: /rag <질문>"
+                        self._append_history(question, msg)
+                        yield msg
+                        return
+                    yield from self.ask_rag_iter(command_text, doc_context=doc_context)
+                    return
                 tool_outputs = self._run_explicit_tool_command(
                     command=command,
                     command_text=command_text,
@@ -296,16 +323,26 @@ class ChatAgent:
                 doc_context=doc_context,
             )
 
-    def ask_rag_iter(self, question: str) -> Iterator[str]:
+    def ask_rag_iter(self, question: str, doc_context: str = "") -> Iterator[str]:
+        """Streaming strict document-grounded Q&A — same grounding as ask_rag.
+
+        The frontend "RAG" chat mode streams through here, so off-corpus
+        questions get the same "not in this workspace's materials" refusal as the
+        one-shot path rather than a permissive general-knowledge answer.
+        """
         with self._conversation_lock:
             collected: list[str] = []
             try:
-                for chunk in self.rag_service.iter_answer(question, use_history=True):
+                for chunk in self.rag_service.iter_answer(
+                    question, use_history=True, doc_context=doc_context
+                ):
                     collected.append(chunk)
                     yield chunk
             except AttributeError:
-                # rag_service does not support iter_answer yet; fall back to one-shot.
-                answer = self.rag_service.answer(question, stream=False, use_history=True)
+                # Defensive: older rag_service without iter_answer — one-shot.
+                answer = self.rag_service.answer(
+                    question, stream=False, use_history=True, doc_context=doc_context
+                )
                 collected.append(answer)
                 yield answer
             self._append_history(question, "".join(collected))
