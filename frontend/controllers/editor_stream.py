@@ -114,26 +114,3 @@ class EditorAssistWorker(_EditorStreamWorker):
             },
             parent,
         )
-
-
-class EditorChatWorker(_EditorStreamWorker):
-    """Document-grounded chat reply (``POST /api/v1/editor/chat``)."""
-
-    def __init__(
-        self,
-        workspace_id: str,
-        message: str,
-        doc_text: str = "",
-        use_workspace: bool = True,
-        parent: QObject | None = None,
-    ) -> None:
-        super().__init__(
-            "/api/v1/editor/chat",
-            {
-                "workspaceId": workspace_id,
-                "message": message,
-                "docText": doc_text,
-                "useWorkspace": use_workspace,
-            },
-            parent,
-        )

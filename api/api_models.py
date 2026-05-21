@@ -45,6 +45,12 @@ class DraftBuiltinGenerateRequest(BaseModel):
     # When present, generation follows this structure (headings / tables) rather
     # than the outline alone. Empty for the built-in form path.
     formMarkdown: str = ""
+    # Documents the user kept checked in the draft wizard's "자료 선택" step
+    # (sourced from the verification results, keyed by ``docId``). ``None`` means
+    # the step was skipped (no filter — ground on the full knowledge base); a
+    # list — even an empty one — means the user made an explicit selection, so
+    # generation grounds *only* on those documents' per-doc summaries.
+    selectedDocIds: list[str] | None = None
 
 
 class DraftBuiltinRegenerateRequest(BaseModel):
@@ -56,6 +62,11 @@ class ChatMessageRequest(BaseModel):
     workspaceId: str
     message: str
     mode: Literal["research", "autosurvey", "rag"] = "research"
+    # Optional editor-surface extras. Defaults keep the main chat request
+    # unchanged; the editor's 문서 대화 sends the open document as additive
+    # context and tags its turns so both surfaces share one chat log.
+    docText: str = ""
+    source: str = "chat"
 
 
 class FeedbackAnalyzeRequest(BaseModel):
@@ -119,13 +130,6 @@ class EditorAssistRequest(BaseModel):
     action: Literal["rewrite", "summarize", "polish", "grammar", "continue"]
     text: str = ""
     maxTokens: int = Field(default=400, ge=16, le=1024)
-    useWorkspace: bool = True
-
-
-class EditorChatRequest(BaseModel):
-    workspaceId: str
-    message: str
-    docText: str = ""
     useWorkspace: bool = True
 
 

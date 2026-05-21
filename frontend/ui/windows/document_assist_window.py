@@ -17,6 +17,7 @@ from PySide6.QtGui import (
 	QBrush,
 	QColor,
 	QCloseEvent,
+	QFont,
 	QKeyEvent,
 	QKeySequence,
 	QMouseEvent,
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import (
 	QScrollArea,
 	QSizeGrip,
 	QSizePolicy,
+	QSplitter,
 	QTextBrowser,
 	QTextEdit,
 	QVBoxLayout,
@@ -175,11 +177,228 @@ class StatusBadge(QLabel):
 		)
 
 
+# Window-control glyphs. Plain-text symbols (－ ▢ ×) render as tofu in the UI
+# font; these Private-Use codepoints come from Windows' built-in icon fonts
+# (Win11: "Segoe Fluent Icons", Win10: "Segoe MDL2 Assets") and draw crisp
+# minimise / maximise / restore / close marks. Shared by the editor title bar
+# (which imports them) so both frameless windows match.
+WIN_GLYPH_MINIMIZE = chr(0xE921)  # ChromeMinimize
+WIN_GLYPH_MAXIMIZE = chr(0xE922)  # ChromeMaximize
+WIN_GLYPH_RESTORE = chr(0xE923)  # ChromeRestore
+WIN_GLYPH_CLOSE = chr(0xE8BB)  # ChromeClose
+
+
+def apply_window_icon_font(button: QPushButton, point_size: int = 10) -> None:
+	"""Render a window-control button with the OS icon font so its glyph is not
+	subject to the UI font (which lacks these symbols)."""
+	font = QFont()
+	font.setFamilies(["Segoe Fluent Icons", "Segoe MDL2 Assets"])
+	font.setPointSize(point_size)
+	button.setFont(font)
+
+
+_LOGO_PNG = Path(__file__).resolve().parent.parent / "public" / "images" / "veritas_logo.png"
+
+
+class WindowControlButton(QPushButton):
+	"""Minimise / maximise / restore / close button that *draws* its own glyph
+	with QPainter, so it is always visible regardless of which icon fonts the
+	system has (the earlier font-glyph buttons rendered blank on some setups)."""
+
+	def __init__(self, role: str, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self._role = role  # 'min' | 'max' | 'restore' | 'close'
+		self.setObjectName("WinCtlCloseButton" if role == "close" else "WinCtlButton")
+		self.setFixedSize(44, 30)
+		self.setCursor(Qt.PointingHandCursor)
+		self.setFocusPolicy(Qt.NoFocus)
+
+	def set_role(self, role: str) -> None:
+		self._role = role
+		self.update()
+
+	def paintEvent(self, event) -> None:  # type: ignore[override]
+		super().paintEvent(event)  # background / hover from the stylesheet
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.Antialiasing, True)
+		hovered = self.underMouse()
+		color = QColor("#FFFFFF") if (self._role == "close" and hovered) else QColor("#3C4043")
+		pen = QPen(color)
+		pen.setWidthF(1.4)
+		painter.setPen(pen)
+		r = self.rect()
+		cx, cy = r.center().x() + 1, r.center().y() + 1
+		h = 5
+		if self._role == "min":
+			painter.drawLine(cx - h, cy, cx + h, cy)
+		elif self._role == "max":
+			painter.drawRect(cx - h, cy - h, 2 * h, 2 * h)
+		elif self._role == "restore":
+			painter.drawRect(cx - h, cy - h + 2, 2 * h - 2, 2 * h - 2)
+			painter.drawLine(cx - h + 2, cy - h + 2, cx - h + 2, cy - h)
+			painter.drawLine(cx - h + 2, cy - h, cx + h, cy - h)
+			painter.drawLine(cx + h, cy - h, cx + h, cy + h - 2)
+			painter.drawLine(cx + h, cy + h - 2, cx + h - 2, cy + h - 2)
+		else:  # close
+			painter.drawLine(cx - h, cy - h, cx + h, cy + h)
+			painter.drawLine(cx - h, cy + h, cx + h, cy - h)
+		painter.end()
+
+
+class VeritasTitleBar(QFrame):
+	"""Shared frameless title bar: Veritas logo + 'VERITAS' + optional subtitle /
+	status badge, with drawn minimise / maximise / close buttons and drag-to-move.
+	Used by every Veritas window so they share one chrome."""
+
+	def __init__(
+		self,
+		window: QWidget,
+		*,
+		subtitle: bool = False,
+		status: bool = False,
+		maximize: bool = True,
+		on_close=None,
+		parent: QWidget | None = None,
+	) -> None:
+		super().__init__(parent)
+		self._window = window
+		self._drag_start: QPoint | None = None
+		self._can_maximize = maximize
+		self.setObjectName("VeritasTitleBar")
+
+		layout = QHBoxLayout(self)
+		layout.setContentsMargins(12, 7, 8, 7)
+		layout.setSpacing(8)
+
+		logo = QLabel()
+		logo.setObjectName("VeritasTitleLogo")
+		if _LOGO_PNG.exists():
+			logo.setPixmap(QPixmap(str(_LOGO_PNG)).scaled(20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+		layout.addWidget(logo, 0, Qt.AlignVCenter)
+
+		brand = QLabel("VERITAS")
+		brand.setObjectName("VeritasTitleBrand")
+		layout.addWidget(brand, 0, Qt.AlignVCenter)
+
+		self.subtitle = None
+		if subtitle:
+			sep = QLabel("·")
+			sep.setObjectName("VeritasTitleSep")
+			layout.addWidget(sep, 0, Qt.AlignVCenter)
+			self.subtitle = QLabel("")
+			self.subtitle.setObjectName("VeritasTitleSub")
+			layout.addWidget(self.subtitle, 0, Qt.AlignVCenter)
+
+		layout.addStretch(1)
+
+		self.status = None
+		if status:
+			self.status = StatusBadge("● 대기", "idle")
+			layout.addWidget(self.status, 0, Qt.AlignVCenter)
+
+		self.minimize_button = WindowControlButton("min")
+		self.minimize_button.clicked.connect(window.showMinimized)
+		layout.addWidget(self.minimize_button)
+
+		self.maximize_button = WindowControlButton("max")
+		if maximize:
+			self.maximize_button.clicked.connect(self._toggle_max_restore)
+			layout.addWidget(self.maximize_button)
+
+		self.close_button = WindowControlButton("close")
+		self.close_button.clicked.connect(on_close or window.close)
+		layout.addWidget(self.close_button)
+
+	def set_subtitle(self, text: str) -> None:
+		if self.subtitle is not None:
+			self.subtitle.setText(text or "")
+
+	def _toggle_max_restore(self) -> None:
+		if self._window.isMaximized():
+			self._window.showNormal()
+			self.maximize_button.set_role("max")
+		else:
+			self._window.showMaximized()
+			self.maximize_button.set_role("restore")
+
+	def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+		if self._can_maximize:
+			self._toggle_max_restore()
+
+	def mousePressEvent(self, event) -> None:  # type: ignore[override]
+		if event.button() == Qt.LeftButton and not self._window.isMaximized():
+			self._drag_start = event.globalPosition().toPoint() - self._window.frameGeometry().topLeft()
+			event.accept()
+			return
+		super().mousePressEvent(event)
+
+	def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+		if self._drag_start is not None and event.buttons() & Qt.LeftButton:
+			self._window.move(event.globalPosition().toPoint() - self._drag_start)
+			event.accept()
+			return
+		super().mouseMoveEvent(event)
+
+	def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+		self._drag_start = None
+		super().mouseReleaseEvent(event)
+
+
+# Stylesheet for the shared title bar; appended to each window's stylesheet so
+# all three windows share one chrome look.
+VERITAS_TITLEBAR_QSS = """
+	QFrame#VeritasTitleBar {
+		background-color: #FFFFFF;
+		border-top-left-radius: 16px;
+		border-top-right-radius: 16px;
+		border-bottom: 1px solid #E5E7EB;
+	}
+	QLabel#VeritasTitleBrand { color: #111827; font-size: 13px; font-weight: 850; letter-spacing: 1px; }
+	QLabel#VeritasTitleSub { color: #6B7280; font-size: 11px; font-weight: 650; }
+	QLabel#VeritasTitleSep { color: #CBD5E1; font-size: 12px; }
+	QPushButton#WinCtlButton, QPushButton#WinCtlCloseButton {
+		background-color: transparent; border: none; border-radius: 6px;
+	}
+	QPushButton#WinCtlButton:hover { background-color: #EDEFF2; }
+	QPushButton#WinCtlCloseButton:hover { background-color: #E81123; }
+"""
+
+
+# Chat surface styling, copied from the main window so the editor's 대화 tab
+# renders identically to the main 채팅 page (both reuse ChatPanel / ChatInputBar /
+# ChatMessageBubble, but each top-level window must carry the rules itself).
+# Keep in sync with the matching rules in MainWindow._build_stylesheet.
+CHAT_QSS = """
+	QFrame#AssistPagePanel { background-color: #F8FAFC; border: 1px solid #E5E7EB; border-radius: 16px; }
+	QFrame#AssistSectionCard { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 13px; }
+	QLabel#AssistSectionTitle { color: #111827; font-size: 13px; font-weight: 850; }
+	QScrollArea#AssistScrollArea { background-color: transparent; border: none; }
+	QScrollArea#ChatScroll { background: transparent; border: none; }
+	QLabel#AssistEmptyState { background-color: #F8FAFC; border: 1px dashed #CBD5E1; border-radius: 12px; color: #6B7280; padding: 18px 14px; font-weight: 650; }
+	QPushButton#AssistCopyButton { background-color: #FFFFFF; color: #4B5563; border: 1px solid #D1D5DB; border-radius: 8px; padding: 5px 8px; font-size: 11px; font-weight: 800; }
+	QPushButton#AssistCopyButton:hover { background-color: #F3F4F6; color: #111827; }
+	QFrame#AssistUserBubble { background-color: #DBEAFE; border: 1px solid #BFDBFE; border-radius: 13px; border-top-right-radius: 4px; }
+	QFrame#AssistAiBubble { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 13px; border-top-left-radius: 4px; }
+	QLabel#AssistBubbleMeta { color: #6B7280; font-size: 10px; font-weight: 800; }
+	QTextBrowser#AssistBubbleText { color: #1F2937; font-size: 12px; font-weight: 600; background: transparent; border: none; }
+	QFrame#AssistInputBar { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 14px; }
+	QTextEdit#AssistChatInput { background-color: #F8FAFC; border: 1px solid #E5E7EB; border-radius: 11px; padding: 8px 10px; color: #111827; selection-background-color: #BFDBFE; selection-color: #111827; }
+	QTextEdit#AssistChatInput:focus { background-color: #FFFFFF; border: 1px solid #3B82F6; }
+	QPushButton#AssistSendButton { background-color: #3B82F6; border: 1px solid #2563EB; border-radius: 11px; color: #FFFFFF; font-weight: 850; }
+	QPushButton#AssistSendButton:hover { background-color: #2563EB; }
+	QPushButton#AssistModeButton { background-color: #F1F5F9; color: #475569; border: 1px solid #D1D5DB; border-radius: 11px; padding: 0px; font-size: 13px; font-weight: 800; }
+	QPushButton#AssistModeButton:hover { background-color: #E0E7FF; border-color: #818CF8; color: #3730A3; }
+	QPushButton#AssistModeButton[researchActive="true"] { background-color: #1E3A8A; border-color: #1E3A8A; color: #FFFFFF; }
+	QPushButton#AssistModeButton[researchActive="true"]:hover { background-color: #1E40AF; border-color: #1E40AF; color: #FFFFFF; }
+"""
+
+
 class WindowIconButton(QPushButton):
 	def __init__(self, text: str, role: str, parent: QWidget | None = None) -> None:
 		super().__init__(text, parent)
 		self.setObjectName("AssistCloseButton" if role == "close" else "AssistMinimizeButton")
 		self.setFixedSize(32, 32)
+		apply_window_icon_font(self)
 		self.setCursor(Qt.PointingHandCursor)
 
 
@@ -207,8 +426,8 @@ class CustomTitleBar(QFrame):
 		title_col.addWidget(self.document_context)
 
 		self.status = StatusBadge("● 분석 중", "working")
-		self.minimize_button = WindowIconButton("－", "minimize")
-		self.close_button = WindowIconButton("×", "close")
+		self.minimize_button = WindowIconButton(WIN_GLYPH_MINIMIZE, "minimize")
+		self.close_button = WindowIconButton(WIN_GLYPH_CLOSE, "close")
 		self.minimize_button.clicked.connect(window.showMinimized)
 		self.close_button.clicked.connect(window.hide)
 
@@ -310,8 +529,6 @@ class SuggestionCard(QFrame):
 		self._body.setTextFormat(Qt.PlainText)
 		self._body.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
 		self._body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-		# Keep the text pinned to the top: the last card may be stretched to
-		# fill the panel, and its text should not float to the middle.
 		self._body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
 		# Commentary after "설명:" renders here, muted, and is NOT copied.
@@ -359,9 +576,26 @@ class SuggestionCard(QFrame):
 			self._dislike_button = None
 
 	def set_card_width(self, width: int) -> None:
+		self._card_width = width
 		self.setMinimumWidth(width)
 		self.setMaximumWidth(width)
-		self.updateGeometry()
+		self._sync_height()
+
+	def _sync_height(self) -> None:
+		"""Pin the card to the real wrapped text height for its current width.
+
+		A word-wrapped QLabel reports a width-agnostic sizeHint/minimumSizeHint
+		that over-estimates its height, which forced the surrounding list to
+		reserve slack below the text. Locking the height to ``heightForWidth``
+		makes the card hug its text exactly, so no blank trails it.
+		"""
+		width = getattr(self, "_card_width", 0)
+		if width <= 0:
+			return
+		height = self.layout().heightForWidth(width)
+		if height > 0:
+			self.setFixedHeight(height)
+			self.updateGeometry()
 
 	def _copy_text(self, text: str) -> None:
 		app = QApplication.instance()
@@ -572,11 +806,12 @@ class SuggestionList(QFrame):
 			self._cards.append(card)
 			if item_id:
 				self._cards_by_id[item_id] = card
-			# The last card carries the stretch factor so it grows down to the
-			# bottom of the panel — no blank gap trails the list. Earlier cards
-			# keep their natural height. In hug_content mode the frame is sized
-			# to the content, so there is no slack for it to absorb.
-			self.layout.addWidget(card, 1 if index == last_index else 0)
+			# Every card keeps its natural height so the text box hugs its text.
+			self.layout.addWidget(card)
+		# A trailing stretch soaks up the leftover panel height, so the slack
+		# falls below the list as plain background instead of inflating the
+		# last card and trailing a blank gap under its text.
+		self.layout.addStretch(1)
 
 		self.count_label.setText(f"{len(self._suggestions)}개")
 		self.schedule_width_update()
@@ -608,11 +843,9 @@ class SuggestionList(QFrame):
 			# Leaving the empty state: drop the placeholder + its trailing stretch.
 			self._clear()
 		else:
-			# The previous last card carried the fill stretch; hand it off so the
-			# new card is the one that grows to the bottom of the panel.
-			prev_index = self.layout.indexOf(self._cards[-1])
-			if prev_index >= 0:
-				self.layout.setStretch(prev_index, 0)
+			# Lift the trailing stretch so the new card lands above it; it gets
+			# re-added below to keep absorbing the leftover panel height.
+			self._drop_trailing_stretch()
 
 		self._suggestions.append(item)
 		card = SuggestionCard(
@@ -627,7 +860,8 @@ class SuggestionList(QFrame):
 		self._cards.append(card)
 		if event_id:
 			self._cards_by_id[event_id] = card
-		self.layout.addWidget(card, 1)
+		self.layout.addWidget(card)
+		self.layout.addStretch(1)
 
 		self.count_label.setText(f"{len(self._suggestions)}개")
 		self.schedule_width_update()
@@ -714,10 +948,19 @@ class SuggestionList(QFrame):
 		return max(96, total)
 
 	def _max_height(self) -> int:
-		parent = self.parentWidget()
-		if parent is None:
+		# Cap against the top-level window, not the immediate parent: on the
+		# DocumentAssistPage the parent panel hugs *this* widget, so reading the
+		# parent's height would feed back on itself and collapse the box. The
+		# window height is a stable reference in both the page and the floating
+		# window (where parent ≈ window anyway).
+		window = self.window()
+		ref = window.height() if window is not None else 0
+		if ref <= 0:
+			parent = self.parentWidget()
+			ref = parent.height() if parent is not None else 0
+		if ref <= 0:
 			return 0
-		return max(160, int(parent.height() * self.MAX_HEIGHT_RATIO))
+		return max(160, int(ref * self.MAX_HEIGHT_RATIO))
 
 	def _content_width(self) -> int:
 		return max(120, self.scroll.viewport().width() - 2)
@@ -730,6 +973,15 @@ class SuggestionList(QFrame):
 		# Card heights (word-wrapped text) just changed — refresh our hint.
 		if self._hug_content:
 			self.updateGeometry()
+
+	def _drop_trailing_stretch(self) -> None:
+		"""Remove the trailing stretch spacer if the layout currently has one."""
+		count = self.layout.count()
+		if count == 0:
+			return
+		item = self.layout.itemAt(count - 1)
+		if item is not None and item.widget() is None:
+			self.layout.takeAt(count - 1)
 
 	def _clear(self) -> None:
 		while self.layout.count():
@@ -1308,6 +1560,25 @@ class ChatPanel(QFrame):
 		bar = self.scroll.verticalScrollBar()
 		bar.setValue(bar.maximum())
 
+	def force_scroll_bottom(self) -> None:
+		"""Pin to the newest message across the next few layout passes.
+
+		A single scroll often lands short because bubble heights settle a tick
+		or two later (markdown re-flow / width measurement). This also covers the
+		case where the panel just became visible — e.g. the editor's 대화 tab was
+		hidden while its history loaded, so the viewport had no width to measure
+		against until now.
+		"""
+		for delay in (0, 60, 160):
+			QTimer.singleShot(delay, self._scroll_to_bottom)
+
+	def showEvent(self, event) -> None:  # type: ignore[override]
+		super().showEvent(event)
+		# Now that the panel has a real viewport, re-flow the bubbles and pin to
+		# the latest message so switching to the chat always lands at the bottom.
+		self._update_bubble_widths()
+		self.force_scroll_bottom()
+
 	def resizeEvent(self, event) -> None:  # type: ignore[override]
 		super().resizeEvent(event)
 		# Coalesce a drag-resize burst: re-measuring every bubble's wrapped
@@ -1409,7 +1680,11 @@ class DocumentAssistWindow(QWidget):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setWindowTitle("Veritas Assist")
-		self.setWindowFlags(Qt.Window | Qt.Tool | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+		# No Qt.Tool: tool windows cannot be minimised on Windows and get no
+		# taskbar button. As a plain top-level (stays-on-top) frameless window the
+		# '-' button minimises it independently and it can be restored from the
+		# taskbar.
+		self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
 		# Wider default/min footprint — the previous 560/380 px made the chat
 		# answers feel cramped horizontally.
 		self.resize(680, 820)
@@ -1470,7 +1745,7 @@ class DocumentAssistWindow(QWidget):
 		panel_layout.setContentsMargins(0, 0, 0, 0)
 		panel_layout.setSpacing(0)
 
-		self.title_bar = CustomTitleBar(self)
+		self.title_bar = VeritasTitleBar(self, subtitle=True, status=True, on_close=self.hide)
 
 		content = QFrame()
 		content.setObjectName("AssistContent")
@@ -1478,18 +1753,27 @@ class DocumentAssistWindow(QWidget):
 		content_layout.setContentsMargins(12, 10, 12, 8)
 		content_layout.setSpacing(10)
 
-		self.suggestion_list = SuggestionList(hug_content=True)
+		# A draggable divider lets the user trade height between the suggestion
+		# list and the chat, so neither caps the other at a fixed ratio.
+		self.suggestion_list = SuggestionList()
+		self.suggestion_list.setMinimumHeight(120)
 		self.chat_panel = ChatPanel()
-		# Keep the chat usable even when a long suggestion list claims its cap.
 		self.chat_panel.setMinimumHeight(160)
 		self.input_bar = ChatInputBar()
 		self.input_bar.sendRequested.connect(self.on_message_submitted)
 		self.input_bar.modeChanged.connect(self._on_mode_changed)
 
-		# suggestion_list sizes itself to its content (stretch 0); the chat
-		# panel absorbs all remaining space so no blank gap trails the list.
-		content_layout.addWidget(self.suggestion_list, 0)
-		content_layout.addWidget(self.chat_panel, 1)
+		self.content_split = QSplitter(Qt.Vertical)
+		self.content_split.setObjectName("AssistContentSplit")
+		self.content_split.setChildrenCollapsible(False)
+		self.content_split.setHandleWidth(10)
+		self.content_split.addWidget(self.suggestion_list)
+		self.content_split.addWidget(self.chat_panel)
+		self.content_split.setStretchFactor(0, 0)
+		self.content_split.setStretchFactor(1, 1)
+		self.content_split.setSizes([220, 380])
+
+		content_layout.addWidget(self.content_split, 1)
 		content_layout.addWidget(self.input_bar)
 
 		grip_row = QHBoxLayout()
@@ -1574,6 +1858,18 @@ class DocumentAssistWindow(QWidget):
 				background-color: #F8FAFC;
 				border-bottom-left-radius: 16px;
 				border-bottom-right-radius: 16px;
+			}
+			QSplitter#AssistContentSplit {
+				background-color: transparent;
+			}
+			QSplitter#AssistContentSplit::handle:vertical {
+				background-color: #E5E7EB;
+				height: 3px;
+				margin: 3px 40px;
+				border-radius: 1px;
+			}
+			QSplitter#AssistContentSplit::handle:vertical:hover {
+				background-color: #94A3B8;
 			}
 			QLabel#AssistWindowTitle {
 				color: #111827;
@@ -1765,6 +2061,8 @@ class DocumentAssistWindow(QWidget):
 				background: transparent;
 			}
 			"""
+			+ VERITAS_TITLEBAR_QSS
+			+ CHAT_QSS
 		)
 
 	def update_assist_text(self, text: str) -> None:

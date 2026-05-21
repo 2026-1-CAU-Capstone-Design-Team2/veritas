@@ -7,19 +7,23 @@ coupling). This service owns:
    so they sit alongside the workspace's research artifacts and survive an API
    restart. Loading can also seed from the workspace's ``final.md`` without ever
    overwriting it.
-2. SSE plumbing for ghost-writing / quick actions / chat. The actual generation
+2. SSE plumbing for ghost-writing / quick actions. The actual generation
    (and workspace RAG grounding) lives on the **ChatAgent** — same agent and
    workspace-bound ``rag_service`` the chat / document-assist pages use — reached
-   through the runtime facades ``ghostwrite_iter`` / ``editor_assist_iter`` /
-   ``editor_chat_iter``. Prompt text lives in :mod:`core.prompts.editor`. This
-   service only frames the stream (start / delta / done / error) and enforces the
-   "editor workspace must be the active one to ground" guard so a stale editor
-   never grounds against the wrong workspace's index.
+   through the runtime facades ``ghostwrite_iter`` / ``editor_assist_iter``.
+   Prompt text lives in :mod:`core.prompts.editor`. This service only frames the
+   stream (start / delta / done / error) and enforces the "editor workspace must
+   be the active one to ground" guard so a stale editor never grounds against the
+   wrong workspace's index. The editor's 문서 대화 now shares the main chat
+   pipeline (``/api/v1/chat/messages/stream``) through the ChatBus.
 3. Connected-sources count + export (pandoc, via :mod:`export_service`).
 
 Ghost-writing fires on a continuation-moment heuristic (decided in the
-ChatAgent) and uses *additive* RAG — like quick actions and chat, it grounds in
-the workspace index when available but never hard-gates on similarity.
+ChatAgent) and uses *additive* RAG — it grounds in the workspace index when
+available but never hard-gates on similarity. Quick actions, by contrast, split
+into two groups: the forced-RAG ones (rewrite / continue) are hard-gated and
+refuse (``EditorGroundingUnavailable``) when no grounding is available, while
+the rest (summarize / polish / grammar) run as plain LLM calls.
 """
 
 from __future__ import annotations
@@ -31,6 +35,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from fastapi import HTTPException
+
+from agent import EditorGroundingUnavailable
 
 from ..api_common import new_id, utc_now_iso
 from . import export_service
@@ -243,7 +249,13 @@ def suggest_stream(
         yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
         return
 
-    yield _sse("done", {"suggestionId": suggestion_id, "text": "".join(collected).strip()})
+    # Preserve a single leading space (the model is told to prefix one when the
+    # continuation starts a new word) so the suggestion never glues onto the
+    # prefix; only trailing/newline padding is trimmed.
+    text = "".join(collected).strip("\n").rstrip()
+    if text[:1].isspace():
+        text = " " + text.lstrip()
+    yield _sse("done", {"suggestionId": suggestion_id, "text": text})
 
 
 # ---------------------------------------------------- assist (quick actions)
@@ -252,11 +264,18 @@ def assist_stream(
     workspace_id: str,
     action: str,
     text: str,
-    max_tokens: int = 400,
+    max_tokens: int = 800,
     use_workspace: bool = True,
 ) -> Iterator[bytes]:
-    """Stream a quick-action transform as SSE. Additive RAG (runs on the given
-    text; grounds when the workspace index is available and active)."""
+    """Stream a quick-action transform as SSE.
+
+    Grounding no longer depends on the editor's RAG toggle (``use_workspace``):
+    the forced-RAG actions (rewrite / continue) are hard-gated on workspace
+    grounding in the agent and refuse to run when none is available, while every
+    other action runs as a plain LLM call. We only pass whether this editor's
+    workspace is the active index, so a stale editor never grounds against the
+    wrong one.
+    """
     action = (action or "").strip().lower()
     assist_id = new_id("as")
     yield _sse("start", {"assistId": assist_id, "action": action})
@@ -268,7 +287,7 @@ def assist_stream(
 
     collected: list[str] = []
     try:
-        grounded = bool(use_workspace) and _workspace_is_active(workspace_id)
+        grounded = _workspace_is_active(workspace_id)
         for chunk in get_runtime().editor_assist_iter(
             action, body, max_tokens=max_tokens, use_workspace=grounded
         ):
@@ -276,43 +295,16 @@ def assist_stream(
                 continue
             collected.append(chunk)
             yield _sse("delta", {"text": chunk})
+    except EditorGroundingUnavailable as e:
+        # Expected hard-gate refusal for a forced-RAG action with no grounding —
+        # surface the plain Korean reason (no "Type:" prefix).
+        yield _sse("error", {"error": str(e)})
+        return
     except Exception as e:  # noqa: BLE001 — surfaced as SSE error
         yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
         return
 
     yield _sse("done", {"assistId": assist_id, "text": "".join(collected).strip()})
-
-
-# ----------------------------------------------------------- document chat
-
-def chat_stream(
-    workspace_id: str,
-    message: str,
-    doc_text: str = "",
-    use_workspace: bool = True,
-) -> Iterator[bytes]:
-    """Stream a document-grounded chat reply as SSE. Additive RAG (the document
-    is always in the prompt; workspace sources are appended when available)."""
-    chat_id = new_id("ec")
-    yield _sse("start", {"chatId": chat_id})
-
-    if not (message or "").strip():
-        yield _sse("done", {"chatId": chat_id, "text": ""})
-        return
-
-    collected: list[str] = []
-    try:
-        grounded = bool(use_workspace) and _workspace_is_active(workspace_id)
-        for chunk in get_runtime().editor_chat_iter(message, doc_text, use_workspace=grounded):
-            if not chunk:
-                continue
-            collected.append(chunk)
-            yield _sse("delta", {"text": chunk})
-    except Exception as e:  # noqa: BLE001 — surfaced as SSE error
-        yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
-        return
-
-    yield _sse("done", {"chatId": chat_id, "text": "".join(collected).strip()})
 
 
 # --------------------------------------------------------- connected sources

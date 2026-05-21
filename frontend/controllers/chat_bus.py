@@ -24,12 +24,16 @@ class ChatStreamWorker(QThread):
 		workspace_id: str,
 		message: str,
 		mode: str,
+		doc_text: str = "",
+		source: str = "chat",
 		parent: QObject | None = None,
 	) -> None:
 		super().__init__(parent)
 		self._workspace_id = workspace_id
 		self._message = message
 		self._mode = mode
+		self._doc_text = doc_text
+		self._source = source
 
 	def run(self) -> None:  # type: ignore[override]
 		buffer: list[str] = []
@@ -40,6 +44,8 @@ class ChatStreamWorker(QThread):
 					"workspaceId": self._workspace_id,
 					"message": self._message,
 					"mode": self._mode,
+					"docText": self._doc_text,
+					"source": self._source,
 				},
 			)
 			for event_name, data in stream:
@@ -99,7 +105,14 @@ class ChatBus(QObject):
 	def is_busy(self) -> bool:
 		return get_job_manager().is_busy(JobCategory.CHAT)
 
-	def send(self, workspace_id: str, message: str, mode: str) -> bool:
+	def send(
+		self,
+		workspace_id: str,
+		message: str,
+		mode: str,
+		doc_text: str = "",
+		source: str = "chat",
+	) -> bool:
 		"""Begin a streaming chat turn.
 
 		Returns False if the JobManager rejects the request (e.g. another
@@ -118,7 +131,7 @@ class ChatBus(QObject):
 		self.userMessageQueued.emit(workspace_id, text)
 		self.assistantStreamStarted.emit()
 
-		worker = ChatStreamWorker(workspace_id, text, mode)
+		worker = ChatStreamWorker(workspace_id, text, mode, doc_text, source)
 		worker.delta.connect(self._on_delta)
 		worker.completed.connect(self._on_completed)
 		worker.failed.connect(self._on_failed)

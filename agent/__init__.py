@@ -1,3 +1,3 @@
-from .chat_agent import ChatAgent
+from .chat_agent import ChatAgent, EditorGroundingUnavailable
 
-__all__ = ["ChatAgent"]
+__all__ = ["ChatAgent", "EditorGroundingUnavailable"]

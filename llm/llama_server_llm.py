@@ -418,6 +418,14 @@ class LLMClient:
         if filter_think and buffer and not in_think:
             total += len(buffer)
             yield buffer
+        elif filter_think and in_think and total == 0:
+            # Stream ended inside an unclosed <think> with nothing visible emitted
+            # — the model ignored /no_think and spent its whole budget reasoning.
+            # Surfacing the reasoning text beats returning an empty / broken result.
+            leftover = buffer.strip()
+            if leftover:
+                total += len(leftover)
+                yield leftover
 
         if self.trace_latency:
             elapsed = time.perf_counter() - start
