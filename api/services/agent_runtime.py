@@ -319,9 +319,11 @@ class AgentRuntime:
             )
         if normalized_mode == "rag":
             self._ensure_rag_index(require_documents=False)
-            return self.chat_agent.ask_explicit_tool_iter(
-                "rag", message, doc_context=doc_context
-            )
+            # Strict grounded RAG, NOT the permissive rag_search + tool-synthesis
+            # path: when the active workspace's index has nothing relevant to the
+            # question (e.g. it is about another workspace's topic), the model
+            # says so instead of answering from general knowledge.
+            return self.chat_agent.ask_rag_iter(message, doc_context=doc_context)
         return self.chat_agent.ask_auto_iter(message, doc_context=doc_context)
 
     # -- editor (standalone writer) surfaces ----------------------------------
@@ -392,7 +394,9 @@ class AgentRuntime:
             return self.chat_agent.ask_explicit_tool("autosurvey", message, stream=False)
         if normalized_mode == "rag":
             self._ensure_rag_index(require_documents=False)
-            return self.chat_agent.ask_explicit_tool("rag", message, stream=False)
+            # Strict grounded RAG (see answer_chat_selection_iter) — refuses
+            # off-corpus questions rather than answering from general knowledge.
+            return self.chat_agent.ask_rag(message, stream=False)
         return self.chat_agent.ask_auto(message, stream=False)
 
     def _load_workspace_chat_history(self) -> list[tuple[str, str]]:
