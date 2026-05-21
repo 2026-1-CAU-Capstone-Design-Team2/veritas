@@ -747,6 +747,8 @@ class EditorWindow(QWidget):
         self._dirty = False
         self._loading = False
         self._autocomplete_enabled = True
+        # Always on: ghostwriting grounds additively in the workspace index, and
+        # quick actions force RAG backend-side regardless of this flag.
         self._use_workspace_rag = True
         self._view_mode = "split"
         self._suggest_token = 0
@@ -830,7 +832,8 @@ class EditorWindow(QWidget):
         file_btn, file_menu = self._menu_button("파일")
         file_menu.addAction("새 문서", self.new_document)
         file_menu.addAction("자료조사 결과 불러오기", self.load_final_report)
-        file_menu.addAction("저장된 초안 열기…", self.open_draft_dialog)
+        file_menu.addAction("초안 불러오기", self.load_generated_draft)
+        file_menu.addAction("작성중인 문서 불러오기", self.open_draft_dialog)
         file_menu.addSeparator()
         file_menu.addAction("저장", self.save_now)
         export_sub = file_menu.addMenu("내보내기")
@@ -884,15 +887,9 @@ class EditorWindow(QWidget):
         self.autocomplete_action = QAction("자동완성 (고스트라이팅)", self, checkable=True, checked=True)
         self.autocomplete_action.toggled.connect(self._on_autocomplete_toggled)
         assist_menu.addAction(self.autocomplete_action)
-        self.rag_action = QAction("자료 기반 제안 (RAG)", self, checkable=True, checked=True)
-        self.rag_action.toggled.connect(self._on_rag_toggled)
-        assist_menu.addAction(self.rag_action)
         assist_menu.addSeparator()
         for label, action, _needs in QUICK_ACTIONS:
             assist_menu.addAction(label, lambda checked=False, a=action: self.run_quick_action(a))
-        assist_menu.addSeparator()
-        assist_menu.addAction("자료조사 결과 불러오기", self.load_final_report)
-        assist_menu.addAction("초안 불러오기", self.load_generated_draft)
 
         help_btn, help_menu = self._menu_button("도움말")
         help_menu.addAction("키보드 단축키", self._show_shortcuts)
@@ -1653,7 +1650,7 @@ class EditorWindow(QWidget):
 
     def _show_draft_picker(self, items: list) -> None:
         dialog = QDialog(self)
-        dialog.setWindowTitle("저장된 초안 열기")
+        dialog.setWindowTitle("작성중인 문서 불러오기")
         dialog.setModal(True)
         dialog.resize(460, 320)
         layout = QVBoxLayout(dialog)
@@ -1774,13 +1771,6 @@ class EditorWindow(QWidget):
             self._invalidate_suggestion()
             self.editor.clear_ghost()
         self._sync_autocomplete_state()
-
-    def _on_rag_toggled(self, enabled: bool) -> None:
-        # Workspace grounding for inline ghost-writing / 문서 대화. When off, the
-        # editor's text is the only context sent to the model. Quick actions do
-        # NOT follow this toggle: 다시 쓰기 / 다음 문장 제안 always force grounding
-        # (and refuse without it), while 요약 / 다듬기 / 문법 never ground.
-        self._use_workspace_rag = enabled
 
     def _sync_autocomplete_state(self) -> None:
         blocked = get_job_manager().is_blocked(JobCategory.EDITOR)
