@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from core.stdio_utf8 import force_utf8_stdio
@@ -37,6 +38,11 @@ def main() -> None:
 	# in-process backend (the old behavior, which masked port mismatches).
 	app = QApplication([])
 	app.setApplicationName("VERITAS")
+	# App-wide icon → every window and dialog (QMessageBox 정보 / 단축키 / 단어수 …)
+	# shows the Veritas logo in its title bar.
+	_icon_path = Path(__file__).resolve().parent / "public" / "images" / "veritas_logo.ico"
+	if _icon_path.exists():
+		app.setWindowIcon(QIcon(str(_icon_path)))
 
 	try:
 		ensure_api_connection(API_BASE_URL)

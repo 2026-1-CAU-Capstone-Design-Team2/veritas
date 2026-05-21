@@ -19,8 +19,11 @@ coupling). This service owns:
 3. Connected-sources count + export (pandoc, via :mod:`export_service`).
 
 Ghost-writing fires on a continuation-moment heuristic (decided in the
-ChatAgent) and uses *additive* RAG — like quick actions, it grounds in the
-workspace index when available but never hard-gates on similarity.
+ChatAgent) and uses *additive* RAG — it grounds in the workspace index when
+available but never hard-gates on similarity. Quick actions, by contrast, split
+into two groups: the forced-RAG ones (rewrite / continue) are hard-gated and
+refuse (``EditorGroundingUnavailable``) when no grounding is available, while
+the rest (summarize / polish / grammar) run as plain LLM calls.
 """
 
 from __future__ import annotations
@@ -32,6 +35,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from fastapi import HTTPException
+
+from agent import EditorGroundingUnavailable
 
 from ..api_common import new_id, utc_now_iso
 from . import export_service
@@ -256,8 +261,15 @@ def assist_stream(
     max_tokens: int = 400,
     use_workspace: bool = True,
 ) -> Iterator[bytes]:
-    """Stream a quick-action transform as SSE. Additive RAG (runs on the given
-    text; grounds when the workspace index is available and active)."""
+    """Stream a quick-action transform as SSE.
+
+    Grounding no longer depends on the editor's RAG toggle (``use_workspace``):
+    the forced-RAG actions (rewrite / continue) are hard-gated on workspace
+    grounding in the agent and refuse to run when none is available, while every
+    other action runs as a plain LLM call. We only pass whether this editor's
+    workspace is the active index, so a stale editor never grounds against the
+    wrong one.
+    """
     action = (action or "").strip().lower()
     assist_id = new_id("as")
     yield _sse("start", {"assistId": assist_id, "action": action})
@@ -269,7 +281,7 @@ def assist_stream(
 
     collected: list[str] = []
     try:
-        grounded = bool(use_workspace) and _workspace_is_active(workspace_id)
+        grounded = _workspace_is_active(workspace_id)
         for chunk in get_runtime().editor_assist_iter(
             action, body, max_tokens=max_tokens, use_workspace=grounded
         ):
@@ -277,6 +289,11 @@ def assist_stream(
                 continue
             collected.append(chunk)
             yield _sse("delta", {"text": chunk})
+    except EditorGroundingUnavailable as e:
+        # Expected hard-gate refusal for a forced-RAG action with no grounding —
+        # surface the plain Korean reason (no "Type:" prefix).
+        yield _sse("error", {"error": str(e)})
+        return
     except Exception as e:  # noqa: BLE001 — surfaced as SSE error
         yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
         return

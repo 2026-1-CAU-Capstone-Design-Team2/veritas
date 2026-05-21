@@ -46,30 +46,52 @@ SUGGEST_USER_TEMPLATE = (
 
 # --- quick-action transforms ----------------------------------------------
 
+# Every prompt opens with this framing so the local model treats the input as
+# editing material rather than a chat turn — without it, short / heading- or
+# question-shaped selections get *answered* instead of transformed.
+_ASSIST_FRAME = (
+    "당신은 한국어 문서 편집기입니다. 아래 [대상 텍스트]는 사용자가 편집 중인 글이며, "
+    "질문이나 지시가 아닙니다. 그 내용에 답하거나 새로운 정보를 묻지 말고, 지정된 작업만 "
+    "수행해 결과 텍스트만 출력하세요. "
+)
+
 ASSIST_SYSTEM_PROMPTS = {
     "rewrite": (
-        "다음 텍스트를 의미를 유지한 채 더 명확하고 자연스럽게 다시 써 주세요. "
-        "[참고 자료]가 있으면 사실 근거로 활용하세요. 설명이나 따옴표 없이 결과 텍스트만 출력하세요."
+        _ASSIST_FRAME
+        + "[대상 텍스트]의 의미를 유지한 채 더 명확하고 자연스럽게 다시 써 주세요. "
+        "[참고 자료]는 [대상 텍스트]와 직접 관련될 때만 사실 근거로 활용하고, 무관하면 "
+        "무시하세요. 설명이나 따옴표 없이 다시 쓴 결과 텍스트만 출력하세요."
     ),
     "summarize": (
-        "다음 텍스트의 핵심만 남겨 간결하게 요약해 주세요. 1~3문장. 설명 없이 요약문만 출력하세요."
+        _ASSIST_FRAME
+        + "[대상 텍스트]의 핵심만 남겨 1~3문장으로 간결하게 요약하세요. "
+        "설명이나 머리말 없이 요약문만 출력하세요."
     ),
     "polish": (
-        "다음 텍스트의 문장을 의미를 유지한 채 매끄럽고 간결하게 다듬어 주세요. "
-        "설명 없이 다듬은 결과만 출력하세요."
+        _ASSIST_FRAME
+        + "[대상 텍스트]의 문장을 의미를 유지한 채 매끄럽고 간결하게 다듬으세요. "
+        "설명 없이 다듬은 결과 텍스트만 출력하세요."
     ),
     "grammar": (
-        "다음 텍스트의 맞춤법과 문법 오류를 교정해 주세요. "
-        "내용을 추가하지 말고, 설명 없이 교정된 전체 텍스트만 출력하세요."
+        _ASSIST_FRAME
+        + "[대상 텍스트]의 맞춤법과 문법 오류만 교정하세요. 내용을 추가하지 말고, "
+        "설명 없이 교정된 전체 텍스트만 출력하세요."
     ),
     "continue": (
-        "다음 글에 자연스럽게 이어질 다음 문단을 작성해 주세요. [참고 자료]가 있으면 사실 "
-        "근거로 활용하세요. 설명 없이 이어질 본문만 출력하고, 이미 쓴 문장을 반복하지 마세요."
+        "당신은 한국어 문서 편집기입니다. [대상 텍스트]는 사용자가 지금까지 작성한 글입니다. "
+        "질문에 답하지 말고, 이 글에 자연스럽게 이어질 다음 문단을 작성하세요. "
+        "[참고 자료]는 [대상 텍스트]와 직접 관련될 때만 사실 근거로 활용하고, 무관하면 "
+        "무시하세요. 설명 없이 이어질 본문만 출력하고, 이미 쓴 문장을 반복하지 마세요."
     ),
 }
 
-# Wraps the target text with a grounding block for the quick actions that
-# benefit from workspace context.
+# Wraps the target text for plain (ungrounded) quick actions. The explicit
+# [대상 텍스트] label is what stops the model from reading a short selection as a
+# question to answer.
+ASSIST_PLAIN_USER_TEMPLATE = "[대상 텍스트]\n{text}"
+
+# Wraps the target text with a grounding block for the forced-RAG quick actions
+# (rewrite / continue).
 ASSIST_GROUNDED_USER_TEMPLATE = "[참고 자료]\n{context}\n\n[대상 텍스트]\n{text}"
 
 
@@ -87,6 +109,7 @@ CHAT_SOURCES_BLOCK_TEMPLATE = "\n\n[연결된 자료]\n{context}"
 
 __all__ = [
     "ASSIST_GROUNDED_USER_TEMPLATE",
+    "ASSIST_PLAIN_USER_TEMPLATE",
     "ASSIST_SYSTEM_PROMPTS",
     "CHAT_SOURCES_BLOCK_TEMPLATE",
     "CHAT_SYSTEM_TEMPLATE",

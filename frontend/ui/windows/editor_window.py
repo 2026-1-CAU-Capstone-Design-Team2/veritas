@@ -28,6 +28,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QPainter,
     QShortcut,
+    QTextCharFormat,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -65,10 +66,29 @@ from ...controllers import (
     get_job_manager,
 )
 from ..markdown_view import render_markdown_html
-from .document_assist_window import ChatInputBar, ChatPanel, render_history_html
+from .document_assist_window import (
+    CHAT_QSS,
+    VERITAS_TITLEBAR_QSS,
+    ChatInputBar,
+    ChatPanel,
+    TypingIndicator,
+    VeritasTitleBar,
+    render_history_html,
+)
 
 
 GHOST_COLOR = "#9AA0A6"
+
+# Window-control glyphs. The previous plain-text symbols (－ ▢ ×) render as tofu
+# in the UI font; these are the standard Private-Use codepoints in Windows'
+# built-in icon fonts (Win11: "Segoe Fluent Icons", Win10: "Segoe MDL2 Assets"),
+# which draw crisp minimise / maximise / restore / close marks.
+WIN_GLYPH_MINIMIZE = ""
+WIN_GLYPH_MAXIMIZE = ""
+WIN_GLYPH_RESTORE = ""
+WIN_GLYPH_CLOSE = ""
+
+
 # QTextCursor.selectedText() encodes paragraph / line breaks as U+2029 / U+2028
 # rather than "\n"; helpers normalise them to newlines.
 PARAGRAPH_SEP = chr(0x2029)
@@ -89,13 +109,18 @@ def _normalise_selection(text: str) -> str:
 
 
 class MarkdownSourceEdit(QTextEdit):
-    """Markdown source editor with an inline ghost-writing overlay + accept chip.
+    """Markdown source editor with an inline ghost-writing suggestion + chip.
 
-    The ghost suggestion is painted as grey text after the caret without being
-    inserted into the document, so it never leaks into the preview or the
-    auto-saved file. Tab accepts it, Esc rejects it, any other keystroke
-    dismisses it. A small floating chip near the caret offers 수락/거부/다시.
-    Korean IME composition suppresses ghosts.
+    The ghost suggestion is inserted into the document as real, grey-coloured
+    text *after* the caret, so the text that follows the caret is pushed down and
+    flows naturally after it (rather than being painted over). It is kept off the
+    undo stack's user history by always being the topmost edit and removed with
+    ``document().undo()``; ``document_text()`` returns the document without it so
+    it never leaks into the preview / auto-save / counts. Tab accepts it (the
+    grey text is re-inserted as normal text), Esc rejects it, any other keystroke
+    dismisses it. While the model is still generating, a "작성 중" indicator shows
+    at the caret; once text streams in, an accept/reject chip sits just below the
+    suggestion's last character. Korean IME composition suppresses ghosts.
     """
 
     ghostAccepted = Signal()
@@ -108,8 +133,12 @@ class MarkdownSourceEdit(QTextEdit):
         self.setAcceptRichText(False)
         self.setTabChangesFocus(False)
         self._ghost_text = ""
+        self._ghost_anchor = -1  # caret position the suggestion is anchored at
         self._composing = False
+        self._mutating = False  # guards self-inflicted ghost edits from reactions
+        self._generating = False
         self._chip = self._build_chip()
+        self._gen_chip = self._build_gen_chip()
 
     def _build_chip(self) -> QFrame:
         chip = QFrame(self.viewport())
@@ -133,6 +162,30 @@ class MarkdownSourceEdit(QTextEdit):
             layout.addWidget(button)
         return chip
 
+    def _build_gen_chip(self) -> QFrame:
+        chip = QFrame(self.viewport())
+        chip.setObjectName("GhostGenChip")
+        chip.hide()
+        layout = QHBoxLayout(chip)
+        layout.setContentsMargins(6, 2, 10, 2)
+        layout.setSpacing(4)
+        self._gen_indicator = TypingIndicator(chip)  # breathing Veritas logo
+        label = QLabel("작성 중")
+        label.setObjectName("GhostGenLabel")
+        layout.addWidget(self._gen_indicator, 0, Qt.AlignVCenter)
+        layout.addWidget(label, 0, Qt.AlignVCenter)
+        return chip
+
+    def _hide_gen_chip(self) -> None:
+        self._gen_indicator.stop()
+        self._gen_chip.hide()
+
+    @staticmethod
+    def _ghost_format() -> QTextCharFormat:
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(GHOST_COLOR))
+        return fmt
+
     # -- ghost state ----------------------------------------------------------
 
     def has_ghost(self) -> bool:
@@ -141,47 +194,120 @@ class MarkdownSourceEdit(QTextEdit):
     def is_composing(self) -> bool:
         return self._composing
 
+    def document_text(self) -> str:
+        """The document's plain text *without* the pending grey ghost run, for
+        preview / save / counts / outline / suggestion context."""
+        full = self.toPlainText()
+        if self._ghost_text and 0 <= self._ghost_anchor <= len(full):
+            end = self._ghost_anchor + len(self._ghost_text)
+            return full[: self._ghost_anchor] + full[end:]
+        return full
+
+    def _remove_ghost_run(self) -> None:
+        """Drop the inserted grey run. It is always the topmost edit, so a single
+        ``undo()`` removes it without disturbing the user's own undo history."""
+        if not self._ghost_text:
+            return
+        self._mutating = True
+        self.blockSignals(True)
+        try:
+            self.document().undo()
+        finally:
+            self.blockSignals(False)
+            self._mutating = False
+        self._ghost_text = ""
+
+    def set_generating(self) -> None:
+        """Show the "작성 중" indicator at the caret while the model streams its
+        first tokens. Anchors the suggestion at the current caret."""
+        self._remove_ghost_run()
+        self._generating = True
+        self._ghost_anchor = self.textCursor().position()
+        self._chip.hide()
+        self._position_gen_chip()
+
     def set_ghost(self, text: str) -> None:
-        self._ghost_text = text or ""
-        self.viewport().update()
+        text = text or ""
+        if not text:
+            self.clear_ghost()
+            return
+        anchor = self._ghost_anchor if self._ghost_anchor >= 0 else self.textCursor().position()
+        self._remove_ghost_run()
+        anchor = max(0, min(anchor, len(self.toPlainText())))
+        self._mutating = True
+        self.blockSignals(True)
+        try:
+            cursor = self.textCursor()
+            cursor.setPosition(anchor)
+            # Own edit block → a separate undo command that never merges with the
+            # user's preceding keystrokes, so document().undo() pops exactly this.
+            cursor.beginEditBlock()
+            cursor.insertText(text, self._ghost_format())
+            cursor.endEditBlock()
+            # Keep the caret *before* the suggestion so typing/Esc act there.
+            caret = self.textCursor()
+            caret.setPosition(anchor)
+            self.setTextCursor(caret)
+        finally:
+            self.blockSignals(False)
+            self._mutating = False
+        self._ghost_text = text
+        self._ghost_anchor = anchor
+        self._generating = False
+        self._hide_gen_chip()
         self._position_chip()
 
-    def clear_ghost(self) -> None:
-        if self._ghost_text:
-            self._ghost_text = ""
-            self.viewport().update()
+    def _reset_ghost(self) -> None:
+        self._remove_ghost_run()
+        self._ghost_text = ""
+        self._ghost_anchor = -1
+        self._generating = False
         self._chip.hide()
+        self._hide_gen_chip()
+
+    def clear_ghost(self) -> None:
+        self._reset_ghost()
 
     def _dismiss_ghost(self) -> None:
-        had = bool(self._ghost_text)
-        self._ghost_text = ""
-        self.viewport().update()
-        self._chip.hide()
+        had = bool(self._ghost_text) or self._generating
+        self._reset_ghost()
         if had:
             self.ghostDismissed.emit()
 
     def _request_retry(self) -> None:
-        self._ghost_text = ""
-        self.viewport().update()
-        self._chip.hide()
+        self._reset_ghost()
         self.ghostRetryRequested.emit()
 
     def accept_ghost(self) -> None:
+        if not self._ghost_text:
+            self._reset_ghost()
+            return
         text = self._ghost_text
+        anchor = self._ghost_anchor
+        # Remove the grey run, then re-insert as normal text as a single, real
+        # edit (signals on → the window marks dirty / refreshes preview).
+        self._remove_ghost_run()
         self._ghost_text = ""
+        self._ghost_anchor = -1
+        self._generating = False
         self._chip.hide()
-        if text:
-            cursor = self.textCursor()
-            cursor.insertText(text)
-            self.setTextCursor(cursor)
-        self.viewport().update()
+        self._hide_gen_chip()
+        cursor = self.textCursor()
+        cursor.setPosition(max(0, min(anchor, len(self.toPlainText()))))
+        cursor.beginEditBlock()
+        cursor.insertText(text)
+        cursor.endEditBlock()
+        self.setTextCursor(cursor)
         self.ghostAccepted.emit()
 
     def _position_chip(self) -> None:
         if not self._ghost_text:
             self._chip.hide()
             return
-        rect = self.cursorRect(self.textCursor())
+        # Sit just below the suggestion's last character.
+        cursor = self.textCursor()
+        cursor.setPosition(min(self._ghost_anchor + len(self._ghost_text), len(self.toPlainText())))
+        rect = self.cursorRect(cursor)
         self._chip.adjustSize()
         x = min(rect.left(), max(0, self.viewport().width() - self._chip.width() - 4))
         y = rect.bottom() + 4
@@ -190,6 +316,18 @@ class MarkdownSourceEdit(QTextEdit):
         self._chip.move(x, y)
         self._chip.show()
         self._chip.raise_()
+
+    def _position_gen_chip(self) -> None:
+        rect = self.cursorRect(self.textCursor())
+        self._gen_chip.adjustSize()
+        x = min(rect.left(), max(0, self.viewport().width() - self._gen_chip.width() - 4))
+        y = rect.bottom() + 4
+        if y + self._gen_chip.height() > self.viewport().height():
+            y = max(0, rect.top() - self._gen_chip.height() - 4)
+        self._gen_chip.move(x, y)
+        self._gen_chip.show()
+        self._gen_chip.raise_()
+        self._gen_indicator.start()
 
     # -- input handling -------------------------------------------------------
 
@@ -205,16 +343,20 @@ class MarkdownSourceEdit(QTextEdit):
                 self._dismiss_ghost()
                 return
             self._dismiss_ghost()
+        elif self._generating:
+            # A keystroke while still generating cancels the pending indicator;
+            # the in-flight worker bails via its caret/token guard.
+            self._reset_ghost()
         super().keyPressEvent(event)
 
     def inputMethodEvent(self, event) -> None:  # type: ignore[override]
         self._composing = bool(event.preeditString())
-        if self._composing and self._ghost_text:
+        if self._composing and (self._ghost_text or self._generating):
             self._dismiss_ghost()
         super().inputMethodEvent(event)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if self._ghost_text:
+        if self._ghost_text or self._generating:
             self._dismiss_ghost()
         super().mousePressEvent(event)
 
@@ -222,47 +364,12 @@ class MarkdownSourceEdit(QTextEdit):
         self.clear_ghost()
         super().focusOutEvent(event)
 
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        if not self._ghost_text or self._composing:
-            return
-        self._paint_ghost()
-
-    def _paint_ghost(self) -> None:
-        painter = QPainter(self.viewport())
-        painter.setFont(self.font())
-        painter.setPen(QColor(GHOST_COLOR))
-        metrics = QFontMetrics(self.font())
-        rect = self.cursorRect(self.textCursor())
-        left_margin = int(self.document().documentMargin())
-        right_limit = max(left_margin + 20, self.viewport().width() - left_margin)
-        line_height = metrics.height()
-
-        x = rect.left()
-        y = rect.top()
-        for token in re.split(r"(\s+)", self._ghost_text):
-            if not token:
-                continue
-            if "\n" in token:
-                for index, segment in enumerate(token.split("\n")):
-                    if index > 0:
-                        x = left_margin
-                        y += line_height
-                    if segment:
-                        width = metrics.horizontalAdvance(segment)
-                        if x + width > right_limit and x > left_margin:
-                            x = left_margin
-                            y += line_height
-                        painter.drawText(x, y + metrics.ascent(), segment)
-                        x += width
-                continue
-            width = metrics.horizontalAdvance(token)
-            if x + width > right_limit and x > left_margin:
-                x = left_margin
-                y += line_height
-            painter.drawText(x, y + metrics.ascent(), token)
-            x += width
-        painter.end()
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._ghost_text:
+            self._position_chip()
+        elif self._generating:
+            self._position_gen_chip()
 
 
 class OutlinePanel(QFrame):
@@ -407,14 +514,23 @@ class ChatTab(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Mirror WritePage exactly: an AssistPagePanel card wrapping the shared
+        # ChatPanel + ChatInputBar, so the editor 대화 looks like the main 채팅.
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        wrapper = QFrame()
+        wrapper.setObjectName("AssistPagePanel")
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(12, 12, 12, 12)
+        wrapper_layout.setSpacing(10)
 
         self.panel = ChatPanel("문서 대화")
         self.input_bar = ChatInputBar()
-        layout.addWidget(self.panel, 1)
-        layout.addWidget(self.input_bar)
+        wrapper_layout.addWidget(self.panel, 1)
+        wrapper_layout.addWidget(self.input_bar)
+        layout.addWidget(wrapper, 1)
 
 
 class AssistPanel(QFrame):
@@ -471,67 +587,6 @@ class AssistPanel(QFrame):
         self.history_list.insertItem(0, label)
 
 
-class EditorTitleBar(QFrame):
-    """Custom frameless title bar: drag to move, min/max/close, doc title."""
-
-    def __init__(self, window: "EditorWindow", parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._window = window
-        self._drag_start: QPoint | None = None
-        self.setObjectName("EditorTitleBar")
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 8, 10, 8)
-        layout.setSpacing(8)
-
-        self.title = QLabel("제목 없음")
-        self.title.setObjectName("EditorDocTitle")
-        self.save_status = QLabel("새 문서")
-        self.save_status.setObjectName("EditorSaveStatus")
-
-        self.minimize_button = QPushButton("－")
-        self.minimize_button.setObjectName("EditorWinButton")
-        self.maximize_button = QPushButton("▢")
-        self.maximize_button.setObjectName("EditorWinButton")
-        self.close_button = QPushButton("×")
-        self.close_button.setObjectName("EditorCloseButton")
-        for button in (self.minimize_button, self.maximize_button, self.close_button):
-            button.setFixedSize(30, 28)
-            button.setCursor(Qt.PointingHandCursor)
-        self.minimize_button.clicked.connect(window.showMinimized)
-        self.maximize_button.clicked.connect(window.toggle_max_restore)
-        self.close_button.clicked.connect(window.close)
-
-        layout.addWidget(self.title)
-        layout.addSpacing(8)
-        layout.addWidget(self.save_status)
-        layout.addStretch(1)
-        layout.addWidget(self.minimize_button)
-        layout.addWidget(self.maximize_button)
-        layout.addWidget(self.close_button)
-
-    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
-        self._window.toggle_max_restore()
-
-    def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() == Qt.LeftButton and not self._window.isMaximized():
-            self._drag_start = event.globalPosition().toPoint() - self._window.frameGeometry().topLeft()
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        if self._drag_start is not None and event.buttons() & Qt.LeftButton:
-            self._window.move(event.globalPosition().toPoint() - self._drag_start)
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-        self._drag_start = None
-        super().mouseReleaseEvent(event)
-
-
 class EditorWindow(QWidget):
     EXPORT_FORMATS = [
         ("Microsoft Word (.docx)", "docx", "Word 문서 (*.docx)", ".docx"),
@@ -552,6 +607,7 @@ class EditorWindow(QWidget):
 
         self._workspace_id = current_workspace_id()
         self._doc_id: str | None = None
+        self._doc_title = "제목 없음"
         self._dirty = False
         self._loading = False
         self._autocomplete_enabled = True
@@ -610,7 +666,7 @@ class EditorWindow(QWidget):
         panel_layout.setContentsMargins(0, 0, 0, 0)
         panel_layout.setSpacing(0)
 
-        self.title_bar = EditorTitleBar(self)
+        self.title_bar = VeritasTitleBar(self, subtitle=True)
         panel_layout.addWidget(self.title_bar)
         panel_layout.addWidget(self._build_menu_row())
         panel_layout.addWidget(self._build_toolbar())
@@ -744,6 +800,18 @@ class EditorWindow(QWidget):
             sep.setFixedHeight(18)
             layout.addWidget(sep)
 
+        # Left-panel (문서 개요) show/hide toggle, mirroring its position.
+        self.outline_toggle_btn = QPushButton("◧ 개요")
+        self.outline_toggle_btn.setObjectName("PanelToggleButton")
+        self.outline_toggle_btn.setCheckable(True)
+        self.outline_toggle_btn.setChecked(True)
+        self.outline_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.outline_toggle_btn.setToolTip("문서 개요 패널 열기/닫기")
+        self.outline_toggle_btn.setFixedHeight(28)
+        self.outline_toggle_btn.clicked.connect(lambda checked: self._toggle_outline(checked))
+        layout.addWidget(self.outline_toggle_btn)
+        add_sep()
+
         for label, tip, kind in (
             ("H1", "제목 1", "h1"), ("H2", "제목 2", "h2"), ("H3", "제목 3", "h3"),
         ):
@@ -779,6 +847,18 @@ class EditorWindow(QWidget):
             self._view_group.addButton(button)
             self._view_buttons[mode] = button
             layout.addWidget(button)
+
+        add_sep()
+        # Right-panel (AI 도우미) show/hide toggle, mirroring its position.
+        self.assist_toggle_btn = QPushButton("도우미 ◨")
+        self.assist_toggle_btn.setObjectName("PanelToggleButton")
+        self.assist_toggle_btn.setCheckable(True)
+        self.assist_toggle_btn.setChecked(True)
+        self.assist_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.assist_toggle_btn.setToolTip("AI 도우미 패널 열기/닫기")
+        self.assist_toggle_btn.setFixedHeight(28)
+        self.assist_toggle_btn.clicked.connect(lambda checked: self._toggle_assist(checked))
+        layout.addWidget(self.assist_toggle_btn)
         return row
 
     def _build_body(self) -> QWidget:
@@ -959,7 +1039,8 @@ class EditorWindow(QWidget):
         self._loading = True
         self.editor.setPlainText(content)
         self._loading = False
-        self.title_bar.title.setText(title)
+        self.title_bar.set_subtitle(title)
+        self._doc_title = title
         self._dirty = False
         self._render_preview()
         self._refresh_outline()
@@ -1008,12 +1089,12 @@ class EditorWindow(QWidget):
         self.assist_panel.add_history("고스트 제안 수락")
 
     def _update_counts(self) -> None:
-        text = self.editor.toPlainText()
+        text = self.editor.document_text()
         self.status_words.setText(f"단어 {len(text.split()):,}")
         self.status_count.setText(f"글자 {len(text):,}")
 
     def _render_preview(self) -> None:
-        text = self.editor.toPlainText()
+        text = self.editor.document_text()
         html = render_markdown_html(text, font_size="15px")
         if html:
             self.preview.setHtml(html)
@@ -1022,7 +1103,7 @@ class EditorWindow(QWidget):
 
     def _refresh_outline(self) -> None:
         headings: list[tuple[int, str, int]] = []
-        for index, line in enumerate(self.editor.toPlainText().split("\n")):
+        for index, line in enumerate(self.editor.document_text().split("\n")):
             match = re.match(r"^(#{1,6})\s+(.*)$", line.strip())
             if match:
                 headings.append((len(match.group(1)), match.group(2).strip(), index))
@@ -1051,7 +1132,9 @@ class EditorWindow(QWidget):
         cursor = self.editor.textCursor()
         if cursor.hasSelection():
             return
-        text = self.editor.toPlainText()
+        if self.editor.has_ghost():
+            return  # a suggestion is already showing — don't stack another
+        text = self.editor.document_text()
         pos = cursor.position()
         prefix = text[:pos][-500:]
         suffix = text[pos:][:200]
@@ -1066,7 +1149,8 @@ class EditorWindow(QWidget):
 
         def on_start(_sid: str) -> None:
             if token == self._suggest_token:
-                self.editor.clear_ghost()
+                # Show the "작성 중" indicator at the caret until the first token.
+                self.editor.set_generating()
 
         def on_delta(chunk: str) -> None:
             if token != self._suggest_token:
@@ -1106,10 +1190,11 @@ class EditorWindow(QWidget):
         if get_job_manager().is_blocked(JobCategory.EDITOR):
             QMessageBox.information(self, "사용 불가", "AutoSurvey가 진행 중일 때는 AI 작업을 사용할 수 없습니다.")
             return
+        self.editor.clear_ghost()  # don't let a pending suggestion skew positions
         cursor = self.editor.textCursor()
         if action == "continue":
             pos = cursor.position()
-            text = self.editor.toPlainText()[:pos][-800:]
+            text = self.editor.document_text()[:pos][-800:]
             self._assist_target = (pos, pos, True)
         else:
             if cursor.hasSelection():
@@ -1193,7 +1278,7 @@ class EditorWindow(QWidget):
         # page; send through the ChatBus with the open document as additive
         # context and tag the turn as coming from the editor surface.
         self._workspace_id = current_workspace_id()
-        doc_text = self.editor.toPlainText()
+        doc_text = self.editor.document_text()
         if not self._chat_bus.send(
             self._workspace_id, text, self._chat_mode, doc_text=doc_text, source="editor"
         ):
@@ -1274,6 +1359,10 @@ class EditorWindow(QWidget):
                 is_user,
                 rendered_html=spec.get("html") or None,
             )
+        # Land on the most recent turn even if the 대화 tab is hidden right now
+        # (its viewport can't measure heights until shown — force_scroll_bottom
+        # also re-pins on the panel's showEvent).
+        panel.force_scroll_bottom()
 
     # ------------------------------------------------------------- autosave
 
@@ -1290,7 +1379,7 @@ class EditorWindow(QWidget):
             return
         workspace_id = self._workspace_id
         doc_id = self._doc_id
-        content = self.editor.toPlainText()
+        content = self.editor.document_text()
         self.status_save.setText("● 저장 중…")
 
         def _do() -> dict:
@@ -1303,7 +1392,8 @@ class EditorWindow(QWidget):
             self._dirty = False
             info = data if isinstance(data, dict) else {}
             if info.get("title"):
-                self.title_bar.title.setText(str(info.get("title")))
+                self._doc_title = str(info.get("title"))
+                self.title_bar.set_subtitle(self._doc_title)
             self._set_save_status("저장됨")
 
         def _fail(message: str) -> None:
@@ -1315,25 +1405,24 @@ class EditorWindow(QWidget):
 
     def _set_save_status(self, text: str) -> None:
         self.status_save.setText(f"● {text}")
-        self.title_bar.save_status.setText(text)
 
     # --------------------------------------------------------------- export
 
     def export_as(self, fmt: str) -> None:
-        if self.editor.toPlainText().strip() == "":
+        if self.editor.document_text().strip() == "":
             QMessageBox.information(self, "내보내기", "내보낼 내용이 없습니다.")
             return
         spec = next((item for item in self.EXPORT_FORMATS if item[1] == fmt), None)
         if spec is None:
             return
         _label, _fmt, file_filter, ext = spec
-        base_title = self.title_bar.title.text().strip() or "document"
+        base_title = (getattr(self, "_doc_title", "") or "").strip() or "document"
         safe_title = re.sub(r"[^\w가-힣 .-]+", "_", base_title).strip() or "document"
         target, _ = QFileDialog.getSaveFileName(self, "내보내기", f"{safe_title}{ext}", file_filter)
         if not target:
             return
         workspace_id = self._workspace_id
-        content = self.editor.toPlainText()
+        content = self.editor.document_text()
 
         def _do() -> dict:
             return api_client.post(
@@ -1462,16 +1551,18 @@ class EditorWindow(QWidget):
         visible = (not self.outline_panel.isVisible()) if checked is None else checked
         self.outline_panel.setVisible(visible)
         self._outline_action.setChecked(visible)
+        self.outline_toggle_btn.setChecked(visible)
 
     def _toggle_assist(self, checked: bool | None = None) -> None:
         visible = (not self.assist_panel.isVisible()) if checked is None else checked
         self.assist_panel.setVisible(visible)
         self._assist_action.setChecked(visible)
+        self.assist_toggle_btn.setChecked(visible)
 
     # ----------------------------------------------------- tools / help
 
     def _show_word_count(self) -> None:
-        text = self.editor.toPlainText()
+        text = self.editor.document_text()
         QMessageBox.information(
             self, "단어 수",
             f"단어: {len(text.split()):,}\n글자(공백 포함): {len(text):,}\n글자(공백 제외): {len(text.replace(chr(32), '').replace(chr(10), '')):,}",
@@ -1496,8 +1587,10 @@ class EditorWindow(QWidget):
         self._sync_autocomplete_state()
 
     def _on_rag_toggled(self, enabled: bool) -> None:
-        # Workspace grounding for ghost / quick actions / chat. When off, the
-        # editor's text is the only context sent to the model.
+        # Workspace grounding for inline ghost-writing / 문서 대화. When off, the
+        # editor's text is the only context sent to the model. Quick actions do
+        # NOT follow this toggle: 다시 쓰기 / 다음 문장 제안 always force grounding
+        # (and refuse without it), while 요약 / 다듬기 / 문법 never ground.
         self._use_workspace_rag = enabled
 
     def _sync_autocomplete_state(self) -> None:
@@ -1512,14 +1605,6 @@ class EditorWindow(QWidget):
             self.status_autocomplete.setText("자동완성: 켜짐")
 
     # --------------------------------------------------------- window chrome
-
-    def toggle_max_restore(self) -> None:
-        if self.isMaximized():
-            self.showNormal()
-            self.title_bar.maximize_button.setText("▢")
-        else:
-            self.showMaximized()
-            self.title_bar.maximize_button.setText("❐")
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self._dirty and self._doc_id is not None:
@@ -1647,6 +1732,12 @@ class EditorWindow(QWidget):
                 padding: 3px 12px; font-weight: 600;
             }
             QPushButton#ViewToggleButton:checked { background-color: #e8f0fe; color: #0b57d0; border-color: #0b57d0; }
+            QPushButton#PanelToggleButton {
+                background-color: #ffffff; color: #5f6368; border: 1px solid #dadce0; border-radius: 6px;
+                padding: 3px 10px; font-weight: 600;
+            }
+            QPushButton#PanelToggleButton:checked { background-color: #e8f0fe; color: #0b57d0; border-color: #0b57d0; }
+            QPushButton#PanelToggleButton:hover { background-color: #f1f3f4; }
             QSplitter#EditorMainSplit::handle { background-color: #e8eaed; }
             QSplitter#CenterSplit { background-color: #f6f7f9; }
             QSplitter#CenterSplit::handle { background-color: #f6f7f9; }
@@ -1707,6 +1798,8 @@ class EditorWindow(QWidget):
                 background-color: transparent; color: #e8eaed; border: none; padding: 2px 6px; font-size: 11px; font-weight: 600;
             }
             QPushButton#GhostChipButton:hover { color: #ffffff; }
+            QFrame#GhostGenChip { background-color: #f1f3f4; border: 1px solid #e0e3e7; border-radius: 10px; }
+            QLabel#GhostGenLabel { color: #5f6368; font-size: 11px; font-weight: 600; background: transparent; }
             QFrame#EditorStatusBar {
                 background-color: #f8f9fa; border-top: 1px solid #e8eaed;
                 border-bottom-left-radius: 12px; border-bottom-right-radius: 12px;
@@ -1720,6 +1813,8 @@ class EditorWindow(QWidget):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
             """
+            + VERITAS_TITLEBAR_QSS
+            + CHAT_QSS
         )
 
 
