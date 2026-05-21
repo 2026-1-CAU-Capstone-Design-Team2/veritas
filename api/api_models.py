@@ -45,6 +45,12 @@ class DraftBuiltinGenerateRequest(BaseModel):
     # When present, generation follows this structure (headings / tables) rather
     # than the outline alone. Empty for the built-in form path.
     formMarkdown: str = ""
+    # Documents the user kept checked in the draft wizard's "자료 선택" step
+    # (sourced from the verification results, keyed by ``docId``). ``None`` means
+    # the step was skipped (no filter — ground on the full knowledge base); a
+    # list — even an empty one — means the user made an explicit selection, so
+    # generation grounds *only* on those documents' per-doc summaries.
+    selectedDocIds: list[str] | None = None
 
 
 class DraftBuiltinRegenerateRequest(BaseModel):
