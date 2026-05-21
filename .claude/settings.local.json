@@ -103,7 +103,13 @@
       "Read(//c/Users/user/AppData/Local/VERITAS/**)",
       "Read(//c/Users/user/AppData/Local/VERITAS/models/**)",
       "Bash(env)",
-      "PowerShell(& \"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _verify_chat_doc.py)"
+      "PowerShell(& \"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _verify_chat_doc.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -c \"import api.services.editor_service as es; from agent import ChatAgent, EditorGroundingUnavailable; print\\('imports OK'\\); print\\('forced:', ChatAgent._EDITOR_FORCED_RAG_ACTIONS\\)\")",
+      "Bash(QT_QPA_PLATFORM=offscreen C:/Users/user/miniconda3/envs/agent/python.exe -c ' *)",
+      "Bash(QT_QPA_PLATFORM=offscreen C:/Users/user/miniconda3/envs/agent/python.exe -c \"import frontend.ui.pages.writing_page, frontend.ui.windows.document_assist_window; print\\('imports OK'\\)\")",
+      "Bash(QT_QPA_PLATFORM=offscreen C:/Users/user/miniconda3/envs/agent/python.exe -c \"import frontend.ui.windows.document_assist_window, frontend.ui.pages.writing_page; print\\('OK'\\)\")",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -c \"from PySide6.QtSvg import QSvgRenderer; print\\('QtSvg OK'\\)\")",
+      "Bash(QT_QPA_PLATFORM=offscreen grep -n \"_gen_chip.hide\\(\\)\\\\|_gen_chip.show\\(\\)\\\\|_position_gen_chip\\\\|set_generating\" frontend/ui/windows/editor_window.py)"
     ]
   }
 }

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QFrame, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QSizePolicy, QVBoxLayout, QWidget
 
 from ...controllers import format_screen_event, get_screen_event_store
 from ..windows.document_assist_window import SuggestionList
@@ -25,15 +25,19 @@ class DocumentAssistPage(QWidget):
 
 		panel = QFrame()
 		panel.setObjectName("AssistPagePanel")
+		# Hug the result list instead of filling the page, so the box ends right
+		# below the last card with no trailing blank.
+		panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 		panel_layout = QVBoxLayout(panel)
 		panel_layout.setContentsMargins(12, 12, 12, 12)
 		panel_layout.setSpacing(10)
 
-		self.suggestion_list = SuggestionList()
+		self.suggestion_list = SuggestionList(hug_content=True)
 
-		panel_layout.addWidget(self.suggestion_list, 1)
+		panel_layout.addWidget(self.suggestion_list, 0)
 
-		root.addWidget(panel, 1)
+		root.addWidget(panel, 0)
+		root.addStretch(1)
 
 	def _hydrate_screen_suggestions(self) -> None:
 		"""store history 전체로 suggestion_list 재구성. show 시점마다 호출되어 양쪽 위젯 동기화 보장."""
