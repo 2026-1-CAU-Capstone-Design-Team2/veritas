@@ -1359,7 +1359,7 @@ class DraftPage(QWidget):
 		path = self._uploaded_path
 		if path is None:
 			return
-		self.analyze_button.setEnabled(False)
+		self._nav_next.setEnabled(False)
 		self.file_label.setText(f"{path.name} — 양식 분석 중...")
 		controller = self._controller
 
@@ -1381,7 +1381,6 @@ class DraftPage(QWidget):
 			markdown = str(response.get("markdown") or "")
 			note = str(response.get("note") or "")
 		self._form_markdown = markdown
-		self.analyze_button.setEnabled(True)
 		if not outline:
 			outline = ["제목", "개요", "본문", "결론"]
 		self._set_outline(outline)
@@ -1390,11 +1389,11 @@ class DraftPage(QWidget):
 			if note:
 				label += f"  ({note})"
 			self.file_label.setText(label)
-		self._show_outline()
+		# 추출 후에는 FILE_STEPS 2단계(작성 옵션)로 진행 (실패 경로와 동일).
+		self._show_file_options()
 
 	def _on_form_analyze_failed(self, message: str) -> None:
 		# 백엔드 분석 실패 → 로컬 헤딩 파싱(텍스트 계열) 또는 기본 골격으로 폴백.
-		self.analyze_button.setEnabled(True)
 		self._form_markdown = ""
 		sections: list[str] = []
 		path = self._uploaded_path
