@@ -15,7 +15,9 @@ contrast with the structured pipeline prompts in
 * :data:`TOOL_CHAT_SYSTEM_PROMPT` / :data:`TOOL_CHAT_USER_PROMPT_TEMPLATE`
   / :data:`TOOL_CHAT_FINAL_PROMPT_TEMPLATE` — schema-driven tool
   selection + final answer synthesis.
-* :data:`SCREEN_INTERVENTION_SYSTEM_PROMPT` /
+* :data:`SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE` (parameterized by
+  ``{document_type}``, default :data:`SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE`) /
+  :data:`SCREEN_INTERVENTION_SYSTEM_PROMPT` (pre-formatted default) /
   :data:`SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE` — proactive responses
   to screen-context interventions.
 """
@@ -159,15 +161,30 @@ Rules:
 - Preserve proper nouns, model names, file paths, command flags, code identifiers, document IDs, and citations as-is.
 """
 
-SCREEN_INTERVENTION_SYSTEM_PROMPT = """You are VERITAS, a proactive writing/research assistant.
+# Default document type the user is assumed to be writing. Injected into the
+# ``{document_type}`` slot of ``SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE`` so
+# every scenario tailors its tone, structure, and output format to this
+# deliverable. ``ChatAgent`` can override this per agent or per intervention.
+SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE = "a report (보고서)"
+
+# Parameterized system prompt. ``{document_type}`` is filled by
+# ``ChatAgent.answer_screen_intervention`` (defaulting to
+# ``SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE``) so the assumed deliverable is
+# configurable rather than hard-coded into the 23 scenario guidance strings.
+SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE = """You are VERITAS, a proactive writing/research assistant.
 You are responding to an automatic screen-context intervention while the user is in chat mode after AutoSurvey knowledge-base indexing.
+
+Document type:
+- The user is writing {document_type}. Treat this as the target deliverable for every suggestion.
+- Tailor tone, structure, terminology, and the output format of your reply to the conventions of this document type.
+- SCENARIO GUIDANCE below specifies the expected output format for the current situation; honor it within the conventions of this document type.
 
 Rules:
 - Use the screen payload to understand what the user is currently writing or viewing.
 - Base writing suggestions on the latest 1-2 sentences in the screen writing context; do not restate or rework older document text unless it is explicitly included there.
 - Use the knowledge-base context when it is relevant, and cite document IDs in the form [Document <id>] when provided.
 - If the knowledge base does not support a factual claim, do not invent a source.
-- Keep the response short and directly usable: suggest the next sentence, revision, supporting evidence, or a concise answer.
+- Keep the response short and directly usable, and match the output format described in SCENARIO GUIDANCE; do not pad it with preamble or meta-commentary.
 - If the payload indicates no useful action, return a brief no-action explanation.
 - Do not mention implementation details such as OCR, UI Automation, polling, queues, or JSON unless needed to explain uncertainty.
 
@@ -177,6 +194,13 @@ Language policy:
 - If the recent chat history and screen writing context use different languages, prioritize the screen writing context for writing suggestions.
 - Preserve document IDs, citations, model names, code identifiers, file paths, and technical terms as-is.
 """
+
+# Backward-compatible pre-formatted constant for callers that import the system
+# prompt directly (e.g. ``core.prompts`` re-export). Uses the default document
+# type; the live chat agent formats the template itself.
+SCREEN_INTERVENTION_SYSTEM_PROMPT = SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE.format(
+    document_type=SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE
+)
 
 SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE = """RECENT CHAT HISTORY:
 {history}
@@ -193,11 +217,15 @@ INTERVENTION ROUTING HINT:
 SCENARIO GUIDANCE:
 {scenario_guidance}
 
+USER WRITING STYLE:
+{style_guidance}
+
 KNOWLEDGE BASE CONTEXT:
 {knowledge_context}
 
 Write the assistant message that should appear in the chat for this screen context now.
-Language rule: answer in the dominant language of SCREEN WRITING CONTEXT. If SCREEN WRITING CONTEXT is Korean, answer in Korean."""
+Language rule: answer in the dominant language of SCREEN WRITING CONTEXT. If SCREEN WRITING CONTEXT is Korean, answer in Korean.
+Style rule: follow USER WRITING STYLE so the reply matches the user's register and sentence endings."""
 
 
 # Per-scenario guidance injected into ``SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE``
@@ -208,7 +236,9 @@ Language rule: answer in the dominant language of SCREEN WRITING CONTEXT. If SCR
 # whole-document review vs. unstick a churning paragraph, …) instead of one
 # generic rule for every screen situation.
 SCREEN_SCENARIO_GUIDANCE_DEFAULT = (
-    "Respond helpfully to the on-screen situation, following the general rules above."
+    "Respond helpfully to the on-screen situation, following the general rules above. "
+    "Output format: a single short, directly usable suggestion written in the conventions "
+    "of the user's document type. No preamble, no meta-commentary - just the suggestion."
 )
 
 SCREEN_SCENARIO_GUIDANCE = {
@@ -216,119 +246,137 @@ SCREEN_SCENARIO_GUIDANCE = {
         "The user just paused mid-paragraph; the writing flow is still warm. "
         "Pick up from the last 1-2 sentences and propose either the next single sentence "
         "to continue the thought, or one short supporting fact for what they just wrote. "
+        "Output format: reply with just the one continuation sentence (or one short supporting "
+        "sentence), ready to drop into the report - no preamble, no bullets, no labels. "
         "If nothing useful comes to mind, return a brief no-action note rather than forcing content. "
         "Keep it to roughly one sentence; do not break the user's momentum."
     ),
     "whole_document_review": (
-        "The user has built up a substantial document and it is a good moment for a holistic pass. "
-        "Comment on overall logical flow, section balance, and missing points - not individual sentence wording. "
-        "Deliver 2-3 focused observations as a short bulleted list."
+        "The user has built up a substantial report and it is a good moment for a holistic pass. "
+        "Comment on report-level concerns - overall logical flow, section balance, and points or sections "
+        "a report like this should cover but is missing - not individual sentence wording. "
+        "Output format: 2-3 focused observations as a short bulleted list, each bullet a single line. "
+        "Do not rewrite sentences and do not add any closing summary."
     ),
     "long_static_review": (
-        "The document has been sitting open without edits for a long time; the user is likely re-reading and proofreading. "
-        "Scan the entire document and surface 2-3 distinct concrete issues - typos, awkward phrasing, factual slips - quoting the exact text and suggesting a fix for each. "
-        "Do not fixate on a single obvious problem; act as a copy editor making a pass through the whole text."
+        "The report has been sitting open without edits for a long time; the user is likely re-reading and proofreading. "
+        "Scan the entire report and surface 2-3 distinct concrete issues - typos, awkward phrasing, factual slips. "
+        "Output format: a short bulleted list of 2-3 items; each bullet quotes the exact problem text and gives the fix "
+        "in the form \"<quoted text> → <suggested fix>\". "
+        "Do not fixate on a single obvious problem; act as a copy editor making a pass through the whole report."
     ),
     "paragraph_churn": (
         "The user has been writing and deleting within the same paragraph; they are stuck on phrasing. "
         "Offer 1-2 concrete rewrites of the current paragraph (or the specific stuck sentence) as alternatives. "
+        "Output format: present each rewrite as a labeled standalone option (\"Option A: ...\", \"Option B: ...\") the user can paste in directly. "
         "Stay strictly within the user's existing argument and concepts; do not introduce new ideas, terms, or supporting points they were not already trying to express. Rephrase only what is already there. "
         "The goal is to unstick their phrasing, not to expand the argument."
     ),
     "blank_document_start": (
-        "The document is nearly empty; the user is at the very start. "
-        "Offer a low-pressure starting point - one suggested opening sentence or two, or a brief outline of how the piece could begin. "
+        "The report is nearly empty; the user is at the very start. "
+        "Offer a low-pressure starting point. "
+        "Output format: either one or two suggested opening sentences written as report prose, OR a brief section outline "
+        "of the report as a short bulleted list - pick whichever fits, not both. "
         "Present it as an option to take or leave, not as a fixed plan."
     ),
     "outline_phase": (
-        "The user is writing in outline form - short lines, frequent breaks, often with bullet or numbered markers. "
+        "The user is writing the report in outline form - short lines, frequent breaks, often with bullet or numbered markers. "
         "Pick one or two of the visible outline items and offer a brief expansion (1-2 sentences each) of what could fill that item's content. "
+        "Output format: for each chosen item, restate the item label then give its 1-2 sentence expansion underneath it. "
         "Stay within the structure the user has established; do not propose new top-level bullets or restructure the outline."
     ),
     "acronym_introduced": (
         "The user's text contains an acronym (a multi-letter uppercase abbreviation). "
-        "Check whether the surrounding text already defines it on first use. "
-        "If undefined, propose one brief expansion in parentheses or as a short clarifying clause. "
+        "Check whether the surrounding text already defines it on first use, as a report should. "
+        "Output format: one short suggestion giving the spelled-out form, e.g. \"On first use, spell out as <full term> (ABC).\" "
         "Limit to a single suggestion for the most prominent acronym."
     ),
     "heading_added": (
-        "The user has a section heading visible (Markdown '#'/'##' or numbered '1.'/'2.'). "
-        "Help them start that section: offer one opening sentence or a brief one-line outline of what could go under this heading. "
+        "The user has a report section heading visible (Markdown '#'/'##' or numbered '1.'/'2.'). "
+        "Help them start that section. "
+        "Output format: either one opening sentence for the section, OR a one-line outline of what goes under this heading - not both. "
         "Match the tone and scope of nearby existing sections; do not propose a different topic."
     ),
     "long_paragraph_written": (
-        "The user's current paragraph has grown long (500+ characters). "
-        "Suggest one sensible split point with a brief justification - typically where the sub-topic shifts. "
-        "Offer the proposed insertion point (which sentence to start a new paragraph at), not a full rewrite of the paragraph."
+        "The user's current report paragraph has grown long (500+ characters). "
+        "Suggest one sensible split point - typically where the sub-topic shifts. "
+        "Output format: quote the sentence where the new paragraph should begin, followed by a one-line reason for splitting there. "
+        "Do not rewrite the paragraph."
     ),
     "numbered_list_growth": (
-        "The user is building a numbered list with several existing items. "
-        "Suggest one or two more items that would naturally extend the list, staying consistent with the existing items in scope and granularity. "
-        "Do not restructure, merge, or rewrite the existing items."
+        "The user is building a numbered list in the report with several existing items. "
+        "Suggest one or two more items that would naturally extend the list, consistent with the existing items in scope and granularity. "
+        "Output format: the new item(s) only, as numbered entries continuing the existing numbering. Do not restate or rewrite existing items."
     ),
     "todo_marker_present": (
-        "The user's document contains explicit TODO/FIXME/[?] markers. "
-        "Briefly summarize what is open: list each marker and (if obvious from immediate context) a minimal next action. "
+        "The user's report contains explicit TODO/FIXME/[?] markers. "
+        "Summarize what is open. "
+        "Output format: a short bulleted list with one bullet per marker; each bullet states the marker and, if obvious from immediate context, a minimal next action. "
         "Stay strictly with what the markers themselves say; do not invent new tasks not anchored to a marker."
     ),
     "many_question_marks": (
-        "The user is posing several open questions in their writing - likely in a research or brainstorming phase. "
-        "Identify which 2-3 questions are most central and, for each, suggest what kind of evidence or source would help resolve it. "
+        "The user is posing several open questions in the report - likely in a research or framing phase. "
+        "Identify which 2-3 questions are most central. "
+        "Output format: a short list, one line per question, each followed by the kind of evidence or source that would help resolve it. "
         "Do not try to answer every question; pick the most load-bearing ones."
     ),
     "code_block_present": (
-        "The user has inserted a code block. "
-        "Briefly comment on what the code appears to do (one short sentence) or flag any clearly obvious issue. "
+        "The user has inserted a code block into the report. "
+        "Output format: one short sentence describing what the code appears to do, or one short sentence flagging a clearly obvious issue. "
         "Do not propose a rewrite unless there is a clear bug. Stay within the language and conventions of the visible code."
     ),
     "quote_inserted": (
-        "The user's text contains a quoted passage (substantive content inside quotation marks). "
-        "Check whether attribution is present nearby; if missing, suggest a minimal attribution form (speaker/source/date). "
+        "The user's report contains a quoted passage (substantive content inside quotation marks). "
+        "Check whether attribution is present nearby. "
+        "Output format: if attribution is missing, one short suggestion of a minimal attribution form (speaker/source/date) the user can append. "
         "Do not propose changing the quoted content itself."
     ),
     "citation_missing": (
-        "The user's text contains factual claims with statistics or year-references but no visible citation markers. "
-        "Identify the 1-2 most prominent claims that need a source and suggest a citation slot or a brief evidence pointer. "
+        "The user's report contains factual claims with statistics or year-references but no visible citation markers. "
+        "Identify the 1-2 most prominent claims that need a source. "
+        "Output format: a short list naming each specific claim (quote or paraphrase it) followed by a suggested citation slot or brief evidence pointer. "
         "Stay specific - point to which claim, not a general 'add references' note."
     ),
     "factual_claim_made": (
-        "The user just wrote a factual claim with numbers, statistics, or a year reference. "
-        "Briefly note what would verify it (a category of source, not invented URLs) and ask whether the user wants help locating evidence. "
+        "The user just wrote a factual claim in the report with numbers, statistics, or a year reference. "
+        "Output format: one short sentence naming the category of source that would verify it (not an invented URL), then a brief question asking whether the user wants help locating evidence. "
         "Do not assert the claim is right or wrong without grounded evidence."
     ),
     "repeated_phrase_in_paragraph": (
-        "The user is repeating the same short phrase several times within one paragraph. "
-        "Identify the repeated phrase and suggest 1-2 alternative wordings that preserve the meaning. "
+        "The user is repeating the same short phrase several times within one report paragraph. "
+        "Output format: name the repeated phrase in one line, then list 1-2 alternative wordings that preserve the meaning. "
         "Stay within the paragraph's existing scope; do not propose restructuring."
     ),
     "transition_word_overuse": (
-        "The user's recent writing leans heavily on transition words ('그러나', '하지만', '또한' 등). "
-        "Point out the pattern and suggest where one or two could be removed or replaced for a smoother flow. "
+        "The user's recent report writing leans heavily on transition words ('그러나', '하지만', '또한' 등). "
+        "Output format: one line naming the pattern, then 1-2 specific spots quoted with the suggested cut or replacement. "
         "Do not rewrite full sentences; just mark the cuts."
     ),
     "weak_modifier_overuse": (
-        "The user's text relies on vague intensity modifiers ('매우', '정말', '아주' 등) repeatedly. "
-        "Suggest a concrete substitute for one or two occurrences (a measurable detail or stronger verb). "
+        "The user's report relies on vague intensity modifiers ('매우', '정말', '아주' 등) repeatedly. "
+        "Output format: for 1-2 occurrences, give a concrete substitute as \"<weak modifier> → <concrete detail or stronger verb>\". "
         "Stay within the same claim; do not amplify it."
     ),
     "scattered_edits": (
-        "The user has been making small edits scattered across the document rather than focused in one paragraph. "
-        "Offer a quick consistency pass: identify 1-2 spots where the recent changes might create tonal or factual inconsistency with nearby unchanged text. "
-        "Stay specific to the changed spots, do not review the whole document."
+        "The user has been making small edits scattered across the report rather than focused in one paragraph. "
+        "Offer a quick consistency pass. "
+        "Output format: a short list of 1-2 spots where the recent changes might create tonal or factual inconsistency with nearby unchanged text, each spot quoted. "
+        "Stay specific to the changed spots; do not review the whole report."
     ),
     "large_deletion": (
-        "The user just deleted a large chunk of text in one capture. "
-        "Briefly acknowledge what was removed (or its approximate topic if visible) and offer to keep a recovery note in case the deletion needs to be reversed. "
+        "The user just deleted a large chunk of text from the report in one capture. "
+        "Output format: one line acknowledging what was removed (or its approximate topic if visible), then a brief offer to keep a recovery note in case it needs reversing. "
         "Do not insist on undoing - just make the option visible."
     ),
     "copy_paste_growth": (
-        "The user just added a large chunk of text in one capture - likely pasted from elsewhere. "
-        "Help integrate it: suggest a brief connector sentence, or flag if the pasted style/tone diverges from the surrounding text. "
+        "The user just added a large chunk of text to the report in one capture - likely pasted from elsewhere. "
+        "Help integrate it into the report. "
+        "Output format: either one connector sentence that stitches the pasted block into the surrounding text, OR one line flagging that the pasted style/tone diverges - not both. "
         "Do not summarize the pasted content; focus on integration."
     ),
     "undo_cycle_detected": (
-        "The user has been oscillating between two versions of the same text (A -> B -> back to A). "
-        "Briefly note which version they seem to be settling on and offer one phrasing that combines the best of both, if obvious. "
+        "The user has been oscillating between two versions of the same report text (A -> B -> back to A). "
+        "Output format: one line noting which version they seem to be settling on, optionally followed by one phrasing that combines the best of both if obvious. "
         "Do not push either choice; just reflect what's been happening."
     ),
 }
@@ -340,7 +388,9 @@ __all__ = [
     "RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE",
     "RAG_SYSTEM_PROMPT",
     "RAG_USER_PROMPT_TEMPLATE",
+    "SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE",
     "SCREEN_INTERVENTION_SYSTEM_PROMPT",
+    "SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE",
     "SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE",
     "SCREEN_SCENARIO_GUIDANCE",
     "SCREEN_SCENARIO_GUIDANCE_DEFAULT",
