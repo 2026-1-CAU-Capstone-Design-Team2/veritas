@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import threading
@@ -11,6 +12,7 @@ from fastapi import HTTPException
 
 from agent import ChatAgent
 from llm.llama_server_llm import LLMClient
+from llm.llama_supervisor import LlamaServer
 from tools.autosurvey_tool import AutoSurveyTool
 from tools.loader import build_registry, load_schema
 from workflows import AutoSurveyConfig, AutoSurveyWorkflow
@@ -43,11 +45,30 @@ class AgentRuntime:
         except Exception as e:
             print(f"[workspace][reconcile][warn] {e}")
 
+        llm_host = os.getenv("VERITAS_LLM_HOST", "127.0.0.1")
+        llm_port = int(os.getenv("VERITAS_LLM_PORT", "8080"))
+        embed_host = os.getenv("VERITAS_EMBED_HOST") or llm_host
+        embed_port = int(os.getenv("VERITAS_EMBED_PORT", "8081"))
+
+        # The API process owns the llama-server lifecycle so a settings-driven
+        # model switch can restart it (see switch_llm_model). ensure_started
+        # adopts an already-running server (dev / launcher) or spawns one; if it
+        # can't (no binary / model not downloaded yet) we log and fall through —
+        # the LLMClient below then connects to whatever is already serving, or
+        # fails exactly as before.
+        self._llm_server = LlamaServer("llm", llm_host, llm_port)
+        self._embed_server = LlamaServer("embedding", embed_host, embed_port)
+        self._ensure_llama_servers()
+        # Best-effort: stop owned llama children when this process exits
+        # gracefully (atexit does not run on a hard Windows TerminateProcess —
+        # see shutdown_runtime / the API shutdown hook for the uvicorn path).
+        atexit.register(self.shutdown)
+
         self.llm = LLMClient(
-            host=os.getenv("VERITAS_LLM_HOST", "127.0.0.1"),
-            port=int(os.getenv("VERITAS_LLM_PORT", "8080")),
+            host=llm_host,
+            port=llm_port,
             embed_host=os.getenv("VERITAS_EMBED_HOST") or None,
-            embed_port=int(os.getenv("VERITAS_EMBED_PORT", "8081")),
+            embed_port=embed_port,
             trace_latency=os.getenv("VERITAS_TRACE_LATENCY", "1") != "0",
         )
         self._workspace_lock = threading.RLock()
@@ -120,6 +141,100 @@ class AgentRuntime:
             chat_agent=self.chat_agent,
             registry=self.registry,
         )
+
+    def _ensure_llama_servers(self) -> None:
+        """Adopt-or-spawn the LLM + embedding llama-servers (best effort).
+
+        Resolves the selected GGUF paths from settings and asks each supervisor
+        to adopt a running server or spawn one. Failures (missing binary /
+        un-downloaded model) are logged, not raised — the LLMClient constructor
+        still runs and connects to whatever is serving, preserving prior
+        behavior when llama was started outside the app.
+
+        Gated on ``VERITAS_MANAGE_LLAMA=1`` (set by the launcher): only then does
+        the API spawn + own the servers (enabling live restart on model switch).
+        Without it the default behavior is unchanged — the app connects to an
+        externally-started llama-server and a live switch reports it as
+        externally managed.
+        """
+        if os.getenv("VERITAS_MANAGE_LLAMA", "0") != "1":
+            return
+        try:
+            from llm.model_catalog import (
+                find_model_file,
+                selected_embedding_from_settings,
+                selected_model_from_settings,
+            )
+            from llm.model_settings import load_settings
+
+            settings = load_settings()
+            targets = (
+                (self._llm_server, find_model_file(selected_model_from_settings(settings)), "llm"),
+                (self._embed_server, find_model_file(selected_embedding_from_settings(settings)), "embedding"),
+            )
+        except Exception as exc:  # noqa: BLE001 - resolution is best-effort
+            print(f"[runtime][llama][warn] could not resolve model paths: {exc}")
+            return
+
+        for server, path, label in targets:
+            try:
+                if path is not None:
+                    server.ensure_started(path)
+                elif not server.is_healthy(0.5):
+                    print(
+                        f"[runtime][llama][warn] {label} model not downloaded and "
+                        f"no server running on :{server.port}"
+                    )
+            except Exception as exc:  # noqa: BLE001 - keep boot resilient
+                print(f"[runtime][llama][warn] {label} ensure_started failed: {exc}")
+
+    def switch_llm_model(self, model_id: str, *, report=None):
+        """Live-switch the chat LLM model end-to-end.
+
+        Single owner of the *mechanism* so the settings service / route stay
+        thin: (1) download the GGUF if missing, (2) restart the owned
+        llama-server with it, (3) re-detect model + n_ctx on the shared
+        LLMClient *in place* (every tool keeps its reference), (4) persist the
+        selection. ``report(stage, message, detail)`` is an optional progress
+        sink (download bytes / restart / refresh) the caller forwards to a
+        progress buffer.
+        """
+        from pathlib import Path as _Path
+
+        from llm.model_catalog import find_model_file, get_model
+        from llm.model_manager import download_model
+        from llm.model_settings import save_selected_models
+
+        emit = report or (lambda *_a, **_k: None)
+        spec = get_model(model_id, kind="llm")
+
+        path = find_model_file(spec)
+        if path is None:
+            emit("download", f"{spec.short_name} 다운로드 중...", {})
+
+            def _on_bytes(done: int, total: int | None) -> None:
+                emit("download", "모델 다운로드 중", {"done": int(done), "total": int(total or 0)})
+
+            path = download_model(spec, progress=_on_bytes, hf_token=os.getenv("HF_TOKEN"))
+
+        emit("restart", "LLM 서버 재시작 중...", {})
+        self._llm_server.restart(_Path(path))
+
+        emit("refresh", "모델 정보 갱신 중...", {})
+        self.llm.refresh_model_info()
+
+        save_selected_models(llm_model_id=spec.id)
+        return spec
+
+    def shutdown(self) -> None:
+        """Stop any llama-servers this process owns (best effort, idempotent)."""
+        for server in (getattr(self, "_llm_server", None), getattr(self, "_embed_server", None)):
+            if server is None:
+                continue
+            try:
+                server.stop()
+            except Exception:
+                pass
 
     def set_llm_parallel(self, value: int) -> int:
         """Apply the parallel-decoding concurrency to the shared LLM client.
@@ -198,6 +313,30 @@ class AgentRuntime:
             self._ensure_rag_index(require_documents=False)
             return self.chat_agent.ask_explicit_tool_iter("rag", message)
         return self.chat_agent.ask_auto_iter(message)
+
+    # -- editor (standalone writer) surfaces ----------------------------------
+    # Thin facades over the ChatAgent so the editor window's three AI surfaces
+    # run through the same agent (and its workspace-bound rag_service) as the
+    # chat / document-assist pages, instead of calling the LLM directly.
+
+    def ghostwrite_iter(
+        self, prefix: str, suffix: str = "", *, max_tokens: int = 64, use_workspace: bool = True
+    ) -> Iterator[str]:
+        return self.chat_agent.iter_ghostwrite(
+            prefix, suffix, max_tokens=max_tokens, use_workspace=use_workspace
+        )
+
+    def editor_assist_iter(
+        self, action: str, text: str, *, max_tokens: int = 400, use_workspace: bool = True
+    ) -> Iterator[str]:
+        return self.chat_agent.iter_editor_assist(
+            action, text, max_tokens=max_tokens, use_workspace=use_workspace
+        )
+
+    def editor_chat_iter(
+        self, message: str, doc_text: str = "", *, use_workspace: bool = True
+    ) -> Iterator[str]:
+        return self.chat_agent.iter_editor_chat(message, doc_text, use_workspace=use_workspace)
 
     def persist_chat_turn(self, message: str, assistant_text: str) -> None:
         """Persist a (user, assistant) turn into the workspace chat_history.json
@@ -759,3 +898,13 @@ def get_runtime() -> AgentRuntime:
                     detail=f"Agent runtime is not available: {e}",
                 ) from e
         return _runtime
+
+
+def shutdown_runtime() -> None:
+    """Stop the runtime's owned llama-servers if the runtime was built.
+
+    Called from the API's uvicorn shutdown hook (graceful exits). Does not
+    construct the runtime — a no-op if it was never built."""
+    runtime = _runtime
+    if runtime is not None:
+        runtime.shutdown()

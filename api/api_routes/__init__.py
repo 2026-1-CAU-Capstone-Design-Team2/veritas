@@ -2,6 +2,7 @@ from .dashboard import router as dashboard_router
 from .document_assist import router as document_assist_router
 from .documents import router as documents_router
 from .draft_chat import router as draft_chat_router
+from .editor import router as editor_router
 from .feedback import router as feedback_router
 from .frontend import router as frontend_router
 from .research import router as research_router
@@ -17,6 +18,7 @@ __all__ = [
     "document_assist_router",
     "documents_router",
     "draft_chat_router",
+    "editor_router",
     "feedback_router",
     "frontend_router",
     "research_router",

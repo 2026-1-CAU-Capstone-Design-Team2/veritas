@@ -55,6 +55,46 @@ class DocumentAssistChatRequest(BaseModel):
     mode: Literal["research", "autosurvey", "rag"] = "research"
 
 
+class EditorSuggestRequest(BaseModel):
+    # Inline ghost-writing context. `prefix` is the ~500 chars before the
+    # cursor, `suffix` a little after; the suggestion continues at the cursor.
+    workspaceId: str
+    prefix: str = ""
+    suffix: str = ""
+    maxTokens: int = Field(default=64, ge=8, le=256)
+    useWorkspace: bool = True
+
+
+class EditorSaveRequest(BaseModel):
+    workspaceId: str
+    docId: str
+    content: str
+    title: str | None = None
+
+
+class EditorExportRequest(BaseModel):
+    workspaceId: str
+    docId: str | None = None
+    content: str
+    format: Literal["docx", "pdf", "html", "md"]
+    outputPath: str
+
+
+class EditorAssistRequest(BaseModel):
+    workspaceId: str
+    action: Literal["rewrite", "summarize", "polish", "grammar", "continue"]
+    text: str = ""
+    maxTokens: int = Field(default=400, ge=16, le=1024)
+    useWorkspace: bool = True
+
+
+class EditorChatRequest(BaseModel):
+    workspaceId: str
+    message: str
+    docText: str = ""
+    useWorkspace: bool = True
+
+
 class SettingsModelRequest(BaseModel):
     modelId: str | None = None
     # Kept for old frontend payloads. New settings store selected GGUF models

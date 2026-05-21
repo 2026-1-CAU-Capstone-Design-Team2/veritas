@@ -583,8 +583,50 @@ def terminate(processes: list[subprocess.Popen | None]) -> None:
             process.kill()
 
 
+_KILL_JOB = None  # Windows Job Object handle; kept alive for the launcher lifetime.
+
+
+def _install_kill_on_close_job() -> None:
+    """Tie every descendant process to this launcher's lifetime (Windows).
+
+    Creates a Job Object with ``KILL_ON_JOB_CLOSE`` and assigns the launcher
+    itself to it; child + grandchild processes (the API, the UI, and the
+    llama-servers the API spawns) inherit the job. When the launcher dies —
+    graceful exit, console-window close, OR Task Manager kill — the OS
+    terminates the whole job tree. This is the only teardown that survives a
+    hard kill (``finally`` / ``terminate`` run only on a clean exit), so it is
+    what actually prevents the orphaned llama-server holding port 8080. The
+    handle is stored in a module global so it is never GC'd early — closing the
+    handle is what triggers the kill, and we want that to happen exactly when
+    the launcher process ends.
+    """
+    global _KILL_JOB
+    if os.name != "nt" or _KILL_JOB is not None:
+        return
+    try:
+        import win32api
+        import win32job
+
+        job = win32job.CreateJobObject(None, "")
+        info = win32job.QueryInformationJobObject(
+            job, win32job.JobObjectExtendedLimitInformation
+        )
+        info["BasicLimitInformation"]["LimitFlags"] |= (
+            win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        win32job.SetInformationJobObject(
+            job, win32job.JobObjectExtendedLimitInformation, info
+        )
+        win32job.AssignProcessToJobObject(job, win32api.GetCurrentProcess())
+        _KILL_JOB = job
+    except Exception as exc:  # pragma: no cover - best effort
+        print(f"[launcher][warn] kill-on-close job 설정 실패 (orphan 위험): {exc}", flush=True)
+
+
 def main() -> int:
     configure_console_logs_from_argv()
+    # Guarantee no orphaned llama-server/API/UI even on a hard launcher kill.
+    _install_kill_on_close_job()
     app = QApplication(sys.argv)
     if needs_model_setup():
         dialog = ModelSetupDialog()
@@ -608,35 +650,25 @@ def main() -> int:
     os.environ["VERITAS_EMBED_HOST"] = "127.0.0.1"
     os.environ["VERITAS_EMBED_PORT"] = str(embed_port)
     os.environ["VERITAS_LLM_PARALLEL"] = str(settings.get("llmParallel", 1))
+    # The API process now owns the llama-server lifecycle so a settings-driven
+    # model switch can restart it (live model switching). The launcher just
+    # flags the API to manage llama and starts the API; the API spawns + waits
+    # for the llama-servers during its own startup, so the API health wait below
+    # naturally covers llama bring-up (hence the longer timeout). The early
+    # find_model_file checks above still give a fast, clear "missing model"
+    # error before we hand off to the API.
+    os.environ["VERITAS_MANAGE_LLAMA"] = "1"
 
     processes: list[subprocess.Popen | None] = []
     try:
         check_python_dependencies()
-        llm_process = start_llama("llm", llm_path, llm_port)
-        processes.append(llm_process)
-        wait_service(
-            llm_process,
-            f"http://127.0.0.1:{llm_port}/v1/models",
-            name="llama-llm",
-            timeout=180.0,
-        )
-
-        embedding_process = start_llama("embedding", embedding_path, embed_port)
-        processes.append(embedding_process)
-        wait_service(
-            embedding_process,
-            f"http://127.0.0.1:{embed_port}/v1/models",
-            name="llama-embedding",
-            timeout=120.0,
-        )
-
         api_process = start_api(api_port)
         processes.append(api_process)
         wait_service(
             api_process,
             f"http://127.0.0.1:{api_port}/api/v1/health",
             name="api",
-            timeout=60.0,
+            timeout=300.0,
         )
 
         ui_process = start_ui(api_port)

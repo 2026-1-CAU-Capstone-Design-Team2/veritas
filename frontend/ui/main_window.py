@@ -40,6 +40,7 @@ from .pages.write_page import WritePage
 
 from .sidebar import Sidebar
 from .windows.document_assist_window import DocumentAssistWindow, render_history_html
+from .windows.editor_window import EditorWindow
 
 
 class ScreenEventPollWorker(QThread):
@@ -195,6 +196,12 @@ class MainWindow(QMainWindow):
 
 		top_hero_layout.addLayout(hero_text_col, 1)
 
+		self.editor_button = QPushButton("글쓰기")
+		self.editor_button.setObjectName("AssistToggleButton")
+		self.editor_button.setCursor(Qt.PointingHandCursor)
+		self.editor_button.clicked.connect(self.open_editor_new)
+		top_hero_layout.addWidget(self.editor_button, 0, Qt.AlignTop)
+
 		self.assist_toggle_button = QPushButton("AI 보조창")
 		self.assist_toggle_button.setObjectName("AssistToggleButton")
 		self.assist_toggle_button.setCursor(Qt.PointingHandCursor)
@@ -210,6 +217,8 @@ class MainWindow(QMainWindow):
 		self.research_page = ResearchPage()
 		self.research_page.workspaceChanged.connect(self.sidebar.set_current_workspace)
 		self.research_page.workspaceChanged.connect(self._on_workspace_changed)
+		# "이 보고서로 글쓰기" → open the editor seeded from the workspace's final.md.
+		self.research_page.openEditorRequested.connect(self._open_editor_from_research)
 		# Mid-research workspace switch: light reset so the user sees the
 		# new workspace name in the sidebar and a clean chat panel without
 		# tearing down the active research display.
@@ -238,6 +247,7 @@ class MainWindow(QMainWindow):
 		shell.addWidget(center_panel, 1)
 
 		self.document_assist_window = DocumentAssistWindow(self)
+		self.editor_window = EditorWindow(self)
 		self._agent_controller = AgentController()
 		self._chat_bus = get_chat_bus()
 		self.document_assist_window.messageSubmitted.connect(self._send_assist_window_message)
@@ -267,6 +277,8 @@ class MainWindow(QMainWindow):
 
 		self._assist_toggle_shortcut = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
 		self._assist_toggle_shortcut.activated.connect(self.toggle_document_assist_window)
+		self._editor_shortcut = QShortcut(QKeySequence("Ctrl+Shift+W"), self)
+		self._editor_shortcut.activated.connect(self.open_editor_new)
 
 		self._enable_text_selection(container)
 		self._navigate("dashboard")
@@ -281,6 +293,14 @@ class MainWindow(QMainWindow):
 			self.document_assist_window.hide()
 			return
 		self.show_document_assist_window()
+
+	def open_editor_new(self) -> None:
+		"""Open the editor on a fresh blank document for the current workspace."""
+		self.editor_window.open_document(current_workspace_id(), source="new")
+
+	def _open_editor_from_research(self, workspace_id: str) -> None:
+		"""Open the editor seeded from a workspace's final.md ("이 보고서로 글쓰기")."""
+		self.editor_window.open_document(workspace_id or current_workspace_id(), source="final")
 
 	def _start_screen_monitoring(self) -> None:
 		if self._screen_monitor_active:

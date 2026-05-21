@@ -504,6 +504,9 @@ class ResearchPage(QWidget):
 	# views (sidebar footer, chat bubbles) without re-running heavy page
 	# refresh logic that would clobber the in-progress research display.
 	workspaceCreated = Signal(str, str)
+	# Fired by the "이 보고서로 글쓰기" button. Carries the workspace id; the host
+	# (MainWindow) opens the editor window seeded from that workspace's final.md.
+	openEditorRequested = Signal(str)
 
 	# Progress is driven by *document count* against the user-requested total
 	# (`_max_docs`), not by backend stage names. The collection loop owns the
@@ -655,6 +658,16 @@ class ResearchPage(QWidget):
 		info_row.addWidget(self.info_job_name, 1)
 		info_row.addWidget(self.info_save_path, 2)
 		info_row.addWidget(self.info_doc_count, 1)
+		# "이 보고서로 글쓰기" — opens the editor seeded from this workspace's
+		# final.md. Lives inside info_row_widget so it shows/hides together with
+		# the result metadata (i.e. only once a workspace result exists).
+		self.write_button = QPushButton("이 보고서로 글쓰기")
+		self.write_button.setObjectName("PrimaryButton")
+		self.write_button.setCursor(Qt.PointingHandCursor)
+		self.write_button.clicked.connect(
+			lambda: self.openEditorRequested.emit(self._workspace_id)
+		)
+		info_row.addWidget(self.write_button, 0, Qt.AlignVCenter)
 		self.info_row_widget = QFrame()
 		self.info_row_widget.setLayout(info_row)
 		self.info_row_widget.setVisible(False)

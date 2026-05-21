@@ -116,6 +116,12 @@ class AgentController:
 			{"modelId": model_id},
 		)
 
+	def get_model_switch_progress(self, since: int = 0, limit: int = 50) -> dict[str, Any]:
+		return api_client.get(
+			"/api/v1/settings/model/progress",
+			{"since": since, "limit": limit},
+		)
+
 	def update_research_method(self, sample_count: int, plan_count: int) -> dict[str, Any]:
 		return api_client.put(
 			"/api/v1/settings/research-method",
