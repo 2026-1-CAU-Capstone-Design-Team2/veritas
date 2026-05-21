@@ -294,14 +294,17 @@ class SuggestionCard(QFrame):
 		copy_button.setObjectName("AssistCopyButton")
 		copy_button.setFixedSize(46, 28)
 		copy_button.setCursor(Qt.PointingHandCursor)
-		self._copy_value = text
+		self._copy_value = ""
+		self._copy_button = copy_button
 		copy_button.clicked.connect(self._on_copy)
 
 		header.addWidget(badge, 0, Qt.AlignTop)
 		header.addStretch(1)
 		header.addWidget(copy_button)
 
-		self._body = QLabel(add_text_breakpoints(text))
+		# Body holds ONLY the pasteable content (everything before a "설명:" line);
+		# the copy button copies just this.
+		self._body = QLabel()
 		self._body.setObjectName("SuggestionText")
 		self._body.setWordWrap(True)
 		self._body.setTextFormat(Qt.PlainText)
@@ -311,8 +314,20 @@ class SuggestionCard(QFrame):
 		# fill the panel, and its text should not float to the middle.
 		self._body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
+		# Commentary after "설명:" renders here, muted, and is NOT copied.
+		self._note = QLabel()
+		self._note.setObjectName("SuggestionNote")
+		self._note.setWordWrap(True)
+		self._note.setTextFormat(Qt.PlainText)
+		self._note.setTextInteractionFlags(Qt.TextSelectableByMouse)
+		self._note.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+		self._note.setStyleSheet("color:#6B7280; font-size:12px;")
+		self._note.setVisible(False)
+
 		layout.addLayout(header)
 		layout.addWidget(self._body)
+		layout.addWidget(self._note)
+		self._apply_parsed(text)
 
 		# Like/dislike live on their own footer row, not in the header: a screen
 		# intervention card can be narrow, and crowding badge + copy + two rating
@@ -376,9 +391,93 @@ class SuggestionCard(QFrame):
 		self.feedbackSubmitted.emit(self._event_id, self._intervention_type, action)
 
 	def set_text(self, text: str) -> None:
-		"""Replace the card body text in place (used for streaming updates)."""
-		self._copy_value = text
-		self._body.setText(add_text_breakpoints(text))
+		"""Replace the card text in place (used for streaming updates)."""
+		self._apply_parsed(text)
+
+	@staticmethod
+	def _strip_markdown(text: str) -> str:
+		"""Strip the Markdown the local model emits despite the plain-text rule
+		(headings, bold, bullets, backticks, the '→' arrow) so pasted text is
+		clean. Conservative: leaves '_' (identifiers) and '-' lists alone."""
+		out = []
+		for line in (text or "").replace("\r\n", "\n").split("\n"):
+			s = re.sub(r"^\s*#{1,6}\s+", "", line)   # headings
+			s = re.sub(r"^\s*>\s+", "", s)            # blockquote
+			s = re.sub(r"^\s*→\s*", "", s)            # trigger/continuation arrow
+			s = re.sub(r"^(\s*)\*\s+", r"\1- ", s)    # "* item" -> "- item"
+			out.append(s)
+		joined = "\n".join(out)
+		joined = joined.replace("**", "").replace("`", "")
+		joined = re.sub(r"(?<!\*)\*(?!\*)([^*\n]+)\*(?!\*)", r"\1", joined)  # *italic* -> italic
+		return joined
+
+	@staticmethod
+	def _split_content_note(text: str) -> tuple[str, str]:
+		"""Split a screen reply into (pasteable content, commentary note).
+
+		Markdown is stripped first (the local model ignores the plain-text rule).
+		Preferred split is an explicit "설명:" line; when the model omits it (it
+		usually does), trailing document-citation commentary ("[Document 017]
+		참조로, ...") is peeled off as the note so the copy button still takes only
+		the prose the user would paste. No markers at all -> all content (e.g.
+		manual editor cards)."""
+		raw = SuggestionCard._strip_markdown(text or "").strip()
+		lines = raw.split("\n")
+		# Match "설명:" as a line PREFIX, not an exact line — the model usually
+		# writes the note inline ("설명: 해당 문맥은 ...") rather than on its own line.
+		note_prefixes = ("설명:", "설명 :", "[설명]", "[설명]:", "참고:", "Note:", "note:")
+		note_idx = None
+		note_inline = ""
+		for i, ln in enumerate(lines):
+			stripped = ln.strip()
+			matched = next((p for p in note_prefixes if stripped.startswith(p)), None)
+			if matched is not None:
+				note_idx = i
+				note_inline = stripped[len(matched):].strip()
+				break
+		if note_idx is not None:
+			content = "\n".join(lines[:note_idx]).strip()
+			rest = "\n".join(lines[note_idx + 1:]).strip()
+			note = (note_inline + ("\n" + rest if rest else "")).strip()
+		else:
+			content, note = SuggestionCard._peel_citation_commentary(raw)
+		# Drop a stray leading "제안:" label if the model added one anyway.
+		clines = content.split("\n")
+		if clines and clines[0].strip() in ("제안:", "제안", "[제안]", "Suggestion:"):
+			content = "\n".join(clines[1:]).strip()
+		return content.strip(), note.strip()
+
+	@staticmethod
+	def _peel_citation_commentary(text: str) -> tuple[str, str]:
+		"""Move trailing paragraphs that BEGIN with a "[Document ...]" citation
+		(the model's meta-advice, not insertable prose) into the note; keep the
+		leading prose as content. Inline citations mid-paragraph are left in the
+		content since only paragraph-leading markers signal commentary."""
+		paragraphs = re.split(r"\n\s*\n", text)
+		content_paras: list[str] = []
+		note_paras: list[str] = []
+		in_note = False
+		for para in paragraphs:
+			if not in_note and re.match(r"^\s*\[Document\b", para):
+				in_note = True
+			(note_paras if in_note else content_paras).append(para)
+		return "\n\n".join(content_paras).strip(), "\n\n".join(note_paras).strip()
+
+	def _apply_parsed(self, raw: str) -> None:
+		content, note = self._split_content_note(raw)
+		self._copy_value = content
+		if content:
+			self._body.setText(add_text_breakpoints(content))
+			self._note.setText(add_text_breakpoints(note))
+			self._note.setVisible(bool(note))
+			self._copy_button.setVisible(True)
+		else:
+			# Pure-commentary reply (e.g. a review): nothing to paste — show the
+			# note as the body and hide the copy button.
+			self._body.setText(add_text_breakpoints(note))
+			self._note.setText("")
+			self._note.setVisible(False)
+			self._copy_button.setVisible(False)
 
 
 class SuggestionList(QFrame):

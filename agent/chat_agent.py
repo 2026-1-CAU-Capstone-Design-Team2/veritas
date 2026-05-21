@@ -99,18 +99,6 @@ class ChatAgent:
     SCREEN_INTERVENTION_POLL_SEC = 2.0
     SCREEN_INTERVENTION_TIMEOUT_SEC = 180
     SCREEN_INTERVENTION_TTL_SEC = 300.0
-    # Only these scenarios make factual claims that the knowledge base can ground;
-    # every other scenario is a writing-mechanics/structure assist that needs no
-    # retrieval, so we skip the embedding + vector search for them (the dominant
-    # per-intervention latency). Tune this set as scenario behavior changes.
-    SCREEN_KB_SCENARIOS = frozenset(
-        {
-            "citation_missing",
-            "factual_claim_made",
-            "many_question_marks",
-            "whole_document_review",
-        }
-    )
     # Start-phase scenarios generate fresh prose/structure, so a generic opener
     # ("[project name]...") is unhelpful — they should be grounded in the
     # workspace's research subject. They get the KB context too, plus an explicit
@@ -826,9 +814,7 @@ class ChatAgent:
             )
             event_id = str(intervention.get("event_id") or "-")
             screen_trace(
-                f"answering event={event_id} type={intervention_type} "
-                f"skeleton={is_skeleton} "
-                f"kb={'yes' if (is_skeleton or intervention_type in self.SCREEN_KB_SCENARIOS or intervention_type in self.SCREEN_TOPIC_SCENARIOS) else 'skip'}"
+                f"answering event={event_id} type={intervention_type} skeleton={is_skeleton} (KB grounded)"
             )
             screen_trace(f"LLM system prompt:\n{system_prompt}")
             screen_trace(f"LLM user prompt:\n{prompt}")
@@ -1196,14 +1182,12 @@ class ChatAgent:
     def _screen_knowledge_context(
         self, query: str, intervention_type: str = "none", *, force_topic: bool = False
     ) -> str:
-        # Writing-mechanics scenarios make no factual claims, so skip retrieval
-        # entirely — this is the dominant per-intervention latency on a shared
-        # llama-server slot. KB-grounded and start-phase (topic) scenarios pay
-        # for the lookup; the latter also get an explicit workspace topic label.
-        is_kb = intervention_type in self.SCREEN_KB_SCENARIOS
+        # Screen interventions exist to ground suggestions in the workspace's
+        # indexed research, so EVERY scenario retrieves KB context. (An earlier
+        # speed optimization skipped retrieval for non-factual scenarios; that
+        # gutted the grounding and tanked answer quality.) The query-tail cache
+        # keeps the cost bounded across consecutive interventions on one paragraph.
         is_topic = force_topic or intervention_type in self.SCREEN_TOPIC_SCENARIOS
-        if not (is_kb or is_topic):
-            return "(Knowledge base not used for this writing-assist scenario.)"
         topic_label = self._screen_workspace_topic_label() if is_topic else ""
         if self.rag_service is None:
             return self._with_topic_label(topic_label, "(No knowledge base service is available.)")

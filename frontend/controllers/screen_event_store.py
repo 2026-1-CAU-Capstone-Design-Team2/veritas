@@ -21,10 +21,12 @@ def format_screen_event(item: dict[str, Any]) -> tuple[str, str, str] | None:
 	answer = str(item.get("answer") or "").strip()
 	if not answer:
 		return None
-	trigger = str(item.get("triggerText") or "").strip()
+	# Show only the assistant's answer. The trigger (the user's own recent
+	# sentence) used to be prepended as "<trigger>\n→ <answer>", but that glued
+	# the user's text + a "→" arrow into the copyable body; the card now needs a
+	# clean answer it can split into pasteable content vs. commentary.
 	category = "실시간 보조"
-	text = f"{trigger}\n→ {answer}" if trigger else answer
-	return (category, text, "working")
+	return (category, answer, "working")
 
 
 class ScreenEventStore(QObject):
