@@ -217,13 +217,17 @@ class AgentRuntime:
 
             path = download_model(spec, progress=_on_bytes, hf_token=os.getenv("HF_TOKEN"))
 
+        # Persist the selection as soon as the model is on disk — BEFORE the
+        # (riskier) server restart. If the restart then fails, the next runtime
+        # startup still loads THIS model rather than the previously-selected one
+        # (which may be exactly why we are switching, e.g. it OOM'd on load).
+        save_selected_models(llm_model_id=spec.id)
+
         emit("restart", "LLM 서버 재시작 중...", {})
         self._llm_server.restart(_Path(path))
 
         emit("refresh", "모델 정보 갱신 중...", {})
         self.llm.refresh_model_info()
-
-        save_selected_models(llm_model_id=spec.id)
         return spec
 
     def shutdown(self) -> None:

@@ -82,10 +82,15 @@ class LLMClient:
                 base_url=self.embed_base_url,
                 api_key="sk-no-key-required",
             )
-            embed_models = self.embed_client.models.list().data
-            if not embed_models:
-                raise RuntimeError("No models available from embedding server.")
-            self.embed_model = embed_models[0].id
+            # Defer detection if the embedding server is not up yet (e.g. it
+            # failed to load, or we are constructing the runtime to switch away
+            # from a model that won't start) — see refresh_model_info.
+            try:
+                embed_models = self.embed_client.models.list().data
+                self.embed_model = embed_models[0].id if embed_models else ""
+            except Exception as exc:  # noqa: BLE001 - server not ready yet
+                self.embed_model = ""
+                print(f"[llm] embedding model detection deferred (server not ready): {exc}")
         else:
             self.embed_client = self.client
             self.embed_model = self.model
@@ -117,10 +122,25 @@ class LLMClient:
         host:port). Mutating in place keeps this client's object identity
         stable, so every tool / service already holding a reference picks up
         the new model + n_ctx without any rewiring.
+
+        Tolerant of the server not being up yet: if the selected model failed
+        to load (e.g. OOM) or we are constructing the runtime to switch away
+        from a broken model, detection is *deferred* (model id left blank)
+        instead of raising — so ``AgentRuntime`` can still be built and a model
+        switch can recover. It is called again after the server (re)starts.
         """
-        models = self.client.models.list().data
+        try:
+            models = self.client.models.list().data
+        except Exception as exc:  # noqa: BLE001 - server not ready yet
+            self.model = getattr(self, "model", "") or ""
+            self.n_ctx = self._detect_n_ctx(self._chat_host, self._chat_port)
+            print(f"[llm] model detection deferred (server not ready): {exc}")
+            return
         if not models:
-            raise RuntimeError("No models available from llama-server.")
+            self.model = ""
+            self.n_ctx = self._detect_n_ctx(self._chat_host, self._chat_port)
+            print("[llm] server reported no models yet; detection deferred")
+            return
         self.model = models[0].id
         self.n_ctx = self._detect_n_ctx(self._chat_host, self._chat_port)
         print(f"[llm] model={self.model} n_ctx={self.n_ctx}")
