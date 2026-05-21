@@ -9,6 +9,7 @@ from typing import Any, Callable, Iterator
 
 from core.prompts import (
     ASSIST_GROUNDED_USER_TEMPLATE,
+    ASSIST_PLAIN_USER_TEMPLATE,
     ASSIST_SYSTEM_PROMPTS,
     CHAT_DOCUMENT_BLOCK_TEMPLATE,
     REFERENCE_BLOCK_TEMPLATE,
@@ -26,6 +27,22 @@ from core.prompts import (
     TOOL_CHAT_USER_PROMPT_TEMPLATE,
 )
 from tools.llm_tooling import build_llm_tooling
+
+
+class EditorGroundingUnavailable(RuntimeError):
+    """Raised by a RAG-forced editor quick action (rewrite / continue) when no
+    workspace grounding is available — the workspace index is empty or this
+    editor's workspace is not the active one. The action is hard-gated: it
+    refuses to run on the raw text rather than silently falling back to a plain
+    (ungrounded) generation. The service turns this into a user-facing SSE error.
+    """
+
+    def __init__(self, action: str) -> None:
+        self.action = action
+        super().__init__(
+            "연결된 자료가 없어 이 작업을 사용할 수 없습니다. "
+            "워크스페이스에 자료를 연결한 뒤 다시 시도하세요."
+        )
 
 
 _STYLE_GUIDANCE_BY_REGISTER = {
@@ -269,7 +286,12 @@ class ChatAgent:
     # NOT touch chat_history — the editor is a separate surface from the chat
     # panel, so its turns must not pollute the conversation log.
 
-    _EDITOR_RAG_ACTIONS = ("rewrite", "summarize", "polish", "continue")
+    # Quick actions split into two disjoint groups. The forced ones (다시 쓰기 /
+    # 다음 문장 제안) are hard-gated on workspace grounding — they retrieve and
+    # inject [참고 자료], and refuse (EditorGroundingUnavailable) when none is
+    # available, ignoring the editor's RAG toggle. Every other quick action
+    # (요약 / 다듬기 / 문법) runs as a plain LLM call with no retrieval.
+    _EDITOR_FORCED_RAG_ACTIONS = ("rewrite", "continue")
     _EDITOR_CONTEXT_MAX_CHARS = 1200
     # Window of the user's recent text used to retrieve additive grounding.
     _EDITOR_RAG_QUERY_CHARS = 300
@@ -281,6 +303,10 @@ class ChatAgent:
     # hard-block. This is the minimum recent context (normalized chars) required
     # at the writing frontier before suggesting.
     _EDITOR_MIN_CONTINUATION_CHARS = 8
+    # Ghost streaming: hold back this many leading chars to rule out the
+    # NO_SUGGESTION sentinel ("[NO_SUGGESTION]" is 15 chars) before flushing the
+    # head and streaming the rest live. Small enough to be imperceptible.
+    _GHOST_DECISION_CHARS = 16
     # Diagnostic logging defaults ON so the ghost decision (and, when grounding,
     # the retrieved similarity) is visible in the API console; set
     # VERITAS_EDITOR_RAG_DEBUG=0 to silence.
@@ -354,10 +380,17 @@ class ChatAgent:
         max_tokens: int = 64,
         use_workspace: bool = True,
     ) -> Iterator[str]:
-        """Stream an inline continuation. Fires only at a natural continuation
-        moment (the writing frontier with enough recent context); RAG is
-        *additive* — workspace grounding is added when available (and
-        ``use_workspace`` is set), never used as a hard on/off-topic gate."""
+        """Stream an inline continuation token-by-token. Fires only at a natural
+        continuation moment (the writing frontier with enough recent context);
+        RAG is *additive* — workspace grounding is added when available (and
+        ``use_workspace`` is set), never used as a hard on/off-topic gate.
+
+        The NO_SUGGESTION decline (the model emits the sentinel when there is
+        nothing natural to add / the workspace context is off-topic) must never
+        reach the UI. We can't buffer the whole answer (that would kill the live
+        streaming the editor wants), so we hold back only the first
+        ``_GHOST_DECISION_CHARS`` characters: once that head is long enough to
+        rule out the sentinel we flush it and stream every later token live."""
         prefix = (prefix or "")[-2000:]
         suffix = (suffix or "")[:500]
         if not self._is_continuation_moment(prefix, suffix):
@@ -374,26 +407,45 @@ class ChatAgent:
         user_prompt = SUGGEST_USER_TEMPLATE.format(
             reference=reference, prefix=prefix, suffix_block=suffix_block
         )
-        # Stream into a buffer, then honor the NO_SUGGESTION decline: the model is
-        # told (SUGGEST_SYSTEM_PROMPT) to emit it when the workspace context is
-        # off-topic for what the user is writing, or there is nothing natural to
-        # add. Ghost output is short, so buffering costs nothing perceptible and
-        # guarantees the sentinel is never shown as a suggestion.
-        buffer: list[str] = []
-        for chunk in self.llm.iter_ask(
+        stream = self.llm.iter_ask(
             SUGGEST_SYSTEM_PROMPT,
             user_prompt,
             reasoning=False,
             sampling_params={"temperature": 0.3, "top_p": 0.9, "max_tokens": max(8, min(256, int(max_tokens)))},
             stream_label="editor-suggest",
-        ):
+        )
+        buffer: list[str] = []
+        decided = False  # True once the sentinel is ruled out → stream live
+        for chunk in stream:
+            if not chunk:
+                continue
+            if decided:
+                yield chunk
+                continue
             buffer.append(chunk)
-        text = "".join(buffer)
-        if self._is_no_action_suggestion(text):
-            if self._EDITOR_RAG_DEBUG:
-                print("[editor][ghost] declined (NO_SUGGESTION / off-topic)")
-            return
-        yield text
+            stripped = "".join(buffer).strip()
+            if len(stripped) < self._GHOST_DECISION_CHARS:
+                continue
+            compact = "".join(ch for ch in stripped.upper() if ch.isalpha())
+            if compact.startswith("NOSUGGESTION"):
+                # Sentinel-only output: drain the rest and emit nothing.
+                for _ in stream:
+                    pass
+                if self._EDITOR_RAG_DEBUG:
+                    print("[editor][ghost] declined (NO_SUGGESTION / off-topic)")
+                return
+            decided = True
+            yield "".join(buffer)
+            buffer = []
+        if not decided:
+            # Output ended before the decision window — short enough to judge whole.
+            text = "".join(buffer)
+            if self._is_no_action_suggestion(text):
+                if self._EDITOR_RAG_DEBUG:
+                    print("[editor][ghost] declined (NO_SUGGESTION / off-topic)")
+                return
+            if text:
+                yield text
 
     def iter_editor_assist(
         self,
@@ -403,18 +455,28 @@ class ChatAgent:
         max_tokens: int = 400,
         use_workspace: bool = True,
     ) -> Iterator[str]:
-        """Stream a quick-action transform. RAG is additive: grounding is added
-        when available, but the action still runs on the given text without it."""
+        """Stream a quick-action transform.
+
+        Forced-RAG actions (rewrite / continue) are hard-gated: they retrieve
+        workspace grounding and inject [참고 자료], and raise
+        ``EditorGroundingUnavailable`` when none is available (empty index or
+        the workspace is not the active one — surfaced here as
+        ``use_workspace=False``) instead of falling back to a plain generation.
+        Every other action runs as a plain LLM call with no retrieval.
+        """
         action = (action or "").strip().lower()
         system_prompt = ASSIST_SYSTEM_PROMPTS.get(action)
         if system_prompt is None:
             return
         body = (text or "").strip()
-        user_content = body or "(빈 문서)"
-        if use_workspace and action in self._EDITOR_RAG_ACTIONS:
-            context = self._editor_context(body)
-            if context:
-                user_content = ASSIST_GROUNDED_USER_TEMPLATE.format(context=context, text=user_content)
+        target = body or "(빈 문서)"
+        if action in self._EDITOR_FORCED_RAG_ACTIONS:
+            context = self._editor_context(body) if use_workspace else None
+            if not context:
+                raise EditorGroundingUnavailable(action)
+            user_content = ASSIST_GROUNDED_USER_TEMPLATE.format(context=context, text=target)
+        else:
+            user_content = ASSIST_PLAIN_USER_TEMPLATE.format(text=target)
         yield from self.llm.iter_ask(
             system_prompt,
             user_content,
