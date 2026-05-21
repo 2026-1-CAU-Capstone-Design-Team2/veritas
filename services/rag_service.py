@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 from core.prompts import (
     QUERY_REWRITE_PROMPT,
     QUERY_REWRITE_SYSTEM_PROMPT,
+    RAG_DRAFT_CONTEXT_TEMPLATE,
     RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE,
     RAG_SYSTEM_PROMPT,
     RAG_USER_PROMPT_TEMPLATE,
@@ -381,42 +382,84 @@ class RAGService:
 
         return "\n\n---\n\n".join(parts)
 
-    def answer(self, question: str, stream: bool = False, use_history: bool = True) -> str:
+    def _grounded_user_prompt(
+        self, question: str, *, use_history: bool, doc_context: str = ""
+    ) -> str:
+        """Build the strict-RAG user prompt for a question.
+
+        Retrieves workspace documents and formats them as the answer context.
+        When nothing *substantive* is retrieved — including when the only hits
+        are off-topic enough that ``format_retrieved_documents`` strips them —
+        returns the empty-context prompt so ``RAG_SYSTEM_PROMPT`` makes the
+        model say it lacks the information rather than answering from general
+        knowledge. ``doc_context`` (the editor's open draft) rides along as
+        clearly-subordinate context, never as factual evidence.
+
+        Note: relevance is enforced by the LLM reading the retrieved context
+        against the question, not by an embedding-distance gate — this
+        multilingual embedder's cosine floor is too high to separate on- from
+        off-topic by distance (measured: on-topic and cross-topic best
+        distances overlap), so a numeric threshold would drop on-topic hits.
+        """
         retrieved = self.retrieve(question, use_history=use_history)
         history = self._format_recent_history()
-
-        if not retrieved:
-            answer = self.llm.ask(
-                RAG_SYSTEM_PROMPT,
-                RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE.format(history=history, question=question),
-                reasoning=False,
-                stream=stream,
-                stream_label="rag",
-            )
-            return answer
-
-        context = self.format_retrieved_documents(retrieved)
+        context = self.format_retrieved_documents(retrieved) if retrieved else ""
+        draft_block = (
+            RAG_DRAFT_CONTEXT_TEMPLATE.format(draft=doc_context.strip())
+            if doc_context and doc_context.strip()
+            else ""
+        )
         if not context.strip():
-            answer = self.llm.ask(
-                RAG_SYSTEM_PROMPT,
-                RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE.format(history=history, question=question),
-                reasoning=False,
-                stream=stream,
-                stream_label="rag",
+            return (
+                RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE.format(
+                    history=history, question=question
+                )
+                + draft_block
             )
-            return answer
-
-        user_prompt = RAG_USER_PROMPT_TEMPLATE.format(
-            context=context,
-            history=history,
-            question=question,
+        return (
+            RAG_USER_PROMPT_TEMPLATE.format(
+                context=context, history=history, question=question
+            )
+            + draft_block
         )
 
+    def answer(
+        self,
+        question: str,
+        stream: bool = False,
+        use_history: bool = True,
+        *,
+        doc_context: str = "",
+    ) -> str:
+        user_prompt = self._grounded_user_prompt(
+            question, use_history=use_history, doc_context=doc_context
+        )
         return self.llm.ask(
             RAG_SYSTEM_PROMPT,
             user_prompt,
             reasoning=False,
             stream=stream,
+            stream_label="rag",
+        )
+
+    def iter_answer(
+        self, question: str, *, use_history: bool = True, doc_context: str = ""
+    ) -> Iterator[str]:
+        """Streaming counterpart of :meth:`answer` — yields chunks for SSE.
+
+        Uses the same strict grounding as :meth:`answer` (``RAG_SYSTEM_PROMPT``
+        plus retrieved workspace context, or the empty-context refusal prompt
+        when nothing relevant is found), so a streamed chat answer is grounded
+        exactly like the one-shot path instead of falling back to the permissive
+        tool-synthesis prompt.
+        """
+        user_prompt = self._grounded_user_prompt(
+            question, use_history=use_history, doc_context=doc_context
+        )
+        yield from self.llm.iter_ask(
+            RAG_SYSTEM_PROMPT,
+            user_prompt,
+            reasoning=False,
             stream_label="rag",
         )
 
