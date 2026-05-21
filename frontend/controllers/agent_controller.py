@@ -65,6 +65,14 @@ class AgentController:
 	def get_draft_forms(self) -> dict[str, Any]:
 		return api_client.get("/api/v1/draft/forms")
 
+	def import_draft_form(self, file_path: Path) -> dict[str, Any]:
+		"""Upload a form file and get back its extracted md template + outline.
+
+		Supports .docx/.doc/.hwp/.hwpx/.pdf — the backend strips body prose and
+		keeps only structure (headings/bullets/tables).
+		"""
+		return api_client.upload_files("/api/v1/draft/forms/import", [file_path])
+
 	def generate_builtin_draft(self, workspace_id: str, settings: dict[str, Any]) -> dict[str, Any]:
 		"""Generate a built-in form draft from structured wizard settings.
 

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
+
+from services import form_extract
 
 from ..api_models import (
     ChatMessageRequest,
@@ -15,6 +17,24 @@ from ..api_models import (
 from ..services import draft_chat_service, draft_service
 
 router = APIRouter()
+
+
+@router.post("/api/v1/draft/forms/import")
+async def draft_form_import(files: list[UploadFile] = File(...)) -> dict[str, Any]:
+    """Extract a Markdown form template + outline from an uploaded form file.
+
+    Supports .docx / .doc / .hwp / .hwpx / .pdf (and plain text). The body is
+    stripped heuristically, keeping only structure (headings / bullets / tables).
+    Accepts a multipart ``files`` field (the shared upload client posts a list);
+    only the first file is used.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="양식 파일이 필요합니다.")
+    upload = files[0]
+    raw = await upload.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="빈 파일입니다.")
+    return form_extract.extract_form(upload.filename or "", raw)
 
 
 @router.get("/api/v1/draft/forms")

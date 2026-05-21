@@ -99,6 +99,39 @@ DRAFT_USER_PROMPT_TEMPLATE = """{knowledge_block}
 - 문서 맨 위에 `# 제목` 한 줄을 작성하세요."""
 
 
+# --- uploaded-form (양식 파일 사용) path -------------------------------------
+# When the user uploads a form file, its extracted structure (headings /
+# bullets / tables, body stripped) becomes a Markdown *template* the draft must
+# follow. The block + template-specific user prompt below replace the built-in
+# outline-only flow for that path.
+DRAFT_TEMPLATE_BLOCK_TEMPLATE = (
+    "[양식 템플릿]\n"
+    "아래는 사용자가 업로드한 문서에서 추출한 양식 구조입니다. 이 제목 계층·글머리표·표 등 "
+    "특수 요소를 그대로 따르고, 비어 있는 부분을 [지식베이스]의 내용으로 채워 완성하세요.\n\n"
+    "{template}"
+)
+
+DRAFT_USER_PROMPT_TEMPLATE_TEMPLATED = """{knowledge_block}
+
+{template_block}
+
+────────────────────
+위 [지식베이스]를 근거로, [양식 템플릿]의 구조를 따르는 한국어 초안을 작성해 주세요.
+
+[문서 유형] {doc_type}
+[톤 앤 매너] {tone_guide}
+[분량] {length_guide}{audience_block}{keypoints_block}
+
+[목차] (이 순서·구성으로 작성)
+{outline}
+
+[작성 지침]
+- [목차]의 각 항목을 그 순서대로 작성하고, 각 항목에 [양식 템플릿]의 해당 제목 계층·글머리표·표 구조를 반영하세요.
+- 각 부분을 [지식베이스]의 구체적 사실·수치·내용으로 채워 완성하세요. 표는 칸 구조를 유지한 채 채우되, 근거가 없는 칸은 비워 둡니다.
+- 양식 설명이나 빈 골격이 아니라, 조사된 실제 내용으로 채워진 완성 문서를 작성하세요.
+- 문서 맨 위에 `# 제목` 한 줄을 작성하세요."""
+
+
 __all__ = [
     "DRAFT_SYSTEM_PROMPT",
     "DRAFT_TONE_GUIDE",
@@ -106,4 +139,6 @@ __all__ = [
     "DRAFT_KNOWLEDGE_BLOCK_TEMPLATE",
     "DRAFT_NO_KNOWLEDGE_NOTICE",
     "DRAFT_USER_PROMPT_TEMPLATE",
+    "DRAFT_TEMPLATE_BLOCK_TEMPLATE",
+    "DRAFT_USER_PROMPT_TEMPLATE_TEMPLATED",
 ]

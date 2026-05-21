@@ -40,8 +40,10 @@ from core.prompts import (
     DRAFT_LENGTH_GUIDE,
     DRAFT_NO_KNOWLEDGE_NOTICE,
     DRAFT_SYSTEM_PROMPT,
+    DRAFT_TEMPLATE_BLOCK_TEMPLATE,
     DRAFT_TONE_GUIDE,
     DRAFT_USER_PROMPT_TEMPLATE,
+    DRAFT_USER_PROMPT_TEMPLATE_TEMPLATED,
 )
 
 from ..api_common import utc_now_iso
@@ -214,6 +216,21 @@ def _compose_user_prompt(record: dict[str, Any], knowledge: str) -> str:
         else DRAFT_NO_KNOWLEDGE_NOTICE
     )
 
+    # Uploaded-form path: follow the extracted Markdown template (headings /
+    # tables) rather than the outline alone.
+    form_markdown = str(record.get("formMarkdown") or "").strip()
+    if form_markdown:
+        return DRAFT_USER_PROMPT_TEMPLATE_TEMPLATED.format(
+            doc_type=record.get("docType") or "업로드 양식 기반",
+            tone_guide=tone_guide,
+            length_guide=length_guide,
+            audience_block=audience_block,
+            keypoints_block=keypoints_block,
+            outline=outline_text,
+            knowledge_block=knowledge_block,
+            template_block=DRAFT_TEMPLATE_BLOCK_TEMPLATE.format(template=form_markdown),
+        )
+
     return DRAFT_USER_PROMPT_TEMPLATE.format(
         doc_type=record.get("docType") or "직접 구성",
         tone_guide=tone_guide,
@@ -298,6 +315,10 @@ def _normalize_settings(workspace_id: str, payload: dict[str, Any]) -> dict[str,
     tone = draft_forms.resolve_tone(payload.get("tone"))["label"]
     length = draft_forms.resolve_length(payload.get("length"))
 
+    # The form template is only meaningful for the uploaded-form path; ignore
+    # any stray value for the built-in path so it can't alter that prompt.
+    form_markdown = str(payload.get("formMarkdown") or "").strip() if source == "file" else ""
+
     return {
         "source": source,
         "category": category,
@@ -308,6 +329,7 @@ def _normalize_settings(workspace_id: str, payload: dict[str, Any]) -> dict[str,
         "audience": str(payload.get("audience") or "").strip(),
         "keyPoints": str(payload.get("keyPoints") or "").strip(),
         "docType": _doc_type(source, category, subtype),
+        "formMarkdown": form_markdown,
     }
 
 
@@ -338,6 +360,7 @@ def _build_settings_record(
         "length": settings["length"],
         "audience": settings["audience"],
         "keyPoints": settings["keyPoints"],
+        "formMarkdown": settings.get("formMarkdown", ""),
         "sampling": {
             "samplingParams": profile["samplingParams"],
             "extraSamplingParams": profile["extraSamplingParams"],

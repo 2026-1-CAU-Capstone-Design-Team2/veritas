@@ -584,12 +584,17 @@ data: { "error": "..." }
 빌트인 양식 카탈로그(5 대분류 × 3 소분류 + 기본 섹션)와 톤/분량 옵션. 위저드가 렌더링하는 단일 소스.
 응답 `{ categories: [...], tones: [{key,label}], defaultTone, lengths: [...], defaultLength }`
 
+#### `POST /api/v1/draft/forms/import`  ·  `multipart/form-data`
+
+업로드한 양식 파일(.docx/.doc/.hwp/.hwpx/.pdf, 평문 포함)에서 **구조만** 추출합니다. 본문 산문은 휴리스틱으로 제거하고 제목·글머리표·표만 남겨 md 템플릿으로 변환합니다. 폼 필드 `files`(공유 업로드 클라이언트가 리스트로 전송 — 첫 파일만 사용).
+응답 `{ markdown, outline: [string], format, note }`. 빈 파일은 `400`.
+
 #### `POST /api/v1/draft/builtin/generate`
 
 **비동기**: 평문 `def`. 톤(`격식체`/`중립`/`캐주얼`)을 샘플링 전략(temperature/top_p/top_k …)으로 매핑해 생성.
 
-요청 `{ workspaceId, source: "custom"|"file", category?: {key,label}, subtype?: {key,label}, outline: [string], tone, length, audience, keyPoints }`
-응답 `{ draftId, draftNumber, title, content, tone, hasKnowledgeBase, settingsFileName, settingsPath, draftFileName, draftPath }`. `outline` 가 비면 `422`.
+요청 `{ workspaceId, source: "custom"|"file", category?: {key,label}, subtype?: {key,label}, outline: [string], tone, length, audience, keyPoints, formMarkdown? }`
+응답 `{ draftId, draftNumber, title, content, tone, hasKnowledgeBase, settingsFileName, settingsPath, draftFileName, draftPath }`. `outline` 가 비면 `422`. `source="file"` + `formMarkdown` 이면 추출된 양식 템플릿(제목·표 구조)을 따라 생성.
 
 #### `POST /api/v1/draft/builtin/regenerate`
 

@@ -86,9 +86,6 @@ CATEGORIES: list[dict] = [
 TONES = ["격식체", "중립", "캐주얼"]
 LENGTHS = ["짧게", "보통", "길게"]
 
-_TONE_GUIDE = {"격식체": "격식 있고 공식적인 문체", "중립": "중립적이고 명료한 문체", "캐주얼": "부드럽고 친근한 문체"}
-_LENGTH_GUIDE = {"짧게": "핵심 위주로 간결하게", "보통": "보통 수준의 분량으로", "길게": "충분히 상세하게"}
-
 FILE_STEPS = ["소스", "양식 분석", "목차 확정", "초안"]
 CUSTOM_STEPS = ["소스", "대분류", "소분류", "구성", "목차 확정", "초안"]
 
@@ -108,6 +105,9 @@ class DraftPage(QWidget):
 		self._subtype: dict | None = None
 		self._uploaded_path: Path | None = None
 		self._section_checks: list[QCheckBox] = []
+		# Markdown template extracted from an uploaded form file (양식 파일 사용).
+		# Drives generation structure (headings/tables) for the file source.
+		self._form_markdown = ""
 		self._last_draft_text = ""
 		# Built-in draft bookkeeping — set after a structured generation so the
 		# result page can show the saved settings file and offer regeneration.
@@ -599,18 +599,62 @@ class DraftPage(QWidget):
 		self.analyze_button.setEnabled(True)
 
 	def _analyze_format(self) -> None:
-		"""양식 파일에서 목차 골격을 도출. .md/.txt는 헤딩 파싱, 그 외는 기본 골격."""
+		"""업로드한 양식 파일을 백엔드에서 분석해 구조(제목·목록·표)를 추출한다.
+
+		.docx/.doc/.hwp/.hwpx/.pdf는 백엔드가 본문을 제거하고 구조만 md 템플릿으로
+		변환한다. 네트워크 호출이므로 워커 스레드에서 수행하고, 실패 시 로컬 휴리스틱
+		(헤딩 파싱)으로 폴백한다.
+		"""
+		path = self._uploaded_path
+		if path is None:
+			return
+		self.analyze_button.setEnabled(False)
+		self.file_label.setText(f"{path.name} — 양식 분석 중...")
+		controller = self._controller
+
+		def _work():
+			return controller.import_draft_form(path)
+
+		get_job_manager().run_detached(
+			_work,
+			on_success=self._on_form_analyzed,
+			on_error=self._on_form_analyze_failed,
+		)
+
+	def _on_form_analyzed(self, response) -> None:
+		outline: list[str] = []
+		markdown = ""
+		note = ""
+		if isinstance(response, dict):
+			outline = [str(s).strip() for s in (response.get("outline") or []) if str(s).strip()]
+			markdown = str(response.get("markdown") or "")
+			note = str(response.get("note") or "")
+		self._form_markdown = markdown
+		self.analyze_button.setEnabled(True)
+		if not outline:
+			outline = ["제목", "개요", "본문", "결론"]
+		self._set_outline(outline)
+		if self._uploaded_path is not None:
+			label = self._uploaded_path.name
+			if note:
+				label += f"  ({note})"
+			self.file_label.setText(label)
+		self._show_outline()
+
+	def _on_form_analyze_failed(self, message: str) -> None:
+		# 백엔드 분석 실패 → 로컬 헤딩 파싱(텍스트 계열) 또는 기본 골격으로 폴백.
+		self.analyze_button.setEnabled(True)
+		self._form_markdown = ""
 		sections: list[str] = []
 		path = self._uploaded_path
 		if path is not None and path.suffix.lower() in _TEXT_SUFFIXES:
 			try:
-				text = path.read_text(encoding="utf-8", errors="ignore")
-				sections = self._parse_headings(text)
+				sections = self._parse_headings(path.read_text(encoding="utf-8", errors="ignore"))
 			except Exception:
 				sections = []
-		if not sections:
-			sections = ["제목", "개요", "본문", "결론"]
-		self._set_outline(sections)
+		self._set_outline(sections or ["제목", "개요", "본문", "결론"])
+		if path is not None:
+			self.file_label.setText(f"{path.name}  (분석 실패 — 기본 골격 사용: {message})")
 		self._show_outline()
 
 	@staticmethod
@@ -722,53 +766,28 @@ class DraftPage(QWidget):
 		return [self.outline_list.item(i).text().strip() for i in range(self.outline_list.count()) if self.outline_list.item(i).text().strip()]
 
 	# -- 생성 -----------------------------------------------------------------
-	def _compose_prompt(self) -> str:
-		sections = self._outline_sections()
-		if self._source == "file":
-			doc_type = f"업로드 양식 기반 ({self._uploaded_path.name})" if self._uploaded_path else "업로드 양식 기반"
-			tone = "중립"
-			length = "보통"
-			audience = ""
-			key_points = ""
-		else:
-			category = self._category["label"] if self._category else ""
-			subtype = self._subtype["label"] if self._subtype else ""
-			doc_type = f"{category} > {subtype}".strip(" >")
-			tone = self.tone_combo.currentText()
-			length = self.length_combo.currentText()
-			audience = self.audience_input.text().strip()
-			key_points = self.keypoints_input.toPlainText().strip()
-
-		outline_text = "\n".join(f"{i}. {name}" for i, name in enumerate(sections, start=1))
-		lines = [
-			"다음 구성을 따라 바로 사용할 수 있는 한국어 초안을 작성해 주세요.",
-			"",
-			f"[문서 유형] {doc_type}",
-			f"[톤] {_TONE_GUIDE.get(tone, tone)}",
-			f"[분량] {_LENGTH_GUIDE.get(length, length)}",
-		]
-		if audience:
-			lines.append(f"[대상 독자] {audience}")
-		if key_points:
-			lines.append("[핵심 내용]")
-			lines.append(key_points)
-		lines += [
-			"",
-			"[목차]",
-			outline_text,
-			"",
-			"각 목차 항목을 마크다운 제목(##)으로 두고 그 아래에 내용을 채워 주세요.",
-		]
-		return "\n".join(lines)
-
 	def _compose_settings(self) -> dict:
-		"""Structured wizard settings for a built-in (직접 구성) draft.
+		"""Structured wizard settings. Both sources run through the same
+		knowledge-grounded backend path (generate_builtin_draft); the tone-and-
+		manner / form template are carried as data, persisted as
+		``drafts/draft_<n>_settings.json``.
 
-		The backend maps ``tone`` to a sampling strategy and persists this as
-		``drafts/draft_<n>_settings.json`` — so unlike ``_compose_prompt`` (a
-		flat text prompt for the upload-form fallback), the tone-and-manner is
-		carried as data the server can act on, not baked into prose.
+		* custom — 빌트인 양식(대분류·소분류·톤·분량 등).
+		* file   — 업로드 양식에서 추출한 md 템플릿(formMarkdown)으로 구조를 잡고
+		  기본 톤/분량을 사용.
 		"""
+		if self._source == "file":
+			return {
+				"source": "file",
+				"category": None,
+				"subtype": None,
+				"outline": self._outline_sections(),
+				"tone": "중립",
+				"length": "보통",
+				"audience": "",
+				"keyPoints": "",
+				"formMarkdown": self._form_markdown,
+			}
 		return {
 			"source": "custom",
 			"category": {"key": self._category["key"], "label": self._category["label"]} if self._category else None,
@@ -786,26 +805,16 @@ class DraftPage(QWidget):
 			self._show_result()
 			return
 		self._workspace_id = current_workspace_id()
-		# 직접 구성 → 구조화된 설정으로 톤별 샘플링·지식베이스 종합·설정 저장까지 수행.
-		# 업로드 양식(file)은 아직 평문 프롬프트 경로를 사용.
-		if self._source == "custom":
-			started = get_job_manager().submit(
-				JobCategory.DRAFT,
-				self._controller.generate_builtin_draft,
-				self._workspace_id,
-				self._compose_settings(),
-				on_success=self._on_draft_generated,
-				on_error=self._on_draft_failed,
-			)
-		else:
-			started = get_job_manager().submit(
-				JobCategory.DRAFT,
-				self._controller.generate_draft,
-				self._workspace_id,
-				self._compose_prompt(),
-				on_success=self._on_draft_generated,
-				on_error=self._on_draft_failed,
-			)
+		# 직접 구성·업로드 양식 모두 구조화된 설정으로 톤별 샘플링·지식베이스 종합·설정
+		# 저장까지 동일 경로로 수행한다 (file 은 추출된 양식 템플릿을 함께 전달).
+		started = get_job_manager().submit(
+			JobCategory.DRAFT,
+			self._controller.generate_builtin_draft,
+			self._workspace_id,
+			self._compose_settings(),
+			on_success=self._on_draft_generated,
+			on_error=self._on_draft_failed,
+		)
 		if not started:
 			return
 		self.settings_note.setText("")
@@ -875,6 +884,7 @@ class DraftPage(QWidget):
 		self._subtype = None
 		self._uploaded_path = None
 		self._section_checks = []
+		self._form_markdown = ""
 		self._last_draft_text = ""
 		self._last_draft_number = None
 		self._last_settings_file = ""
