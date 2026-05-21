@@ -78,7 +78,12 @@
       "Bash(\"C:/Users/user/miniconda3/envs/agent/python.exe\" -m py_compile frontend/ui/pages/guide_page.py frontend/ui/pages/__init__.py frontend/ui/main_window.py frontend/ui/sidebar.py)",
       "Bash(C:/Users/user/miniconda3/envs/agent/python.exe _ghost_gate.py)",
       "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -m py_compile agent/chat_agent.py)",
-      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe _gate2.py)"
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe _gate2.py)",
+      "Bash(\"C:/Users/user/miniconda3/envs/agent/python.exe\" -c \"import markdown; print\\('agent markdown', markdown.__version__\\)\")",
+      "Bash(\"C:/Users/user/Desktop/test/veritas/frontend/.venv/Scripts/python.exe\" -c \"import markdown; print\\('frontend markdown', markdown.__version__\\)\")",
+      "PowerShell(Get-NetTCPConnection -State Listen -LocalPort 8000,8080,8081 -ErrorAction SilentlyContinue)",
+      "PowerShell($env:VERITAS_EMBED_PORT)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe C:/Users/user/AppData/Local/Temp/veritas_embed_probe.py)"
     ]
   }
 }

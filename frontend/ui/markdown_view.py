@@ -41,8 +41,8 @@ h2 {{ font-size: 18px; }}
 h3 {{ font-size: 15px; }}
 p {{ margin: 6px 0; }}
 code {{ background-color: #F1F5F9; color: #0F172A; padding: 1px 4px; border-radius: 4px; font-family: 'Consolas', 'Cascadia Mono', monospace; font-size: 12px; }}
-pre {{ background-color: #0F172A; color: #E2E8F0; padding: 10px 12px; border-radius: 8px; font-family: 'Consolas', 'Cascadia Mono', monospace; font-size: 12px; }}
-pre code {{ background: transparent; color: inherit; padding: 0; }}
+pre {{ background-color: #F1F5F9; color: #0F172A; padding: 10px 12px; border-radius: 8px; border: 1px solid #E2E8F0; font-family: 'Consolas', 'Cascadia Mono', monospace; font-size: 12px; }}
+pre code {{ background: transparent; color: #0F172A; padding: 0; }}
 blockquote {{ border-left: 3px solid #C7D2FE; color: #4B5563; margin: 8px 0; padding: 2px 10px; }}
 ul, ol {{ margin: 6px 0 6px 20px; }}
 li {{ margin: 2px 0; }}
