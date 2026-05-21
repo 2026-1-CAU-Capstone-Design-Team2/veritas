@@ -228,6 +228,8 @@ class MainWindow(QMainWindow):
 		self.verify_page = VerifyPage()
 		self._add_page("verify", self.verify_page)
 		self.draft_page = DraftPage()
+		# 초안 결과의 "에디터로 보내기" → 생성된 초안을 에디터 창에 시드해서 연다.
+		self.draft_page.openEditorRequested.connect(self._open_editor_from_draft)
 		self._add_page("draft", self.draft_page)
 		self._add_page("document_assist", DocumentAssistPage())
 		self.write_page = WritePage()
@@ -303,6 +305,12 @@ class MainWindow(QMainWindow):
 	def _open_editor_from_research(self, workspace_id: str) -> None:
 		"""Open the editor seeded from a workspace's final.md ("이 보고서로 글쓰기")."""
 		self.editor_window.open_document(workspace_id or current_workspace_id(), source="final")
+
+	def _open_editor_from_draft(self, workspace_id: str, markdown: str) -> None:
+		"""Open the editor seeded with a generated draft ("에디터로 보내기")."""
+		self.editor_window.open_document(
+			workspace_id or current_workspace_id(), source="draft", seed_markdown=markdown
+		)
 
 	def _start_screen_monitoring(self) -> None:
 		if self._screen_monitor_active:

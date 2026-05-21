@@ -370,13 +370,26 @@ class ChatAgent:
         user_prompt = SUGGEST_USER_TEMPLATE.format(
             reference=reference, prefix=prefix, suffix_block=suffix_block
         )
-        yield from self.llm.iter_ask(
+        # Stream into a buffer, then honor the NO_SUGGESTION decline: the model is
+        # told (SUGGEST_SYSTEM_PROMPT) to emit it when the workspace context is
+        # off-topic for what the user is writing, or there is nothing natural to
+        # add. Ghost output is short, so buffering costs nothing perceptible and
+        # guarantees the sentinel is never shown as a suggestion.
+        buffer: list[str] = []
+        for chunk in self.llm.iter_ask(
             SUGGEST_SYSTEM_PROMPT,
             user_prompt,
             reasoning=False,
             sampling_params={"temperature": 0.3, "top_p": 0.9, "max_tokens": max(8, min(256, int(max_tokens)))},
             stream_label="editor-suggest",
-        )
+        ):
+            buffer.append(chunk)
+        text = "".join(buffer)
+        if self._is_no_action_suggestion(text):
+            if self._EDITOR_RAG_DEBUG:
+                print("[editor][ghost] declined (NO_SUGGESTION / off-topic)")
+            return
+        yield text
 
     def iter_editor_assist(
         self,

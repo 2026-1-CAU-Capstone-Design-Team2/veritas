@@ -87,7 +87,15 @@
       "Bash(C:/Users/user/miniconda3/envs/agent/python.exe C:/Users/user/AppData/Local/Temp/veritas_assist_smoke.py)",
       "Bash(C:/Users/user/miniconda3/envs/agent/python.exe C:/Users/user/AppData/Local/Temp/veritas_noaction_test.py)",
       "Bash(echo \"---exit $?---\")",
-      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -c \"import py_compile; [py_compile.compile\\(f, doraise=True\\) for f in [r'C:\\\\Users\\\\user\\\\Desktop\\\\test\\\\veritas\\\\agent\\\\chat_agent.py', r'C:\\\\Users\\\\user\\\\Desktop\\\\test\\\\veritas\\\\core\\\\prompts\\\\editor.py']]; print\\('compile OK'\\)\")"
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -c \"import py_compile; [py_compile.compile\\(f, doraise=True\\) for f in [r'C:\\\\Users\\\\user\\\\Desktop\\\\test\\\\veritas\\\\agent\\\\chat_agent.py', r'C:\\\\Users\\\\user\\\\Desktop\\\\test\\\\veritas\\\\core\\\\prompts\\\\editor.py']]; print\\('compile OK'\\)\")",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe _g6.py)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _smoke_draft.py)",
+      "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _render_draft.py)",
+      "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _smoke_editor.py)",
+      "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" -c \"import os; os.environ['QT_QPA_PLATFORM']='offscreen']\")",
+      "Bash('C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe' -c 'import os; os.environ['\\\\''QT_QPA_PLATFORM'\\\\'']='\\\\''offscreen'\\\\'' *)",
+      "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _render_icons.py)"
     ]
   }
 }
