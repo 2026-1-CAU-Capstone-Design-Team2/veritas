@@ -32,6 +32,7 @@ from .pages.dashboard_page import DashboardPage
 from .pages.document_page import DocumentPage
 from .pages.draft_page import DraftPage
 from .pages.feedback_page import FeedbackPage
+from .pages.guide_page import GuidePage
 from .pages.research_page import ResearchPage
 from .pages.settings_page import SettingsPage
 from .pages.writing_page import DocumentAssistPage
@@ -238,6 +239,7 @@ class MainWindow(QMainWindow):
 		self.settings_page.defaultWorkspaceChanged.connect(self.sidebar.set_current_workspace)
 		self.sidebar.workspaceChanged.connect(self._on_workspace_changed)
 		self._add_page("settings", self.settings_page)
+		self._add_page("guide", GuidePage())
 
 		center_layout.addWidget(top_hero)
 		center_layout.addWidget(self.stepper)
@@ -591,6 +593,7 @@ class MainWindow(QMainWindow):
 			"document": ("요약", "최종 보고서 요약본을 확인합니다."),
 			"feedback": ("문서 피드백", "약한 주장과 저신뢰 문장을 우선 교정합니다."),
 			"settings": ("설정", "모델명과 로컬 접근 폴더를 구성합니다."),
+			"guide": ("가이드", "VERITAS 사용법을 단계별로 안내합니다."),
 		}
 		title, desc = section_map.get(route, ("대시보드", ""))
 		self.section_title.setText(title)

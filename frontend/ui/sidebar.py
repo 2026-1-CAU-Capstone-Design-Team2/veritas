@@ -232,6 +232,7 @@ class Sidebar(QFrame):
 			("\ucc44\ud305", "write", "write.svg", "write_active.svg"),
 			("\ud53c\ub4dc\ubc31", "feedback", "feedback.svg", "feedback_active.svg"),
 			("\uc124\uc815", "settings", "settings.svg", "settings_active.svg"),
+			("\uac00\uc774\ub4dc", "guide", "guide.svg", "guide_active.svg"),
 		]
 
 		for text, route, icon_name, active_icon_name in nav_items:

@@ -27,4 +27,15 @@ networkx>=3.2
 rank-bm25>=0.2.2
 scikit-learn>=1.4
 kiwipiepy>=0.17
+
+# document export (api/services/export_service.py)
+# pandoc is a system binary, not importable Python. `pypandoc-binary` bundles the
+# pandoc executable so `pip install -r requirements.txt` enables DOCX / HTML / PDF
+# export out of the box (Markdown export needs nothing). export_service finds
+# pandoc on PATH, in the active conda/venv, or via this package — so
+# `conda install -c conda-forge pandoc` works equally well.
+pypandoc-binary>=1.13
+# PDF export additionally needs a PDF engine (none are on PyPI). Install one:
+#   conda install -c conda-forge wkhtmltopdf      # lightest
+#   # or a TeX distribution providing xelatex / pdflatex
 kiwipiepy_model>=0.17

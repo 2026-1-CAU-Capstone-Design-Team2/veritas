@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import datetime
 from typing import Any, Callable, Iterator
@@ -216,27 +217,46 @@ class ChatAgent:
 
     _EDITOR_RAG_ACTIONS = ("rewrite", "summarize", "polish", "continue")
     _EDITOR_CONTEXT_MAX_CHARS = 1200
+    # Ghost-writing only grounds when the workspace actually has relevant
+    # material: if the best retrieved chunk's cosine similarity is below this,
+    # the user is writing about something the corpus doesn't cover, so we
+    # suppress the suggestion. Tunable via env; set VERITAS_EDITOR_RAG_DEBUG=1
+    # to print the measured similarity for tuning.
+    _EDITOR_MIN_SIMILARITY = float(os.getenv("VERITAS_EDITOR_RAG_MIN_SIMILARITY", "0.5"))
+    # Diagnostic logging defaults ON so the ghost grounding decision (and the
+    # measured similarity, for tuning the gate) is visible in the API console;
+    # set VERITAS_EDITOR_RAG_DEBUG=0 to silence once tuned.
+    _EDITOR_RAG_DEBUG = os.getenv("VERITAS_EDITOR_RAG_DEBUG", "1") not in ("0", "false", "False")
 
-    def _editor_context(self, query: str) -> str | None:
+    def _editor_context(self, query: str, *, min_similarity: float | None = None) -> str | None:
         """Retrieve grounding context from the workspace RAG index, or ``None``
-        when unavailable (no service, empty index, or retrieval failure).
-        Cached on the query tail so ghost-firing on consecutive pauses with the
-        same context doesn't re-embed each time."""
+        when unavailable. When ``min_similarity`` is given, the best retrieved
+        chunk must clear that cosine-similarity bar or this returns ``None`` (the
+        on-topic gate for ghost-writing). Cached on (gate, query tail) so
+        consecutive pauses with the same context don't re-embed."""
         query = (query or "").strip()
         if not query or self.rag_service is None:
             return None
-        cache_key = query[-200:]
+        cache_key = f"{min_similarity}|{query[-200:]}"
         if self._editor_ctx_cache.get("key") == cache_key:
             return self._editor_ctx_cache.get("context")
+        context: str | None = None
         try:
-            if self.rag_service.get_document_count() <= 0:
-                context: str | None = None
-            else:
+            if self.rag_service.get_document_count() > 0:
                 # use_history=False → embed the query directly (no extra LLM call
                 # for history-aware rewriting; the editor must stay fast).
-                documents = self.rag_service.retrieve(query[-300:], use_history=False)
-                formatted = (self.rag_service.format_retrieved_documents(documents) or "").strip()
-                context = formatted[: self._EDITOR_CONTEXT_MAX_CHARS] or None
+                documents = self.rag_service.retrieve(query[-300:], use_history=False) or []
+                if documents and min_similarity is not None:
+                    # ChromaDB cosine space → distance = 1 - cosine_similarity.
+                    best_distance = min(float(d.get("distance", 1.0)) for d in documents)
+                    best_similarity = 1.0 - best_distance
+                    if self._EDITOR_RAG_DEBUG:
+                        print(f"[editor][rag] best_similarity={best_similarity:.3f} gate={min_similarity:.2f}")
+                    if best_similarity < min_similarity:
+                        documents = []  # off-topic → no grounding → no ghost
+                if documents:
+                    formatted = (self.rag_service.format_retrieved_documents(documents) or "").strip()
+                    context = formatted[: self._EDITOR_CONTEXT_MAX_CHARS] or None
         except Exception as e:  # noqa: BLE001 — grounding is best-effort
             print(f"[editor][rag][warn] retrieval failed: {e}")
             context = None
@@ -260,10 +280,18 @@ class ChatAgent:
             return
         reference = ""
         if use_workspace:
-            context = self._editor_context(prefix)
+            # Forced + on-topic RAG: ground only when the workspace has a
+            # sufficiently similar chunk; otherwise produce no suggestion.
+            context = self._editor_context(prefix, min_similarity=self._EDITOR_MIN_SIMILARITY)
             if context is None:
-                return  # forced RAG: no grounding → no suggestion
+                if self._EDITOR_RAG_DEBUG:
+                    print("[editor][ghost] no suggestion - no on-topic workspace context")
+                return
             reference = REFERENCE_BLOCK_TEMPLATE.format(context=context)
+            if self._EDITOR_RAG_DEBUG:
+                print("[editor][ghost] grounded suggestion")
+        elif self._EDITOR_RAG_DEBUG:
+            print("[editor][ghost] ungrounded - RAG toggle OFF (use_workspace=False)")
         suffix_block = SUGGEST_SUFFIX_BLOCK_TEMPLATE.format(suffix=suffix) if suffix.strip() else ""
         user_prompt = SUGGEST_USER_TEMPLATE.format(
             reference=reference, prefix=prefix, suffix_block=suffix_block
