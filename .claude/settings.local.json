@@ -83,7 +83,11 @@
       "Bash(\"C:/Users/user/Desktop/test/veritas/frontend/.venv/Scripts/python.exe\" -c \"import markdown; print\\('frontend markdown', markdown.__version__\\)\")",
       "PowerShell(Get-NetTCPConnection -State Listen -LocalPort 8000,8080,8081 -ErrorAction SilentlyContinue)",
       "PowerShell($env:VERITAS_EMBED_PORT)",
-      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe C:/Users/user/AppData/Local/Temp/veritas_embed_probe.py)"
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe C:/Users/user/AppData/Local/Temp/veritas_embed_probe.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe C:/Users/user/AppData/Local/Temp/veritas_assist_smoke.py)",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe C:/Users/user/AppData/Local/Temp/veritas_noaction_test.py)",
+      "Bash(echo \"---exit $?---\")",
+      "Bash(C:/Users/user/miniconda3/envs/agent/python.exe -c \"import py_compile; [py_compile.compile\\(f, doraise=True\\) for f in [r'C:\\\\Users\\\\user\\\\Desktop\\\\test\\\\veritas\\\\agent\\\\chat_agent.py', r'C:\\\\Users\\\\user\\\\Desktop\\\\test\\\\veritas\\\\core\\\\prompts\\\\editor.py']]; print\\('compile OK'\\)\")"
     ]
   }
 }

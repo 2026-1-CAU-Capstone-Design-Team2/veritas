@@ -363,7 +363,9 @@ class WholeDocumentReviewScenario(ScenarioType):
         return {
             "focus_scope": "full_document",
             "recent_sentences": review_text,
-            "focused_sentence": "",
+            # 짧은 문서 발췌만 표시용 트리거로 노출 — recent_sentences에는 LLM용
+            # 리뷰 지시문이 들어가므로 그대로 triggerText로 쓰면 프롬프트가 UI에 샌다.
+            "focused_sentence": " ".join((filtered.active_editor_text or "").split())[:120],
             "full_document_excerpt": review_text,
         }
 
@@ -624,7 +626,9 @@ class LongStaticReviewScenario(ScenarioType):
         return {
             "focus_scope": "full_document",
             "recent_sentences": review_text,
-            "focused_sentence": "",
+            # 짧은 문서 발췌만 표시용 트리거로 노출 — recent_sentences에는 LLM용
+            # 리뷰 지시문이 들어가므로 그대로 triggerText로 쓰면 프롬프트가 UI에 샌다.
+            "focused_sentence": " ".join((filtered.active_editor_text or "").split())[:120],
             "full_document_excerpt": review_text,
         }
 
