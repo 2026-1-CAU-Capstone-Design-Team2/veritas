@@ -32,8 +32,18 @@ def get_status() -> dict[str, Any]:
     return get_runtime().screen_monitoring_status()
 
 
-def get_events(since: int, limit: int) -> dict[str, Any]:
-    return get_runtime().get_screen_events_since(since=since, limit=limit)
+def get_events(since: int, limit: int, workspace_id: str | None = None) -> dict[str, Any]:
+    runtime = get_runtime()
+    # Continuous workspace sync (the screen path's equivalent of chat calling
+    # set_workspace per message): keep the screen runtime — and thus its
+    # rag_service — bound to whatever workspace the user is currently in, so
+    # interventions never ground in a stale/other workspace's knowledge base.
+    # set_workspace is a no-op when already on this workspace and only rebuilds
+    # (+ restarts monitoring) on an actual change.
+    ws = str(workspace_id or "").strip()
+    if ws and ws != "default":
+        runtime.set_workspace(ws)
+    return runtime.get_screen_events_since(since=since, limit=limit)
 
 
 def record_feedback(event_id: str, intervention_type: str, action: str) -> dict[str, Any]:

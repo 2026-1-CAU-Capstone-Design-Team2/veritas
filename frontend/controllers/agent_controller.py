@@ -193,11 +193,15 @@ class AgentController:
 	def get_screen_monitoring_status(self) -> dict[str, Any]:
 		return api_client.get("/api/v1/screen-monitoring/status")
 
-	def get_screen_monitoring_events(self, since: int = 0, limit: int = 20) -> dict[str, Any]:
-		return api_client.get(
-			"/api/v1/screen-monitoring/events",
-			{"since": since, "limit": limit},
-		)
+	def get_screen_monitoring_events(
+		self, since: int = 0, limit: int = 20, workspace_id: str | None = None
+	) -> dict[str, Any]:
+		# Carry the active workspace so the backend keeps the screen runtime bound
+		# to it (continuous sync, mirroring how chat sets the workspace per message).
+		params: dict[str, Any] = {"since": since, "limit": limit}
+		if workspace_id:
+			params["workspaceId"] = workspace_id
+		return api_client.get("/api/v1/screen-monitoring/events", params)
 
 	def submit_screen_feedback(
 		self, event_id: str, intervention_type: str, action: str

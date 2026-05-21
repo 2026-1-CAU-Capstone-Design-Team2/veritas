@@ -29,11 +29,17 @@ async def screen_monitoring_status() -> dict[str, Any]:
 
 
 @router.get("/api/v1/screen-monitoring/events")
-async def screen_monitoring_events(
+def screen_monitoring_events(
     since: int = Query(default=0, ge=0),
     limit: int = Query(default=20, ge=1, le=100),
+    workspaceId: str | None = Query(default=None),
 ) -> dict[str, Any]:
-    return screen_monitoring_service.get_events(since=since, limit=limit)
+    # Plain `def` (threadpool): when ``workspaceId`` differs from the runtime's
+    # current workspace the service runs the heavy set_workspace re-sync, which
+    # must not block the event loop.
+    return screen_monitoring_service.get_events(
+        since=since, limit=limit, workspace_id=workspaceId
+    )
 
 
 @router.post("/api/v1/screen-monitoring/feedback")
