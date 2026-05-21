@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+	QApplication,
 	QButtonGroup,
 	QCheckBox,
 	QComboBox,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
 	QListWidgetItem,
 	QPlainTextEdit,
 	QStackedWidget,
+	QTextEdit,
 	QVBoxLayout,
 	QWidget,
 )
@@ -26,6 +28,7 @@ from ...components.buttons import AppButton
 from ...components.cards import CardWidget
 from ...components.stepper import WorkflowStepper
 from ...controllers import AgentController, JobCategory, get_job_manager
+from ..markdown_view import apply_markdown
 
 __all__ = ["DraftPage"]
 
@@ -106,6 +109,10 @@ class DraftPage(QWidget):
 		self._uploaded_path: Path | None = None
 		self._section_checks: list[QCheckBox] = []
 		self._last_draft_text = ""
+		# Built-in draft bookkeeping — set after a structured generation so the
+		# result page can show the saved settings file and offer regeneration.
+		self._last_draft_number: int | None = None
+		self._last_settings_file = ""
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
@@ -458,19 +465,33 @@ class DraftPage(QWidget):
 		hint.setWordWrap(True)
 		card.layout.addWidget(hint)
 
-		self.output = QPlainTextEdit()
+		# QTextEdit (not QPlainTextEdit) so the finished draft can be rendered as
+		# markdown via the shared markdown_view renderer — same one the 요약 탭과
+		# 채팅 답변이 사용한다. 생성 중/오류 메시지는 평문으로 표시.
+		self.output = QTextEdit()
 		self.output.setReadOnly(True)
 		self.output.setObjectName("DraftOutput")
 		self.output.setMinimumHeight(320)
 		card.layout.addWidget(self.output)
 
+		self.settings_note = QLabel("")
+		self.settings_note.setObjectName("CardFooter")
+		self.settings_note.setWordWrap(True)
+		self.settings_note.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+		card.layout.addWidget(self.settings_note)
+
 		actions = QHBoxLayout()
 		self.copy_button = AppButton("초안 복사", variant="ghost")
 		self.copy_button.clicked.connect(self._copy_output)
+		self.regenerate_button = AppButton("이 설정으로 재생성", variant="ghost")
+		self.regenerate_button.setEnabled(False)
+		self.regenerate_button.setToolTip("저장된 설정(draft_<번호>_settings.json)으로 초안을 다시 생성합니다.")
+		self.regenerate_button.clicked.connect(self._regenerate_draft)
 		self.editor_button = AppButton("에디터에서 이어쓰기")
 		self.editor_button.setEnabled(False)
 		self.editor_button.setToolTip("백엔드 연동 후 활성화됩니다 — 생성된 초안을 에디터로 전달합니다.")
 		actions.addWidget(self.copy_button, 0)
+		actions.addWidget(self.regenerate_button, 0)
 		actions.addStretch(1)
 		actions.addWidget(self.editor_button, 0)
 		card.layout.addLayout(actions)
@@ -740,42 +761,113 @@ class DraftPage(QWidget):
 		]
 		return "\n".join(lines)
 
+	def _compose_settings(self) -> dict:
+		"""Structured wizard settings for a built-in (직접 구성) draft.
+
+		The backend maps ``tone`` to a sampling strategy and persists this as
+		``drafts/draft_<n>_settings.json`` — so unlike ``_compose_prompt`` (a
+		flat text prompt for the upload-form fallback), the tone-and-manner is
+		carried as data the server can act on, not baked into prose.
+		"""
+		return {
+			"source": "custom",
+			"category": {"key": self._category["key"], "label": self._category["label"]} if self._category else None,
+			"subtype": {"key": self._subtype["key"], "label": self._subtype["label"]} if self._subtype else None,
+			"outline": self._outline_sections(),
+			"tone": self.tone_combo.currentText(),
+			"length": self.length_combo.currentText(),
+			"audience": self.audience_input.text().strip(),
+			"keyPoints": self.keypoints_input.toPlainText().strip(),
+		}
+
 	def _generate_draft(self) -> None:
 		if not self._outline_sections():
 			self.output.setPlainText("목차에 항목을 1개 이상 추가하세요.")
 			self._show_result()
 			return
-		prompt = self._compose_prompt()
+		self._workspace_id = current_workspace_id()
+		# 직접 구성 → 구조화된 설정으로 톤별 샘플링·지식베이스 종합·설정 저장까지 수행.
+		# 업로드 양식(file)은 아직 평문 프롬프트 경로를 사용.
+		if self._source == "custom":
+			started = get_job_manager().submit(
+				JobCategory.DRAFT,
+				self._controller.generate_builtin_draft,
+				self._workspace_id,
+				self._compose_settings(),
+				on_success=self._on_draft_generated,
+				on_error=self._on_draft_failed,
+			)
+		else:
+			started = get_job_manager().submit(
+				JobCategory.DRAFT,
+				self._controller.generate_draft,
+				self._workspace_id,
+				self._compose_prompt(),
+				on_success=self._on_draft_generated,
+				on_error=self._on_draft_failed,
+			)
+		if not started:
+			return
+		self.settings_note.setText("")
+		self.output.setPlainText("agent가 초안을 생성하는 중입니다...")
+		self._show_result()
+
+	def _regenerate_draft(self) -> None:
+		if self._last_draft_number is None:
+			return
 		started = get_job_manager().submit(
 			JobCategory.DRAFT,
-			self._controller.generate_draft,
+			self._controller.regenerate_builtin_draft,
 			self._workspace_id,
-			prompt,
+			self._last_draft_number,
 			on_success=self._on_draft_generated,
 			on_error=self._on_draft_failed,
 		)
 		if not started:
 			return
-		self.output.setPlainText("agent가 초안을 생성하는 중입니다...")
+		self.output.setPlainText(f"동일 설정(초안 #{self._last_draft_number})으로 다시 생성하는 중입니다...")
 		self._show_result()
 
 	def _on_draft_generated(self, response) -> None:
+		number = None
+		settings_file = ""
+		has_kb = None
 		if isinstance(response, dict):
 			text = str(response.get("content") or "")
+			number = response.get("draftNumber")
+			settings_file = str(response.get("settingsFileName") or "")
+			has_kb = response.get("hasKnowledgeBase")
 		else:
 			text = str(response or "")
 		self._last_draft_text = text
-		self.output.setPlainText(text)
+		# 완료된 초안은 마크다운으로 렌더링; 빈 결과만 평문으로.
+		if text.strip():
+			apply_markdown(self.output, text)
+		else:
+			self.output.setPlainText("(빈 초안이 생성되었습니다)")
+
+		if number is not None:
+			self._last_draft_number = int(number)
+			self._last_settings_file = settings_file
+			note = f"설정이 {settings_file} 으로 저장되었습니다 · 초안 #{self._last_draft_number}"
+			if has_kb is False:
+				note += "  (지식베이스 없음 — 골격 위주로 생성)"
+			self.settings_note.setText(note)
+		else:
+			# 업로드 양식 등 비구조화 경로 — 재생성 대상 없음.
+			self._last_draft_number = None
+			self._last_settings_file = ""
+			self.settings_note.setText("")
+		self._sync_busy_state()
 
 	def _on_draft_failed(self, message: str) -> None:
 		self.output.setPlainText(f"API 요청 실패: {message}")
 
 	def _copy_output(self) -> None:
-		self.output.selectAll()
-		self.output.copy()
-		cursor = self.output.textCursor()
-		cursor.clearSelection()
-		self.output.setTextCursor(cursor)
+		# Copy the raw markdown source (not the rendered rich text) so it pastes
+		# cleanly into an editor.
+		text = self._last_draft_text or self.output.toPlainText()
+		QApplication.clipboard().setText(text)
 
 	def _reset(self) -> None:
 		self._source = None
@@ -784,6 +876,9 @@ class DraftPage(QWidget):
 		self._uploaded_path = None
 		self._section_checks = []
 		self._last_draft_text = ""
+		self._last_draft_number = None
+		self._last_settings_file = ""
+		self.settings_note.setText("")
 		self.file_label.setText("선택된 파일이 없습니다.")
 		self.analyze_button.setEnabled(False)
 		self.category_next.setEnabled(False)
@@ -798,8 +893,17 @@ class DraftPage(QWidget):
 
 	# ------------------------------------------------------------------ 외부 API
 	def set_workspace_by_name(self, workspace_name: str) -> None:
+		# Keep the id in sync with the (already-refreshed) bootstrap cache so a
+		# draft is generated against the workspace currently shown, not the one
+		# captured when this page was first constructed.
+		self._workspace_id = current_workspace_id()
 		self.workspace_label.setText(f"현재 워크스페이스: {workspace_name or self._workspace_id}")
+		# A draft + its saved settings belong to the workspace they were built
+		# from; when the workspace switches, return the wizard to its start so a
+		# previous workspace's draft no longer lingers in the result view.
+		self._reset()
 
 	def _sync_busy_state(self) -> None:
 		blocked = get_job_manager().is_blocked(JobCategory.DRAFT)
 		self.generate_button.setEnabled(not blocked)
+		self.regenerate_button.setEnabled(not blocked and self._last_draft_number is not None)
