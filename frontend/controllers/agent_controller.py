@@ -205,6 +205,18 @@ class AgentController:
 			{"since": since, "limit": limit},
 		)
 
+	def submit_screen_feedback(
+		self, event_id: str, intervention_type: str, action: str
+	) -> dict[str, Any]:
+		return api_client.post(
+			"/api/v1/screen-monitoring/feedback",
+			{
+				"eventId": event_id,
+				"interventionType": intervention_type,
+				"action": action,
+			},
+		)
+
 	# -- verification --------------------------------------------------------
 	# Mirrors the research controller surface: a long-running POST plus a fast
 	# cursor-based progress poll, with read-only list/detail/summary endpoints

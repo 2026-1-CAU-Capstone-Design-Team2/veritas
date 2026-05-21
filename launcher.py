@@ -81,6 +81,31 @@ def configure_console_logs_from_argv() -> None:
         sys.argv.remove("--console-logs")
 
 
+_SCREEN_DEBUG: bool = False
+
+
+def screen_debug_enabled() -> bool:
+    return _SCREEN_DEBUG
+
+
+def configure_screen_debug_from_argv() -> None:
+    """``--screen-debug``: stream ONLY the screen pipeline's ``[screen_debug]``
+    trace (candidate scenarios, the LLM prompt, the steps run) to the console —
+    suppressing every other log and the per-capture noise.
+
+    Forces console streaming on (we need the API child's stdout piped so it can
+    be filtered) and sets ``VERITAS_SCREEN_TRACE=1`` so the child emits the
+    focused trace. Must run after :func:`configure_console_logs_from_argv` so it
+    can override ``_CONSOLE_LOGS`` even when ``--console-logs`` was not passed."""
+    global _SCREEN_DEBUG, _CONSOLE_LOGS
+    if "--screen-debug" in sys.argv:
+        _SCREEN_DEBUG = True
+        _CONSOLE_LOGS = True
+        os.environ["VERITAS_SCREEN_TRACE"] = "1"
+    while "--screen-debug" in sys.argv:
+        sys.argv.remove("--screen-debug")
+
+
 class DownloadWorker(QObject):
     # Qt int signals are 32-bit on Windows. GGUF downloads commonly exceed
     # 2GB, so pass Python ints as objects to avoid progress overflow.
@@ -424,12 +449,19 @@ def _start_output_stream(process: subprocess.Popen, name: str, path: Path) -> No
         stream = process.stdout
         if stream is None:
             return
+        # --screen-debug: the full child output still goes to the log file, but
+        # the console shows only the screen pipeline's [screen_debug] lines.
+        screen_only = screen_debug_enabled()
         with path.open("a", encoding="utf-8", errors="replace") as log:
             for line in stream:
-                prefix = "" if line.startswith(("[llm]", "[api]")) else f"[{name}] "
-                print(f"{prefix}{line}", end="", flush=True)
                 log.write(line)
                 log.flush()
+                if screen_only:
+                    if "[screen_debug]" in line:
+                        print(line, end="", flush=True)
+                    continue
+                prefix = "" if line.startswith(("[llm]", "[api]")) else f"[{name}] "
+                print(f"{prefix}{line}", end="", flush=True)
 
     thread = threading.Thread(
         target=_stream,
@@ -637,6 +669,10 @@ def main() -> int:
     # re-print can't crash on a cp949 console.
     force_utf8_stdio()
     configure_console_logs_from_argv()
+    # --screen-debug must run after console-logs config: it overrides the console
+    # mode (forcing streaming on) and flags the API child to emit the focused
+    # screen trace that the relay then filters down to.
+    configure_screen_debug_from_argv()
     # Guarantee no orphaned llama-server/API/UI even on a hard launcher kill.
     _install_kill_on_close_job()
     app = QApplication(sys.argv)

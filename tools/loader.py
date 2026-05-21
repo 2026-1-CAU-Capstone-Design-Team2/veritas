@@ -144,6 +144,7 @@ def build_registry(
                 run_root,
                 interval_sec=screen_interval_sec,
                 console_log=screen_debug_log,
+                llm=llm,
             )
             registry.register(
                 ScreenContextTool(

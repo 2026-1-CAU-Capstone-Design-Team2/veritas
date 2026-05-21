@@ -129,6 +129,7 @@ class AgentRuntime:
             rag_service=self.rag_service,
             tool_registry=self.registry,
             screen_debug=os.getenv("VERITAS_SCREEN_DEBUG", "0") == "1",
+            screen_workspace_id=self.workspace_id,
         )
         self.chat_agent.chat_history = self._load_workspace_chat_history()
         if self.rag_service is not None:
@@ -871,6 +872,16 @@ class AgentRuntime:
             since=since,
             limit=limit,
             workspace_id=self.workspace_id,
+        )
+
+    def record_screen_feedback(
+        self, *, event_id: str, intervention_type: str, action: str, reward: float
+    ) -> dict[str, Any]:
+        return self._screen_monitor.record_feedback(
+            event_id=event_id,
+            intervention_type=intervention_type,
+            action=action,
+            reward=reward,
         )
 
     def _compact_workflow_result(self, result: Any) -> dict[str, Any]:

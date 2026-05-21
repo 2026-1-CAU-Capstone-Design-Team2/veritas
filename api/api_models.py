@@ -213,3 +213,9 @@ class PredictionApplyRequest(BaseModel):
 
 class ScreenMonitoringStartRequest(BaseModel):
     workspaceId: str | None = None
+
+
+class ScreenFeedbackRequest(BaseModel):
+    eventId: str
+    action: str
+    interventionType: str | None = None

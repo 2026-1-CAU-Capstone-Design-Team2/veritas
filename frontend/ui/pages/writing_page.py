@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QFrame, QVBoxLayout, QWidget
 
-from ...controllers import format_screen_event, get_screen_event_store
+from ...controllers import (
+	AgentController,
+	format_screen_event,
+	get_job_manager,
+	get_screen_event_store,
+)
 from ..windows.document_assist_window import SuggestionList
 
 
@@ -16,6 +21,7 @@ class DocumentAssistPage(QWidget):
 		self._screen_store.eventsAppended.connect(self._on_screen_events_appended)
 		# 워크스페이스 전환 시 store.clear() → cleared emit → hydrate로 위젯 reset.
 		self._screen_store.cleared.connect(self._hydrate_screen_suggestions)
+		self.suggestion_list.feedbackSubmitted.connect(self._on_screen_feedback)
 		self._hydrate_screen_suggestions()
 
 	def _build_ui(self) -> None:
@@ -44,7 +50,13 @@ class DocumentAssistPage(QWidget):
 			if formatted is None:
 				continue
 			category, text, tone = formatted
-			suggestions.append({"id": str(item.get("eventId") or ""), "category": category, "text": text, "tone": tone})
+			suggestions.append({
+				"id": str(item.get("eventId") or ""),
+				"category": category,
+				"text": text,
+				"tone": tone,
+				"interventionType": str(item.get("interventionType") or ""),
+			})
 		self.suggestion_list.set_suggestions(suggestions)
 
 	def _on_screen_events_appended(self, items: list) -> None:
@@ -58,7 +70,25 @@ class DocumentAssistPage(QWidget):
 			if formatted is None:
 				continue
 			category, text, tone = formatted
-			self.suggestion_list.upsert_suggestion(str(item.get("eventId") or ""), category, text, tone)
+			self.suggestion_list.upsert_suggestion(
+				str(item.get("eventId") or ""),
+				category,
+				text,
+				tone,
+				intervention_type=str(item.get("interventionType") or ""),
+			)
+
+	def _on_screen_feedback(self, event_id: str, intervention_type: str, action: str) -> None:
+		"""사용자의 좋아요/싫어요/복사를 보상 로그로 비동기 전송 (UI 스레드 비차단)."""
+		if not event_id:
+			return
+		get_job_manager().run_detached(
+			AgentController().submit_screen_feedback,
+			event_id,
+			intervention_type,
+			action,
+			on_error=lambda err: print(f"[screen_feedback][warn] {err}"),
+		)
 
 	def showEvent(self, event) -> None:  # type: ignore[override]
 		super().showEvent(event)

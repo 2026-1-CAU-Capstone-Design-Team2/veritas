@@ -18,6 +18,7 @@ from core.prompts import (
     SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE,
     SCREEN_SCENARIO_GUIDANCE,
     SCREEN_SCENARIO_GUIDANCE_DEFAULT,
+    SCREEN_SKELETON_GUIDANCE,
     SUGGEST_SUFFIX_BLOCK_TEMPLATE,
     SUGGEST_SYSTEM_PROMPT,
     SUGGEST_USER_TEMPLATE,
@@ -26,6 +27,7 @@ from core.prompts import (
     TOOL_CHAT_SYSTEM_PROMPT,
     TOOL_CHAT_USER_PROMPT_TEMPLATE,
 )
+from services.screen_tool_funcs.trace import screen_trace
 from tools.llm_tooling import build_llm_tooling
 
 
@@ -97,6 +99,40 @@ class ChatAgent:
     SCREEN_INTERVENTION_POLL_SEC = 2.0
     SCREEN_INTERVENTION_TIMEOUT_SEC = 180
     SCREEN_INTERVENTION_TTL_SEC = 300.0
+    # Only these scenarios make factual claims that the knowledge base can ground;
+    # every other scenario is a writing-mechanics/structure assist that needs no
+    # retrieval, so we skip the embedding + vector search for them (the dominant
+    # per-intervention latency). Tune this set as scenario behavior changes.
+    SCREEN_KB_SCENARIOS = frozenset(
+        {
+            "citation_missing",
+            "factual_claim_made",
+            "many_question_marks",
+            "whole_document_review",
+        }
+    )
+    # Start-phase scenarios generate fresh prose/structure, so a generic opener
+    # ("[project name]...") is unhelpful — they should be grounded in the
+    # workspace's research subject. They get the KB context too, plus an explicit
+    # topic label, and fall back to a topic probe when the document is too empty
+    # to form a real retrieval query.
+    SCREEN_TOPIC_SCENARIOS = frozenset(
+        {
+            "blank_document_start",
+            "outline_phase",
+            "heading_added",
+        }
+    )
+    SCREEN_TOPIC_PROBE = "이 워크스페이스 지식베이스의 핵심 주제와 다루는 내용 개요"
+    # Sentinel returned by _screen_intervention_query when the screen has no real
+    # writing content yet; treated as a "weak" query that triggers the topic probe.
+    SCREEN_QUERY_FALLBACK = "screen writing context"
+    # Placeholder-filler markers that signal skeleton/outline text rather than
+    # finished prose: "~~~", "...", "___", "[ ]", TODO/FIXME. Two or more runs ->
+    # the paragraph is a skeleton, and review/grammar/citation scenarios must not
+    # "correct" it (see SCREEN_SKELETON_GUIDANCE).
+    _SKELETON_RE = re.compile(r"~{2,}|…|\.{3,}|_{3,}|\[\s*\]|TODO|FIXME")
+    SCREEN_SKELETON_MIN_RUNS = 2
 
     def __init__(
         self,
@@ -109,6 +145,7 @@ class ChatAgent:
         max_tool_calls: int = 1,
         screen_debug: bool = False,
         screen_document_type: str = SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE,
+        screen_workspace_id: str = "",
     ) -> None:
         self.llm = llm
         self.rag_service = rag_service
@@ -121,6 +158,9 @@ class ChatAgent:
         # writing. Filled into SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE; can be
         # overridden per intervention via the payload's "document_type" field.
         self.screen_document_type = screen_document_type or SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE
+        # Workspace id doubles as the research subject (the run dir is named after
+        # it), so start-phase suggestions can be grounded in the actual topic.
+        self.screen_workspace_id = screen_workspace_id
         self.chat_history: list[tuple[str, str]] = []
         self._conversation_lock = threading.RLock()
         self._screen_stop_event = threading.Event()
@@ -130,6 +170,9 @@ class ChatAgent:
         # Small per-workspace cache for editor RAG grounding (the agent is rebuilt
         # on every workspace switch, so this resets with the workspace).
         self._editor_ctx_cache: dict[str, Any] = {"key": "", "context": None}
+        # Same idea for screen-intervention KB lookups: consecutive interventions
+        # on the same paragraph re-issue the same query, so cache on the query tail.
+        self._screen_ctx_cache: dict[str, Any] = {"key": "", "context": None}
 
     def ask_rag(self, question: str, *, stream: bool = False) -> str:
         """Strict document-grounded Q&A mode for explicit --phase rag sessions."""
@@ -751,11 +794,20 @@ class ChatAgent:
         """Generate a proactive answer from one queued screen intervention."""
         with self._conversation_lock:
             query = self._screen_intervention_query(intervention)
-            knowledge_context = self._screen_knowledge_context(query)
             intervention_type = intervention.get("intervention_type") or "none"
-            scenario_guidance = SCREEN_SCENARIO_GUIDANCE.get(
-                intervention_type, SCREEN_SCENARIO_GUIDANCE_DEFAULT
+            # Skeleton guard: if the text is placeholder filler, override whatever
+            # scenario fired with fill-or-skip guidance and force topic grounding so
+            # the model can propose real content instead of proofreading "~~~".
+            is_skeleton = self._screen_is_skeleton(intervention)
+            knowledge_context = self._screen_knowledge_context(
+                query, intervention_type, force_topic=is_skeleton
             )
+            if is_skeleton:
+                scenario_guidance = SCREEN_SKELETON_GUIDANCE
+            else:
+                scenario_guidance = SCREEN_SCENARIO_GUIDANCE.get(
+                    intervention_type, SCREEN_SCENARIO_GUIDANCE_DEFAULT
+                )
             prompt = SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE.format(
                 history=self._format_recent_history(),
                 app_context=self._pretty_payload(
@@ -772,6 +824,14 @@ class ChatAgent:
             system_prompt = SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE.format(
                 document_type=self._screen_document_type(intervention)
             )
+            event_id = str(intervention.get("event_id") or "-")
+            screen_trace(
+                f"answering event={event_id} type={intervention_type} "
+                f"skeleton={is_skeleton} "
+                f"kb={'yes' if (is_skeleton or intervention_type in self.SCREEN_KB_SCENARIOS or intervention_type in self.SCREEN_TOPIC_SCENARIOS) else 'skip'}"
+            )
+            screen_trace(f"LLM system prompt:\n{system_prompt}")
+            screen_trace(f"LLM user prompt:\n{prompt}")
             try:
                 if stream:
                     answer = self._stream_screen_answer(prompt, intervention, system_prompt)
@@ -790,6 +850,7 @@ class ChatAgent:
 
             if not str(answer or "").strip():
                 answer = "[screen_context][warn] LLM returned an empty screen assist answer."
+            screen_trace(f"answer event={event_id} chars={len(str(answer or '').strip())}")
             history_question = self._screen_history_question(intervention)
             self._append_history(history_question, answer)
             return answer.strip()
@@ -1026,7 +1087,7 @@ class ChatAgent:
             text = " ".join(str(candidate or "").split()).strip()
             if text:
                 return text[:1000]
-        return "screen writing context"
+        return self.SCREEN_QUERY_FALLBACK
 
     def _screen_prompt_writing_context(self, intervention: dict[str, Any]) -> dict[str, Any]:
         writing = intervention.get("writing_context") if isinstance(intervention, dict) else {}
@@ -1100,21 +1161,86 @@ class ChatAgent:
             return f"[screen_context] active window: {title_text[:200]}"
         return "[screen_context] proactive intervention"
 
-    def _screen_knowledge_context(self, query: str) -> str:
+    def _screen_workspace_topic_label(self) -> str:
+        """Human-readable research subject from the workspace id (its run dir name),
+        e.g. ``기아_문제_발생원인_분석-2`` -> ``기아 문제 발생원인 분석``. Empty for the
+        unnamed default workspace."""
+        ws = str(self.screen_workspace_id or "").strip()
+        if not ws or ws in {"default", "api"}:
+            return ""
+        return re.sub(r"-\d+$", "", ws).replace("_", " ").strip()
+
+    def _with_topic_label(self, label: str, context: str) -> str:
+        if label:
+            return f"현재 워크스페이스 주제: {label}\n\n{context}"
+        return context
+
+    def _screen_is_skeleton(self, intervention: dict[str, Any]) -> bool:
+        """True when the writing context is a placeholder skeleton, not real prose.
+
+        The rule-based scenario detector cannot tell sketched placeholders from
+        finished text, so without this guard a review/grammar scenario will try to
+        proofread "기아는 ~~~하며 ~~~ 하게 된다". Detected on the same fields the model
+        sees so the guard matches what would otherwise be reviewed."""
+        writing = intervention.get("writing_context") if isinstance(intervention, dict) else {}
+        if not isinstance(writing, dict):
+            return False
+        text = " ".join(
+            str(writing.get(key) or "")
+            for key in ("focused_sentence", "recent_sentences", "current_paragraph", "changed_text")
+        )
+        if not text.strip():
+            return False
+        return len(self._SKELETON_RE.findall(text)) >= self.SCREEN_SKELETON_MIN_RUNS
+
+    def _screen_knowledge_context(
+        self, query: str, intervention_type: str = "none", *, force_topic: bool = False
+    ) -> str:
+        # Writing-mechanics scenarios make no factual claims, so skip retrieval
+        # entirely — this is the dominant per-intervention latency on a shared
+        # llama-server slot. KB-grounded and start-phase (topic) scenarios pay
+        # for the lookup; the latter also get an explicit workspace topic label.
+        is_kb = intervention_type in self.SCREEN_KB_SCENARIOS
+        is_topic = force_topic or intervention_type in self.SCREEN_TOPIC_SCENARIOS
+        if not (is_kb or is_topic):
+            return "(Knowledge base not used for this writing-assist scenario.)"
+        topic_label = self._screen_workspace_topic_label() if is_topic else ""
         if self.rag_service is None:
-            return "(No knowledge base service is available.)"
+            return self._with_topic_label(topic_label, "(No knowledge base service is available.)")
+        # A near-empty start-phase document yields a query too thin to retrieve the
+        # subject, so fall back to a topic probe that surfaces the central content.
+        effective_query = query
+        stripped_query = query.strip()
+        weak_query = (
+            not stripped_query
+            or stripped_query == self.SCREEN_QUERY_FALLBACK
+            or len(stripped_query) < 8
+        )
+        if is_topic and weak_query:
+            effective_query = self.SCREEN_TOPIC_PROBE
+        # Consecutive interventions on the same paragraph issue the same query;
+        # serve the cached context instead of re-embedding + re-searching.
+        cache_key = f"{intervention_type}:{effective_query[-self._EDITOR_RAG_QUERY_CHARS:]}"
+        cached = self._screen_ctx_cache
+        if cached.get("key") == cache_key:
+            return cached.get("context") or self._with_topic_label(topic_label, "(No relevant knowledge-base documents found.)")
         try:
             if self.rag_service.get_document_count() <= 0:
-                return "(The knowledge base is empty.)"
-            documents = self.rag_service.retrieve(query, use_history=False)
+                return self._with_topic_label(topic_label, "(The knowledge base is empty.)")
+            documents = self.rag_service.retrieve(effective_query, use_history=False)
             context = self.rag_service.format_retrieved_documents(documents)
-            return context if context.strip() else "(No relevant knowledge-base documents found.)"
         except Exception as e:
-            return f"(Knowledge-base lookup failed: {e})"
+            return self._with_topic_label(topic_label, f"(Knowledge-base lookup failed: {e})")
+        context = (context or "").strip() or "(No relevant knowledge-base documents found.)"
+        result = self._with_topic_label(topic_label, context)
+        self._screen_ctx_cache = {"key": cache_key, "context": result}
+        return result
 
     def _pretty_payload(self, payload: Any) -> str:
+        # Compact separators (no indent): the model only needs the field values,
+        # and pretty-printing inflates token count for no comprehension gain.
         try:
-            return json.dumps(payload, ensure_ascii=False, indent=2)
+            return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         except Exception:
             return str(payload)
 

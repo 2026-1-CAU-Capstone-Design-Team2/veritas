@@ -17,7 +17,16 @@ class ScreenContextTool(BaseTool):
     def name(self) -> str:
         return "screen_context"
 
-    def run(self, action: str, limit: int = 10) -> ToolResult:
+    def run(
+        self,
+        action: str,
+        limit: int = 10,
+        *,
+        event_id: str = "",
+        intervention_type: str = "",
+        feedback_action: str = "",
+        reward: float = 0.0,
+    ) -> ToolResult:
         try:
             action = str(action or "").strip()
             try:
@@ -74,6 +83,21 @@ class ScreenContextTool(BaseTool):
             if action == "consume_interventions":
                 consumed = self._screen_context_service.store.consume_pending_interventions(limit=safe_limit)
                 return ToolResult(success=True, data={"interventions": consumed})
+
+            if action == "record_feedback":
+                event_id = str(event_id or "").strip()
+                if not event_id:
+                    return ToolResult(success=False, error="record_feedback requires event_id")
+                from datetime import datetime, timezone
+                record = {
+                    "event_id": event_id,
+                    "intervention_type": str(intervention_type or "").strip() or "none",
+                    "action": str(feedback_action or "").strip(),
+                    "reward": float(reward),
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._screen_context_service.store.append_intervention_feedback(record)
+                return ToolResult(success=True, data=record)
 
             if action == "start_polling":
                 self._screen_context_service.start_polling()

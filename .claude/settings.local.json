@@ -95,7 +95,9 @@
       "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _smoke_editor.py)",
       "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" -c \"import os; os.environ['QT_QPA_PLATFORM']='offscreen']\")",
       "Bash('C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe' -c 'import os; os.environ['\\\\''QT_QPA_PLATFORM'\\\\'']='\\\\''offscreen'\\\\'' *)",
-      "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _render_icons.py)"
+      "Bash(\"C:\\\\Users\\\\user\\\\miniconda3\\\\envs\\\\agent\\\\python.exe\" _render_icons.py)",
+      "Bash(python -c \"import ast,sys; [ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\) or print\\('OK',f\\) for f in ['services/screen_tool_funcs/core/store.py','tools/screen_context_tool/screen_context_tool.py','api/services/agent_runtime.py','api/services/screen_monitor.py','api/services/screen_monitoring_service.py','api/api_models.py','api/api_routes/screen_monitoring.py']]\")",
+      "Bash(venv/Scripts/python.exe -c ' *)"
     ]
   }
 }

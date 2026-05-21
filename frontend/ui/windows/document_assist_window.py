@@ -46,7 +46,12 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
-from ...controllers import format_screen_event, get_screen_event_store
+from ...controllers import (
+	AgentController,
+	format_screen_event,
+	get_job_manager,
+	get_screen_event_store,
+)
 from ..markdown_view import render_markdown_html
 
 
@@ -232,11 +237,50 @@ class CustomTitleBar(QFrame):
 		super().mouseReleaseEvent(event)
 
 
+# Rating chips are styled inline (not via an ancestor stylesheet): the card
+# renders in two hosts — the floating DocumentAssistWindow and the main-window
+# DocumentAssistPage — and only the former carries the assist stylesheet, so an
+# objectName rule there left the chips falling back to a dark global QPushButton
+# style with text clipped. Inline QSS travels with the widget and wins over the
+# ancestor sheet everywhere.
+_RATE_CHIP_BASE = (
+	"QPushButton{{background:#FFFFFF;color:#4B5563;border:1px solid #D1D5DB;"
+	"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}}"
+	"QPushButton:hover{{background:{hbg};color:{hfg};border-color:{hbd};}}"
+)
+_LIKE_CHIP_QSS = _RATE_CHIP_BASE.format(hbg="#ECFDF5", hfg="#047857", hbd="#6EE7B7")
+_DISLIKE_CHIP_QSS = _RATE_CHIP_BASE.format(hbg="#FEF2F2", hfg="#B91C1C", hbd="#FCA5A5")
+_LIKE_CHIP_CHOSEN_QSS = (
+	"QPushButton{background:#D1FAE5;color:#047857;border:1px solid #6EE7B7;"
+	"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}"
+)
+_DISLIKE_CHIP_CHOSEN_QSS = (
+	"QPushButton{background:#FEE2E2;color:#B91C1C;border:1px solid #FCA5A5;"
+	"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}"
+)
+
+
 class SuggestionCard(QFrame):
-	def __init__(self, category: str, text: str, tone: str = "working", parent: QWidget | None = None) -> None:
+	# (event_id, intervention_type, action) — action ∈ {"like","dislike","copy"}.
+	# Re-emitted up through SuggestionList so the host page can POST the reward.
+	feedbackSubmitted = Signal(str, str, str)
+
+	def __init__(
+		self,
+		category: str,
+		text: str,
+		tone: str = "working",
+		parent: QWidget | None = None,
+		*,
+		event_id: str = "",
+		intervention_type: str = "",
+	) -> None:
 		super().__init__(parent)
 		self.setObjectName("SuggestionCard")
 		self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+		self._event_id = event_id
+		self._intervention_type = intervention_type
+		self._rated = False
 
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(12, 11, 12, 11)
@@ -251,7 +295,7 @@ class SuggestionCard(QFrame):
 		copy_button.setFixedSize(46, 28)
 		copy_button.setCursor(Qt.PointingHandCursor)
 		self._copy_value = text
-		copy_button.clicked.connect(lambda: self._copy_text(self._copy_value))
+		copy_button.clicked.connect(self._on_copy)
 
 		header.addWidget(badge, 0, Qt.AlignTop)
 		header.addStretch(1)
@@ -270,6 +314,35 @@ class SuggestionCard(QFrame):
 		layout.addLayout(header)
 		layout.addWidget(self._body)
 
+		# Like/dislike live on their own footer row, not in the header: a screen
+		# intervention card can be narrow, and crowding badge + copy + two rating
+		# chips into one row overflowed/clipped them. Only screen interventions
+		# (which carry an event_id) get rated; manual editor suggestions do not.
+		if event_id:
+			footer = QHBoxLayout()
+			footer.setSpacing(6)
+			footer.addStretch(1)
+			self._like_button = QPushButton("도움됨")
+			self._like_button.setObjectName("AssistLikeButton")
+			self._like_button.setStyleSheet(_LIKE_CHIP_QSS)
+			self._like_button.setFixedHeight(30)
+			self._like_button.setMinimumWidth(60)
+			self._like_button.setCursor(Qt.PointingHandCursor)
+			self._like_button.clicked.connect(lambda: self._on_rate("like"))
+			self._dislike_button = QPushButton("아쉬움")
+			self._dislike_button.setObjectName("AssistDislikeButton")
+			self._dislike_button.setStyleSheet(_DISLIKE_CHIP_QSS)
+			self._dislike_button.setFixedHeight(30)
+			self._dislike_button.setMinimumWidth(60)
+			self._dislike_button.setCursor(Qt.PointingHandCursor)
+			self._dislike_button.clicked.connect(lambda: self._on_rate("dislike"))
+			footer.addWidget(self._like_button)
+			footer.addWidget(self._dislike_button)
+			layout.addLayout(footer)
+		else:
+			self._like_button = None
+			self._dislike_button = None
+
 	def set_card_width(self, width: int) -> None:
 		self.setMinimumWidth(width)
 		self.setMaximumWidth(width)
@@ -279,6 +352,28 @@ class SuggestionCard(QFrame):
 		app = QApplication.instance()
 		if app is not None:
 			app.clipboard().setText(text)
+
+	def _on_copy(self) -> None:
+		self._copy_text(self._copy_value)
+		# Copy is a weak positive signal: the user took the suggestion even if
+		# they never click 도움됨. Only report it for real screen interventions.
+		if self._event_id:
+			self.feedbackSubmitted.emit(self._event_id, self._intervention_type, "copy")
+
+	def _on_rate(self, action: str) -> None:
+		# One explicit rating per card; lock the pair after the first click so a
+		# single intervention contributes one clean like/dislike reward.
+		if self._rated or not self._event_id:
+			return
+		self._rated = True
+		for button in (self._like_button, self._dislike_button):
+			if button is not None:
+				button.setEnabled(False)
+		if action == "like" and self._like_button is not None:
+			self._like_button.setStyleSheet(_LIKE_CHIP_CHOSEN_QSS)
+		elif action == "dislike" and self._dislike_button is not None:
+			self._dislike_button.setStyleSheet(_DISLIKE_CHIP_CHOSEN_QSS)
+		self.feedbackSubmitted.emit(self._event_id, self._intervention_type, action)
 
 	def set_text(self, text: str) -> None:
 		"""Replace the card body text in place (used for streaming updates)."""
@@ -294,6 +389,9 @@ class SuggestionList(QFrame):
 	# no trailing gap). Left off, the card keeps the default fill behaviour for
 	# callers that give it a whole panel (e.g. DocumentAssistPage).
 	MAX_HEIGHT_RATIO = 0.55
+
+	# Bubbles each card's (event_id, intervention_type, action) up to the host.
+	feedbackSubmitted = Signal(str, str, str)
 
 	def __init__(self, parent: QWidget | None = None, *, hug_content: bool = False) -> None:
 		super().__init__(parent)
@@ -362,14 +460,17 @@ class SuggestionList(QFrame):
 
 		last_index = len(self._suggestions) - 1
 		for index, item in enumerate(self._suggestions):
+			item_id = str(item.get("id") or "")
 			card = SuggestionCard(
 				item.get("category", "수정"),
 				item.get("text", item.get("description", "")),
 				item.get("tone", "working"),
+				event_id=item_id,
+				intervention_type=str(item.get("interventionType") or ""),
 			)
+			card.feedbackSubmitted.connect(self.feedbackSubmitted)
 			card.set_card_width(self._content_width())
 			self._cards.append(card)
-			item_id = str(item.get("id") or "")
 			if item_id:
 				self._cards_by_id[item_id] = card
 			# The last card carries the stretch factor so it grows down to the
@@ -384,7 +485,15 @@ class SuggestionList(QFrame):
 		if self._hug_content:
 			self.updateGeometry()
 
-	def add_suggestion(self, category: str, text: str, tone: str = "working", *, event_id: str = "") -> None:
+	def add_suggestion(
+		self,
+		category: str,
+		text: str,
+		tone: str = "working",
+		*,
+		event_id: str = "",
+		intervention_type: str = "",
+	) -> None:
 		"""Append a single suggestion card.
 
 		Unlike :meth:`set_suggestions`, this does not tear down and rebuild every
@@ -394,6 +503,8 @@ class SuggestionList(QFrame):
 		item: dict[str, str] = {"category": category, "text": text, "tone": tone}
 		if event_id:
 			item["id"] = event_id
+		if intervention_type:
+			item["interventionType"] = intervention_type
 		if not self._cards:
 			# Leaving the empty state: drop the placeholder + its trailing stretch.
 			self._clear()
@@ -405,7 +516,14 @@ class SuggestionList(QFrame):
 				self.layout.setStretch(prev_index, 0)
 
 		self._suggestions.append(item)
-		card = SuggestionCard(item["category"], item["text"], item["tone"])
+		card = SuggestionCard(
+			item["category"],
+			item["text"],
+			item["tone"],
+			event_id=event_id,
+			intervention_type=intervention_type,
+		)
+		card.feedbackSubmitted.connect(self.feedbackSubmitted)
 		card.set_card_width(self._content_width())
 		self._cards.append(card)
 		if event_id:
@@ -416,7 +534,15 @@ class SuggestionList(QFrame):
 		self.schedule_width_update()
 		self.schedule_scroll_to_bottom()
 
-	def upsert_suggestion(self, event_id: str, category: str, text: str, tone: str = "working") -> None:
+	def upsert_suggestion(
+		self,
+		event_id: str,
+		category: str,
+		text: str,
+		tone: str = "working",
+		*,
+		intervention_type: str = "",
+	) -> None:
 		"""Update an existing card's text by ``event_id``, or add a new card.
 
 		Streaming screen-intervention answers arrive as the same ``event_id``
@@ -432,7 +558,7 @@ class SuggestionList(QFrame):
 					break
 			self.schedule_scroll_to_bottom()
 			return
-		self.add_suggestion(category, text, tone, event_id=event_id)
+		self.add_suggestion(category, text, tone, event_id=event_id, intervention_type=intervention_type)
 		if self._hug_content:
 			self.updateGeometry()
 
@@ -1205,6 +1331,7 @@ class DocumentAssistWindow(QWidget):
 		self._screen_store.eventsAppended.connect(self._on_screen_events_appended)
 		# 워크스페이스 전환 시 store.clear() → cleared emit → hydrate로 위젯 reset.
 		self._screen_store.cleared.connect(self._hydrate_screen_suggestions)
+		self.suggestion_list.feedbackSubmitted.connect(self._on_screen_feedback)
 		self._hydrate_screen_suggestions()
 
 	def _install_chat_zoom_shortcuts(self) -> None:
@@ -1285,7 +1412,13 @@ class DocumentAssistWindow(QWidget):
 			if formatted is None:
 				continue
 			category, text, tone = formatted
-			suggestions.append({"id": str(item.get("eventId") or ""), "category": category, "text": text, "tone": tone})
+			suggestions.append({
+				"id": str(item.get("eventId") or ""),
+				"category": category,
+				"text": text,
+				"tone": tone,
+				"interventionType": str(item.get("interventionType") or ""),
+			})
 		self.suggestion_list.set_suggestions(suggestions)
 
 	def _on_screen_events_appended(self, items: list) -> None:
@@ -1299,7 +1432,25 @@ class DocumentAssistWindow(QWidget):
 			if formatted is None:
 				continue
 			category, text, tone = formatted
-			self.suggestion_list.upsert_suggestion(str(item.get("eventId") or ""), category, text, tone)
+			self.suggestion_list.upsert_suggestion(
+				str(item.get("eventId") or ""),
+				category,
+				text,
+				tone,
+				intervention_type=str(item.get("interventionType") or ""),
+			)
+
+	def _on_screen_feedback(self, event_id: str, intervention_type: str, action: str) -> None:
+		"""사용자의 좋아요/싫어요/복사를 보상 로그로 비동기 전송 (UI 스레드 비차단)."""
+		if not event_id:
+			return
+		get_job_manager().run_detached(
+			AgentController().submit_screen_feedback,
+			event_id,
+			intervention_type,
+			action,
+			on_error=lambda err: print(f"[screen_feedback][warn] {err}"),
+		)
 
 	def _apply_stylesheet(self) -> None:
 		self.setStyleSheet(

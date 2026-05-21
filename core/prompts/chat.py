@@ -181,8 +181,9 @@ Document type:
 
 Rules:
 - Use the screen payload to understand what the user is currently writing or viewing.
+- Placeholder / skeleton text: the writing context is often an outline or skeleton where the real content is only sketched with placeholder fillers - runs of "~", "...", "___", "[ ]", "TODO", or repeated stand-in markers (e.g. "기아는 ~~~하며 ~~~ 하게 된다"). Treat such fillers as NOT-YET-WRITTEN content, never as real words. Do NOT correct their spelling, grammar, punctuation, or word choice, do NOT critique their phrasing, and do NOT attach citations to them. Instead either propose concrete content (grounded in the topic / knowledge base) that would REPLACE the placeholders, or return a brief no-action note. If the latest sentence is essentially all placeholders, prefer the no-action note over forcing a review.
 - Base writing suggestions on the latest 1-2 sentences in the screen writing context; do not restate or rework older document text unless it is explicitly included there.
-- Use the knowledge-base context when it is relevant, and cite document IDs in the form [Document <id>] when provided.
+- Citations: only use [Document <id>] ids that appear verbatim in KNOWLEDGE BASE CONTEXT. Never invent a document id, never attribute a claim to a document that is not shown there, and never add a citation to text the user only sketched with placeholders.
 - If the knowledge base does not support a factual claim, do not invent a source.
 - Keep the response short and directly usable, and match the output format described in SCENARIO GUIDANCE; do not pad it with preamble or meta-commentary.
 - If the payload indicates no useful action, return a brief no-action explanation.
@@ -241,6 +242,26 @@ SCREEN_SCENARIO_GUIDANCE_DEFAULT = (
     "of the user's document type. No preamble, no meta-commentary - just the suggestion."
 )
 
+# Deterministic override injected (by ``ChatAgent.answer_screen_intervention``) in
+# place of the per-scenario guidance whenever the writing context is detected as a
+# skeleton/outline dominated by placeholder fillers. It exists because the
+# rule-based scenario detector cannot tell sketched placeholders from finished
+# prose, so review/grammar/citation scenarios otherwise "correct" text like
+# "기아는 ~~~하며 ~~~ 하게 된다" - which is nonsense. This forces the only useful
+# behaviors: fill a placeholder with real content, or stay quiet.
+SCREEN_SKELETON_GUIDANCE = (
+    "The on-screen text is a SKELETON/outline: its real content is only sketched with "
+    "placeholder fillers (runs of ~, ..., ___, [ ], TODO). These are NOT real words. "
+    "Absolutely do not proofread, spell-check, grammar-check, rephrase, or attach citations "
+    "to the placeholders or the sentences built around them. "
+    "Do exactly one of: "
+    "(a) propose concrete content - grounded in the document's topic and KNOWLEDGE BASE CONTEXT - "
+    "that would REPLACE the single most prominent placeholder run, written as ready-to-paste prose; or "
+    "(b) if you cannot ground real content, return a one-line no-action note. "
+    "Output format: at most 1-2 sentences of replacement prose for one placeholder, OR the no-action note. "
+    "Never invent document ids and never comment on the placeholder characters themselves."
+)
+
 SCREEN_SCENARIO_GUIDANCE = {
     "idle_after_writing": (
         "The user just paused mid-paragraph; the writing flow is still warm. "
@@ -275,6 +296,9 @@ SCREEN_SCENARIO_GUIDANCE = {
     "blank_document_start": (
         "The report is nearly empty; the user is at the very start. "
         "Offer a low-pressure starting point. "
+        "Ground the suggestion in the workspace's actual research subject shown in KNOWLEDGE BASE CONTEXT "
+        "(the '현재 워크스페이스 주제' label and the retrieved material) - name the real topic and reflect its key themes. "
+        "Do NOT use generic placeholders like '[프로젝트 명]' or '[관련 주제]'; if the knowledge base is empty, only then keep it generic. "
         "Output format: either one or two suggested opening sentences written as report prose, OR a brief section outline "
         "of the report as a short bulleted list - pick whichever fits, not both. "
         "Present it as an option to take or leave, not as a fixed plan."
@@ -394,6 +418,7 @@ __all__ = [
     "SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE",
     "SCREEN_SCENARIO_GUIDANCE",
     "SCREEN_SCENARIO_GUIDANCE_DEFAULT",
+    "SCREEN_SKELETON_GUIDANCE",
     "SYSTEM_PROMPT",
     "TOOL_CHAT_FINAL_PROMPT_TEMPLATE",
     "TOOL_CHAT_SYSTEM_PROMPT",
