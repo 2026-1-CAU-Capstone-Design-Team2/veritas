@@ -17,9 +17,14 @@ This is general language processing — no domain assumptions, no keyword lists
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 import re
+from pathlib import Path
 
 from kiwipiepy import Kiwi
+from kiwipiepy_model import __version__ as _KIWI_MODEL_VERSION
+from kiwipiepy_model import get_model_path
 
 # Kiwi POS tags worth keeping — content-bearing morphemes only. Deliberately
 # narrower than a blanket "all N*/V*": bound nouns (NNB: 수/것/등), pronouns
@@ -33,6 +38,48 @@ _KEEP_TAGS = frozenset({"NNG", "NNP", "VV", "VA", "SH", "SN"})
 # Latin / alphanumeric identifier spans (>= 2 chars). Surrounding punctuation is
 # stripped afterwards so "guide." and "guide" tokenize the same.
 _LATIN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_\-.]+")
+_ASCII_MODEL_PATH: str | None = None
+
+
+def _is_ascii_path(path: Path) -> bool:
+    return all(ord(ch) < 128 for ch in str(path))
+
+
+def _copy_model_to_ascii_cache(src: Path) -> Path:
+    """Return an ASCII-only model path for Kiwi's native file loader."""
+    global _ASCII_MODEL_PATH
+    if _ASCII_MODEL_PATH is not None:
+        return Path(_ASCII_MODEL_PATH)
+
+    dst = Path(tempfile.gettempdir()) / "veritas_kiwipiepy_model" / _KIWI_MODEL_VERSION
+    dst.mkdir(parents=True, exist_ok=True)
+
+    for item in src.iterdir():
+        if item.name == "__pycache__":
+            continue
+        target = dst / item.name
+        if item.is_dir():
+            if not target.exists():
+                shutil.copytree(item, target)
+            continue
+        if not target.exists() or target.stat().st_size != item.stat().st_size:
+            shutil.copy2(item, target)
+
+    _ASCII_MODEL_PATH = str(dst)
+    return dst
+
+
+def create_kiwi() -> Kiwi:
+    """Build Kiwi with the installed model package path.
+
+    Some Windows virtualenvs fail to resolve kiwipiepy_model implicitly. Also,
+    Kiwi's native loader can fail to open model files when the package lives
+    under a non-ASCII path, so cache the model under an ASCII temp path.
+    """
+    model_path = Path(get_model_path()).resolve()
+    if not _is_ascii_path(model_path):
+        model_path = _copy_model_to_ascii_cache(model_path)
+    return Kiwi(model_path=str(model_path))
 
 
 class HybridTokenizer:
@@ -43,7 +90,7 @@ class HybridTokenizer:
     """
 
     def __init__(self) -> None:
-        self._kiwi = Kiwi()
+        self._kiwi = create_kiwi()
 
     def __call__(self, text: str) -> list[str]:
         if not text:
@@ -66,4 +113,4 @@ class HybridTokenizer:
         return tokens
 
 
-__all__ = ["HybridTokenizer"]
+__all__ = ["HybridTokenizer", "create_kiwi"]
