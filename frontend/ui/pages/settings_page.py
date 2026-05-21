@@ -98,9 +98,13 @@ class FlowLayout(QLayout):
 
 
 MODEL_OPTIONS = [
-	("0.8B", "0.8B"),
-	("9B", "9B"),
+	("0.8B 8bit", "qwen35-0.8b-q8_0"),
+	("2B 8bit", "qwen35-2b-q8_0"),
+	("4B 4bit", "qwen35-4b-q4"),
+	("9B 4bit", "qwen35-9b-q4"),
 ]
+DEFAULT_MODEL_ID = "qwen35-0.8b-q8_0"
+MODEL_LABELS = {model_id: label for label, model_id in MODEL_OPTIONS}
 
 # Document editing tools VERITAS already recognizes as "문서 작업" screens.
 # Shown read-only in the settings page so users see the current coverage
@@ -231,7 +235,12 @@ class SettingsPage(QWidget):
 			"settings",
 			{
 				"model": {
-					"modelName": "0.8B",
+					"modelId": DEFAULT_MODEL_ID,
+					"modelName": MODEL_LABELS[DEFAULT_MODEL_ID],
+				},
+				"embeddingModel": {
+					"modelId": "granite-embedding-97m-r2-q8_0",
+					"modelName": "Granite Embedding 97M Multilingual R2 8-bit",
 				},
 				"localAccess": {
 					"folderPaths": [],
@@ -241,7 +250,7 @@ class SettingsPage(QWidget):
 				},
 			},
 		)
-		self._settings.setdefault("model", {}).setdefault("modelName", "0.8B")
+		self._settings.setdefault("model", {}).setdefault("modelId", DEFAULT_MODEL_ID)
 		self._settings.setdefault("localAccess", {})
 		self._settings.setdefault("documentTools", {}).setdefault("custom", [])
 		research_defaults = self._settings.setdefault("research", {})
@@ -612,8 +621,16 @@ class SettingsPage(QWidget):
 
 	def _load_model_settings(self) -> None:
 		model_settings = self._settings.get("model", {})
-		model_name = model_settings.get("modelName") or model_settings.get("modelId") or "0.8B"
-		self._set_selected_model(str(model_name))
+		model_id = model_settings.get("modelId")
+		if not model_id:
+			legacy_name = str(model_settings.get("modelName") or "")
+			model_id = {
+				"0.8B": "qwen35-0.8b-q8_0",
+				"2B": "qwen35-2b-q8_0",
+				"4B": "qwen35-4b-q4",
+				"9B": "qwen35-9b-q4",
+			}.get(legacy_name, DEFAULT_MODEL_ID)
+		self._set_selected_model(str(model_id))
 		self._update_model_status("현재 모델이 적용되어 있습니다.")
 
 	def _load_local_access_settings(self) -> None:
@@ -634,24 +651,30 @@ class SettingsPage(QWidget):
 
 	def _set_selected_model(self, model_name: str) -> None:
 		if model_name not in self._model_buttons:
-			model_name = "0.8B"
+			model_name = DEFAULT_MODEL_ID
 		self._model_buttons[model_name].setChecked(True)
 
 	def _selected_model(self) -> str:
 		for model_name, button in self._model_buttons.items():
 			if button.isChecked():
 				return model_name
-		return "0.8B"
+		return DEFAULT_MODEL_ID
 
 	def _reset_model_settings(self) -> None:
-		self._set_selected_model("0.8B")
+		self._set_selected_model(DEFAULT_MODEL_ID)
 		self._save_model_settings()
 
 	def _save_model_settings(self) -> None:
-		model_name = self._selected_model()
+		model_id = self._selected_model()
 		self._settings["model"] = {
-			"modelName": model_name,
+			"modelId": model_id,
+			"modelName": MODEL_LABELS.get(model_id, model_id),
 		}
+		try:
+			AgentController().update_model(model_id)
+		except Exception as e:
+			self._update_model_status(f"???以??ㅻ쪟媛 諛쒖깮?덉뒿?덈떎: {e}")
+			return
 		self._update_model_status("모델 설정이 저장되었습니다.")
 
 	def _browse_local_folder(self) -> None:
@@ -851,7 +874,8 @@ class SettingsPage(QWidget):
 		return
 
 	def _update_model_status(self, prefix: str) -> None:
-		self.model_status.setText(f"{prefix} · {self._selected_model()}")
+		model_id = self._selected_model()
+		self.model_status.setText(f"{prefix} · {MODEL_LABELS.get(model_id, model_id)}")
 
 	def _update_local_folder_status(self, prefix: str | None = None) -> None:
 		folder_paths = self._folder_paths()

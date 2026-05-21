@@ -1,8 +1,55 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
+from db.app_state import read_json, write_json
+from llm.model_catalog import (
+    DEFAULT_EMBEDDING_MODEL_ID,
+    DEFAULT_LLM_MODEL_ID,
+    default_model_settings,
+    get_model,
+)
+
 from ..api_common import STATE
+
+
+SETTINGS_STATE_KEY = "settings"
+_settings_loaded = False
+
+
+def _deep_merge(defaults: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(defaults)
+    for key, value in override.items():
+        if (
+            isinstance(value, dict)
+            and isinstance(merged.get(key), dict)
+        ):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _settings_defaults() -> dict[str, Any]:
+    defaults = deepcopy(STATE.get("settings") or {})
+    return _deep_merge(defaults, default_model_settings())
+
+
+def _ensure_settings_loaded() -> None:
+    global _settings_loaded
+    if _settings_loaded:
+        return
+    stored = read_json(SETTINGS_STATE_KEY, {})
+    if not isinstance(stored, dict):
+        stored = {}
+    STATE["settings"] = _deep_merge(_settings_defaults(), stored)
+    _settings_loaded = True
+
+
+def _persist_settings() -> None:
+    _ensure_settings_loaded()
+    write_json(SETTINGS_STATE_KEY, STATE["settings"])
 
 
 def get_dashboard_summary() -> dict[str, int]:
@@ -138,21 +185,52 @@ def get_ui_state() -> dict[str, Any]:
 
 
 def get_settings() -> dict[str, Any]:
+    _ensure_settings_loaded()
     return STATE["settings"]
 
 
-def set_model_settings(model_name: str) -> dict[str, Any]:
-    STATE["settings"]["model"] = {"modelName": model_name}
+def set_model_settings(model_id: str) -> dict[str, Any]:
+    _ensure_settings_loaded()
+    spec = get_model(model_id or DEFAULT_LLM_MODEL_ID, kind="llm")
+    STATE["settings"]["model"] = {
+        "modelId": spec.id,
+        "modelName": spec.name,
+    }
+    _persist_settings()
     return STATE["settings"]["model"]
 
 
+def set_embedding_model_settings(model_id: str) -> dict[str, Any]:
+    _ensure_settings_loaded()
+    spec = get_model(model_id or DEFAULT_EMBEDDING_MODEL_ID, kind="embedding")
+    STATE["settings"]["embeddingModel"] = {
+        "modelId": spec.id,
+        "modelName": spec.name,
+    }
+    _persist_settings()
+    return STATE["settings"]["embeddingModel"]
+
+
+def set_launcher_initial_model_selected(value: bool) -> dict[str, Any]:
+    _ensure_settings_loaded()
+    launcher = STATE["settings"].setdefault("launcher", {})
+    if not isinstance(launcher, dict):
+        launcher = {}
+        STATE["settings"]["launcher"] = launcher
+    launcher["initialModelSelected"] = bool(value)
+    _persist_settings()
+    return launcher
+
+
 def set_local_access_settings(folder_paths: list[str]) -> dict[str, Any]:
+    _ensure_settings_loaded()
     cleaned_paths: list[str] = []
     for folder_path in folder_paths:
         cleaned = folder_path.strip()
         if cleaned and cleaned not in cleaned_paths:
             cleaned_paths.append(cleaned)
     STATE["settings"]["localAccess"] = {"folderPaths": cleaned_paths}
+    _persist_settings()
     return STATE["settings"]["localAccess"]
 
 
@@ -162,6 +240,7 @@ def set_document_tools_settings(custom_tools: list[dict[str, Any]]) -> dict[str,
     Each tool is normalized to ``{"name", "identifier"}``; entries without a
     name are dropped and exact duplicates are collapsed.
     """
+    _ensure_settings_loaded()
     cleaned: list[dict[str, str]] = []
     seen: set[str] = set()
     for tool in custom_tools:
@@ -177,6 +256,7 @@ def set_document_tools_settings(custom_tools: list[dict[str, Any]]) -> dict[str,
         seen.add(key)
         cleaned.append({"name": name, "identifier": identifier})
     STATE["settings"]["documentTools"] = {"custom": cleaned}
+    _persist_settings()
     return STATE["settings"]["documentTools"]
 
 
@@ -184,10 +264,12 @@ def set_research_method_settings(sample_count: int, plan_count: int) -> dict[str
     """Persist AutoSurvey pacing — initial scout sample size and per-plan
     collect/batch-summary cycle size — so research runs honor the user's
     설정 > 고급 설정 values."""
+    _ensure_settings_loaded()
     STATE["settings"]["research"] = {
         "sampleCount": max(1, int(sample_count)),
         "planCount": max(1, int(plan_count)),
     }
+    _persist_settings()
     return STATE["settings"]["research"]
 
 
@@ -198,8 +280,10 @@ def set_llm_parallel_settings(value: int) -> int:
     many concurrent requests a low-spec local llama-server is asked to juggle.
     The clamped value is what callers should apply to ``LLMClient.max_parallel``.
     """
+    _ensure_settings_loaded()
     clamped = max(1, min(5, int(value)))
     STATE["settings"]["llmParallel"] = clamped
+    _persist_settings()
     return clamped
 
 

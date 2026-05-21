@@ -801,6 +801,19 @@ class LLMClient:
 
         return embedding
 
+    def check_embedding_endpoint(self) -> None:
+        """Fail fast if the configured embedding endpoint cannot embed text."""
+        try:
+            self.embed("veritas embedding health check")
+        except Exception as exc:
+            raise RuntimeError(
+                "Embedding endpoint is not usable. "
+                f"endpoint={self.embed_base_url}, model={self.embed_model}. "
+                f"Underlying error: {type(exc).__name__}: {exc}. "
+                "If this is llama-server, start the embedding server with "
+                "--embeddings."
+            ) from exc
+
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Generate embeddings for multiple texts.
 

@@ -7,6 +7,20 @@ RAG over generated markdown outputs, and schema-driven chat tool use.
 
 - API/CLI entrypoints now use separate OpenAI-compatible servers by default:
   chat completions on `127.0.0.1:8080`, embeddings on `127.0.0.1:8081`.
+- `launcher.py` is the future `veritas-launcher.exe` entrypoint. On first run it
+  checks `%LOCALAPPDATA%\VERITAS\models\llm` and
+  `%LOCALAPPDATA%\VERITAS\models\embedding`, offers the Qwen3.5 GGUF choices,
+  downloads missing models from Hugging Face with progress, then starts the two
+  `llama-server` processes, the FastAPI server, and the PySide UI.
+  The embedding server is started with `--embeddings`; without that flag
+  `POST /api/v1/verify/jobs` can fail when the verification pipeline first
+  calls `/v1/embeddings`.
+  By default child-process logs are written to `%LOCALAPPDATA%\VERITAS\logs`.
+  For development, run `python launcher.py --console-logs` or set
+  `VERITAS_LOG_MODE=console` to stream llama-server/API/UI logs into the same
+  terminal. If a server is already running on ports 8000/8080/8081, the
+  launcher reuses it and cannot attach to that old process's stdout; stop the
+  existing process first to see live logs from a fresh launch.
 - The frontend Research page runs `/api/v1/research/jobs` on a Qt worker thread
   so the UI stays responsive during long AutoSurvey runs.
 - Completed research jobs return document titles/links from `summary/index.json`,
