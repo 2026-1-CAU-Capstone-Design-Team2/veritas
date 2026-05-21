@@ -48,6 +48,12 @@ class JobCategory:
 	# feedback can keep running in parallel — only research / workspace switch
 	# can race with it.
 	VERIFY = "verify"
+	# Inline ghost-writing in the standalone editor. Suggestions are tiny,
+	# frequent LLM calls; the only hard rule is that they must not fire while
+	# AutoSurvey is running (research saturates the local model). The editor
+	# gates each trigger on ``is_blocked(EDITOR)`` rather than registering, so
+	# rapid keystroke re-triggers never fight over a busy slot.
+	EDITOR = "editor"
 
 
 # "If any of these are active, this category cannot start."
@@ -77,6 +83,12 @@ _BLOCKS_THIS: dict[str, set[str]] = {
 		JobCategory.VERIFY,
 		JobCategory.WORKSPACE_SWITCH,
 	},
+	# Ghost-writing is blocked only by an in-flight AutoSurvey run. It does not
+	# block anything itself (not added to other categories' blocker sets) and is
+	# not blocked by another EDITOR job, so the editor can re-trigger on every
+	# keystroke without being rejected; the editor window keeps a single live
+	# worker on its own.
+	JobCategory.EDITOR: {JobCategory.RESEARCH},
 }
 
 

@@ -6,10 +6,18 @@ from datetime import datetime
 from typing import Any, Callable, Iterator
 
 from core.prompts import (
+    ASSIST_GROUNDED_USER_TEMPLATE,
+    ASSIST_SYSTEM_PROMPTS,
+    CHAT_SOURCES_BLOCK_TEMPLATE,
+    CHAT_SYSTEM_TEMPLATE,
+    REFERENCE_BLOCK_TEMPLATE,
     SCREEN_INTERVENTION_SYSTEM_PROMPT,
     SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE,
     SCREEN_SCENARIO_GUIDANCE,
     SCREEN_SCENARIO_GUIDANCE_DEFAULT,
+    SUGGEST_SUFFIX_BLOCK_TEMPLATE,
+    SUGGEST_SYSTEM_PROMPT,
+    SUGGEST_USER_TEMPLATE,
     SYSTEM_PROMPT,
     TOOL_CHAT_FINAL_PROMPT_TEMPLATE,
     TOOL_CHAT_SYSTEM_PROMPT,
@@ -68,6 +76,9 @@ class ChatAgent:
         self._screen_monitor_thread: threading.Thread | None = None
         self._screen_answer_callback: Callable[[str, dict[str, Any], bool], None] | None = None
         self._last_handled_screen_event_id = ""
+        # Small per-workspace cache for editor RAG grounding (the agent is rebuilt
+        # on every workspace switch, so this resets with the workspace).
+        self._editor_ctx_cache: dict[str, Any] = {"key": "", "context": None}
 
     def ask_rag(self, question: str, *, stream: bool = False) -> str:
         """Strict document-grounded Q&A mode for explicit --phase rag sessions."""
@@ -195,6 +206,130 @@ class ChatAgent:
                 collected.append(answer)
                 yield answer
             self._append_history(question, "".join(collected))
+
+    # -- editor (standalone writer) surfaces ---------------------------------
+    # Power the editor window's ghost-writing / quick actions / chat. They reuse
+    # this agent's workspace-bound rag_service for grounding (the same RAG index
+    # ask_rag uses) but generate with the editor prompts, and deliberately do
+    # NOT touch chat_history — the editor is a separate surface from the chat
+    # panel, so its turns must not pollute the conversation log.
+
+    _EDITOR_RAG_ACTIONS = ("rewrite", "summarize", "polish", "continue")
+    _EDITOR_CONTEXT_MAX_CHARS = 1200
+
+    def _editor_context(self, query: str) -> str | None:
+        """Retrieve grounding context from the workspace RAG index, or ``None``
+        when unavailable (no service, empty index, or retrieval failure).
+        Cached on the query tail so ghost-firing on consecutive pauses with the
+        same context doesn't re-embed each time."""
+        query = (query or "").strip()
+        if not query or self.rag_service is None:
+            return None
+        cache_key = query[-200:]
+        if self._editor_ctx_cache.get("key") == cache_key:
+            return self._editor_ctx_cache.get("context")
+        try:
+            if self.rag_service.get_document_count() <= 0:
+                context: str | None = None
+            else:
+                # use_history=False → embed the query directly (no extra LLM call
+                # for history-aware rewriting; the editor must stay fast).
+                documents = self.rag_service.retrieve(query[-300:], use_history=False)
+                formatted = (self.rag_service.format_retrieved_documents(documents) or "").strip()
+                context = formatted[: self._EDITOR_CONTEXT_MAX_CHARS] or None
+        except Exception as e:  # noqa: BLE001 — grounding is best-effort
+            print(f"[editor][rag][warn] retrieval failed: {e}")
+            context = None
+        self._editor_ctx_cache = {"key": cache_key, "context": context}
+        return context
+
+    def iter_ghostwrite(
+        self,
+        prefix: str,
+        suffix: str = "",
+        *,
+        max_tokens: int = 64,
+        use_workspace: bool = True,
+    ) -> Iterator[str]:
+        """Stream an inline continuation. When ``use_workspace`` is set this is
+        *forced* RAG: if the workspace has no usable context, nothing is
+        produced (no ungrounded fallback)."""
+        prefix = (prefix or "")[-2000:]
+        suffix = (suffix or "")[:500]
+        if not prefix.strip() and not suffix.strip():
+            return
+        reference = ""
+        if use_workspace:
+            context = self._editor_context(prefix)
+            if context is None:
+                return  # forced RAG: no grounding → no suggestion
+            reference = REFERENCE_BLOCK_TEMPLATE.format(context=context)
+        suffix_block = SUGGEST_SUFFIX_BLOCK_TEMPLATE.format(suffix=suffix) if suffix.strip() else ""
+        user_prompt = SUGGEST_USER_TEMPLATE.format(
+            reference=reference, prefix=prefix, suffix_block=suffix_block
+        )
+        yield from self.llm.iter_ask(
+            SUGGEST_SYSTEM_PROMPT,
+            user_prompt,
+            reasoning=False,
+            sampling_params={"temperature": 0.3, "top_p": 0.9, "max_tokens": max(8, min(256, int(max_tokens)))},
+            stream_label="editor-suggest",
+        )
+
+    def iter_editor_assist(
+        self,
+        action: str,
+        text: str,
+        *,
+        max_tokens: int = 400,
+        use_workspace: bool = True,
+    ) -> Iterator[str]:
+        """Stream a quick-action transform. RAG is additive: grounding is added
+        when available, but the action still runs on the given text without it."""
+        action = (action or "").strip().lower()
+        system_prompt = ASSIST_SYSTEM_PROMPTS.get(action)
+        if system_prompt is None:
+            return
+        body = (text or "").strip()
+        user_content = body or "(빈 문서)"
+        if use_workspace and action in self._EDITOR_RAG_ACTIONS:
+            context = self._editor_context(body)
+            if context:
+                user_content = ASSIST_GROUNDED_USER_TEMPLATE.format(context=context, text=user_content)
+        yield from self.llm.iter_ask(
+            system_prompt,
+            user_content,
+            reasoning=False,
+            sampling_params={"temperature": 0.4, "top_p": 0.9, "max_tokens": max(16, min(1024, int(max_tokens)))},
+            stream_label=f"editor-{action}",
+        )
+
+    def iter_editor_chat(
+        self,
+        message: str,
+        doc_text: str = "",
+        *,
+        use_workspace: bool = True,
+    ) -> Iterator[str]:
+        """Stream a document-grounded chat reply. RAG is additive — the current
+        document is always in the prompt; workspace sources are appended when
+        available."""
+        msg = (message or "").strip()
+        if not msg:
+            return
+        doc = (doc_text or "")[:4000]
+        system_prompt = CHAT_SYSTEM_TEMPLATE.format(doc=doc or "(빈 문서)")
+        if use_workspace:
+            context = self._editor_context(msg)
+            if context:
+                system_prompt += CHAT_SOURCES_BLOCK_TEMPLATE.format(context=context)
+        yield from self.llm.iter_ask(
+            system_prompt,
+            msg,
+            reasoning=False,
+            sampling_params={"temperature": 0.6, "top_p": 0.9, "max_tokens": 512},
+            stream_label="editor-chat",
+        )
 
     def _stream_final_answer(
         self,
