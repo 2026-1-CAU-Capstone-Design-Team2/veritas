@@ -1,7 +1,6 @@
 import unittest
 
-from services.screen_tool_funcs.models import UiAutomationResult, WindowContext
-from services.screen_tool_funcs.ui_automation import UiAutomationReader
+from services.screen_tool_funcs import UiAutomationReader, UiAutomationResult, WindowContext
 
 
 class UiAutomationQualityTests(unittest.TestCase):

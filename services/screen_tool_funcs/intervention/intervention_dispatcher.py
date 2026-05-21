@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import re
 
-from .models import ScreenContextEvent
-from .scenario import ScenarioType
-from .store import ScreenContextStore
+from ..core.models import ScreenContextEvent
+from ..core.store import ScreenContextStore
+from ..scenario import ScenarioType
 
 
 class InterventionDispatcher:

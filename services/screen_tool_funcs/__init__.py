@@ -1,7 +1,10 @@
-from .content_filter import ContentFilter
-from .intervention_detector import InterventionDetector
-from .intervention_dispatcher import InterventionDispatcher
-from .models import (
+from .capture.ocr_engine import OcrEngine
+from .capture.powerpoint_com import PowerPointComReader
+from .capture.screen_capture import ScreenCapture
+from .capture.ui_automation import UiAutomationReader
+from .capture.window_context import WindowContextReader
+from .core.content_filter import ContentFilter
+from .core.models import (
     AppTextResult,
     BoundingBox,
     FilteredScreenContext,
@@ -11,9 +14,10 @@ from .models import (
     UiAutomationResult,
     WindowContext,
 )
-from .ocr_engine import OcrEngine
-from .powerpoint_com import PowerPointComReader
-from .scenario_scheduler import ScenarioScheduler, ScenarioSchedulerState, ScenarioWeights
+from .core.store import ScreenContextStore
+from .intervention.intervention_detector import InterventionDetector
+from .intervention.intervention_dispatcher import InterventionDispatcher
+from .intervention.scenario_scheduler import ScenarioScheduler, ScenarioSchedulerState, ScenarioWeights
 from .scenario import (
     AcronymIntroducedScenario,
     BlankDocumentStartScenario,
@@ -42,11 +46,7 @@ from .scenario import (
     WeakModifierOveruseScenario,
     WholeDocumentReviewScenario,
 )
-from .screen_capture import ScreenCapture
 from .screen_context_service import ScreenContextService
-from .store import ScreenContextStore
-from .ui_automation import UiAutomationReader
-from .window_context import WindowContextReader
 
 __all__ = [
     "AcronymIntroducedScenario",

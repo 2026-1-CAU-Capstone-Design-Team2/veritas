@@ -5,8 +5,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .scenario import ScenarioType
-from .store import ScreenContextStore
+from ..core.store import ScreenContextStore
+from ..scenario import ScenarioType
 
 
 @dataclass

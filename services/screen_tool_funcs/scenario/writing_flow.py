@@ -16,7 +16,7 @@ from __future__ import annotations
 import difflib
 from typing import Any
 
-from ..models import FilteredScreenContext
+from ..core.models import FilteredScreenContext
 from ._shared import _event_document_key, _event_paragraph_fingerprint
 from .base import ScenarioContext, ScenarioEvaluation, ScenarioType
 
@@ -37,7 +37,7 @@ class IdleAfterWritingScenario(ScenarioType):
         min_idle_captures: int = 2,
         idle_similarity_threshold: float = 0.985,
         cooldown_events: int = 3,
-        cooldown_min_seconds: float = 60.0,
+        cooldown_min_seconds: float = 30.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -58,7 +58,7 @@ class IdleAfterWritingScenario(ScenarioType):
         typing_pause = self._typing_pause_status(context.same_document_events)
         typing_pause_passed = bool(typing_pause.get("ready"))
         # paragraph_cooldown(`_passes_paragraph_cooldown`) 게이트는 의도적으로
-        # 평가에서 제외 — `time_cooldown`(60s)이 같은 시나리오의 재발화를 이미
+        # 평가에서 제외 — `time_cooldown`(30s)이 같은 시나리오의 재발화를 이미
         # 막아주고, paragraph fingerprint 기반 윈도우(`cooldown_events`)는 같은
         # 문단에 머무는 동안 사실상 영구 차단으로 동작해 "최빈도 2번 후 침묵"
         # 증상의 원인이었다. 메서드/필드는 보존하므로 필요 시 재활성화 가능.
@@ -206,7 +206,7 @@ class IdleAfterWritingScenario(ScenarioType):
         paragraph_fingerprint: str,
     ) -> bool:
         """[Deprecated] paragraph fingerprint 기반 dedupe. `evaluate()` 에서 호출
-        하지 않는다 — `time_cooldown`(60s) 으로 통합됨. 같은 문단 윈도우 안에서
+        하지 않는다 — `time_cooldown`(30s) 으로 통합됨. 같은 문단 윈도우 안에서
         영구 차단으로 작동하는 부작용 때문에 비활성. 필요 시 재활성화 가능."""
         if not paragraph_fingerprint:
             return False
@@ -273,7 +273,7 @@ class WholeDocumentReviewScenario(ScenarioType):
         sustained_min_active_captures: int = 4,
         idle_after_sustained_captures: int = 2,
         idle_similarity_threshold: float = 0.97,
-        cooldown_min_seconds: float = 300.0,
+        cooldown_min_seconds: float = 150.0,
         cooldown_min_added_chars: int = 200,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
@@ -560,7 +560,7 @@ class LongStaticReviewScenario(ScenarioType):
         min_static_captures: int = 3,
         min_document_chars: int = 200,
         idle_similarity_threshold: float = 0.99,
-        cooldown_min_seconds: float = 240.0,
+        cooldown_min_seconds: float = 120.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -747,7 +747,7 @@ class ParagraphChurnScenario(ScenarioType):
         max_capture_delta: int = 15,
         max_net_change: int = 25,
         min_paragraph_chars: int = 20,
-        cooldown_min_seconds: float = 150.0,
+        cooldown_min_seconds: float = 75.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -909,7 +909,7 @@ class BlankDocumentStartScenario(ScenarioType):
         *,
         max_document_chars: int = 30,
         min_blank_captures: int = 3,
-        cooldown_min_seconds: float = 200.0,
+        cooldown_min_seconds: float = 100.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:

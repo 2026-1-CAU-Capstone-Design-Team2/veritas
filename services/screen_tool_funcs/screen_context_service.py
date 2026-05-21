@@ -5,13 +5,18 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .content_filter import ContentFilter
-from .intervention_detector import InterventionDetector
-from .intervention_dispatcher import InterventionDispatcher
-from .models import AppTextResult, OcrResult, ScreenContextEvent, UiAutomationResult
-from .ocr_engine import OcrEngine
-from .powerpoint_com import PowerPointComReader
-from .scenario_scheduler import ScenarioScheduler
+from .capture.ocr_engine import OcrEngine
+from .capture.powerpoint_com import PowerPointComReader
+from .capture.screen_capture import ScreenCapture
+from .capture.text_extraction_targets import is_text_extraction_target
+from .capture.ui_automation import UiAutomationReader
+from .capture.window_context import WindowContextReader
+from .core.content_filter import ContentFilter
+from .core.models import AppTextResult, OcrResult, ScreenContextEvent, UiAutomationResult
+from .core.store import ScreenContextStore
+from .intervention.intervention_detector import InterventionDetector
+from .intervention.intervention_dispatcher import InterventionDispatcher
+from .intervention.scenario_scheduler import ScenarioScheduler
 from .scenario import (
     AcronymIntroducedScenario,
     BlankDocumentStartScenario,
@@ -37,11 +42,6 @@ from .scenario import (
     WeakModifierOveruseScenario,
     WholeDocumentReviewScenario,
 )
-from .screen_capture import ScreenCapture
-from .store import ScreenContextStore
-from .text_extraction_targets import is_text_extraction_target
-from .ui_automation import UiAutomationReader
-from .window_context import WindowContextReader
 
 
 """

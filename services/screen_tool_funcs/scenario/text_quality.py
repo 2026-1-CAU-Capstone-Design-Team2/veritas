@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from ..models import FilteredScreenContext
+from ..core.models import FilteredScreenContext
 from ._shared import (
     KO_TRANSITION_WORDS,
     KO_WEAK_MODIFIERS,
@@ -36,7 +36,7 @@ class QuoteInsertedScenario(ScenarioType):
         self,
         *,
         min_quote_chars: int = 20,
-        cooldown_min_seconds: float = 300.0,
+        cooldown_min_seconds: float = 150.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -102,7 +102,7 @@ class CitationMissingScenario(ScenarioType):
         self,
         *,
         min_statistics: int = 2,
-        cooldown_min_seconds: float = 300.0,
+        cooldown_min_seconds: float = 150.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -170,7 +170,7 @@ class FactualClaimMadeScenario(ScenarioType):
         self,
         *,
         min_statistics: int = 1,
-        cooldown_min_seconds: float = 240.0,
+        cooldown_min_seconds: float = 120.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -238,7 +238,7 @@ class RepeatedPhraseInParagraphScenario(ScenarioType):
         ngram: int = 2,
         min_repeats: int = 3,
         min_paragraph_words: int = 20,
-        cooldown_min_seconds: float = 180.0,
+        cooldown_min_seconds: float = 90.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -318,7 +318,7 @@ class TransitionWordOveruseScenario(ScenarioType):
         self,
         *,
         min_count: int = 4,
-        cooldown_min_seconds: float = 300.0,
+        cooldown_min_seconds: float = 150.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:
@@ -384,7 +384,7 @@ class WeakModifierOveruseScenario(ScenarioType):
         self,
         *,
         min_count: int = 4,
-        cooldown_min_seconds: float = 300.0,
+        cooldown_min_seconds: float = 150.0,
         initial_vruntime: float | None = None,
         vruntime_increment: float | None = None,
     ) -> None:

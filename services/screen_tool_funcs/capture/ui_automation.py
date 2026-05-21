@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .models import BoundingBox, UiAutomationResult, WindowContext
+from ..core.models import BoundingBox, UiAutomationResult, WindowContext
 from .text_extraction_targets import is_text_extraction_target
 
 

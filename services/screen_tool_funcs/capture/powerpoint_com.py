@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .models import AppTextResult, WindowContext
+from ..core.models import AppTextResult, WindowContext
 
 
 class PowerPointComReader:
