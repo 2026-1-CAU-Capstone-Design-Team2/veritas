@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
 	QFrame,
 	QHBoxLayout,
@@ -28,6 +29,8 @@ _KST = timezone(timedelta(hours=9))
 
 
 class DashboardPage(QWidget):
+	openDraftRequested = Signal(str, str)  # (workspace_id, markdown)
+
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		init_db()
@@ -35,7 +38,7 @@ class DashboardPage(QWidget):
 
 		self._stat_values: dict[str, QLabel] = {}
 		self._workspace_list = QVBoxLayout()
-		self._activity_list = QVBoxLayout()
+		self._draft_list = QVBoxLayout()
 		# Last payload rendered — an unchanged refresh skips the widget rebuild
 		# entirely so an idle dashboard costs nothing. ``_loading`` coalesces
 		# overlapping ticks into one in-flight fetch.
@@ -63,9 +66,9 @@ class DashboardPage(QWidget):
 		self._workspace_list.setSpacing(8)
 		workspace_card.layout.addLayout(self._workspace_list)
 
-		doc_card = CardWidget("최근 문서/피드백")
-		self._activity_list.setSpacing(8)
-		doc_card.layout.addLayout(self._activity_list)
+		doc_card = CardWidget("최근 작성 초안")
+		self._draft_list.setSpacing(8)
+		doc_card.layout.addLayout(self._draft_list)
 
 		recent.layout.addWidget(workspace_card)
 		recent.layout.addWidget(doc_card)
@@ -119,7 +122,7 @@ class DashboardPage(QWidget):
 			self._stat_values["validated_workspaces"].setText(str(data["validated_workspaces"]))
 			self._stat_values["feedback_rate"].setText(f"{data['feedback_rate']}%")
 			self._render_recent_workspaces(data["recent_workspaces"])
-			self._render_recent_activities(data["recent_activities"])
+			self._render_recent_drafts(data.get("recent_drafts", []))
 
 		def _failed(_message: str) -> None:
 			self._loading = False
@@ -336,17 +339,58 @@ class DashboardPage(QWidget):
 			pass
 		self.load_dashboard_data()
 
-	def _render_recent_activities(self, activities: list[dict[str, object]]) -> None:
-		self._clear_layout(self._activity_list)
-		if not activities:
-			self._activity_list.addWidget(self._empty_label("최근 작업 없음"))
+	def _render_recent_drafts(self, drafts: list[dict[str, object]]) -> None:
+		self._clear_layout(self._draft_list)
+		if not drafts:
+			self._draft_list.addWidget(self._empty_label("작성된 초안 없음"))
 			return
 
-		for activity in activities:
-			action = self._format_action(str(activity.get("action") or "activity"))
-			description = str(activity.get("description") or "작업 설명 없음")
-			created_at = str(activity.get("created_at") or "-")
-			self._activity_list.addLayout(self._create_text_row(action, f"{description} · {created_at}"))
+		for draft in drafts:
+			title = str(draft.get("title") or "제목 없는 초안")
+			workspace_name = str(draft.get("workspace_name") or "")
+			workspace_id = str(draft.get("workspace_id") or "")
+			updated_at = self._format_created_at(str(draft.get("updated_at") or "-"))
+			detail = f"{workspace_name} · {updated_at}" if workspace_name else updated_at
+			draft_path = str(draft.get("path") or "")
+			self._draft_list.addLayout(self._create_draft_row(title, detail, workspace_id, draft_path))
+
+	def _create_draft_row(self, title: str, detail: str, workspace_id: str, draft_path: str) -> QHBoxLayout:
+		row = self._create_text_row(title, detail)
+		open_button = QPushButton("열기")
+		open_button.setObjectName("DashboardDraftOpenButton")
+		open_button.setCursor(Qt.PointingHandCursor)
+		open_button.setFixedHeight(28)
+		open_button.setStyleSheet(
+			"QPushButton#DashboardDraftOpenButton {"
+			" background-color: #FFFFFF; color: #1D4ED8;"
+			" border: 1px solid #93C5FD; border-radius: 8px;"
+			" padding: 4px 10px; font-size: 11px; font-weight: 800;"
+			"}"
+			"QPushButton#DashboardDraftOpenButton:hover {"
+			" background-color: #EFF6FF; border-color: #60A5FA;"
+			"}"
+			"QPushButton#DashboardDraftOpenButton:disabled {"
+			" color: #9CA3AF; border-color: #E5E7EB;"
+			"}"
+		)
+		if draft_path and Path(draft_path).exists():
+			open_button.setToolTip(f"글쓰기 창에서 열기: {title}")
+			open_button.clicked.connect(
+				lambda _checked=False, wid=workspace_id, p=draft_path: self._open_draft(wid, p)
+			)
+		else:
+			open_button.setEnabled(False)
+			open_button.setToolTip("파일을 찾을 수 없습니다.")
+		row.addWidget(open_button, 0, Qt.AlignTop | Qt.AlignRight)
+		return row
+
+	def _open_draft(self, workspace_id: str, path: str) -> None:
+		try:
+			markdown = Path(path).read_text(encoding="utf-8")
+		except Exception as e:
+			QMessageBox.warning(self, "파일 열기 실패", f"초안 파일을 읽지 못했습니다.\n\n{e}")
+			return
+		self.openDraftRequested.emit(workspace_id, markdown)
 
 	def _create_text_row(self, title: str, detail: str) -> QHBoxLayout:
 		row = QHBoxLayout()
@@ -395,12 +439,3 @@ class DashboardPage(QWidget):
 			widget = item.widget()
 			if widget is not None:
 				widget.deleteLater()
-
-	def _format_action(self, action: str) -> str:
-		return {
-			"document_uploaded": "최근 업로드 문서",
-			"draft_created": "최근 초안 생성",
-			"validation_completed": "최근 검증 완료",
-			"feedback_completed": "최근 피드백 완료",
-			"workspace_opened": "최근 워크스페이스 열림",
-		}.get(action, action)

@@ -26,7 +26,10 @@ from fastapi import HTTPException
 
 from services.verification import VerificationPersistence
 
+from db import activity_repository as activity
+
 from ..api_common import new_id
+from ..repositories import state_repository as repo
 from . import verify_view
 from .agent_runtime import get_runtime
 
@@ -55,6 +58,25 @@ def create_verify_job(
         tasks=tasks,
         job_id=job_id,
     )
+    # run_verification resolves "default"/None to the real workspace and
+    # returns it as ``workspaceId`` (camelCase) — that resolved id is what the
+    # research documents were recorded under, so prefer it over the raw param.
+    resolved_workspace_id = (
+        str(summary.get("workspaceId") or "")
+        or str(workspace_id or "")
+        or repo.get_current_workspace_id()
+    )
+    if resolved_workspace_id:
+        updated = activity.update_workspace_documents_status(resolved_workspace_id, "validated")
+        if not updated:
+            # No dashboard documents recorded yet (workspace researched before
+            # this feature, or its research job not re-synced this session).
+            # Backfill from the on-disk research index, then validate.
+            from .research_service import backfill_dashboard_documents
+
+            backfill_dashboard_documents(resolved_workspace_id)
+            activity.update_workspace_documents_status(resolved_workspace_id, "validated")
+        activity.log_activity(resolved_workspace_id, "validation_completed", "검증 완료")
     return {"jobId": job_id, **summary}
 
 

@@ -8,6 +8,8 @@ from xml.etree import ElementTree
 
 from fastapi import HTTPException, UploadFile
 
+from db import activity_repository as activity
+
 from ..api_common import new_id
 from ..repositories import state_repository as repo
 from .agent_runtime import get_runtime
@@ -74,6 +76,18 @@ def analyze_feedback(file_ids: list[str]) -> dict[str, str]:
         )
 
     repo.save_feedback_session(analysis_id, file_ids, "completed")
+
+    # Feedback is file-centric (no workspace_id on the request), so attribute
+    # the completion to the workspace the user currently has open.
+    current_workspace_id = repo.get_current_workspace_id()
+    if current_workspace_id:
+        activity.update_workspace_documents_status(current_workspace_id, "feedback_completed")
+        activity.log_activity(
+            current_workspace_id,
+            "feedback_completed",
+            f"피드백 분석 완료 · 파일 {len(file_ids)}개",
+        )
+    activity.record_feedback(analysis_id, status="completed")
     return {"analysisId": analysis_id, "status": "completed"}
 
 

@@ -46,6 +46,8 @@ from core.prompts import (
     DRAFT_USER_PROMPT_TEMPLATE_TEMPLATED,
 )
 
+from db import activity_repository as activity
+
 from ..api_common import utc_now_iso
 from . import draft_forms
 from .agent_runtime import get_runtime
@@ -81,7 +83,9 @@ def generate_builtin_draft(workspace_id: str, payload: dict[str, Any]) -> dict[s
         # Reserve the number on disk immediately so a concurrent request cannot
         # grab the same one while this draft is still generating.
         _write_settings(workspace_id, number, record)
-    return _render_and_persist(workspace_id, number, record)
+    result = _render_and_persist(workspace_id, number, record)
+    activity.log_activity(workspace_id, "draft_created", f"초안 draft_{number} 생성")
+    return result
 
 
 def regenerate_builtin_draft(workspace_id: str, draft_number: int) -> dict[str, Any]:

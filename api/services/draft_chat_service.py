@@ -7,6 +7,8 @@ from typing import Any, Iterator
 
 from fastapi import HTTPException
 
+from db import activity_repository as activity
+
 from ..api_common import new_id, utc_now_iso
 from ..repositories import state_repository as repo
 from .agent_runtime import get_runtime
@@ -31,6 +33,7 @@ def generate_draft(workspace_id: str, prompt: str) -> dict[str, Any]:
         "updatedAt": utc_now_iso(),
     }
     repo.save_draft(draft_id, draft)
+    activity.log_activity(workspace_id, "draft_created", f"초안 생성 · {draft['title']}")
     return {"draftId": draft_id, "title": draft["title"], "content": draft["content"]}
 
 

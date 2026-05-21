@@ -216,7 +216,10 @@ class MainWindow(QMainWindow):
 		self.pages = AnimatedStackedWidget()
 
 		self.route_to_index: dict[str, int] = {}
-		self._add_page("dashboard", DashboardPage())
+		self.dashboard_page = DashboardPage()
+		# 대시보드 "열기" → 글쓰기 에디터에 초안 시드.
+		self.dashboard_page.openDraftRequested.connect(self._open_editor_from_draft)
+		self._add_page("dashboard", self.dashboard_page)
 		self.research_page = ResearchPage()
 		self.research_page.workspaceChanged.connect(self.sidebar.set_current_workspace)
 		self.research_page.workspaceChanged.connect(self._on_workspace_changed)

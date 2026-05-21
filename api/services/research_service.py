@@ -8,6 +8,8 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from db import activity_repository as activity
+
 from ..api_common import new_id, utc_now_iso
 from ..repositories import state_repository as repo
 from . import workspaces_service
@@ -119,6 +121,12 @@ def create_research_job(
             "updatedAt": job["completedAt"],
         },
     )
+    activity.record_documents(result_workspace_id, documents, status="completed")
+    activity.log_activity(
+        result_workspace_id,
+        "document_uploaded",
+        f"{result_workspace_name} · 문서 {job['documentCount']}개 처리",
+    )
     return job
 
 
@@ -218,6 +226,30 @@ def _sync_run_research_jobs() -> None:
                 "updatedAt": completed_at,
             },
         )
+        # Backfill the dashboard documents for workspaces reconstructed from
+        # disk (researched before this feature, or in a prior process). No
+        # activity log here: the timestamps would all collapse to "now" and
+        # flood the recent-activity feed on first sync.
+        if status in ("completed", "partial"):
+            activity.record_documents(workspace_id, documents, status="completed")
+
+
+def backfill_dashboard_documents(workspace_id: str) -> None:
+    """Record a workspace's collected documents into the dashboard DB from disk.
+
+    Used when a lifecycle event (e.g. verification) fires for a workspace whose
+    research predates the dashboard-recording hook, so its ``documents`` rows
+    were never written. Reads ``summary/index.json`` and records the documents
+    as ``completed`` (idempotent; never downgrades an advanced status).
+    """
+    workspace_id = str(workspace_id or "").strip()
+    if not workspace_id:
+        return
+    root = Path(os.getenv("VERITAS_OUTPUT_DIR", "runs")).expanduser().resolve()
+    index_path = root / workspace_id / "summary" / "index.json"
+    documents = _read_index_documents(index_path)
+    if documents:
+        activity.record_documents(workspace_id, documents, status="completed")
 
 
 def _workspace_name(workspace_id: str) -> str:
