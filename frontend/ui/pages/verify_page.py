@@ -22,10 +22,12 @@ from math import ceil
 from typing import Any
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
 	QDialog,
 	QDialogButtonBox,
 	QFrame,
+	QGraphicsDropShadowEffect,
 	QHBoxLayout,
 	QLabel,
 	QScrollArea,
@@ -38,7 +40,7 @@ from PySide6.QtWidgets import (
 from ...api_common import current_workspace_id
 from ...components.badges import Badge
 from ...components.buttons import AppButton
-from ...components.cards import CardWidget, DocumentCard
+from ...components.cards import CardWidget
 from ...components.progress import ResearchProgressBar
 from ...controllers import AgentController, JobCategory, get_job_manager
 
@@ -155,69 +157,104 @@ class _SummaryStripe(QFrame):
 
 	issuesClicked = Signal()
 
+	# Per-tile palette: (bg, border, value_color, caption_color). The band tiles
+	# borrow the app's success/warning/danger tints so the distribution reads at
+	# a glance; 검토 자료 stays neutral white and 점검 필요 항목 takes the indigo
+	# brand accent because it is the actionable (clickable) tile.
+	_TILE_STYLES = {
+		"total": ("#FFFFFF", "#E2E8F0", "#0F172A", "#64748B"),
+		"high": ("#ECFDF3", "#BBF7D0", "#15803D", "#15803D"),
+		"medium": ("#FFF7ED", "#FED7AA", "#B45309", "#B45309"),
+		"low": ("#FEF2F2", "#FECACA", "#B91C1C", "#B91C1C"),
+		"issues": ("#EEF2FF", "#C7D2FE", "#3730A3", "#4F46E5"),
+	}
+
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("VerifySummaryStripe")
 		self.setStyleSheet(
-			"QFrame#VerifySummaryStripe { background-color: #F8FAFC; "
-			"border: 1px solid #E2E8F0; border-radius: 12px; }"
-			"QLabel#SummaryCaption { color: #64748B; font-size: 11px; font-weight: 700; }"
-			"QLabel#SummaryValue { color: #0F172A; font-size: 20px; font-weight: 800; }"
-			"QLabel#SummaryValueClickable { color: #4F46E5; font-size: 20px; font-weight: 800; text-decoration: underline; }"
-			"QLabel#SummaryHint { color: #64748B; font-size: 12px; font-weight: 600; }"
-			"QLabel#SummaryActionHint { color: #4F46E5; font-size: 10px; font-weight: 700; }"
+			"QFrame#VerifySummaryStripe { background: transparent; border: none; }"
+			"QLabel#SummaryHint { color: #94A3B8; font-size: 11px; font-weight: 600; }"
 		)
-		row = QHBoxLayout(self)
-		row.setContentsMargins(16, 12, 16, 12)
-		row.setSpacing(18)
+		outer = QVBoxLayout(self)
+		outer.setContentsMargins(0, 0, 0, 0)
+		outer.setSpacing(8)
 
-		self._total = self._stat("검토 자료", "—")
-		self._high = self._stat("높음", "—")
-		self._medium = self._stat("중간", "—")
-		self._low = self._stat("낮음", "—")
-		self._issues = self._stat("점검 필요 항목", "—", clickable=True, action_hint="자세히 보기")
+		row = QHBoxLayout()
+		row.setContentsMargins(0, 0, 0, 0)
+		row.setSpacing(10)
+
+		self._total = self._tile("검토 자료", "total")
+		self._high = self._tile("높음", "high")
+		self._medium = self._tile("중간", "medium")
+		self._low = self._tile("낮음", "low")
+		self._issues = self._tile(
+			"점검 필요 항목", "issues", clickable=True, action_hint="자세히 보기"
+		)
 		self._issues["value"].clicked.connect(self.issuesClicked)
 
 		for stat in (self._total, self._high, self._medium, self._low, self._issues):
-			row.addLayout(stat["layout"])
-			row.addStretch(0)
-		row.addStretch(1)
+			row.addWidget(stat["frame"], 1)
+		outer.addLayout(row)
 
 		self._hint = QLabel("")
 		self._hint.setObjectName("SummaryHint")
 		self._hint.setWordWrap(True)
-		row.addWidget(self._hint, 0, Qt.AlignRight | Qt.AlignVCenter)
+		outer.addWidget(self._hint, 0, Qt.AlignRight)
 
 		self._issue_count = 0
 
-	def _stat(
+	def _tile(
 		self,
 		caption: str,
-		value: str,
+		key: str,
 		*,
 		clickable: bool = False,
 		action_hint: str = "",
 	) -> dict[str, Any]:
-		layout = QVBoxLayout()
-		layout.setContentsMargins(0, 0, 0, 0)
-		layout.setSpacing(2)
+		bg, border, value_color, caption_color = self._TILE_STYLES[key]
+		frame = QFrame()
+		frame.setObjectName("SummaryTile")
+		frame.setStyleSheet(
+			f"QFrame#SummaryTile {{ background-color: {bg}; border: 1px solid {border};"
+			f" border-radius: 12px; }}"
+			f"QFrame#SummaryTile:hover {{ border-color: {value_color}; }}"
+			if clickable
+			else f"QFrame#SummaryTile {{ background-color: {bg}; border: 1px solid {border};"
+			f" border-radius: 12px; }}"
+		)
+		layout = QVBoxLayout(frame)
+		layout.setContentsMargins(14, 12, 14, 12)
+		layout.setSpacing(3)
+
 		caption_label = QLabel(caption)
-		caption_label.setObjectName("SummaryCaption")
-		if clickable:
-			value_label: QLabel = _ClickableLabel(value)
-			value_label.setObjectName("SummaryValueClickable")
-		else:
-			value_label = QLabel(value)
-			value_label.setObjectName("SummaryValue")
+		caption_label.setStyleSheet(
+			f"color: {caption_color}; font-size: 11px; font-weight: 800;"
+			" background: transparent; border: none;"
+		)
 		layout.addWidget(caption_label)
+
+		if clickable:
+			value_label: QLabel = _ClickableLabel("—")
+		else:
+			value_label = QLabel("—")
+		value_label.setStyleSheet(
+			f"color: {value_color}; font-size: 26px; font-weight: 800;"
+			" background: transparent; border: none;"
+		)
 		layout.addWidget(value_label)
+
 		action_label: QLabel | None = None
 		if clickable and action_hint:
 			action_label = QLabel(action_hint)
-			action_label.setObjectName("SummaryActionHint")
+			action_label.setStyleSheet(
+				f"color: {value_color}; font-size: 10px; font-weight: 700;"
+				" background: transparent; border: none;"
+			)
 			layout.addWidget(action_label)
+
 		return {
-			"layout": layout,
+			"frame": frame,
 			"caption": caption_label,
 			"value": value_label,
 			"action": action_label,
@@ -856,9 +893,8 @@ class _SectionsPanel(CardWidget):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(title="보고서 흐름 구조", parent=parent)
 		self._caption = QLabel(
-			"LLM 이 조사 의도·계획·자료 메타를 보고 정한 보고서 작성 순서입니다."
-			" 각 섹션을 클릭하면 어느 자료의 어느 문장이 그 섹션에 배치되는지"
-			" 확인할 수 있습니다."
+			"LLM 이 정한 보고서 작성 순서입니다. 각 섹션을 클릭하면 어떤 자료의"
+			" 문장이 배치되는지 볼 수 있습니다."
 		)
 		self._caption.setObjectName("CardSecondary")
 		self._caption.setWordWrap(True)
@@ -1137,6 +1173,107 @@ def _summary_for_level(level: str) -> str:
 	return "검증 결과를 확인해 주세요."
 
 
+# Left-accent colour per reliability band — saturated versions of the badge
+# tones so a scanning reader spots the band from the card edge alone.
+_LEVEL_ACCENT = {
+	"높음": "#22C55E",
+	"중간": "#F59E0B",
+	"낮음": "#EF4444",
+}
+
+
+class _VerifyResultCard(QFrame):
+	"""One per-document result row with a band-coloured left accent.
+
+	Replaces the generic :class:`DocumentCard` so the reliability band is
+	legible from the card edge (left accent) instead of relying solely on the
+	small badge. Carries the same content — title · 근거 한 줄 · band badge ·
+	'상세 보기' — but with a tighter, more scannable layout.
+	"""
+
+	detailClicked = Signal()
+
+	def __init__(self, item: dict[str, Any], parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		level = str(item.get("level") or "")
+		accent = _LEVEL_ACCENT.get(level, "#94A3B8")
+		self.setObjectName("VerifyResultCard")
+		self.setStyleSheet(
+			f"QFrame#VerifyResultCard {{ background-color: #FFFFFF;"
+			f" border: 1px solid #E2E8F0; border-left: 5px solid {accent};"
+			f" border-radius: 12px; }}"
+			f"QFrame#VerifyResultCard:hover {{ border-color: #C7D2FE;"
+			f" border-left-color: {accent}; }}"
+			"QLabel#ResultTitle { color: #0F172A; font-size: 14px; font-weight: 800;"
+			" background: transparent; border: none; }"
+			"QLabel#ResultSubtitle { color: #64748B; font-size: 12px; font-weight: 600;"
+			" background: transparent; border: none; }"
+			"QLabel#ResultFooter { color: #475569; font-size: 12px; font-weight: 500;"
+			" background: transparent; border: none; }"
+		)
+
+		shadow = QGraphicsDropShadowEffect(self)
+		shadow.setBlurRadius(18)
+		shadow.setXOffset(0)
+		shadow.setYOffset(6)
+		shadow.setColor(QColor(15, 23, 42, 12))
+		self.setGraphicsEffect(shadow)
+
+		outer = QHBoxLayout(self)
+		outer.setContentsMargins(16, 14, 16, 14)
+		outer.setSpacing(14)
+
+		body = QVBoxLayout()
+		body.setContentsMargins(0, 0, 0, 0)
+		body.setSpacing(5)
+
+		title = QLabel(str(item.get("title") or item.get("docId") or "문서"))
+		title.setObjectName("ResultTitle")
+		title.setWordWrap(True)
+		body.addWidget(title)
+
+		subtitle_text = str(item.get("matchRate") or "").strip()
+		if subtitle_text:
+			subtitle = QLabel(subtitle_text)
+			subtitle.setObjectName("ResultSubtitle")
+			subtitle.setWordWrap(True)
+			body.addWidget(subtitle)
+
+		issues = item.get("issues") or []
+		footer_text = str(issues[0]) if issues else "특이사항이 발견되지 않았습니다."
+		footer_row = QHBoxLayout()
+		footer_row.setContentsMargins(0, 2, 0, 0)
+		footer_row.setSpacing(7)
+		dot = QLabel("●")
+		dot.setStyleSheet(
+			f"color: {accent if issues else '#94A3B8'}; font-size: 9px;"
+			" background: transparent; border: none;"
+		)
+		footer_row.addWidget(dot, 0, Qt.AlignTop)
+		footer = QLabel(footer_text)
+		footer.setObjectName("ResultFooter")
+		footer.setWordWrap(True)
+		footer_row.addWidget(footer, 1)
+		body.addLayout(footer_row)
+
+		outer.addLayout(body, 1)
+
+		right_layout = QVBoxLayout()
+		right_layout.setContentsMargins(0, 0, 0, 0)
+		right_layout.setSpacing(8)
+		right_layout.addWidget(
+			Badge(level or "—", _tone_for_level(level)), 0, Qt.AlignRight
+		)
+		action = AppButton("상세 보기", variant="ghost")
+		action.setObjectName("VerifyDetailButton")
+		action.setFixedHeight(28)
+		action.setFixedWidth(92)
+		action.clicked.connect(self.detailClicked)
+		right_layout.addWidget(action, 0, Qt.AlignRight)
+		right_layout.addStretch(1)
+		outer.addLayout(right_layout, 0)
+
+
 class VerifyPage(QWidget):
 	"""검증 페이지 — runs verification asynchronously, renders the saved results.
 
@@ -1205,10 +1342,8 @@ class VerifyPage(QWidget):
 		# Summary stripe (counts + reliability distribution). The "점검 필요 항목"
 		# stat is clickable — :class:`VerifyIssuesDialog` opens with the full list.
 		summary_caption = QLabel(
-			"각 자료의 신뢰도는 LLM 이 출처 권위 · 검증 가능성 · 자기일관성 세 신호를"
-			" 종합 판단해 ‘높음 / 중간 / 낮음’ 중 하나로 분류한 결과입니다."
-			" ‘점검 필요 항목’ 은 근거 부족 섹션, 신뢰도 낮음 자료, 그리고 출처 간"
-			" 입장 차이를 합산한 수입니다."
+			"신뢰도는 출처 권위·검증 가능성·자기일관성을 종합해 높음/중간/낮음으로"
+			" 분류한 결과입니다. ‘점검 필요 항목’ 을 누르면 세부 내역을 볼 수 있습니다."
 		)
 		summary_caption.setObjectName("CardSecondary")
 		summary_caption.setWordWrap(True)
@@ -1248,10 +1383,8 @@ class VerifyPage(QWidget):
 		results_header.layout.addWidget(self._results_count_badge, 0, Qt.AlignLeft)
 
 		results_header_caption = QLabel(
-			"각 자료에는 LLM 이 종합 판정한 신뢰도 등급(높음 / 중간 / 낮음)과 그"
-			" 근거가 한 줄로 표시됩니다. 아래 칩을 누르면 해당 등급의 자료만 추려"
-			" 볼 수 있고, ‘상세 보기’ 로 권위·검증성·자기일관성 세 sub-signal 과"
-			" 이 자료를 인용한 batch summary 발췌를 확인할 수 있습니다."
+			"각 자료에 신뢰도 등급과 근거가 표시됩니다. 칩으로 등급별 필터링,"
+			" ‘상세 보기’ 로 세부 신호와 인용 발췌를 확인하세요."
 		)
 		results_header_caption.setObjectName("CardSecondary")
 		results_header_caption.setWordWrap(True)
@@ -1567,42 +1700,9 @@ class VerifyPage(QWidget):
 		self._next_btn.setEnabled(self._current_page < total_pages - 1)
 
 	def _build_card(self, item: dict[str, Any]) -> QWidget:
-		level = str(item.get("level") or "")
-		tone = _tone_for_level(level)
-
-		right_panel = QWidget()
-		right_panel.setAttribute(Qt.WA_StyledBackground, False)
-		right_panel.setStyleSheet("background: transparent;")
-		right_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-		right_panel.setFixedWidth(104)
-		right_layout = QVBoxLayout(right_panel)
-		right_layout.setContentsMargins(0, 0, 0, 0)
-		right_layout.setSpacing(6)
-		right_layout.addWidget(Badge(level or "—", tone), 0, Qt.AlignRight)
-
-		action = AppButton("상세 보기", variant="ghost")
-		action.setObjectName("VerifyDetailButton")
-		action.setFixedHeight(28)
-		action.setFixedWidth(92)
-		action.clicked.connect(partial(self._show_detail, item))
-		right_layout.addWidget(action, 0, Qt.AlignRight)
-		right_layout.addStretch(1)
-
-		wrapper = QWidget()
-		wrapper_layout = QVBoxLayout(wrapper)
-		wrapper_layout.setContentsMargins(0, 0, 0, 0)
-		wrapper_layout.setSpacing(0)
-		issues = item.get("issues") or []
-		footer = issues[0] if issues else "특이사항이 발견되지 않았습니다."
-		wrapper_layout.addWidget(
-			DocumentCard(
-				title=str(item.get("title") or item.get("docId") or "문서"),
-				subtitle=str(item.get("matchRate") or ""),
-				right_widget=right_panel,
-				footer=str(footer),
-			)
-		)
-		return wrapper
+		card = _VerifyResultCard(item)
+		card.detailClicked.connect(partial(self._show_detail, item))
+		return card
 
 	def _on_issues_clicked(self) -> None:
 		"""Open the issues dialog with whatever the summary already carries."""
