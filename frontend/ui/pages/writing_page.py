@@ -60,6 +60,7 @@ class DocumentAssistPage(QWidget):
 				"text": text,
 				"tone": tone,
 				"interventionType": str(item.get("interventionType") or ""),
+				"debugTrace": item.get("debugTrace"),
 			})
 		self.suggestion_list.set_suggestions(suggestions)
 
@@ -80,6 +81,7 @@ class DocumentAssistPage(QWidget):
 				text,
 				tone,
 				intervention_type=str(item.get("interventionType") or ""),
+				debug_trace=item.get("debugTrace"),
 			)
 
 	def _on_screen_feedback(self, event_id: str, intervention_type: str, action: str) -> None:

@@ -284,14 +284,22 @@ class ScreenMonitor:
                     if candidate.get("eventId") == event_id:
                         existing = candidate
                         break
+            # --screen-debug rides scenario/KB-data/prompts on the intervention;
+            # surface it on the event so the frontend card can show the same trace.
+            # Absent otherwise, keeping the payload byte-compatible with the default.
+            debug_trace = (
+                intervention.get("debug_trace") if isinstance(intervention, dict) else None
+            )
             # Mid-stream update: refresh the same event's text in place and
             # bump its seq so the cursor poller re-delivers the growing answer.
             if existing is not None:
                 existing["answer"] = text
                 existing["partial"] = not done
                 existing["seq"] = seq
+                if debug_trace:
+                    existing["debugTrace"] = debug_trace
                 return
-            self._events.append({
+            event: dict[str, Any] = {
                 "seq": seq,
                 "eventId": event_id or f"proactive_{seq}",
                 "workspaceId": workspace_id,
@@ -320,7 +328,10 @@ class ScreenMonitor:
                     "fullTextChars": writing_context.get("full_text_chars"),
                     "confidence": writing_context.get("confidence"),
                 },
-            })
+            }
+            if debug_trace:
+                event["debugTrace"] = debug_trace
+            self._events.append(event)
 
     def get_events_since(
         self,

@@ -27,7 +27,7 @@ from core.prompts import (
     TOOL_CHAT_SYSTEM_PROMPT,
     TOOL_CHAT_USER_PROMPT_TEMPLATE,
 )
-from services.screen_tool_funcs.trace import screen_trace
+from services.screen_tool_funcs.trace import screen_trace, screen_trace_enabled
 from tools.llm_tooling import build_llm_tooling
 
 
@@ -917,6 +917,18 @@ class ChatAgent:
             )
             screen_trace(f"LLM system prompt:\n{system_prompt}")
             screen_trace(f"LLM user prompt:\n{prompt}")
+            # In --screen-debug, ride the same decision trace (scenario, the KB data
+            # that was retrieved, the exact prompts) on the intervention dict so the
+            # answer callback carries it to the frontend. Off by default the field is
+            # simply absent, so the UI shows nothing extra.
+            if screen_trace_enabled() and isinstance(intervention, dict):
+                intervention["debug_trace"] = {
+                    "scenario": intervention_type,
+                    "skeleton": is_skeleton,
+                    "knowledgeContext": knowledge_context,
+                    "systemPrompt": system_prompt,
+                    "userPrompt": prompt,
+                }
             try:
                 if stream:
                     answer = self._stream_screen_answer(prompt, intervention, system_prompt)

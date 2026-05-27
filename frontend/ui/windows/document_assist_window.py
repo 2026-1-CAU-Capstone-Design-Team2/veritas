@@ -483,6 +483,9 @@ class SuggestionCard(QFrame):
 	# (event_id, intervention_type, action) — action ∈ {"like","dislike","copy"}.
 	# Re-emitted up through SuggestionList so the host page can POST the reward.
 	feedbackSubmitted = Signal(str, str, str)
+	# Emitted when the debug detail is expanded/collapsed so the host list can
+	# re-measure the card's now-changed height.
+	debugToggled = Signal()
 
 	def __init__(
 		self,
@@ -493,6 +496,7 @@ class SuggestionCard(QFrame):
 		*,
 		event_id: str = "",
 		intervention_type: str = "",
+		debug_trace: dict | None = None,
 	) -> None:
 		super().__init__(parent)
 		self.setObjectName("SuggestionCard")
@@ -500,6 +504,8 @@ class SuggestionCard(QFrame):
 		self._event_id = event_id
 		self._intervention_type = intervention_type
 		self._rated = False
+		self._debug_box: QTextBrowser | None = None
+		self._debug_toggle: QPushButton | None = None
 
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(12, 11, 12, 11)
@@ -574,6 +580,66 @@ class SuggestionCard(QFrame):
 		else:
 			self._like_button = None
 			self._dislike_button = None
+
+		# --screen-debug only: a collapsed "디버그 정보" disclosure carrying the
+		# scenario, the KB data that was retrieved, and the exact prompts. The
+		# payload omits debug_trace unless trace mode is on, so this stays absent.
+		if debug_trace:
+			self._build_debug_section(layout, debug_trace)
+
+	def _build_debug_section(self, layout: QVBoxLayout, trace: dict) -> None:
+		toggle = QPushButton("디버그 정보 ▶")
+		toggle.setObjectName("AssistDebugToggle")
+		toggle.setCursor(Qt.PointingHandCursor)
+		toggle.setCheckable(True)
+		toggle.setStyleSheet(
+			"QPushButton#AssistDebugToggle { background: transparent; border: none; "
+			"color:#6B7280; font-size:11px; text-align:left; padding:2px 0; }"
+			"QPushButton#AssistDebugToggle:hover { color:#2563EB; }"
+		)
+		# Read-only, monospace, fixed-height with its own scrollbar: a full prompt
+		# can be very long, so the card grows by a bounded amount and the text
+		# scrolls inside instead of stretching the card off-screen.
+		box = QTextBrowser()
+		box.setObjectName("AssistDebugBox")
+		box.setReadOnly(True)
+		box.setVisible(False)
+		box.setFixedHeight(240)
+		box.setLineWrapMode(QTextBrowser.WidgetWidth)
+		box.setStyleSheet(
+			"QTextBrowser#AssistDebugBox { background:#0F172A; color:#E2E8F0; "
+			"border:1px solid #1E293B; border-radius:8px; padding:8px; "
+			"font-family: Consolas, 'Courier New', monospace; font-size:11px; }"
+		)
+		box.setPlainText(self._format_debug_text(trace))
+		toggle.toggled.connect(self._on_debug_toggled)
+		layout.addWidget(toggle)
+		layout.addWidget(box)
+		self._debug_toggle = toggle
+		self._debug_box = box
+
+	def _on_debug_toggled(self, checked: bool) -> None:
+		if self._debug_box is None or self._debug_toggle is None:
+			return
+		self._debug_box.setVisible(checked)
+		self._debug_toggle.setText("디버그 정보 ▼" if checked else "디버그 정보 ▶")
+		self._sync_height()
+		self.debugToggled.emit()
+
+	@staticmethod
+	def _format_debug_text(trace: dict) -> str:
+		scenario = str(trace.get("scenario") or "-")
+		skeleton = trace.get("skeleton")
+		skel = f" (skeleton={skeleton})" if skeleton is not None else ""
+		kb = str(trace.get("knowledgeContext") or "").strip() or "(없음)"
+		sys_p = str(trace.get("systemPrompt") or "").strip() or "(없음)"
+		usr_p = str(trace.get("userPrompt") or "").strip() or "(없음)"
+		return (
+			f"[시나리오] {scenario}{skel}\n\n"
+			f"[읽은 데이터 / KB]\n{kb}\n\n"
+			f"[시스템 프롬프트]\n{sys_p}\n\n"
+			f"[유저 프롬프트]\n{usr_p}"
+		)
 
 	def set_card_width(self, width: int) -> None:
 		self._card_width = width
@@ -800,8 +866,10 @@ class SuggestionList(QFrame):
 				item.get("tone", "working"),
 				event_id=item_id,
 				intervention_type=str(item.get("interventionType") or ""),
+				debug_trace=item.get("debugTrace"),
 			)
 			card.feedbackSubmitted.connect(self.feedbackSubmitted)
+			card.debugToggled.connect(self.schedule_width_update)
 			card.set_card_width(self._content_width())
 			self._cards.append(card)
 			if item_id:
@@ -827,6 +895,7 @@ class SuggestionList(QFrame):
 		*,
 		event_id: str = "",
 		intervention_type: str = "",
+		debug_trace: dict | None = None,
 	) -> None:
 		"""Append a single suggestion card.
 
@@ -854,8 +923,10 @@ class SuggestionList(QFrame):
 			item["tone"],
 			event_id=event_id,
 			intervention_type=intervention_type,
+			debug_trace=debug_trace,
 		)
 		card.feedbackSubmitted.connect(self.feedbackSubmitted)
+		card.debugToggled.connect(self.schedule_width_update)
 		card.set_card_width(self._content_width())
 		self._cards.append(card)
 		if event_id:
@@ -875,6 +946,7 @@ class SuggestionList(QFrame):
 		tone: str = "working",
 		*,
 		intervention_type: str = "",
+		debug_trace: dict | None = None,
 	) -> None:
 		"""Update an existing card's text by ``event_id``, or add a new card.
 
@@ -891,7 +963,14 @@ class SuggestionList(QFrame):
 					break
 			self.schedule_scroll_to_bottom()
 			return
-		self.add_suggestion(category, text, tone, event_id=event_id, intervention_type=intervention_type)
+		self.add_suggestion(
+			category,
+			text,
+			tone,
+			event_id=event_id,
+			intervention_type=intervention_type,
+			debug_trace=debug_trace,
+		)
 		if self._hug_content:
 			self.updateGeometry()
 
@@ -1383,6 +1462,10 @@ class ChatPanel(QFrame):
 		self.layout = QVBoxLayout(self.container)
 		self.layout.setContentsMargins(0, 0, 0, 0)
 		self.layout.setSpacing(8)
+		# Leading stretch pins the conversation to the BOTTOM of the viewport: a
+		# short thread sits just above the input instead of clinging to the top
+		# with a big blank trailing below it. Bubbles are appended after it; once
+		# the thread outgrows the viewport the stretch collapses and the list scrolls.
 		self.layout.addStretch(1)
 		self.scroll.setWidget(self.container)
 
@@ -1390,7 +1473,7 @@ class ChatPanel(QFrame):
 		self.empty.setObjectName("AssistEmptyState")
 		self.empty.setAlignment(Qt.AlignCenter)
 		self.empty.setWordWrap(True)
-		self.layout.insertWidget(0, self.empty)
+		self.layout.addWidget(self.empty)
 
 		root.addWidget(title)
 		root.addWidget(self.scroll, 1)
@@ -1461,8 +1544,9 @@ class ChatPanel(QFrame):
 		# fills the screen horizontally; sender is distinguished by colour.
 		row.addWidget(bubble, 1)
 
-		insert_at = max(0, self.layout.count() - 1)
-		self.layout.insertLayout(insert_at, row)
+		# Append after the leading stretch (and the now-hidden placeholder) so the
+		# newest bubble lands at the very bottom of the conversation.
+		self.layout.addLayout(row)
 		self.schedule_scroll_to_bottom()
 		return bubble
 
@@ -1529,8 +1613,8 @@ class ChatPanel(QFrame):
 			item = self.layout.takeAt(0)
 			self._dispose_layout_item(item)
 		self._bubbles.clear()
-		self.layout.addWidget(self.empty)
 		self.layout.addStretch(1)
+		self.layout.addWidget(self.empty)
 		self.empty.show()
 
 	def _dispose_layout_item(self, item) -> None:
@@ -1801,6 +1885,7 @@ class DocumentAssistWindow(QWidget):
 				"text": text,
 				"tone": tone,
 				"interventionType": str(item.get("interventionType") or ""),
+				"debugTrace": item.get("debugTrace"),
 			})
 		self.suggestion_list.set_suggestions(suggestions)
 
@@ -1821,6 +1906,7 @@ class DocumentAssistWindow(QWidget):
 				text,
 				tone,
 				intervention_type=str(item.get("interventionType") or ""),
+				debug_trace=item.get("debugTrace"),
 			)
 
 	def _on_screen_feedback(self, event_id: str, intervention_type: str, action: str) -> None:
