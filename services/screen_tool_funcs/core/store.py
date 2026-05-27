@@ -38,6 +38,11 @@ class ScreenContextStore:
         self.intervention_feedback_path = self.screen_dir / "intervention_feedback.jsonl"
         self.intervention_queue_path = self.screen_dir / "intervention_queue.json"
         self.latest_intervention_path = self.screen_dir / "latest_intervention.json"
+        # Per-scenario preference weights learned by PreferenceStore (EMA on
+        # reward signals from intervention_feedback.jsonl). Single JSON file:
+        # one snapshot per flush, no append log — replay reconstructs from the
+        # feedback jsonl, not from past snapshots.
+        self.preference_state_path = self.screen_dir / "preference_state.json"
         # debug 모드면 capture log를 capture_logs/ 대신 debug/에 기록
         self.capture_log_dir = self.screen_dir / ("debug" if debug else "capture_logs")
         self.scheduler_dir = self.screen_dir / "scheduler_state"
@@ -199,6 +204,54 @@ class ScreenContextStore:
         path = self.scheduler_state_path(document_key)
         with self._lock:
             self._write_json_atomic(path, payload, indent=2)
+
+    def load_preference_state(self) -> dict[str, Any] | None:
+        with self._lock:
+            if not self.preference_state_path.exists():
+                return None
+            try:
+                data = json.loads(self.preference_state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+        return data if isinstance(data, dict) else None
+
+    def save_preference_state(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            self._write_json_atomic(self.preference_state_path, payload, indent=2)
+
+    def iter_intervention_feedback(self):
+        """Yield feedback records in append order across rotated files.
+
+        Reads the oldest rotated segment first (path.N → path.1 → path) so
+        replay applies updates in chronological order. Caller must tolerate
+        a missing/empty live file.
+        """
+        with self._lock:
+            paths = []
+            keep = self.INTERVENTION_FEEDBACK_ROTATE_KEEP
+            for index in range(keep, 0, -1):
+                rotated = self.intervention_feedback_path.with_name(
+                    f"{self.intervention_feedback_path.name}.{index}"
+                )
+                if rotated.exists():
+                    paths.append(rotated)
+            if self.intervention_feedback_path.exists():
+                paths.append(self.intervention_feedback_path)
+        for path in paths:
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(record, dict):
+                            yield record
+            except OSError:
+                continue
 
     def _safe_document_filename(self, document_key: str) -> str:
         normalized = (document_key or "unknown").strip() or "unknown"

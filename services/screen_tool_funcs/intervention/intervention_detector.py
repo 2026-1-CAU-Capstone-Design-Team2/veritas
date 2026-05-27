@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import time
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 from ..core.models import FilteredScreenContext, InterventionDecision, WindowContext
 from ..trace import screen_trace
 from .llm_router import ScenarioRouter
+from .preference_store import PreferenceStore
 from .scenario_scheduler import ScenarioScheduler, ScenarioWeights
 from ..scenario import (
     IdleAfterWritingScenario,
@@ -16,6 +18,23 @@ from ..scenario import (
     ScenarioType,
     WholeDocumentReviewScenario,
 )
+
+
+# Combine learned preference weight (PreferenceStore) with the LLM router's
+# confidence. Env-controlled so the measurement track can toggle between
+# modes without code changes.
+#   post  — router picks; final = confidence × weight; threshold gates.
+#   pre   — prune/sort candidates by weight before the router sees them.
+#   off   — ignore weights entirely (== legacy LLM-only behavior).
+# Default is "post": deployment runs combined-post; setting "off" gives the
+# llm-only baseline cell of the policy comparison matrix.
+COMBINED_MODE_ENV = "VERITAS_COMBINED_MODE"
+COMBINED_MODE_DEFAULT = "post"
+COMBINED_MODES = ("off", "pre", "post")
+# pre-mode prune threshold: drop candidates whose weight is at or below this.
+# Defaults to PreferenceStore.WEIGHT_CLIP_MIN so only scenarios the user has
+# strongly disliked (saturated at the floor) get pruned; envvar can tighten.
+PREFERENCE_PRUNE_THRESHOLD_ENV = "VERITAS_PREFERENCE_PRUNE_THRESHOLD"
 
 
 class InterventionDetector:
@@ -48,6 +67,7 @@ class InterventionDetector:
         scenarios: list[ScenarioType] | None = None,
         scheduler: ScenarioScheduler | None = None,
         router: ScenarioRouter | None = None,
+        preference_store: PreferenceStore | None = None,
     ) -> None:
         self.history_window = history_window
         self.min_history_count = min_history_count
@@ -61,6 +81,7 @@ class InterventionDetector:
         ]
         self.scheduler = scheduler
         self.router = router
+        self.preference_store = preference_store
 
     @property
     def scenario_weights(self) -> dict[str, ScenarioWeights]:
@@ -324,14 +345,50 @@ class InterventionDetector:
         doc_chars: int,
         trace_out: dict[str, Any],
     ) -> str | None:
-        """Pick one ready scenario via the LLM router (or decline). The global
-        throttle still gates (anti-spam); a fire is recorded for recency."""
+        """Pick one ready scenario via the LLM router (or decline).
+
+        When a PreferenceStore is attached, the learned per-scenario weight
+        combines with the router output per VERITAS_COMBINED_MODE:
+          - "post": router picks freely, then final = confidence × weight is
+                    compared against ROUTER_MIN_CONFIDENCE.
+          - "pre" : candidates are pruned/sorted by weight before the router
+                    sees them; router output is used as-is (no post-mul).
+          - "off" : weights ignored (legacy LLM-only behavior).
+        The global throttle still gates (anti-spam); a fire is recorded for
+        recency on accept.
+        """
         if self.scheduler is not None and self.scheduler.is_globally_throttled(document_key, now=now):
             trace_out["rejected_reason"] = "global_throttle"
             trace_out["router"] = None
+            trace_out["combined"] = None
             screen_trace("router: skipped (global throttle)")
             return None
-        candidates = [(name, list(scenario_results[name].reasons)) for name in ready_names]
+
+        mode = self._combined_mode()
+        weights_active = self.preference_store is not None and mode != "off"
+        weight_snapshot: dict[str, float] = {}
+        if weights_active:
+            weight_snapshot = {
+                name: round(self.preference_store.weight(name), 3)
+                for name in ready_names
+            }
+
+        # pre-mode: prune low-weight candidates and order by weight desc so
+        # the router prompt surfaces user-preferred scenarios first.
+        if mode == "pre" and weights_active:
+            threshold = self._preference_prune_threshold()
+            sorted_names = sorted(
+                ready_names, key=lambda n: (-weight_snapshot.get(n, 1.0), n)
+            )
+            pruned = [n for n in sorted_names if weight_snapshot.get(n, 1.0) > threshold]
+            # Safety: never hand the router an empty candidate list — fall
+            # back to the unfiltered (but still sorted) set so it can still
+            # decline naturally.
+            candidate_names = pruned if pruned else sorted_names
+        else:
+            candidate_names = ready_names
+
+        candidates = [(name, list(scenario_results[name].reasons)) for name in candidate_names]
         recent_text = " ".join(
             (filtered.current_paragraph_text or filtered.active_editor_text or "").split()
         )[:1500]
@@ -351,16 +408,68 @@ class InterventionDetector:
             "confidence": round(decision.confidence, 3),
             "reason": decision.reason,
         }
-        screen_trace(
-            f"router: pick={decision.scenario or 'none'} "
-            f"conf={decision.confidence:.2f} ({decision.reason})"
+        combined_trace: dict[str, Any] = {
+            "mode": mode,
+            "weight_snapshot": weight_snapshot,
+            "candidate_names": list(candidate_names),
+            "preference_weight": None,
+            "combined_score": None,
+        }
+        trace_out["combined"] = combined_trace
+
+        if not decision.scenario:
+            trace_out.setdefault("rejected_reason", "router_declined")
+            screen_trace(
+                f"router: pick=none conf={decision.confidence:.2f} ({decision.reason})"
+            )
+            return None
+
+        weight = (
+            self.preference_store.weight(decision.scenario)
+            if weights_active
+            else 1.0
         )
-        if decision.scenario and decision.confidence >= self.ROUTER_MIN_CONFIDENCE:
-            if self.scheduler is not None:
-                self.scheduler.record_fire(document_key, decision.scenario, now=now, doc_chars=doc_chars)
-            return decision.scenario
-        trace_out.setdefault("rejected_reason", "router_declined")
-        return None
+        combined_trace["preference_weight"] = round(weight, 3)
+
+        if mode == "post" and weights_active:
+            combined_score = decision.confidence * weight
+            combined_trace["combined_score"] = round(combined_score, 4)
+            screen_trace(
+                f"router: pick={decision.scenario} conf={decision.confidence:.2f} "
+                f"weight={weight:.2f} combined={combined_score:.2f} ({decision.reason})"
+            )
+            if combined_score < self.ROUTER_MIN_CONFIDENCE:
+                trace_out.setdefault("rejected_reason", "combined_below_threshold")
+                return None
+        else:
+            combined_trace["combined_score"] = round(decision.confidence, 4)
+            screen_trace(
+                f"router: pick={decision.scenario} conf={decision.confidence:.2f} "
+                f"weight={weight:.2f} mode={mode} ({decision.reason})"
+            )
+            if decision.confidence < self.ROUTER_MIN_CONFIDENCE:
+                trace_out.setdefault("rejected_reason", "router_low_confidence")
+                return None
+
+        if self.scheduler is not None:
+            self.scheduler.record_fire(document_key, decision.scenario, now=now, doc_chars=doc_chars)
+        return decision.scenario
+
+    @staticmethod
+    def _combined_mode() -> str:
+        mode = (os.getenv(COMBINED_MODE_ENV) or COMBINED_MODE_DEFAULT).strip().lower()
+        return mode if mode in COMBINED_MODES else COMBINED_MODE_DEFAULT
+
+    def _preference_prune_threshold(self) -> float:
+        raw = os.getenv(PREFERENCE_PRUNE_THRESHOLD_ENV)
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                pass
+        if self.preference_store is not None:
+            return float(self.preference_store.clip_min)
+        return 0.5
 
     def _snapshot(self, *, window: WindowContext, filtered: FilteredScreenContext) -> dict[str, Any]:
         paragraph = filtered.current_paragraph_text or ""

@@ -17,6 +17,7 @@ from .core.store import ScreenContextStore
 from .intervention.intervention_detector import InterventionDetector
 from .intervention.intervention_dispatcher import InterventionDispatcher
 from .intervention.llm_router import ScenarioRouter
+from .intervention.preference_store import PreferenceStore
 from .intervention.scenario_scheduler import ScenarioScheduler
 from .scenario import (
     AcronymIntroducedScenario,
@@ -130,10 +131,15 @@ class ScreenContextService:
         # LLM-backed selection (replaces CFS vruntime ranking when enabled). Built
         # only when an llm is available; the detector falls back to CFS otherwise.
         self.scenario_router = ScenarioRouter(llm) if llm is not None else None
+        # Learned per-scenario weights for combined-policy selection. State
+        # persists across sessions via ScreenContextStore; reward updates are
+        # written by the feedback handler (see T3).
+        self.preference_store = PreferenceStore(self.store)
         self.intervention_detector = InterventionDetector(
             scenarios=scenarios,
             scheduler=self.scenario_scheduler,
             router=self.scenario_router,
+            preference_store=self.preference_store,
         )
         self.intervention_dispatcher = InterventionDispatcher(
             self.store,
@@ -325,12 +331,50 @@ class ScreenContextService:
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
 
-    # 폴링 스레드 정지 + scenario_scheduler 정지(상태 flush)
+    def rebuild_preferences_from_feedback(self) -> int:
+        """Replay intervention_feedback.jsonl into a fresh preference state.
+
+        Default operation trusts the persisted snapshot (PreferenceStore loads
+        it on construction), so this is opt-in: the measurement track uses it
+        to rebuild the learning curve offline, and it doubles as recovery if
+        preference_state.json gets corrupted. Existing weights are discarded
+        before replay; result is flushed before return.
+
+        Reward scale shift: feedback jsonl rows carry the [-1, +1] reward
+        defined in api.services.screen_monitoring_service
+        .SCREEN_FEEDBACK_REWARDS; PreferenceStore expects [0, 2] where 1.0 is
+        neutral, so each reward is shifted by +1.
+        """
+        def reward_for(record: dict) -> float | None:
+            value = record.get("reward")
+            if value is None:
+                return None
+            try:
+                return float(value) + 1.0
+            except (TypeError, ValueError):
+                return None
+        applied = self.preference_store.replay_from_feedback(reward_for=reward_for)
+        try:
+            self.preference_store.flush()
+        except OSError as exc:
+            if self.console_log:
+                print(f"[screen_context][preference][warn] flush after rebuild failed: {exc}")
+        return applied
+
+    # 폴링 스레드 정지 + scenario_scheduler 정지(상태 flush) + preference_store flush
     def stop_polling(self) -> None:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=self.interval_sec + 1)
         self.scenario_scheduler.stop()
+        # Persist learned preference weights. The feedback handler also flushes
+        # per update, so this is a safety net for any in-memory state that has
+        # not been written (e.g. updates between the last feedback and shutdown).
+        try:
+            self.preference_store.flush()
+        except OSError as exc:
+            if self.console_log:
+                print(f"[screen_context][preference][warn] flush failed: {exc}")
         # debug 모드면 세션 통계 1줄을 capture log 끝에 append
         if self.console_log:
             self._write_debug_stats_summary()

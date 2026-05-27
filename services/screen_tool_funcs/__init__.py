@@ -17,6 +17,7 @@ from .core.models import (
 from .core.store import ScreenContextStore
 from .intervention.intervention_detector import InterventionDetector
 from .intervention.intervention_dispatcher import InterventionDispatcher
+from .intervention.preference_store import PreferenceStore
 from .intervention.scenario_scheduler import ScenarioScheduler, ScenarioSchedulerState, ScenarioWeights
 from .scenario import (
     AcronymIntroducedScenario,
@@ -74,6 +75,7 @@ __all__ = [
     "OutlinePhaseScenario",
     "ParagraphChurnScenario",
     "PowerPointComReader",
+    "PreferenceStore",
     "QuoteInsertedScenario",
     "RepeatedPhraseInParagraphScenario",
     "ScatteredEditsScenario",

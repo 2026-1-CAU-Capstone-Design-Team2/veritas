@@ -89,14 +89,28 @@ class ScreenContextTool(BaseTool):
                 if not event_id:
                     return ToolResult(success=False, error="record_feedback requires event_id")
                 from datetime import datetime, timezone
+                scenario = str(intervention_type or "").strip() or "none"
                 record = {
                     "event_id": event_id,
-                    "intervention_type": str(intervention_type or "").strip() or "none",
+                    "intervention_type": scenario,
                     "action": str(feedback_action or "").strip(),
                     "reward": float(reward),
                     "recorded_at": datetime.now(timezone.utc).isoformat(),
                 }
                 self._screen_context_service.store.append_intervention_feedback(record)
+                # Update the preference store so the next selection sees the
+                # new weight. Incoming reward is on api.services
+                # .screen_monitoring_service.SCREEN_FEEDBACK_REWARDS' [-1, +1]
+                # scale; PreferenceStore expects [0, 2] with 1.0 = neutral.
+                preference_store = getattr(self._screen_context_service, "preference_store", None)
+                if preference_store is not None and scenario and scenario != "none":
+                    preference_store.update(scenario, float(reward) + 1.0)
+                    try:
+                        preference_store.flush()
+                    except OSError:
+                        # stop_polling has a final flush; keep the request
+                        # path quiet on disk hiccups.
+                        pass
                 return ToolResult(success=True, data=record)
 
             if action == "start_polling":
