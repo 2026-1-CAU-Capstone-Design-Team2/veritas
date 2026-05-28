@@ -606,12 +606,16 @@ class ProactiveOrchestrator:
         task: ProactiveTask = prediction  # type: ignore[assignment]
         context: ContextBundle = bundle["context"]
         observation: ProactiveObservation = bundle["observation"]
+        # Pass the observation so the generator can use raw prefix/suffix for
+        # native ghost mode — the context_selector's reconstructed parts often
+        # fall below ChatAgent._is_continuation_moment's min-chars threshold.
         return self.generator.stream(
             decision_id=decision_id,
             task=task,
             context=context,
             workspace_id=observation.workspace_id,
             surface=observation.surface,
+            observation=observation,
         )
 
     # ----------------------------------------------------------- feedback

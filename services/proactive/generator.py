@@ -171,6 +171,7 @@ class ProactiveGenerator:
         context: ContextBundle,
         workspace_id: str,
         surface: str,
+        observation: Any | None = None,
     ) -> Iterator[dict[str, Any]]:
         render_mode = task.render_mode
         start_event: dict[str, Any] = {
@@ -203,6 +204,7 @@ class ProactiveGenerator:
                 surface=surface,
                 task=task,
                 context=context,
+                observation=observation,
                 use_workspace=grounded,
             ):
                 if chunk:
@@ -222,6 +224,7 @@ class ProactiveGenerator:
         surface: str,
         task: ProactiveTask,
         context: ContextBundle,
+        observation: Any | None,
         use_workspace: bool,
     ) -> Iterator[str]:
         surface_is_native = surface == "native_editor"
@@ -230,14 +233,26 @@ class ProactiveGenerator:
         # forbids meta-commentary). Everything else goes through editor_assist
         # so we can carry the lead-in contract.
         if task.task_type == "next_sentence" and surface_is_native:
-            prefix = (
-                context.text_parts.get("prev_sentence", "")
-                + ("\n" if context.text_parts.get("prev_sentence") else "")
-                + context.text_parts.get("current_fragment", "")
-            )
-            suffix = ""  # the orchestrator hasn't captured suffix in the bundle
+            # IMPORTANT: use the editor's raw prefix/suffix here, NOT the
+            # context_selector's reconstructed (prev_sentence + current_fragment).
+            # The reconstruction often produces too-short text (e.g. when the
+            # paragraph has only one sentence) which then fails ChatAgent's
+            # ``_is_continuation_moment`` (min ~8 chars after normalization) and
+            # the ghost LLM silently declines. Falling back to the bundle parts
+            # only when raw prefix is unavailable (e.g. screen-bridge captures).
+            prefix = ""
+            suffix = ""
+            if observation is not None:
+                prefix = str(getattr(observation, "prefix", "") or "")
+                suffix = str(getattr(observation, "suffix", "") or "")
             if not prefix.strip():
-                prefix = context.text_parts.get("current_paragraph", "")
+                prefix = (
+                    context.text_parts.get("prev_sentence", "")
+                    + ("\n" if context.text_parts.get("prev_sentence") else "")
+                    + context.text_parts.get("current_fragment", "")
+                )
+                if not prefix.strip():
+                    prefix = context.text_parts.get("current_paragraph", "")
             yield from self._ghostwrite_iter(
                 prefix,
                 suffix,

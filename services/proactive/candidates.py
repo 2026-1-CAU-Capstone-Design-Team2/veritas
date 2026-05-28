@@ -228,8 +228,21 @@ def _maybe_next_sentence(
         return None
     if not (anchor.cursor_index is not None or _has_sentence_fragment(anchor.sentence_text)):
         return None
-    if signals.idle_sec < 2.0 or signals.stable_capture_count < 1:
-        return None
+
+    # The "user is paused" signal is surface-specific:
+    # - **native_editor**: the frontend's debounce QTimer triggers /editor/suggest
+    #   only AFTER the user stops typing. By the time observe runs, the pause
+    #   has already happened — but the orchestrator's ``_DocumentTrack`` resets
+    #   ``_last_mutation_ts`` to the captured_ts on every text-change, so
+    #   ``idle_sec`` reads as 0 even though the user paused. We'd be double-
+    #   counting if we re-gated on it. Trust the debounce.
+    # - **external_app**: observe is a periodic capture poll (every ~5s) and
+    #   fires regardless of activity. The idle gate is what distinguishes
+    #   "actively typing in Word" from "paused in Word".
+    if surface.surface != "native_editor":
+        if signals.idle_sec < 2.0 or signals.stable_capture_count < 1:
+            return None
+
     if not anchor.paragraph_text:
         return None
     if not (_at_end_of_paragraph(anchor) or _has_sentence_fragment(anchor.sentence_text)):
@@ -244,7 +257,11 @@ def _maybe_next_sentence(
         target_anchor_id=anchor.anchor_id,
         context_scope="cursor_previous_sentences",
         render_mode=render,
-        reason="caret at sentence/paragraph end, user pausing",
+        reason=(
+            "native debounce implies pause"
+            if surface.surface == "native_editor"
+            else "external poll observed idle pause"
+        ),
         confidence=anchor.confidence,
     )
 
