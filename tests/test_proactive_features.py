@@ -1,16 +1,15 @@
-"""Unit tests for the proactive feature math + primitive extractor."""
+"""Unit tests for ``services.proactive.features``.
+
+After the lexical-keyword purge this module only carries numeric helpers and
+the primitive-dict extractor. Tests cover those plus a regression guard
+asserting no lexical-keyword feature has been added back in.
+"""
 from __future__ import annotations
 
-import math
 import unittest
 
 from services.proactive.features import (
-    ENGAGE_FEATURE_NAMES,
-    SUGGEST_FEATURE_NAMES,
-    build_engage_features,
-    build_suggest_features,
     clip01,
-    compute_evidence_need,
     extract_primitive_features,
     log_norm,
     signed_log_norm,
@@ -26,12 +25,9 @@ class FeatureMathTests(unittest.TestCase):
 
     def test_log_norm_monotonic_and_bounded(self) -> None:
         self.assertEqual(log_norm(0.0, 100.0), 0.0)
-        # Cap value should produce 1.0 exactly.
         self.assertAlmostEqual(log_norm(100.0, 100.0), 1.0, places=6)
-        # Strictly monotonic.
         self.assertLess(log_norm(1.0, 100.0), log_norm(10.0, 100.0))
         self.assertLess(log_norm(10.0, 100.0), log_norm(100.0, 100.0))
-        # Negative inputs clamp to 0.
         self.assertEqual(log_norm(-50.0, 100.0), 0.0)
 
     def test_signed_log_norm_keeps_sign(self) -> None:
@@ -43,66 +39,6 @@ class FeatureMathTests(unittest.TestCase):
             signed_log_norm(123.0, 1000.0),
             places=6,
         )
-
-    def test_evidence_score_scales_with_signals(self) -> None:
-        empty = compute_evidence_need(sentence="", paragraph="")
-        weak = compute_evidence_need(sentence="이건 그냥 의견이다.", paragraph="짧은 단락")
-        strong = compute_evidence_need(
-            sentence="2024년 통계에 따르면 35%가 증가했다는데 근거는?",
-            paragraph="2024년 통계 자료에서 35% 증가가 관측된다는 보고가 있다. 출처가 필요하다.",
-        )
-        self.assertEqual(empty, 0.0)
-        self.assertGreater(strong, weak)
-        self.assertLessEqual(strong, 1.0)
-
-
-class FeatureVectorShapeTests(unittest.TestCase):
-    def _primitive(self, **overrides) -> dict:
-        base = {
-            "idle_sec": 3.0,
-            "stable_capture_count": 2,
-            "added_chars_window": 30.0,
-            "deleted_chars_window": 5.0,
-            "edit_volume": 35.0,
-            "net_growth": 25.0,
-            "churn_score": 0.05,
-            "paragraph_len": 120.0,
-            "document_len": 1200.0,
-            "cursor_pos": 0.5,
-            "evidence_need_score": 0.2,
-            "relevant_sources_available": True,
-            "recent_negative_rate": 0.1,
-            "time_since_last_intervention": 30.0,
-            "surface_is_native": 1.0,
-        }
-        base.update(overrides)
-        return base
-
-    def test_engage_vector_dimension(self) -> None:
-        x = build_engage_features(self._primitive())
-        self.assertEqual(len(x), len(ENGAGE_FEATURE_NAMES))
-        self.assertEqual(x[0], 1.0)  # bias
-
-    def test_suggest_vector_dimension(self) -> None:
-        x = build_suggest_features(self._primitive())
-        self.assertEqual(len(x), len(SUGGEST_FEATURE_NAMES))
-        self.assertEqual(x[0], 1.0)  # bias
-
-    def test_engage_features_in_unit_box_or_known_range(self) -> None:
-        x = build_engage_features(self._primitive(idle_sec=999.0, edit_volume=99999.0))
-        for name, value in zip(ENGAGE_FEATURE_NAMES, x):
-            if name == "bias":
-                continue
-            self.assertGreaterEqual(value, 0.0, name)
-            self.assertLessEqual(value, 1.0, name)
-
-    def test_suggest_features_signed_growth_in_minus_one_plus_one(self) -> None:
-        x_pos = build_suggest_features(self._primitive(net_growth=500.0))
-        x_neg = build_suggest_features(self._primitive(net_growth=-500.0))
-        # net_growth_signed_norm is the second entry (after bias).
-        self.assertGreater(x_pos[1], 0.0)
-        self.assertLess(x_neg[1], 0.0)
-        self.assertAlmostEqual(x_pos[1], -x_neg[1], places=6)
 
 
 class PrimitiveExtractorTests(unittest.TestCase):
@@ -146,8 +82,68 @@ class PrimitiveExtractorTests(unittest.TestCase):
             relevant_sources_available=False,
         )
         self.assertEqual(p["surface_is_native"], 0.0)
-        # Cursor unknown → cursor_pos defaults to 1.0 per spec.
+        # Cursor unknown → cursor_pos defaults to 1.0.
         self.assertEqual(p["cursor_pos"], 1.0)
+
+    def test_primitive_has_no_lexical_keyword_features(self) -> None:
+        """Regression guard for the 2026-05-28 directive: no hard-coded
+        keyword-derived features are allowed in the primitive dict."""
+        obs = ProactiveObservation(
+            surface="native_editor",
+            workspace_id="ws",
+            document_key="doc",
+            text="2024년 통계청 자료에 따르면 35%가 증가했다. 근거가 필요하다.",
+            current_paragraph="2024년 통계청 자료에 따르면 35%가 증가했다.",
+            current_sentence="근거가 필요하다.",
+            cursor_index=30,
+        )
+        p = extract_primitive_features(
+            observation=obs,
+            idle_sec=2.0,
+            stable_capture_count=1,
+            added_chars_window=50.0,
+            deleted_chars_window=0.0,
+            recent_negative_rate=0.0,
+            time_since_last_intervention=60.0,
+            relevant_sources_available=False,
+        )
+        # The dict must not carry any lexical-keyword-derived score, even
+        # when the input text would have triggered the old detector.
+        self.assertNotIn("evidence_need_score", p)
+        for forbidden in ("factual_claim", "needs_citation", "claim_score"):
+            self.assertNotIn(forbidden, p)
+
+
+class NoKeywordModulesTests(unittest.TestCase):
+    """Regression guard: the removed lexical-keyword symbols must NOT come
+    back. If someone adds a ``_EVIDENCE_KEYWORDS`` / ``_FACTUAL_KEYWORDS``
+    tuple anywhere in the proactive package, this fails loudly."""
+
+    def test_features_has_no_keyword_constants(self) -> None:
+        import services.proactive.features as f
+
+        for forbidden in (
+            "_EVIDENCE_KEYWORDS",
+            "_FACTUAL_KEYWORDS",
+            "compute_evidence_need",
+            "_NUMBER_RE",
+            "_YEAR_RE",
+            "_PERCENT_RE",
+        ):
+            self.assertFalse(hasattr(f, forbidden), forbidden)
+
+    def test_candidates_has_no_keyword_constants(self) -> None:
+        import services.proactive.candidates as c
+
+        for forbidden in (
+            "_FACTUAL_KEYWORDS",
+            "_has_factual_claim",
+            "_NUMERIC",
+            "_YEAR",
+            "_PERCENT",
+            "_maybe_evidence_or_citation_prompt",
+        ):
+            self.assertFalse(hasattr(c, forbidden), forbidden)
 
 
 if __name__ == "__main__":

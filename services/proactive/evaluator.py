@@ -128,12 +128,11 @@ def check_hard_gates(
         if _is_in_recent_negative_streak(user_adaptation, signals):
             reasons.append("recent_negative_streak")
 
-    if (
-        candidate.task_type == "evidence_or_citation_prompt"
-        and not signals.relevant_sources_available
-        and not bool(candidate.metadata.get("allow_placeholder_only", True))
-    ):
-        reasons.append("no_relevant_source_for_strong_evidence_task")
+    # ``evidence_or_citation_prompt`` no longer has an auto-trigger path in
+    # the candidate factory (the lexical-keyword detector was removed). When
+    # a future explicit invocation produces one, the candidate's metadata
+    # should carry whatever provenance signal justifies it; we don't impose
+    # a source-availability gate here anymore.
 
     return GateResult(allowed=(not reasons), reasons=reasons)
 
@@ -299,7 +298,9 @@ def _need_signal(
     if task_type == "logic_flow_review":
         return max(0.4, _scale(s.paragraph_len, lo=120, hi=500))
     if task_type == "evidence_or_citation_prompt":
-        return max(0.5, _scale(s.evidence_need_score, lo=0.20, hi=0.80))
+        # No keyword-derived urgency signal anymore — keep a neutral baseline
+        # so an explicitly-invoked evidence task still scores reasonably.
+        return 0.6
     if task_type == "recovery_or_integration_note":
         return 0.7 if s.recent_diff_overlaps_anchor else 0.4
     if task_type == "long_paragraph_split":
@@ -359,7 +360,7 @@ def _task_fit(task_type: str, s: PrimitiveSignals, anchor: ActiveAnchor) -> floa
     if task_type == "local_copyedit":
         return 0.7
     if task_type == "evidence_or_citation_prompt":
-        return 0.8 if s.evidence_need_score >= 0.35 else 0.6
+        return 0.7  # neutral fit; no auto-trigger anymore
     if task_type == "recovery_or_integration_note":
         return 0.8 if s.recent_diff_overlaps_anchor else 0.4
     if task_type == "long_paragraph_split":

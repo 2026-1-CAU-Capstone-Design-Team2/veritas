@@ -1,20 +1,22 @@
-"""Primitive telemetry → engage / suggest feature vectors.
+"""Primitive telemetry normalization helpers.
 
-The bandit *never* sees raw text and *never* sees the 23-scenario situation
-labels: it only ever sees the normalized primitive features defined here. That
-keeps the policy's input dimensionality fixed (so saved state can be reloaded
-across app versions) and keeps the action mask — not the bandit — responsible
-for capability gating.
+After the rule-based pivot most of this module's bandit-era contents are
+gone — feature vectors aren't projected into a learned policy anymore. What
+remains is the *primitive dict* the CandidateFactory and the RuleEvaluator
+both consume: a small set of numeric / boolean signals derived directly from
+the rolling write telemetry.
 
-Order matters: ``ENGAGE_FEATURE_NAMES`` / ``SUGGEST_FEATURE_NAMES`` are the
-authoritative column ordering for everything that stores a feature vector
-(``policy_state.json``, ``decisions.jsonl``, etc.). Adding or reordering a
-column is a policy-state version bump.
+Strict rule (locked in by the user's directive 2026-05-28): **no hard-coded
+lexical-keyword features.** Anything like "if 근거 or 출처 appears in the
+sentence" is a culture-/topic-specific heuristic that doesn't generalize and
+will be a source of model bias for future users. This file only carries
+purely numeric / structural primitives. If a future feature needs lexical
+content, it must come from a model-driven signal (e.g. RAG retrieval
+relevance), never from a hard-coded vocabulary.
 """
 from __future__ import annotations
 
 import math
-import re
 from typing import Any
 
 
@@ -40,46 +42,6 @@ def signed_log_norm(x: float, cap: float) -> float:
     return sign * clip01(math.log1p(abs(float(x))) / math.log1p(cap_val))
 
 
-# ------------------------------------------------------- evidence heuristics
-
-# Light-weight Korean + arabic evidence-need scoring. We avoid lexical
-# dictionaries large enough to be culture-specific; the goal is "this sentence
-# is making a claim that *probably* wants a number/source", not perfect
-# classification.
-_EVIDENCE_KEYWORDS = (
-    "근거", "출처", "자료", "통계", "논문", "연구", "사례",
-    "보고", "조사", "데이터", "실험", "결과",
-)
-_NUMBER_RE = re.compile(r"\d")
-_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
-_PERCENT_RE = re.compile(r"\d+\s*%")
-
-
-def compute_evidence_need(*, sentence: str, paragraph: str) -> float:
-    """Heuristic 0..1 score for "does this passage want a citation?"
-
-    A sentence with a number and a question mark is the strongest signal;
-    keyword hits are weaker but additive. We cap at 1.0 so a paragraph that
-    matches everything is treated the same as one strong signal — bandit
-    features should not have unbounded magnitude.
-    """
-    text = f"{sentence}\n{paragraph}".strip()
-    if not text:
-        return 0.0
-    score = 0.0
-    if _NUMBER_RE.search(text):
-        score += 0.25
-    if _YEAR_RE.search(text):
-        score += 0.20
-    if _PERCENT_RE.search(text):
-        score += 0.20
-    if "?" in sentence:
-        score += 0.15
-    hits = sum(1 for kw in _EVIDENCE_KEYWORDS if kw in text)
-    score += min(0.40, hits * 0.10)
-    return clip01(score)
-
-
 # ---------------------------------------------------- primitive extraction
 
 
@@ -94,12 +56,11 @@ def extract_primitive_features(
     time_since_last_intervention: float,
     relevant_sources_available: bool,
 ) -> dict[str, float | int | str | bool]:
-    """Build the primitive dict the feature vectors are projected from.
+    """Build the primitive dict the CandidateFactory + RuleEvaluator share.
 
     All time/edit telemetry is owned by the orchestrator (it sees the
-    observation stream); this function only does the *normalization* and the
-    cheap evidence-need heuristic. No I/O, no RAG, no LLM — those are too
-    expensive for an observe tick.
+    observation stream); this function only does the *normalization*. No I/O,
+    no RAG, no LLM — those are too expensive for an observe tick.
 
     ``observation`` is duck-typed to avoid a circular import on
     ``ProactiveObservation``.
@@ -108,13 +69,13 @@ def extract_primitive_features(
     text = str(getattr(observation, "text", "") or "")
     cursor_index = getattr(observation, "cursor_index", None)
     paragraph = str(getattr(observation, "current_paragraph", "") or "")
-    sentence = str(getattr(observation, "current_sentence", "") or "")
 
     edit_volume = max(0.0, float(added_chars_window)) + max(0.0, float(deleted_chars_window))
     net_growth = float(added_chars_window) - float(deleted_chars_window)
 
     # churn_score: lots of edits but little net change — the user is rewriting
-    # the same region rather than making forward progress.
+    # the same region rather than making forward progress. Structural, not
+    # lexical: derived from character-count deltas only.
     churn_score = clip01(edit_volume / 300.0) * (
         1.0 - clip01(abs(net_growth) / (edit_volume + 1e-6))
     )
@@ -125,8 +86,6 @@ def extract_primitive_features(
         cursor_pos = 1.0
     else:
         cursor_pos = clip01(float(cursor_index) / max(document_len, 1.0))
-
-    evidence_need = compute_evidence_need(sentence=sentence, paragraph=paragraph)
 
     return {
         "idle_sec": float(idle_sec),
@@ -139,78 +98,8 @@ def extract_primitive_features(
         "paragraph_len": paragraph_len,
         "document_len": document_len,
         "cursor_pos": float(cursor_pos),
-        "evidence_need_score": float(evidence_need),
         "relevant_sources_available": bool(relevant_sources_available),
         "recent_negative_rate": clip01(recent_negative_rate),
         "time_since_last_intervention": float(time_since_last_intervention),
         "surface_is_native": 1.0 if surface == "native_editor" else 0.0,
     }
-
-
-# ----------------------------------------------------------- feature vectors
-
-ENGAGE_FEATURE_NAMES: list[str] = [
-    "bias",
-    "idle_sec_norm",
-    "stable_capture_count_norm",
-    "edit_volume_norm",
-    "churn_score",
-    "paragraph_len_norm",
-    "recent_negative_rate",
-    "time_since_last_intervention_norm",
-    "surface_is_native",
-]
-
-
-def build_engage_features(primitive: dict[str, Any]) -> list[float]:
-    """Project primitives onto the engage policy's input vector.
-
-    Engage policy decides "show candidate vs. no-op" only — it deliberately
-    excludes net_growth / cursor_pos / evidence_need (those belong to *what*
-    to suggest, not *whether* to suggest).
-    """
-    return [
-        1.0,
-        log_norm(float(primitive.get("idle_sec", 0.0)), 120.0),
-        clip01(float(primitive.get("stable_capture_count", 0)) / 5.0),
-        log_norm(float(primitive.get("edit_volume", 0.0)), 1500.0),
-        clip01(float(primitive.get("churn_score", 0.0))),
-        log_norm(float(primitive.get("paragraph_len", 0.0)), 2000.0),
-        clip01(float(primitive.get("recent_negative_rate", 0.0))),
-        log_norm(float(primitive.get("time_since_last_intervention", 0.0)), 1800.0),
-        float(primitive.get("surface_is_native", 0.0)),
-    ]
-
-
-SUGGEST_FEATURE_NAMES: list[str] = [
-    "bias",
-    "net_growth_signed_norm",
-    "churn_score",
-    "paragraph_len_norm",
-    "document_len_norm",
-    "cursor_pos_norm",
-    "evidence_need_score",
-    "relevant_sources_available",
-    "recent_negative_rate",
-    "surface_is_native",
-]
-
-
-def build_suggest_features(primitive: dict[str, Any]) -> list[float]:
-    """Project primitives onto the suggestion policy's input vector.
-
-    Suggestion policy decides *which* type — so it sees the content-shape
-    features (net_growth, cursor_pos, evidence_need) the engage vector skipped.
-    """
-    return [
-        1.0,
-        signed_log_norm(float(primitive.get("net_growth", 0.0)), 1500.0),
-        clip01(float(primitive.get("churn_score", 0.0))),
-        log_norm(float(primitive.get("paragraph_len", 0.0)), 2000.0),
-        log_norm(float(primitive.get("document_len", 0.0)), 20000.0),
-        clip01(float(primitive.get("cursor_pos", 0.0))),
-        clip01(float(primitive.get("evidence_need_score", 0.0))),
-        1.0 if bool(primitive.get("relevant_sources_available", False)) else 0.0,
-        clip01(float(primitive.get("recent_negative_rate", 0.0))),
-        float(primitive.get("surface_is_native", 0.0)),
-    ]

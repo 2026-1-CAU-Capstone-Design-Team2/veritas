@@ -49,7 +49,6 @@ def _signals(**overrides) -> PrimitiveSignals:
         paragraph_len=80,
         document_len=400,
         cursor_pos=0.9,
-        evidence_need_score=0.0,
         relevant_sources_available=False,
     )
     for k, v in overrides.items():
@@ -143,7 +142,6 @@ class CandidateFactoryTests(unittest.TestCase):
                 churn_score=0.50,
                 paragraph_len=len(big),
                 document_len=len(big),
-                evidence_need_score=0.5,
                 relevant_sources_available=True,
             ),
             surface=SurfaceCapabilities.for_external(),

@@ -49,8 +49,9 @@ MAX_CANDIDATES = 3
 class PrimitiveSignals:
     """Cheap rolling-window telemetry the factory consumes.
 
-    Mirrors the bandit-era primitive dict but typed for readability — the
-    factory accesses the same fields, no new feature extraction needed.
+    Pure numeric/structural primitives — no lexical-keyword fields. See
+    ``features.py``'s docstring for the rule about why we don't carry
+    word-list-derived signals here.
     """
 
     idle_sec: float = 0.0
@@ -61,7 +62,6 @@ class PrimitiveSignals:
     paragraph_len: int = 0
     document_len: int = 0
     cursor_pos: float = 1.0  # 0..1 over document length
-    evidence_need_score: float = 0.0
     relevant_sources_available: bool = False
     recent_diff_overlaps_anchor: bool = False
     recent_large_delete: bool = False
@@ -79,7 +79,6 @@ class PrimitiveSignals:
             paragraph_len=int(float(primitive.get("paragraph_len", 0))),
             document_len=int(float(primitive.get("document_len", 0))),
             cursor_pos=float(primitive.get("cursor_pos", 1.0)),
-            evidence_need_score=float(primitive.get("evidence_need_score", 0.0)),
             relevant_sources_available=bool(
                 primitive.get("relevant_sources_available", False)
             ),
@@ -93,16 +92,21 @@ class PrimitiveSignals:
 
 
 # ----------------------------------------------------------- helpers
+#
+# The detectors below are all *syntactic* / structural — sentence terminators
+# are universal punctuation, the repeated-word regex matches any word-boundary
+# pair regardless of meaning. We deliberately do NOT carry any lexical word
+# list (the kind that would say "this paragraph mentions 근거 → needs source").
+# Anything domain- or topic-specific must come from a learned/model signal,
+# never from a hard-coded vocabulary.
 
 
 _INCOMPLETE_SENTENCE_END = re.compile(r"[A-Za-z가-힣0-9,\s]$")  # not a terminator
 _SENTENCE_TERMINATORS = ".!?。！？"
 
-_NUMERIC = re.compile(r"\d")
-_YEAR = re.compile(r"\b(19|20)\d{2}\b")
-_PERCENT = re.compile(r"\d+\s*%")
-_FACTUAL_KEYWORDS = ("근거", "출처", "자료", "통계", "논문", "연구", "사례", "보고", "조사", "데이터")
-_AWKWARD_REPEAT = re.compile(r"(\b\w+\b)(?:\s+\1\b){1,}")  # repeated word
+# Repeated whole word — purely structural ("the the", "이렇게 이렇게").
+# Works for space-separated tokens; doesn't claim to catch every redundancy.
+_AWKWARD_REPEAT = re.compile(r"(\b\w+\b)(?:\s+\1\b){1,}")
 
 
 def _has_sentence_fragment(text: Optional[str]) -> bool:
@@ -126,14 +130,6 @@ def _at_end_of_paragraph(anchor: ActiveAnchor) -> bool:
     if not sent or not para:
         return False
     return para.endswith(sent)
-
-
-def _has_factual_claim(text: Optional[str]) -> bool:
-    if not text:
-        return False
-    if _NUMERIC.search(text) and (_YEAR.search(text) or _PERCENT.search(text)):
-        return True
-    return any(kw in text for kw in _FACTUAL_KEYWORDS)
 
 
 def _has_local_polish_signal(text: Optional[str]) -> bool:
@@ -186,12 +182,16 @@ def build_candidates(
         # will still emit a NullPrediction for telemetry.
         return out
 
+    # evidence_or_citation_prompt was previously auto-triggered by lexical
+    # keyword detection ("근거", "출처", ...). That heuristic is gone per the
+    # user's directive against hard-coded keyword features — the task type
+    # stays in the catalog but can only be invoked via an explicit signal
+    # (e.g. a future "find evidence" UI button), never inferred from text.
     for builder in (
         _maybe_next_sentence,
         _maybe_local_copyedit,
         _maybe_paragraph_rewrite,
         _maybe_logic_flow_review,
-        _maybe_evidence_or_citation_prompt,
         _maybe_recovery_or_integration_note,
         _maybe_long_paragraph_split,
     ):
@@ -356,33 +356,12 @@ def _maybe_logic_flow_review(
     )
 
 
-def _maybe_evidence_or_citation_prompt(
-    anchor: ActiveAnchor,
-    signals: PrimitiveSignals,
-    surface: SurfaceCapabilities,
-) -> Optional[ProactiveTask]:
-    if anchor.confidence < MIN_CONFIDENCE_FOR_REWRITE:
-        return None
-    sentence = anchor.sentence_text or ""
-    paragraph = anchor.paragraph_text or ""
-    if not (_has_factual_claim(sentence) or _has_factual_claim(paragraph)):
-        return None
-    if signals.evidence_need_score < 0.20:
-        return None
-    render = _native_or_external(
-        surface, native="native_inline_marker", external="external_card_green"
-    )
-    if render is None:
-        return None
-    return ProactiveTask(
-        task_type="evidence_or_citation_prompt",
-        target_anchor_id=anchor.anchor_id,
-        context_scope="claim_window",
-        render_mode=render,
-        reason="factual claim detected; sources available" if signals.relevant_sources_available else "factual claim, no source — placeholder only",
-        confidence=anchor.confidence,
-        metadata={"sources_available": bool(signals.relevant_sources_available)},
-    )
+# _maybe_evidence_or_citation_prompt removed (2026-05-28). The auto-trigger
+# relied on hard-coded Korean lexical keywords ("근거", "출처", "자료", ...)
+# which don't generalize across domains/languages. ``evidence_or_citation_prompt``
+# stays in the TaskType catalog so an explicit-invocation path (a future UI
+# button, RAG retrieval signal, etc.) can still produce one — but the
+# candidate factory will never propose it from free text again.
 
 
 def _maybe_recovery_or_integration_note(

@@ -43,13 +43,7 @@ from .evaluator import (
     check_hard_gates,
     score_candidate,
 )
-from .features import (
-    ENGAGE_FEATURE_NAMES,
-    SUGGEST_FEATURE_NAMES,
-    build_engage_features,
-    build_suggest_features,
-    extract_primitive_features,
-)
+from .features import extract_primitive_features
 from .generator import ProactiveGenerator
 from .models import ProactiveObservation
 from .null_outcome_monitor import (
