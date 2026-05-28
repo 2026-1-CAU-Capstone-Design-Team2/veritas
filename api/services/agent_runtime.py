@@ -13,6 +13,8 @@ from fastapi import HTTPException
 from agent import ChatAgent
 from llm.llama_server_llm import LLMClient
 from llm.llama_supervisor import LlamaServer
+from llm.memory_aware_llm import MemoryAwareLLMClient
+from services.memory_tools_funcs import MemoryRuntime
 from tools.autosurvey_tool import AutoSurveyTool
 from tools.loader import build_registry, load_schema
 from workflows import AutoSurveyConfig, AutoSurveyWorkflow
@@ -64,12 +66,24 @@ class AgentRuntime:
         # see shutdown_runtime / the API shutdown hook for the uvicorn path).
         atexit.register(self.shutdown)
 
-        self.llm = LLMClient(
+        self.raw_llm = LLMClient(
             host=llm_host,
             port=llm_port,
             embed_host=os.getenv("VERITAS_EMBED_HOST") or None,
             embed_port=embed_port,
             trace_latency=os.getenv("VERITAS_TRACE_LATENCY", "1") != "0",
+        )
+        # MemoryRuntime은 workspace 결정 전이라 placeholder로 만들고,
+        # _configure_workspace_runtime에서 configure_workspace로 갈아 끼운다.
+        self.memory_runtime = MemoryRuntime(
+            raw_llm=self.raw_llm,
+            workspace_root=self.output_root / "api",
+            max_context_tokens=int(getattr(self.raw_llm, "n_ctx", 8192) or 8192),
+        )
+        # self.llm은 wrapper. callers는 동일한 surface(.ask/.iter_ask/.call/...)를 본다.
+        self.llm = MemoryAwareLLMClient(
+            raw_llm=self.raw_llm,
+            memory_runtime=self.memory_runtime,
         )
         self._workspace_lock = threading.RLock()
         # ScreenMonitor owns the intervention event ring buffer + lifecycle
@@ -109,6 +123,9 @@ class AgentRuntime:
 
         output_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir = output_dir
+        # workspace 전환마다 memory storage 핸들을 새 디렉토리로 교체.
+        if hasattr(self, "memory_runtime"):
+            self.memory_runtime.configure_workspace(output_dir)
         self.registry, self.run_store_service, self.rag_service = build_registry(
             llm=self.llm,
             run_root=self.output_dir,
