@@ -21,6 +21,13 @@ class _EditorStreamWorker(QThread):
     delta = Signal(str)
     completed = Signal(str)  # full text
     failed = Signal(str)
+    # Proactive bandit start-event extras: emitted exactly once per stream when
+    # the backend's /editor/suggest wrapper carries a decisionId. Subscribers
+    # store it and use it for /api/v1/proactive/feedback when the user
+    # accepts/rejects/retries the suggestion. ``should_intervene=False`` means
+    # the bandit chose no_op — the legacy slot still emits ``completed("")``
+    # so existing on_completed handlers keep working.
+    proactive_started = Signal(dict)  # {"decisionId": str, "shouldIntervene": bool, ...}
 
     _START_ID_KEYS = ("suggestionId", "assistId", "chatId")
 
@@ -41,6 +48,17 @@ class _EditorStreamWorker(QThread):
                             start_id = str(data.get(key))
                             break
                     self.started_stream.emit(start_id)
+                    # Forward the proactive-only fields without polluting the
+                    # legacy start-id slot. Empty dict for non-proactive routes.
+                    if data.get("decisionId"):
+                        self.proactive_started.emit(
+                            {
+                                "decisionId": str(data.get("decisionId") or ""),
+                                "shouldIntervene": bool(data.get("shouldIntervene")),
+                                "suggestionType": data.get("suggestionType"),
+                                "renderMode": data.get("renderMode"),
+                            }
+                        )
                 elif event_name == "delta":
                     chunk = str(data.get("text") or "")
                     if chunk:

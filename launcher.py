@@ -106,6 +106,30 @@ def configure_screen_debug_from_argv() -> None:
         sys.argv.remove("--screen-debug")
 
 
+_PROACTIVE_DEBUG: bool = False
+
+
+def proactive_debug_enabled() -> bool:
+    return _PROACTIVE_DEBUG
+
+
+def configure_proactive_debug_from_argv() -> None:
+    """``--proactive-debug``: stream ONLY the proactive bandit's ``[proactive]``
+    lines (decision / feedback / update / noop_out) to the console — every
+    other API tag still writes to the log file but is suppressed from stdout.
+
+    Same shape as :func:`configure_screen_debug_from_argv`: forces console
+    streaming on (the relay needs the pipe to filter) and sets
+    ``VERITAS_PROACTIVE_LOG=1`` so the API child emits the proactive lines."""
+    global _PROACTIVE_DEBUG, _CONSOLE_LOGS
+    if "--proactive-debug" in sys.argv:
+        _PROACTIVE_DEBUG = True
+        _CONSOLE_LOGS = True
+        os.environ["VERITAS_PROACTIVE_LOG"] = "1"
+    while "--proactive-debug" in sys.argv:
+        sys.argv.remove("--proactive-debug")
+
+
 class DownloadWorker(QObject):
     # Qt int signals are 32-bit on Windows. GGUF downloads commonly exceed
     # 2GB, so pass Python ints as objects to avoid progress overflow.
@@ -451,13 +475,21 @@ def _start_output_stream(process: subprocess.Popen, name: str, path: Path) -> No
             return
         # --screen-debug: the full child output still goes to the log file, but
         # the console shows only the screen pipeline's [screen_debug] lines.
+        # --proactive-debug: same idea for [proactive][*] lines. These two
+        # filters are mutually exclusive; if both are given we keep both.
         screen_only = screen_debug_enabled()
+        proactive_only = proactive_debug_enabled()
+        focused = screen_only or proactive_only
         with path.open("a", encoding="utf-8", errors="replace") as log:
             for line in stream:
                 log.write(line)
                 log.flush()
-                if screen_only:
-                    if "[screen_debug]" in line:
+                if focused:
+                    keep = (
+                        (screen_only and "[screen_debug]" in line)
+                        or (proactive_only and "[proactive]" in line)
+                    )
+                    if keep:
                         print(line, end="", flush=True)
                     continue
                 prefix = "" if line.startswith(("[llm]", "[api]")) else f"[{name}] "
@@ -673,6 +705,7 @@ def main() -> int:
     # mode (forcing streaming on) and flags the API child to emit the focused
     # screen trace that the relay then filters down to.
     configure_screen_debug_from_argv()
+    configure_proactive_debug_from_argv()
     # Guarantee no orphaned llama-server/API/UI even on a hard launcher kill.
     _install_kill_on_close_job()
     app = QApplication(sys.argv)
