@@ -336,14 +336,25 @@ class UserAdaptationMemory:
         canonical: str,
         task_type: Optional[str],
         anchor_id: Optional[str],
+        surface: Optional[str] = None,
     ) -> dict[str, Any]:
         """Single entry point for canonical feedback. Returns a dict
-        summarizing what changed — used by the orchestrator's update log."""
+        summarizing what changed — used by the orchestrator's update log.
+
+        ``surface`` controls one specific behavior: for ``"native_editor"``
+        we DO NOT set a per-(anchor, task) JSON-persisted cooldown — that
+        gate is owned by the orchestrator's in-memory reject ladder (see
+        ``services/proactive/README.md`` §"Native reject ladder"). The
+        ladder gives the user 3 rejects before any per-anchor block, which
+        is what feels less punitive on native where the only task type is
+        ``next_sentence``.
+        """
         with self._lock:
             changes: dict[str, Any] = {
                 "canonical": canonical,
                 "task_type": task_type,
                 "anchor_id": anchor_id,
+                "surface": surface,
                 "threshold_offset_before": self._state.threshold_offset,
             }
 
@@ -351,14 +362,18 @@ class UserAdaptationMemory:
             self._update_ema(canonical)
             self._state.last_feedback_at = _now_iso()
 
+            anchor_id_for_cooldown = (
+                anchor_id if surface != "native_editor" else None
+            )
+
             if canonical == "accept":
                 self._apply_accept(task_type, anchor_id, changes)
             elif canonical == "reject":
-                self._apply_reject(task_type, anchor_id, changes)
+                self._apply_reject(task_type, anchor_id_for_cooldown, changes)
             elif canonical == "retry":
                 self._apply_retry(task_type, changes)
             elif canonical == "timeout":
-                self._apply_timeout(task_type, anchor_id, changes)
+                self._apply_timeout(task_type, anchor_id_for_cooldown, changes)
             elif canonical == "wrong_anchor":
                 self._apply_wrong_anchor(task_type, changes)
             elif canonical == "cancelled":

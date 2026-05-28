@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Iterator
 
-from core.prompts.proactive import lead_in_for
+from core.prompts.proactive import lead_in_for, native_retry_lead_in
 
 from .context_selector import ContextBundle
 from .proposal_models import ProactiveTask
@@ -155,13 +155,8 @@ class ProactiveGenerator:
         # forbids meta-commentary). Everything else goes through editor_assist
         # so we can carry the lead-in contract.
         if task.task_type == "next_sentence" and surface_is_native:
-            # IMPORTANT: use the editor's raw prefix/suffix here, NOT the
-            # context_selector's reconstructed (prev_sentence + current_fragment).
-            # The reconstruction often produces too-short text (e.g. when the
-            # paragraph has only one sentence) which then fails ChatAgent's
-            # ``_is_continuation_moment`` (min ~8 chars after normalization) and
-            # the ghost LLM silently declines. Falling back to the bundle parts
-            # only when raw prefix is unavailable (e.g. screen-bridge captures).
+            # Use the editor's raw prefix/suffix — see README §"Native ghost
+            # context source" for why we don't reconstruct from text_parts.
             prefix = ""
             suffix = ""
             if observation is not None:
@@ -175,6 +170,28 @@ class ProactiveGenerator:
                 )
                 if not prefix.strip():
                     prefix = context.text_parts.get("current_paragraph", "")
+
+            # Native retry / post-reject path: if the orchestrator attached
+            # reject_level >= 1 or a last_rejected_text to task.metadata, we
+            # CAN'T use the plain ghostwrite system prompt — it has no way to
+            # convey "avoid this previous suggestion". Switch to editor_assist
+            # with the native_retry_lead_in template, which includes the
+            # rejected text as a negative example and an explicit instruction
+            # to vary.
+            reject_level = int(task.metadata.get("reject_level") or 0)
+            avoid_text = str(task.metadata.get("last_rejected_text") or "")
+            if reject_level >= 1 or avoid_text:
+                lead_in = native_retry_lead_in(
+                    avoid_text=avoid_text, reject_level=reject_level
+                )
+                yield from self._editor_assist_iter(
+                    "continue",
+                    f"{lead_in}{prefix}",
+                    max_tokens=self.max_tokens_assist,
+                    use_workspace=use_workspace,
+                )
+                return
+
             yield from self._ghostwrite_iter(
                 prefix,
                 suffix,

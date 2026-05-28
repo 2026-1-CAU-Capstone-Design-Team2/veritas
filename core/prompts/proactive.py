@@ -126,9 +126,47 @@ def lead_in_for(*, task_type: str, surface_is_native: bool) -> str:
     return table.get(task_type, "")
 
 
+# ------------------------------------------------------- native retry path
+
+# Triggered when the user clicked "다시" or rejected once at this anchor —
+# the generator switches from iter_ghostwrite to iter_editor_assist with this
+# lead-in so we can explicitly pass the previous (rejected) suggestion as a
+# negative example and bias the next attempt away from it.
+#
+# reject_level meaning:
+#   0 — never rejected at this anchor (we won't call this function)
+#   1 — rejected once: ask for a different angle, keep the prefix
+#   2 — rejected twice: ask the model to consider broader context
+#   3+ — handled by per-anchor cooldown (this lead-in not used)
+def native_retry_lead_in(*, avoid_text: str, reject_level: int) -> str:
+    parts: list[str] = [
+        "[과업] 다음에 이어질 한 문장만 본문으로 출력. 어떠한 머리말/꼬리말/설명도 금지.\n",
+    ]
+    if avoid_text and avoid_text.strip():
+        parts.append(
+            "[금지 — 이전에 제안했지만 사용자가 거절한 문장. "
+            "동일하거나 거의 같은 표현을 다시 제안하지 말 것]:\n"
+            f"{avoid_text.strip()}\n\n"
+        )
+    if reject_level >= 2:
+        parts.append(
+            "[지시] 사용자가 이미 2번 이상 거절했으므로, 표현뿐 아니라 "
+            "문장의 방향/주제 전개를 명확히 다르게 시도. 직전 단락의 흐름도 "
+            "함께 고려할 것.\n\n"
+        )
+    elif reject_level >= 1:
+        parts.append(
+            "[지시] 이전과 다른 단어 선택과 다른 문장 구조로 시도. "
+            "내용도 직전 거절된 제안과 명확히 구분되어야 함.\n\n"
+        )
+    parts.append("[이어쓸 문맥]\n")
+    return "".join(parts)
+
+
 __all__ = [
     "FORMAT_CONTRACT_EXTERNAL",
     "LEAD_IN_EXTERNAL",
     "LEAD_IN_NATIVE",
     "lead_in_for",
+    "native_retry_lead_in",
 ]

@@ -106,7 +106,11 @@ class FeedbackTests(unittest.TestCase):
             finally:
                 orch.close()
 
-    def test_reject_creates_anchor_task_cooldown(self) -> None:
+    def test_native_3_rejects_trigger_anchor_ladder_cooldown(self) -> None:
+        """Per services/proactive/README.md §"Native reject ladder":
+        native rejects DON'T touch adaptation's per-(anchor, task) cooldown
+        (the in-memory ladder owns that gate). The ladder reaches its
+        cooldown after 3 consecutive rejects at the same anchor."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             orch = _build_orch(tmp_path)
@@ -116,13 +120,36 @@ class FeedbackTests(unittest.TestCase):
                     self.skipTest("orchestrator chose null for this observation")
                 decision_id = result["decision_id"]
                 anchor_id = result["task"].target_anchor_id
-                task_type = result["task"].task_type
+
+                # 1 reject — ladder records reject_count=1 but no cooldown.
                 orch.record_feedback(decision_id=decision_id, raw_action="esc")
-                state = orch.store.adaptation.state
-                self.assertIn(
-                    f"{anchor_id}|{task_type}",
-                    state.anchor_cooldowns,
+                # adaptation cooldown should still be empty for native:
+                self.assertNotIn(
+                    f"{anchor_id}|next_sentence",
+                    orch.store.adaptation.state.anchor_cooldowns,
                 )
+                count, _, in_cd = orch._read_anchor_state(anchor_id)
+                self.assertEqual(count, 1)
+                self.assertFalse(in_cd)
+
+                # Two more rejects to trip the 3-strike ladder.
+                for _ in range(2):
+                    r = orch.observe(_native_obs())
+                    if r["prediction"] != "task":
+                        self.skipTest("ladder produced null mid-test")
+                    orch.record_feedback(
+                        decision_id=r["decision_id"], raw_action="esc"
+                    )
+
+                count, _, in_cd = orch._read_anchor_state(anchor_id)
+                self.assertEqual(count, 3)
+                self.assertTrue(in_cd, "ladder cooldown should be active")
+
+                # Next observe at the same anchor should null with the
+                # ladder cooldown reason.
+                blocked = orch.observe(_native_obs())
+                self.assertEqual(blocked["prediction"], "null")
+                self.assertEqual(blocked["null"].reason, "anchor_reject_cooldown")
             finally:
                 orch.close()
 

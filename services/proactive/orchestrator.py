@@ -28,10 +28,32 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
+
+
+# ----------------------------------------------------------- per-anchor reject ladder
+#
+# Tracked in-memory only (see services/proactive/README.md §"Native reject
+# ladder"). NOT persisted — this is a per-session UX gate, not learned state.
+# Three-strike rule:
+#   1st reject at anchor X → next attempt expands context (reject_level=1)
+#   2nd reject at anchor X → broader still (reject_level=2)
+#   3rd reject at anchor X → 180s per-anchor cooldown set
+# Other anchors are unaffected by this state; returning to a cool-down anchor
+# does NOT reset the cooldown (the cooldown is only cleared by an accept).
+
+NATIVE_ANCHOR_REJECT_LIMIT: int = 3
+NATIVE_ANCHOR_REJECT_COOLDOWN_S: float = 180.0
+
+
+@dataclass
+class _AnchorRejectState:
+    reject_count: int = 0
+    cooldown_until_monotonic: Optional[float] = None
+    last_rejected_text: Optional[str] = None
 
 from .anchors import ActiveAnchor, compute_anchor_id, confidence_from_source
 from .candidates import PrimitiveSignals, build_candidates
@@ -273,6 +295,12 @@ class ProactiveOrchestrator:
         self._tracks: dict[str, _DocumentTrack] = {}
         self._tracks_lock = threading.Lock()
 
+        # In-memory per-anchor reject ladder for native_editor.
+        # Documented in services/proactive/README.md §"Native reject ladder".
+        # Deliberately NOT persisted — closing/reopening the editor resets it.
+        self._anchor_reject_state: dict[str, _AnchorRejectState] = {}
+        self._anchor_reject_lock = threading.Lock()
+
         self._render_timeout_monitor = TimeoutMonitor(
             on_render_timeout=self._resolve_render_timeout,
             get_pending=self._read_pending_render,
@@ -362,6 +390,44 @@ class ProactiveOrchestrator:
         rolling = track.observe(text=observation.text, captured_ts=captured_ts)
 
         anchor = _extract_anchor(observation)
+
+        # Per-anchor reject ladder check (native only).
+        # This MUST happen before the candidate factory + evaluator chain so
+        # we don't waste cycles building a candidate that's only going to be
+        # vetoed on a per-anchor cooldown.
+        decision_id_early = f"pd_{uuid.uuid4().hex[:16]}"
+        if observation.surface == "native_editor":
+            reject_level, last_rejected, in_cooldown = self._read_anchor_state(
+                anchor.anchor_id
+            )
+            if in_cooldown:
+                # Compute primitive minimally so the null log still has the
+                # primitive snapshot operators expect.
+                primitive_cooldown = extract_primitive_features(
+                    observation=observation,
+                    idle_sec=float(rolling["idle_sec"]),
+                    stable_capture_count=int(rolling["stable_capture_count"]),
+                    added_chars_window=float(rolling["added_chars_window"]),
+                    deleted_chars_window=float(rolling["deleted_chars_window"]),
+                    recent_negative_rate=float(
+                        self.store.adaptation.state.global_stats.recent_negative_rate
+                    ),
+                    time_since_last_intervention=float(rolling["time_since_last_intervention"]),
+                    relevant_sources_available=self._workspace_has_sources(),
+                )
+                return self._emit_null(
+                    decision_id=decision_id_early,
+                    observation=observation,
+                    anchor=anchor,
+                    primitive=primitive_cooldown,
+                    reason="anchor_reject_cooldown",
+                    gate_reasons=["per_anchor_3_reject_cooldown"],
+                    candidate_count=0,
+                    threshold=float("inf"),
+                )
+        else:
+            reject_level, last_rejected = 0, None
+
         primitive = extract_primitive_features(
             observation=observation,
             idle_sec=float(rolling["idle_sec"]),
@@ -489,6 +555,14 @@ class ProactiveOrchestrator:
 
         # Task chosen — materialize context, log, register render timeout.
         best_task.evaluator_score = best_score
+        # Attach the per-anchor reject ladder state into task metadata. The
+        # generator uses these for the native-retry path so the LLM gets the
+        # previous (rejected) suggestion as a negative example, plus an
+        # explicit instruction to vary on reject_level ≥ 1.
+        if observation.surface == "native_editor" and reject_level > 0:
+            best_task.metadata["reject_level"] = int(reject_level)
+            if last_rejected:
+                best_task.metadata["last_rejected_text"] = str(last_rejected)
         context_bundle = materialize_context(task=best_task, anchor=anchor)
 
         track.mark_intervention(captured_ts)
@@ -646,10 +720,35 @@ class ProactiveOrchestrator:
                 anchor_id = prediction.target_anchor_id  # type: ignore[union-attr]
 
         canonical = canonicalize_feedback(surface=surface, raw_action=raw_action)
+
+        # --- Per-anchor reject ladder (native only, in-memory) ----------
+        # Documented in services/proactive/README.md §"Native reject ladder".
+        # We update this BEFORE calling adaptation.apply_feedback so any
+        # downstream observe at the same anchor sees the new reject_level
+        # immediately. The adaptation layer's per-(anchor,task) cooldown is
+        # skipped for native — the ladder owns the gate now.
+        meta = dict(metadata or {})
+        generated_text = str(meta.get("generated_text") or "")
+        if surface == "native_editor" and anchor_id:
+            if canonical == "reject":
+                self._bump_anchor_reject(anchor_id, generated_text)
+            elif canonical == "retry":
+                # Retry doesn't increment the count — the user wanted the
+                # help, just not THIS rendition. But we DO need to remember
+                # the rejected text so the next observe's generator can
+                # tell the LLM "avoid this".
+                self._remember_anchor_rejected_text(anchor_id, generated_text)
+            elif canonical == "accept":
+                # Accept clears the ladder entirely so the next observe at
+                # this anchor gets a fresh attempt.
+                self._clear_anchor_state(anchor_id)
+        # ----------------------------------------------------------------
+
         changes = self.store.adaptation.apply_feedback(
             canonical=canonical,
             task_type=task_type,
             anchor_id=anchor_id,
+            surface=surface,
         )
         self.store.log_feedback(
             {
@@ -687,6 +786,52 @@ class ProactiveOrchestrator:
             "task_type": task_type,
             "adaptation_changes": dict(changes),
         }
+
+    # ----------------------------------------------------------- anchor ladder
+
+    def _read_anchor_state(
+        self, anchor_id: str
+    ) -> tuple[int, Optional[str], bool]:
+        """Return ``(reject_count, last_rejected_text, in_cooldown)`` for
+        ``anchor_id``. All three are zero/None/False if the anchor has no
+        ladder state yet."""
+        with self._anchor_reject_lock:
+            state = self._anchor_reject_state.get(anchor_id)
+            if state is None:
+                return 0, None, False
+            in_cd = (
+                state.cooldown_until_monotonic is not None
+                and time.monotonic() < state.cooldown_until_monotonic
+            )
+            return state.reject_count, state.last_rejected_text, in_cd
+
+    def _bump_anchor_reject(self, anchor_id: str, generated_text: str) -> None:
+        with self._anchor_reject_lock:
+            state = self._anchor_reject_state.setdefault(
+                anchor_id, _AnchorRejectState()
+            )
+            state.reject_count += 1
+            if generated_text:
+                state.last_rejected_text = generated_text
+            if state.reject_count >= NATIVE_ANCHOR_REJECT_LIMIT:
+                state.cooldown_until_monotonic = (
+                    time.monotonic() + NATIVE_ANCHOR_REJECT_COOLDOWN_S
+                )
+
+    def _remember_anchor_rejected_text(
+        self, anchor_id: str, generated_text: str
+    ) -> None:
+        if not generated_text:
+            return
+        with self._anchor_reject_lock:
+            state = self._anchor_reject_state.setdefault(
+                anchor_id, _AnchorRejectState()
+            )
+            state.last_rejected_text = generated_text
+
+    def _clear_anchor_state(self, anchor_id: str) -> None:
+        with self._anchor_reject_lock:
+            self._anchor_reject_state.pop(anchor_id, None)
 
     # ----------------------------------------------------------- pending
 

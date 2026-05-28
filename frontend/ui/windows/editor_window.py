@@ -243,7 +243,10 @@ class MarkdownSourceEdit(QTextEdit):
 
     ghostAccepted = Signal()
     ghostDismissed = Signal()
-    ghostRetryRequested = Signal()
+    # Carries the ghost text the user was looking at when they hit "다시" so
+    # the backend can pass it to the LLM as a "do NOT repeat this" hint.
+    # See services/proactive/README.md §"Native reject ladder".
+    ghostRetryRequested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -405,8 +408,12 @@ class MarkdownSourceEdit(QTextEdit):
             self.ghostDismissed.emit()
 
     def _request_retry(self) -> None:
+        # Snapshot the ghost text BEFORE _reset_ghost wipes ``self._ghost_text``.
+        # The signal carries it to ``_on_ghost_retry`` which forwards it to the
+        # backend as the "previous rejected suggestion" the LLM must avoid.
+        prev_text = self._ghost_text or ""
         self._reset_ghost()
-        self.ghostRetryRequested.emit()
+        self.ghostRetryRequested.emit(prev_text)
 
     def accept_ghost(self) -> None:
         if not self._ghost_text:
@@ -1266,10 +1273,15 @@ class EditorWindow(QWidget):
         self._invalidate_suggestion()
         self.assist_panel.add_history("고스트 제안 수락")
 
-    def _on_ghost_retry(self) -> None:
-        """User hit the 다시 chip. Record retry feedback then start a fresh
-        suggestion cycle (which clears the cached decisionId)."""
-        self._submit_proactive_feedback("retry")
+    def _on_ghost_retry(self, prev_text: str = "") -> None:
+        """User hit the 다시 chip. Record retry feedback (with the previous
+        ghost text so the backend can pass it to the LLM as a "don't repeat
+        this" hint) then start a fresh suggestion cycle.
+        """
+        self._submit_proactive_feedback(
+            "retry",
+            metadata={"generated_text": prev_text} if prev_text else None,
+        )
         self._fire_suggestion()
 
     def _on_proactive_timeout(self) -> None:
@@ -1281,12 +1293,20 @@ class EditorWindow(QWidget):
         """
         self._submit_proactive_feedback("timeout")
 
-    def _submit_proactive_feedback(self, raw_action: str) -> None:
+    def _submit_proactive_feedback(
+        self,
+        raw_action: str,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
         """Fire-and-forget proactive feedback for the cached decision.
 
+        ``metadata`` is forwarded to ``/api/v1/proactive/feedback``. The
+        ``retry`` and ``reject`` paths include ``generated_text`` so the
+        backend's per-anchor reject ladder can record the previous (rejected)
+        suggestion text — the LLM gets it back as a "don't repeat this"
+        instruction on the next observe at the same anchor.
+
         Always clears the cached id afterwards so we never double-submit.
-        Network failures are logged at warn level and swallowed — losing a
-        single feedback line is preferable to interrupting the user's flow.
         """
         decision_id = self._active_decision_id
         self._proactive_timeout_timer.stop()
@@ -1305,6 +1325,7 @@ class EditorWindow(QWidget):
             controller.submit_proactive_feedback,
             decision_id,
             raw_action,
+            metadata,
             on_error=lambda err: print(f"[proactive_feedback][warn] {err}"),
         )
 
