@@ -277,7 +277,8 @@ def suggest_stream(
 
     decision_id = str(decision_dict.get("decisionId") or "")
     should_intervene = bool(decision_dict.get("shouldIntervene"))
-    suggestion_type = decision_dict.get("suggestionType")
+    task = decision_dict.get("task") or {}
+    suggestion_type = task.get("taskType") if isinstance(task, dict) else None
 
     yield _sse(
         "start",
@@ -286,8 +287,12 @@ def suggest_stream(
             "workspaceId": workspace_id,
             "decisionId": decision_id,
             "shouldIntervene": should_intervene,
+            # Keep ``suggestionType`` for backward-compat with the existing
+            # native frontend; the rule-based system calls this ``taskType``
+            # internally but the wire field name stays the same.
             "suggestionType": suggestion_type,
-            "renderMode": decision_dict.get("renderMode"),
+            "taskType": suggestion_type,
+            "renderMode": task.get("renderMode") if isinstance(task, dict) else None,
         },
     )
 

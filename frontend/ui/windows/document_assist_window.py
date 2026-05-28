@@ -561,13 +561,26 @@ class SuggestionCard(QFrame):
 		self._like_button = None
 		self._dislike_button = None
 		self._retry_button = None
+		self._wrong_anchor_button = None
 		if event_id:
 			footer = QHBoxLayout()
 			footer.setSpacing(6)
 			footer.addStretch(1)
 			if self._is_proactive:
-				# Spec §17.3 — 복사 maps to accept (already wired on the copy
-				# button above), so the footer only needs 거절 + 다시.
+				# Rule-based card layout — 복사 (accept) on the header,
+				# 거절 (red_reject) + 다시 (retry) + "현재 위치와 관련 없음"
+				# (wrong_anchor) in the footer. wrong_anchor is the
+				# operator's way to tell the system "the suggestion didn't
+				# target where I'm editing" without poisoning the task_type
+				# preference EMA.
+				self._wrong_anchor_button = QPushButton("위치 다름")
+				self._wrong_anchor_button.setObjectName("AssistWrongAnchorButton")
+				self._wrong_anchor_button.setStyleSheet(_DISLIKE_CHIP_QSS)
+				self._wrong_anchor_button.setFixedHeight(30)
+				self._wrong_anchor_button.setMinimumWidth(70)
+				self._wrong_anchor_button.setCursor(Qt.PointingHandCursor)
+				self._wrong_anchor_button.setToolTip("현재 편집 위치와 관련 없는 제안일 때")
+				self._wrong_anchor_button.clicked.connect(lambda: self._on_rate("wrong_anchor"))
 				self._dislike_button = QPushButton("거절")
 				self._dislike_button.setObjectName("AssistRejectButton")
 				self._dislike_button.setStyleSheet(_DISLIKE_CHIP_QSS)
@@ -582,6 +595,7 @@ class SuggestionCard(QFrame):
 				self._retry_button.setMinimumWidth(60)
 				self._retry_button.setCursor(Qt.PointingHandCursor)
 				self._retry_button.clicked.connect(lambda: self._on_rate("retry"))
+				footer.addWidget(self._wrong_anchor_button)
 				footer.addWidget(self._dislike_button)
 				footer.addWidget(self._retry_button)
 			else:
@@ -650,13 +664,20 @@ class SuggestionCard(QFrame):
 			return
 		if action != "retry":
 			self._rated = True
-			for button in (self._like_button, self._dislike_button, self._retry_button):
+			for button in (
+				self._like_button,
+				self._dislike_button,
+				self._retry_button,
+				self._wrong_anchor_button,
+			):
 				if button is not None:
 					button.setEnabled(False)
 		if action == "like" and self._like_button is not None:
 			self._like_button.setStyleSheet(_LIKE_CHIP_CHOSEN_QSS)
 		elif action in ("dislike", "red_reject") and self._dislike_button is not None:
 			self._dislike_button.setStyleSheet(_DISLIKE_CHIP_CHOSEN_QSS)
+		elif action == "wrong_anchor" and self._wrong_anchor_button is not None:
+			self._wrong_anchor_button.setStyleSheet(_DISLIKE_CHIP_CHOSEN_QSS)
 		self.feedbackSubmitted.emit(self._event_id, self._intervention_type, action)
 
 	def set_text(self, text: str) -> None:

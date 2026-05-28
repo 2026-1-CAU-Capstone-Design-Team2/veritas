@@ -137,8 +137,12 @@ def observe_screen_intervention(
             changed_text="",
             confidence=0.0,
         )
-        decision = orchestrator.observe(observation)
-        return decision.decision_id
+        result = orchestrator.observe(observation)
+        # Rule-based orchestrator returns a dict {decision_id, prediction, ...}.
+        # We treat both task and null as "observed" — the screen bridge's job
+        # is to wire the bandit/adaptation learning loop into the existing
+        # screen pipeline, not to gate the legacy scenario scheduler's cards.
+        return str(result.get("decision_id") or "") or None
     except Exception as exc:  # noqa: BLE001 — never break the screen surface
         log.warning("[proactive][screen_bridge] observe failed: %s", exc)
         return None

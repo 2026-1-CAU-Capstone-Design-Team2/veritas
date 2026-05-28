@@ -361,7 +361,13 @@ class AgentRuntime:
 
     def get_proactive_orchestrator(self) -> ProactiveOrchestrator:
         """Return (and lazily build) the proactive orchestrator for the
-        current workspace. Reused on every observe / feedback call."""
+        current workspace. Reused on every observe / feedback call.
+
+        Post-pivot the orchestrator is purely deterministic — no rng to wire,
+        no bandit state to seed. The generator is constructed from the
+        AgentRuntime's existing ghostwrite / editor_assist facades so the
+        LLM call path stays unchanged.
+        """
         with self._workspace_lock:
             if self._proactive_orchestrator is not None:
                 return self._proactive_orchestrator

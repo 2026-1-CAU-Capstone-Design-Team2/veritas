@@ -1,56 +1,81 @@
-"""Proactive intervention bandit (services/proactive/).
+"""Proactive intervention pipeline (services/proactive/).
 
-Owns the *decision* of when and what to suggest while the user is writing —
-native editor or external Windows app — and the *learning* signal that closes
-the loop with canonical user feedback.
+After the rule-based pivot (see ``veritas_proactive_rule_based_reimplementation.md``)
+the public surface is:
 
-Layout (per veritas_bandit_policy_implementation_guide.md):
+- ``models``                — observation / feedback dataclasses
+- ``anchors``               — ActiveAnchor extraction + confidence bands
+- ``proposal_models``       — ProactiveTask / NullPrediction / SurfaceCapabilities
+- ``features``              — primitive feature math (kept; helper for candidates)
+- ``candidates``            — deterministic CandidateFactory (no LLM)
+- ``evaluator``             — hard gates + rubric score
+- ``adaptation``            — UserAdaptationMemory (threshold/cooldown/suppression)
+- ``context_selector``      — anchor-relative ContextBundle materialization
+- ``policy_store``          — JSONL append-only logs + adaptation glue
+- ``timeout_monitor``       — render timeouts (no policy updates)
+- ``null_outcome_monitor``  — TN/FN proxy classification for null decisions
+- ``orchestrator``          — observe / record_feedback / explain / reset
+- ``generator``             — ProactiveTask + ContextBundle → SSE
+- ``screen_bridge``         — ChatAgent screen pipeline glue
+- ``telemetry``             — console + per-workspace log file
+- ``reward``                — canonical feedback mapping (incl. wrong_anchor)
 
-- ``models``             — pure dataclasses (observation/decision/feedback) +
-                           Literal types shared across surfaces.
-- ``features``           — primitive telemetry extractor + engage / suggest
-                           feature vectors. No LLM, no I/O.
-- ``action_space``       — suggestion-type action mask from primitives.
-- ``context_selector``   — default per-action context scope + extraction.
-- ``reward``             — surface-specific feedback → canonical reward.
-- ``policies/``          — Disjoint Discounted LinUCB (suggestion candidate)
-                           and Action-Centered Engage Policy (intervene/no-op).
-- ``policy_store``       — per-workspace JSON state + JSONL append logs.
-- ``timeout_monitor``    — backend timeout sweeper for rendered interventions
-                           and no-op outcome horizon.
-- ``orchestrator``       — observe / record_feedback wiring; the one entry
-                           point for both native and external surfaces.
-- ``generator``          — SSE generator that maps suggestion_type +
-                           selected_context onto the shared LLM pipeline.
+Frozen modules — kept for reference only:
+- ``legacy_bandit.policies.*`` — Action-Centered Engage + LinUCB (do not import
+  in production).
 
 The API layer (``api/api_routes/proactive.py``,
-``api/services/proactive_service.py``) is a thin adapter over the orchestrator
-so this package stays UI- and HTTP-agnostic.
+``api/services/proactive_service.py``) is the only place that translates
+between Pydantic request shapes and these dataclasses.
 """
 from __future__ import annotations
 
+from .anchors import ActiveAnchor
 from .models import (
     CanonicalFeedback,
-    ContextScope,
+    ContextScope as LegacyContextScope,  # alias to avoid shadowing proposal_models
     EngageAction,
     FeatureSnapshot,
     FeedbackRecord,
     ProactiveDecision,
     ProactiveObservation,
-    RenderMode,
+    RenderMode as LegacyRenderMode,
     Surface,
-    SuggestionType,
+    SuggestionType as LegacySuggestionType,
+)
+from .proposal_models import (
+    ContextScope,
+    NullPrediction,
+    Prediction,
+    ProactiveTask,
+    RenderMode,
+    SurfaceCapabilities,
+    TaskType,
+    is_null,
+    is_task,
 )
 
 __all__ = [
+    "ActiveAnchor",
     "CanonicalFeedback",
     "ContextScope",
     "EngageAction",
     "FeatureSnapshot",
     "FeedbackRecord",
+    "NullPrediction",
+    "Prediction",
     "ProactiveDecision",
     "ProactiveObservation",
+    "ProactiveTask",
     "RenderMode",
     "Surface",
-    "SuggestionType",
+    "SurfaceCapabilities",
+    "TaskType",
+    "is_null",
+    "is_task",
+    # Legacy aliases kept for any straggling import sites — prefer
+    # proposal_models.* in new code.
+    "LegacyContextScope",
+    "LegacyRenderMode",
+    "LegacySuggestionType",
 ]

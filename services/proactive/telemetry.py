@@ -1,26 +1,16 @@
-"""Structured console + file telemetry for the proactive bandit.
+"""Structured console + file telemetry for the rule-based proactive system.
 
-The user wants two things when they run with ``--console-logs``:
+Reads the same toggles as before:
+- ``--proactive-debug`` (launcher) or ``VERITAS_PROACTIVE_LOG=1``
+- ``VERITAS_LOG_MODE=console`` as the global fallback
 
-1. **A single readable line per decision** in the API process's console so they
-   can watch the bandit's behavior in real time without tailing JSONL files.
-2. **A per-workspace timeline file** (``proactive.log``) under the policy
-   store dir so they can review the day's decisions even after restart.
+But every emitted line now describes the rule-based pipeline:
+``[proactive][decision]`` carries evaluator_score / threshold / gate_reasons,
+``[proactive][feedback]`` carries canonical + adaptation deltas,
+``[proactive][null_outcome]`` carries TN/FN proxy classifications.
 
-The launcher already pipes API-child stdout to the console when
-``--console-logs`` (or ``VERITAS_LOG_MODE``) is set. We honor the same toggles
-plus an explicit ``VERITAS_PROACTIVE_LOG`` override for users who want
-proactive telemetry on without enabling every other tag.
-
-Format (one line per event):
-
-    [proactive][decision] pd_abcd1234 native_editor engage=intervene π=0.42 \\
-        candidate=paragraph_rewrite mean=+0.18 std=0.32 gate=- recent_neg=0.05 \\
-        idle=4.2s mask=[next_sentence,paragraph_rewrite,local_copyedit]
-    [proactive][feedback] pd_abcd1234 native_editor accept r_engage=+1.0 \\
-        r_suggest=+1.0 took=2.3s
-    [proactive][update]   pd_abcd1234 engage_residual=+0.58 suggest_arm=paragraph_rewrite
-    [proactive][noop_out] pd_abcd1234 noop_positive vol=85 churn=0.12 idle=8.3s
+Lines no longer reference θ̂, UCB, residuals, or warmup — those were
+bandit-era concepts.
 """
 from __future__ import annotations
 
@@ -36,17 +26,11 @@ _LOGGER_NAME = "proactive"
 
 
 def _console_enabled() -> bool:
-    """True when the user wants proactive telemetry on the console.
-
-    Mirrors launcher.console_logs_enabled() — we do NOT import the launcher
-    here because the API child process doesn't always have it on sys.path and
-    we want this module to stay importable from anywhere.
-    """
-    if os.getenv("VERITAS_PROACTIVE_LOG", "").strip().lower() in {"0", "false", "off"}:
+    raw = os.getenv("VERITAS_PROACTIVE_LOG", "").strip().lower()
+    if raw in {"0", "false", "off"}:
         return False
-    if os.getenv("VERITAS_PROACTIVE_LOG", "").strip().lower() in {"1", "true", "on"}:
+    if raw in {"1", "true", "on"}:
         return True
-    # Fall through to the global console-logs toggle.
     if "--console-logs" in sys.argv:
         return True
     return os.getenv("VERITAS_LOG_MODE", "").strip().lower() in {
@@ -61,8 +45,6 @@ def _now_iso() -> str:
 
 
 class _ProactiveTelemetry:
-    """Per-workspace logger. Constructed by ``get_telemetry(workspace_id)``."""
-
     def __init__(self, *, workspace_id: str, log_dir: Path) -> None:
         self.workspace_id = workspace_id
         self.log_dir = Path(log_dir)
@@ -70,9 +52,6 @@ class _ProactiveTelemetry:
         self.log_path = self.log_dir / "proactive.log"
         self._lock = threading.Lock()
         self._console = _console_enabled()
-        # The logger is shared across telemetry instances (Python's name-keyed
-        # registry handles that for us); we attach the file handler exactly
-        # once per workspace path so a workspace switch doesn't double-log.
         self._logger = logging.getLogger(f"{_LOGGER_NAME}.{workspace_id}")
         self._logger.setLevel(logging.INFO)
         self._logger.propagate = False
@@ -81,17 +60,10 @@ class _ProactiveTelemetry:
             fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
             self._logger.addHandler(fh)
 
-    # ----------------------------------------------------------- emit
-
     def _emit(self, line: str) -> None:
         with self._lock:
             self._logger.info(line)
             if self._console:
-                # Plain print so it shows up in the launcher's API-child pipe
-                # without going through Python logging's stderr routing. The
-                # launcher's API child calls ``force_utf8_stdio`` at startup, but
-                # if this is exercised under a cp949 stdout (e.g. a one-off
-                # script) we still want a readable line, not a UnicodeEncodeError.
                 try:
                     print(line, flush=True)
                 except UnicodeEncodeError:
@@ -99,131 +71,7 @@ class _ProactiveTelemetry:
                     fallback = line.encode(enc, errors="replace").decode(enc, errors="replace")
                     print(fallback, flush=True)
 
-    # ----------------------------------------------------------- events
-
-    def decision(
-        self,
-        *,
-        decision_id: str,
-        surface: str,
-        engage_action: str,
-        intervention_probability: float,
-        candidate: str | None,
-        suggestion_type: str | None,
-        render_mode: str,
-        engage_info: dict[str, Any],
-        primitive: dict[str, Any],
-        available: list[str],
-        suggest_scores: dict[str, float] | None = None,
-    ) -> None:
-        gate = str(engage_info.get("gate_reason") or "-") or "-"
-        mean = float(engage_info.get("mean") or 0.0)
-        std = float(engage_info.get("std") or 0.0)
-        idle = float(primitive.get("idle_sec") or 0.0)
-        recent_neg = float(primitive.get("recent_negative_rate") or 0.0)
-        mask_str = ",".join(available) if available else "-"
-        chosen = suggestion_type or candidate or "-"
-        # Warmup progress is the operator's eye-level signal for "is the
-        # policy still in forced-exploration?" — surface it inline.
-        warmup_active = bool(engage_info.get("warmup_active"))
-        warmup_remaining = int(engage_info.get("warmup_remaining") or 0)
-        warmup_str = (
-            f" warmup={warmup_remaining}left"
-            if warmup_active
-            else ""
-        )
-        # Top-3 UCB scores: operator's "which arms were close runners-up?"
-        # signal. Empty when only one arm was in the mask.
-        scores_str = ""
-        if suggest_scores:
-            ranked = sorted(
-                suggest_scores.items(), key=lambda kv: kv[1], reverse=True
-            )[:3]
-            if ranked:
-                scores_str = " ucb=[" + ",".join(
-                    f"{arm}:{score:+.2f}" for arm, score in ranked
-                ) + "]"
-        line = (
-            f"[proactive][decision] {decision_id} {surface} "
-            f"engage={engage_action} π={intervention_probability:.3f} "
-            f"candidate={candidate or '-'} chosen={chosen} render={render_mode} "
-            f"mean={mean:+.3f} std={std:.3f} gate={gate} "
-            f"recent_neg={recent_neg:.2f} idle={idle:.1f}s{warmup_str}{scores_str} "
-            f"mask=[{mask_str}]"
-        )
-        self._emit(line)
-
-    def feedback(
-        self,
-        *,
-        decision_id: str,
-        surface: str,
-        canonical: str,
-        engage_reward: float | None,
-        suggestion_reward: float | None,
-        decision_created_at: str | None = None,
-    ) -> None:
-        took = ""
-        if decision_created_at:
-            try:
-                start = datetime.fromisoformat(
-                    decision_created_at.replace("Z", "+00:00")
-                )
-                took = f" took={(datetime.now(timezone.utc) - start).total_seconds():.1f}s"
-            except Exception:
-                took = ""
-        er = f"{engage_reward:+.2f}" if engage_reward is not None else "-"
-        sr = f"{suggestion_reward:+.2f}" if suggestion_reward is not None else "-"
-        line = (
-            f"[proactive][feedback] {decision_id} {surface} {canonical} "
-            f"r_engage={er} r_suggest={sr}{took}"
-        )
-        self._emit(line)
-
-    def update(
-        self,
-        *,
-        decision_id: str,
-        engage_update: dict[str, Any] | None,
-        suggest_update: dict[str, Any] | None,
-    ) -> None:
-        eng = engage_update or {}
-        sug = suggest_update or {}
-        parts = [f"[proactive][update]  {decision_id}"]
-        if eng.get("updated"):
-            parts.append(
-                f"engage_residual={float(eng.get('residual') or 0.0):+.3f}"
-                f" var_factor={float(eng.get('variance_factor') or 0.0):.3f}"
-            )
-        if sug.get("updated"):
-            parts.append(
-                f"suggest_arm={sug.get('action')} reward={float(sug.get('reward') or 0.0):+.2f}"
-            )
-        if len(parts) == 1:
-            parts.append("skipped")
-        self._emit(" ".join(parts))
-
-    def noop_outcome(
-        self,
-        *,
-        decision_id: str,
-        outcome: str,
-        edit_volume: float,
-        churn: float,
-        idle: float,
-    ) -> None:
-        self._emit(
-            f"[proactive][noop_out] {decision_id} {outcome} "
-            f"vol={edit_volume:.0f} churn={churn:.2f} idle={idle:.1f}s"
-        )
-
-    def custom(self, tag: str, message: str) -> None:
-        """Escape hatch for one-off lines (e.g. wrapper diagnostics)."""
-        self._emit(f"[proactive][{tag}] {message}")
-
     def close(self) -> None:
-        """Release the file handle so a Windows-side directory cleanup
-        (workspace switch / test teardown) doesn't trip on a held handle."""
         with self._lock:
             for handler in list(self._logger.handlers):
                 try:
@@ -233,9 +81,98 @@ class _ProactiveTelemetry:
                     pass
                 self._logger.removeHandler(handler)
 
+    # ----------------------------------------------------------- events
 
-# Cache one logger per workspace so the file handler isn't reopened on every
-# observe(). Keyed by the absolute policy_dir path to survive workspace renames.
+    def decision_task(
+        self,
+        *,
+        decision_id: str,
+        surface: str,
+        task_type: str,
+        anchor_id: str,
+        anchor_confidence: float,
+        context_scope: str,
+        render_mode: str,
+        evaluator_score: float,
+        threshold: float,
+        candidate_count: int,
+        primitive: dict[str, Any],
+    ) -> None:
+        idle = float(primitive.get("idle_sec", 0.0) or 0.0)
+        churn = float(primitive.get("churn_score", 0.0) or 0.0)
+        recent_neg = float(primitive.get("recent_negative_rate", 0.0) or 0.0)
+        line = (
+            f"[proactive][decision] {decision_id} {surface} task={task_type} "
+            f"anchor={anchor_id} conf={anchor_confidence:.2f} "
+            f"scope={context_scope} render={render_mode} "
+            f"score={evaluator_score:.3f} threshold={threshold:.3f} "
+            f"candidates={candidate_count} "
+            f"idle={idle:.1f}s churn={churn:.2f} recent_neg={recent_neg:.2f}"
+        )
+        self._emit(line)
+
+    def decision_null(
+        self,
+        *,
+        decision_id: str,
+        surface: str,
+        reason: str,
+        candidate_count: int,
+        gate_reasons: list[str],
+        best_score: float | None = None,
+        threshold: float | None = None,
+    ) -> None:
+        gates = ",".join(gate_reasons) if gate_reasons else "-"
+        score = f" best_score={best_score:.3f}" if best_score is not None else ""
+        thr = f" threshold={threshold:.3f}" if threshold is not None else ""
+        line = (
+            f"[proactive][decision] {decision_id} {surface} prediction=null "
+            f"reason={reason} candidates={candidate_count} gates=[{gates}]{score}{thr}"
+        )
+        self._emit(line)
+
+    def feedback(
+        self,
+        *,
+        decision_id: str,
+        surface: str,
+        canonical: str,
+        task_type: str | None,
+        anchor_id: str | None,
+        adaptation_changes: dict[str, Any],
+    ) -> None:
+        ttype = task_type or "-"
+        threshold_delta = adaptation_changes.get("threshold_delta")
+        td_str = f" Δthr={float(threshold_delta):+.3f}" if isinstance(threshold_delta, (int, float)) else ""
+        suppressed = adaptation_changes.get("task_type_suppressed_until")
+        sup_str = f" suppressed_until={suppressed}" if suppressed else ""
+        cooldown = adaptation_changes.get("anchor_cooldown_set")
+        cd_str = f" cooldown_set={cooldown}" if cooldown else ""
+        line = (
+            f"[proactive][feedback] {decision_id} {surface} {canonical} "
+            f"task={ttype} anchor={anchor_id or '-'}{td_str}{cd_str}{sup_str}"
+        )
+        self._emit(line)
+
+    def null_outcome(
+        self,
+        *,
+        decision_id: str,
+        outcome: str,
+        edit_volume: float,
+        churn: float,
+        idle: float,
+    ) -> None:
+        line = (
+            f"[proactive][null_outcome] {decision_id} {outcome} "
+            f"vol={edit_volume:.0f} churn={churn:.2f} idle={idle:.1f}s"
+        )
+        self._emit(line)
+
+    def custom(self, tag: str, message: str) -> None:
+        self._emit(f"[proactive][{tag}] {message}")
+
+
 _telemetry_cache: dict[str, _ProactiveTelemetry] = {}
 _cache_lock = threading.Lock()
 
@@ -252,7 +189,6 @@ def get_telemetry(*, workspace_id: str, log_dir: Path) -> _ProactiveTelemetry:
 
 
 def release_telemetry(log_dir: Path) -> None:
-    """Drop the cached telemetry for ``log_dir`` and close its file handler."""
     key = str(Path(log_dir).resolve())
     with _cache_lock:
         instance = _telemetry_cache.pop(key, None)
@@ -261,6 +197,4 @@ def release_telemetry(log_dir: Path) -> None:
 
 
 def console_enabled() -> bool:
-    """Public re-export so tests / callers can short-circuit expensive log
-    builds when nothing is listening."""
     return _console_enabled()

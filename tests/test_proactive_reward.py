@@ -87,10 +87,24 @@ class CanonicalMappingTests(unittest.TestCase):
             "retry",
             "timeout",
             "cancelled",
+            "wrong_anchor",
             "noop_positive",
             "noop_negative",
         ):
             self.assertIn(k, CANONICAL_REWARD)
+
+    def test_wrong_anchor_round_trip_both_surfaces(self) -> None:
+        # New rule-based feedback. Both surfaces must accept it.
+        for surface in ("native_editor", "external_screen"):
+            with self.subTest(surface=surface):
+                self.assertEqual(
+                    canonicalize_feedback(surface=surface, raw_action="wrong_anchor"),
+                    "wrong_anchor",
+                )
+                self.assertEqual(
+                    canonicalize_feedback(surface=surface, raw_action="off_target"),
+                    "wrong_anchor",
+                )
 
     def test_describe_feedback_round_trip(self) -> None:
         d = describe_feedback(surface="native_editor", raw_action="TAB")
