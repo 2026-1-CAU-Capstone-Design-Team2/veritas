@@ -90,10 +90,9 @@ class DisjointDiscountedLinUCB:
     ) -> dict[str, Any]:
         """Pick the arm with the highest UCB score over ``available_actions``.
 
-        ``available_actions`` is the capability mask from
-        :func:`services.proactive.action_space.build_suggestion_action_mask`.
-        Unknown actions in the mask are silently dropped (the policy may
-        have been trained on a stricter action set than the current mask).
+        ``available_actions`` was the capability mask the bandit era's
+        action_space module supplied; that module was deleted with the
+        rule-based pivot. Unknown actions in the mask are silently dropped.
         """
         if len(x) != self.dim:
             raise ValueError(

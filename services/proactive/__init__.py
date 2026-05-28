@@ -1,18 +1,17 @@
 """Proactive intervention pipeline (services/proactive/).
 
-After the rule-based pivot (see ``veritas_proactive_rule_based_reimplementation.md``)
-the public surface is:
+After the rule-based pivot the public surface is intentionally small:
 
-- ``models``                — observation / feedback dataclasses
+- ``models``                — ``ProactiveObservation`` (the observe-tick input)
 - ``anchors``               — ActiveAnchor extraction + confidence bands
 - ``proposal_models``       — ProactiveTask / NullPrediction / SurfaceCapabilities
-- ``features``              — primitive feature math (kept; helper for candidates)
+- ``features``              — primitive feature math (lexical-keyword free)
 - ``candidates``            — deterministic CandidateFactory (no LLM)
 - ``evaluator``             — hard gates + rubric score
-- ``adaptation``            — UserAdaptationMemory (threshold/cooldown/suppression)
+- ``adaptation``            — UserAdaptationMemory (threshold / cooldown / suppression)
 - ``context_selector``      — anchor-relative ContextBundle materialization
 - ``policy_store``          — JSONL append-only logs + adaptation glue
-- ``timeout_monitor``       — render timeouts (no policy updates)
+- ``timeout_monitor``       — render timeouts
 - ``null_outcome_monitor``  — TN/FN proxy classification for null decisions
 - ``orchestrator``          — observe / record_feedback / explain / reset
 - ``generator``             — ProactiveTask + ContextBundle → SSE
@@ -20,29 +19,13 @@ the public surface is:
 - ``telemetry``             — console + per-workspace log file
 - ``reward``                — canonical feedback mapping (incl. wrong_anchor)
 
-Frozen modules — kept for reference only:
-- ``legacy_bandit.policies.*`` — Action-Centered Engage + LinUCB (do not import
-  in production).
-
-The API layer (``api/api_routes/proactive.py``,
-``api/services/proactive_service.py``) is the only place that translates
-between Pydantic request shapes and these dataclasses.
+Frozen reference (do not import in production): ``legacy_bandit/`` —
+see ``services/proactive/README.md`` §2.
 """
 from __future__ import annotations
 
 from .anchors import ActiveAnchor
-from .models import (
-    CanonicalFeedback,
-    ContextScope as LegacyContextScope,  # alias to avoid shadowing proposal_models
-    EngageAction,
-    FeatureSnapshot,
-    FeedbackRecord,
-    ProactiveDecision,
-    ProactiveObservation,
-    RenderMode as LegacyRenderMode,
-    Surface,
-    SuggestionType as LegacySuggestionType,
-)
+from .models import ProactiveObservation, Surface
 from .proposal_models import (
     ContextScope,
     NullPrediction,
@@ -57,14 +40,9 @@ from .proposal_models import (
 
 __all__ = [
     "ActiveAnchor",
-    "CanonicalFeedback",
     "ContextScope",
-    "EngageAction",
-    "FeatureSnapshot",
-    "FeedbackRecord",
     "NullPrediction",
     "Prediction",
-    "ProactiveDecision",
     "ProactiveObservation",
     "ProactiveTask",
     "RenderMode",
@@ -73,9 +51,4 @@ __all__ = [
     "TaskType",
     "is_null",
     "is_task",
-    # Legacy aliases kept for any straggling import sites — prefer
-    # proposal_models.* in new code.
-    "LegacyContextScope",
-    "LegacyRenderMode",
-    "LegacySuggestionType",
 ]

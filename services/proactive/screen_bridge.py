@@ -31,23 +31,6 @@ from .models import ProactiveObservation
 log = logging.getLogger(__name__)
 
 
-_SCENARIO_TO_SUGGESTION: dict[str, str] = {
-    # Coarse mapping from the existing 23 scenario types onto the bandit's
-    # 6-suggestion action space. Anything we don't have an obvious projection
-    # for falls back to ``paragraph_rewrite`` because that's the workhorse
-    # screen suggestion (the model rewrites the surrounding paragraph).
-    "idle_after_writing": "next_sentence",
-    "whole_document_review": "logic_flow_review",
-    "paragraph_rewrite_needed": "paragraph_rewrite",
-    "local_copyedit_needed": "local_copyedit",
-    "logic_flow_check": "logic_flow_review",
-    "evidence_needed": "evidence_citation_prompt",
-    "citation_needed": "evidence_citation_prompt",
-    "diff_recovery": "recovery_integration_note",
-    "paste_integration": "recovery_integration_note",
-}
-
-
 def proactive_screen_enabled() -> bool:
     """Return False only when the user explicitly opts out via env."""
     return os.getenv("VERITAS_PROACTIVE_SCREEN", "1").strip().lower() not in {

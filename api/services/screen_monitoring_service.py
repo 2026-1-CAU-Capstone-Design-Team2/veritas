@@ -10,10 +10,10 @@ from .agent_runtime import get_runtime
 
 
 # Legacy reward shaping for the (non-proactive) intervention selection policy.
-# The proactive pipeline owns its own canonical reward table — see
-# ``services.proactive.reward.CANONICAL_REWARD``. This map stays here only for
-# screen events that originated *before* the proactive bandit was wired in
-# (events without a ``decisionId`` come through the old scheduler path).
+# The proactive pipeline now collapses feedback to canonical names in
+# ``services.proactive.reward.canonicalize_feedback``. This map stays here
+# only for screen events that originated *before* proactive was wired in —
+# events without a ``decisionId`` come through the old scheduler path.
 SCREEN_FEEDBACK_REWARDS: dict[str, float] = {
     "like": 1.0,
     "copy": 0.3,

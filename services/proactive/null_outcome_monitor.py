@@ -20,8 +20,12 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Callable
+
+# ``now_plus`` is identical to the timeout_monitor's; re-exporting one source
+# of truth keeps the ISO format consistent across both sweepers.
+from .timeout_monitor import now_plus  # noqa: F401 — re-exported for callers
 
 log = logging.getLogger(__name__)
 
@@ -40,11 +44,6 @@ def _parse_iso(value: str) -> datetime | None:
         return datetime.fromisoformat(value)
     except Exception:
         return None
-
-
-def now_plus(seconds: float) -> str:
-    when = datetime.now(timezone.utc) + timedelta(seconds=float(seconds))
-    return when.isoformat().replace("+00:00", "Z")
 
 
 def classify_null_outcome(
