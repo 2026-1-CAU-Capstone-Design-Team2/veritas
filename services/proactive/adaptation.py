@@ -42,8 +42,31 @@ ADAPTATION_FILE = "user_adaptation.json"
 ADAPTATION_VERSION = 1
 
 
+def _env_float(name: str, default: float, *, lo: float, hi: float) -> float:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    return max(lo, min(hi, v))
+
+
+def _env_int(name: str, default: int, *, lo: int, hi: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        return default
+    return max(lo, min(hi, v))
+
+
 # Feedback shaping constants — kept here so an operator can read them at a
-# glance and tune via the env overrides below if needed.
+# glance. Each one accepts a ``VERITAS_PROACTIVE_*`` env override clamped to
+# a sane range so a stray value can't break behavior.
 EMA_ALPHA: float = 0.20
 THRESHOLD_OFFSET_MIN: float = -0.10
 THRESHOLD_OFFSET_MAX: float = +0.20
@@ -52,11 +75,29 @@ THRESHOLD_DELTA_REJECT: float = +0.030
 THRESHOLD_DELTA_TIMEOUT: float = +0.010
 THRESHOLD_DELTA_WRONG_ANCHOR: float = +0.005
 
-ANCHOR_COOLDOWN_REJECT_SECONDS: float = 180.0       # 3 minutes
-ANCHOR_COOLDOWN_TIMEOUT_SECONDS: float = 60.0        # 1 minute
-TASK_TYPE_REJECTS_FOR_SUPPRESSION: int = 3
-TASK_TYPE_SUPPRESSION_SECONDS: float = 600.0         # 10 minutes
-TASK_TYPE_REJECT_WINDOW_SECONDS: float = 900.0       # 15 minutes — rolling
+# Defaults are deliberately less aggressive than the spec MVP suggested:
+# - 60s (was 180s) per-anchor cooldown — 3 minutes felt punitive when the
+#   only native task type is next_sentence; user kept seeing "no
+#   suggestions" after a single dismissal.
+# - 5 rejects (was 3) within 15-min window before task-type suppression
+#   kicks in — gives more room for the user's preference to differ from
+#   the default before we shut a task type down.
+# - 5 min (was 10 min) suppression duration.
+ANCHOR_COOLDOWN_REJECT_SECONDS: float = _env_float(
+    "VERITAS_PROACTIVE_ANCHOR_COOLDOWN_S", 60.0, lo=5.0, hi=900.0
+)
+ANCHOR_COOLDOWN_TIMEOUT_SECONDS: float = _env_float(
+    "VERITAS_PROACTIVE_ANCHOR_TIMEOUT_COOLDOWN_S", 30.0, lo=5.0, hi=600.0
+)
+TASK_TYPE_REJECTS_FOR_SUPPRESSION: int = _env_int(
+    "VERITAS_PROACTIVE_SUPPRESSION_REJECTS", 5, lo=2, hi=50
+)
+TASK_TYPE_SUPPRESSION_SECONDS: float = _env_float(
+    "VERITAS_PROACTIVE_SUPPRESSION_S", 300.0, lo=10.0, hi=3600.0
+)
+TASK_TYPE_REJECT_WINDOW_SECONDS: float = _env_float(
+    "VERITAS_PROACTIVE_SUPPRESSION_WINDOW_S", 900.0, lo=60.0, hi=7200.0
+)
 
 
 def _now() -> datetime:
@@ -350,7 +391,17 @@ class UserAdaptationMemory:
         changes: dict[str, Any],
     ) -> None:
         if task_type:
-            self._ensure_task_stats(task_type).accept += 1
+            stats = self._ensure_task_stats(task_type)
+            stats.accept += 1
+            # An accept on a currently-suppressed task type indicates our
+            # earlier reject-driven suppression was overzealous — clear it
+            # so the user immediately sees more of this type again.
+            if stats.suppressed_until is not None:
+                changes["cleared_suppression"] = stats.suppressed_until
+                stats.suppressed_until = None
+            # Also drop the reject ring so we don't immediately re-suppress
+            # if the next observation goes rough.
+            stats.recent_reject_iso = []
         self._state.threshold_offset += THRESHOLD_DELTA_ACCEPT
         changes["threshold_delta"] = THRESHOLD_DELTA_ACCEPT
         # Clear the matching anchor/task cooldown if any.

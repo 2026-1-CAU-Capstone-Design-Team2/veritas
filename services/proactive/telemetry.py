@@ -101,11 +101,14 @@ class _ProactiveTelemetry:
         idle = float(primitive.get("idle_sec", 0.0) or 0.0)
         churn = float(primitive.get("churn_score", 0.0) or 0.0)
         recent_neg = float(primitive.get("recent_negative_rate", 0.0) or 0.0)
+        # threshold shouldn't be inf on the task path (we wouldn't have
+        # picked a task if it were), but format defensively.
+        thr_str = "BLOCKED" if threshold == float("inf") else f"{threshold:.3f}"
         line = (
             f"[proactive][decision] {decision_id} {surface} task={task_type} "
             f"anchor={anchor_id} conf={anchor_confidence:.2f} "
             f"scope={context_scope} render={render_mode} "
-            f"score={evaluator_score:.3f} threshold={threshold:.3f} "
+            f"score={evaluator_score:.3f} threshold={thr_str} "
             f"candidates={candidate_count} "
             f"idle={idle:.1f}s churn={churn:.2f} recent_neg={recent_neg:.2f}"
         )
@@ -124,7 +127,15 @@ class _ProactiveTelemetry:
     ) -> None:
         gates = ",".join(gate_reasons) if gate_reasons else "-"
         score = f" best_score={best_score:.3f}" if best_score is not None else ""
-        thr = f" threshold={threshold:.3f}" if threshold is not None else ""
+        # ``threshold=+inf`` is a sentinel meaning "blocked by cooldown or
+        # task-type suppression" — display the readable label, not 'inf',
+        # so operators tailing the log know why it's stuck.
+        if threshold is None:
+            thr = ""
+        elif threshold == float("inf"):
+            thr = " threshold=BLOCKED(cooldown_or_suppression)"
+        else:
+            thr = f" threshold={threshold:.3f}"
         line = (
             f"[proactive][decision] {decision_id} {surface} prediction=null "
             f"reason={reason} candidates={candidate_count} gates=[{gates}]{score}{thr}"

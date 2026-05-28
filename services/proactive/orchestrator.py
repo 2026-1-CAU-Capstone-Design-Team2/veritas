@@ -465,12 +465,22 @@ class ProactiveOrchestrator:
         )
 
         if best_score < threshold:
+            # When the threshold is ``+inf`` the candidate didn't lose on
+            # score quality — it lost because the (anchor, task) pair is
+            # on cooldown or the task type is suppressed. Surface that
+            # distinction in the reason so the operator can tell "this
+            # would have shown if not for adaptation" apart from "this
+            # candidate was just too weak".
+            if threshold == float("inf"):
+                reason = "blocked_by_cooldown_or_suppression"
+            else:
+                reason = "score_below_threshold"
             return self._emit_null(
                 decision_id=decision_id,
                 observation=observation,
                 anchor=anchor,
                 primitive=primitive,
-                reason="score_below_threshold",
+                reason=reason,
                 gate_reasons=[],
                 candidate_count=len(candidates),
                 threshold=threshold,
