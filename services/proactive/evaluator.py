@@ -59,8 +59,15 @@ class GateResult:
 @dataclass
 class ScoreBreakdown:
     """Per-coefficient contribution to the final score — kept so /explain
-    can show "anchor_confidence contributed +0.18, recent_negative_rate
-    subtracted -0.05" and the operator can sanity-check the formula."""
+    can show how each signal contributed.
+
+    Note: ``recent_negative_rate`` is recorded here for visibility but it
+    does NOT subtract from the score. It only raises the threshold (in
+    ``adjusted_threshold``). The previous double-penalty was making the
+    score unbeatable: a single signal was simultaneously cutting the score
+    and raising the bar, so after ~5 rejects no candidate could pass.
+    The "user is grumpy" effect now lives on the threshold side only.
+    """
 
     anchor_confidence: float = 0.0
     need_signal: float = 0.0
@@ -68,7 +75,7 @@ class ScoreBreakdown:
     task_fit: float = 0.0
     source_support: float = 0.0
     interruption_risk: float = 0.0
-    recent_negative_rate: float = 0.0
+    recent_negative_rate: float = 0.0  # diagnostic only — see docstring
 
     @property
     def total(self) -> float:
@@ -79,7 +86,6 @@ class ScoreBreakdown:
             + 0.15 * self.task_fit
             + 0.10 * self.source_support
             - 0.20 * self.interruption_risk
-            - 0.15 * self.recent_negative_rate
         )
         return max(0.0, min(1.0, raw))
 
@@ -125,8 +131,12 @@ def check_hard_gates(
             reasons.append("cooldown_same_anchor_task")
         if _is_task_type_suppressed(user_adaptation, candidate.task_type):
             reasons.append("same_task_recently_rejected")
-        if _is_in_recent_negative_streak(user_adaptation, signals):
-            reasons.append("recent_negative_streak")
+        # NOTE: the ``recent_negative_streak`` hard gate was removed (2026-05-28).
+        # It was redundant with task-type suppression (5-reject default) and
+        # the threshold's ``recent_negative_rate`` contribution. Keeping it
+        # caused a permanent veto once the EMA persisted past 0.85 across
+        # sessions. See the regression test
+        # ``test_score_beats_threshold_at_max_realistic_adaptation``.
 
     # ``evidence_or_citation_prompt`` no longer has an auto-trigger path in
     # the candidate factory (the lexical-keyword detector was removed). When
@@ -426,5 +436,8 @@ def adjusted_threshold(
         if user_adaptation is not None
         else 0.0
     )
-    threshold = base + offset + 0.15 * recent_neg
+    # Lowered from 0.15 → 0.05 (2026-05-28). With the score formula no longer
+    # double-penalizing recent_negative_rate, a smaller threshold contribution
+    # is enough to express "raise the bar when the user has been rejecting".
+    threshold = base + offset + 0.05 * recent_neg
     return max(THRESHOLD_FLOOR, min(THRESHOLD_CEIL, threshold))

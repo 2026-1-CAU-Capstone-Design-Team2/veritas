@@ -312,6 +312,20 @@ class UserAdaptationMemory:
                 return
             self._state = _state_from_dict(data)
             self._state.workspace_id = self.workspace_id
+            # ``recent_negative_rate`` is a short-term mood gauge (EMA over
+            # the last ~5 feedback events). Persisting it across sessions
+            # meant a bad afternoon yesterday started today already grumpy,
+            # which combined with the threshold's recent_neg contribution
+            # would lock the user out. Long-term learning still persists via
+            # ``threshold_offset`` and ``task_type_stats``. The rate resets
+            # on each orchestrator construct.
+            self._state.global_stats.recent_negative_rate = 0.0
+            # Symmetric reset for the positive EMA so the operator-facing
+            # snapshot doesn't look stale either; both are short-term.
+            self._state.global_stats.accept_ema = 0.0
+            self._state.global_stats.reject_ema = 0.0
+            self._state.global_stats.retry_ema = 0.0
+            self._state.global_stats.timeout_ema = 0.0
 
     def save(self) -> None:
         with self._lock:

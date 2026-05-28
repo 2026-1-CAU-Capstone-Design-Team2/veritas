@@ -129,7 +129,11 @@ class ScoreTests(unittest.TestCase):
         self.assertGreaterEqual(breakdown.total, 0.0)
         self.assertLessEqual(breakdown.total, 1.0)
 
-    def test_recent_negative_rate_reduces_score(self) -> None:
+    def test_recent_negative_rate_only_raises_threshold_not_score(self) -> None:
+        """``recent_negative_rate`` used to subtract from the score AND add
+        to the threshold — effective -0.30·rate penalty. That made the
+        score un-winnable once rate climbed past ~0.5. Now it only affects
+        the threshold side."""
         a = _anchor()
         task = _task(task_type="paragraph_rewrite", anchor_id=a.anchor_id)
         no_neg = score_candidate(candidate=task, anchor=a, signals=_signals()).total
@@ -142,13 +146,61 @@ class ScoreTests(unittest.TestCase):
             anchor_cooldowns: dict = {}
             task_type_stats: dict = {}
 
-        high_neg = score_candidate(
+        with_neg = score_candidate(
             candidate=task,
             anchor=a,
             signals=_signals(),
             user_adaptation=State(),
         ).total
-        self.assertLess(high_neg, no_neg)
+        # Score is unchanged regardless of recent_negative_rate.
+        self.assertAlmostEqual(with_neg, no_neg, places=6)
+
+    def test_score_beats_threshold_at_max_realistic_adaptation(self) -> None:
+        """Regression for the "unwinnable score" issue. With offset clamped
+        at +0.20 and rate at 0.95 (effectively the cap), a good native
+        candidate MUST still clear the threshold. Otherwise the user gets
+        permanently locked out after a few rejects."""
+        from services.proactive.anchors import ActiveAnchor
+
+        a = ActiveAnchor(
+            document_id="doc-x",
+            surface="native_editor",
+            cursor_index=80,
+            paragraph_text="이 문서는 충분히 긴 본문을 가집니다. 다음 문장을 작성합니다.",
+            sentence_text="다음 문장을 작성합니다.",
+            source="native_cursor",
+            confidence=0.95,
+        )
+        task = _task(
+            task_type="next_sentence",
+            anchor_id=a.anchor_id,
+            render="native_ghost",
+        )
+
+        class State:
+            class global_stats:
+                recent_negative_rate = 0.95  # near-maximum
+
+            threshold_offset = 0.20  # at the clamp ceiling
+            anchor_cooldowns: dict = {}
+            task_type_stats: dict = {}
+
+        score = score_candidate(
+            candidate=task,
+            anchor=a,
+            signals=PrimitiveSignals(paragraph_len=60),
+            user_adaptation=State(),
+        ).total
+        thr = adjusted_threshold(
+            task_type="next_sentence",
+            anchor_id=a.anchor_id,
+            user_adaptation=State(),
+        )
+        self.assertGreater(
+            score, thr,
+            f"good native candidate must clear the threshold even at "
+            f"max adaptation; got score={score:.3f} threshold={thr:.3f}",
+        )
 
     def test_native_next_sentence_passes_threshold_at_idle_zero(self) -> None:
         """Regression test for the live-usage issue: native ghost ought to
