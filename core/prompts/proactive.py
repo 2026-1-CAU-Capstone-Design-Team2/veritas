@@ -128,19 +128,30 @@ def lead_in_for(*, task_type: str, surface_is_native: bool) -> str:
 
 # ------------------------------------------------------- native retry path
 
-# Triggered when the user clicked "다시" or rejected once at this anchor —
-# the generator switches from iter_ghostwrite to iter_editor_assist with this
-# lead-in so we can explicitly pass the previous (rejected) suggestion as a
-# negative example and bias the next attempt away from it.
+# Triggered when the user clicked "다시" or rejected at this anchor — the
+# generator switches from iter_ghostwrite to iter_editor_assist with this
+# template so we can:
+#   (a) pass the previous (rejected) suggestion as a negative example, and
+#   (b) actually inject MORE EXPLICIT CONTEXT into the prompt as the reject
+#       level rises. The caller passes the extracted slice via
+#       ``context_label`` + ``context_text`` so the model sees an obvious
+#       "[현재 문단 전체]: ..." block, not just an instruction to consider one.
 #
-# reject_level meaning:
-#   0 — never rejected at this anchor (we won't call this function)
-#   1 — rejected once: ask for a different angle, keep the prefix
-#   2 — rejected twice: ask the model to consider broader context
-#   3+ — handled by per-anchor cooldown (this lead-in not used)
-def native_retry_lead_in(*, avoid_text: str, reject_level: int) -> str:
+# reject_level meaning (driven by orchestrator's per-anchor ladder):
+#   0   — never rejected at this anchor (this template not used; ghostwrite handles it)
+#   1   — rejected once: extract last 2-3 sentences before cursor as context
+#   2   — rejected twice: extract the WHOLE current paragraph as context
+#   3+  — handled by per-anchor cooldown (template not invoked)
+def native_retry_lead_in(
+    *,
+    avoid_text: str,
+    reject_level: int,
+    context_label: str,
+    context_text: str,
+) -> str:
     parts: list[str] = [
-        "[과업] 다음에 이어질 한 문장만 본문으로 출력. 어떠한 머리말/꼬리말/설명도 금지.\n",
+        "[과업] 다음에 이어질 한 문장만 본문으로 출력. "
+        "어떠한 머리말/꼬리말/설명도 금지.\n\n",
     ]
     if avoid_text and avoid_text.strip():
         parts.append(
@@ -151,15 +162,17 @@ def native_retry_lead_in(*, avoid_text: str, reject_level: int) -> str:
     if reject_level >= 2:
         parts.append(
             "[지시] 사용자가 이미 2번 이상 거절했으므로, 표현뿐 아니라 "
-            "문장의 방향/주제 전개를 명확히 다르게 시도. 직전 단락의 흐름도 "
-            "함께 고려할 것.\n\n"
+            "문장의 방향/주제 전개를 명확히 다르게 시도. 아래에 "
+            "현재 문단 전체를 제공하므로 그 흐름과 일관되게 작성할 것.\n\n"
         )
     elif reject_level >= 1:
         parts.append(
             "[지시] 이전과 다른 단어 선택과 다른 문장 구조로 시도. "
-            "내용도 직전 거절된 제안과 명확히 구분되어야 함.\n\n"
+            "아래에 직전 몇 문장을 제공하므로 그 흐름에 자연스럽게 이어갈 것.\n\n"
         )
-    parts.append("[이어쓸 문맥]\n")
+    label = (context_label or "직전 문맥").strip()
+    body = (context_text or "").strip()
+    parts.append(f"[{label}]\n{body}\n\n[이어쓰기]: ")
     return "".join(parts)
 
 

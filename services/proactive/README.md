@@ -70,12 +70,17 @@ JSON 영구화 **안 함** — 세션 단위 UX 게이트이지 학습 상태가
 
 ### 3.1 규칙
 
-| Reject 횟수 (같은 anchor) | 다음 observe에서의 동작 |
-|---|---|
-| 0 | 기본 — `iter_ghostwrite`로 standard ghost continuation |
-| **1** | Generator가 `editor_assist` 경로로 전환. Prompt에 [이전 거절된 제안] 명시적으로 포함, "다른 표현/단어로 시도"라는 지시 추가 |
-| **2** | (1)과 동일 + "직전 단락의 흐름까지 고려, 방향/주제 전개를 명확히 다르게" 지시 추가 |
-| **3** | 이 anchor에 대해 **180초 cooldown 발동** — 모든 후속 observe가 `prediction=null reason=anchor_reject_cooldown`으로 막힘 |
+| Reject 횟수 (같은 anchor) | 다음 observe에서의 동작 | Prompt에 들어가는 실제 context |
+|---|---|---|
+| 0 | `iter_ghostwrite`로 standard ghost continuation | (편집기 raw prefix, 최대 ~1500자) |
+| **1** | `editor_assist`로 전환 + `[금지: 이전 거절된 제안]` + 변경 지시 | **`[직전 N문장]` — prefix에서 마지막 2~3 문장 추출하여 prompt body에 그대로 삽입** |
+| **2** | (1)과 동일 + "방향/주제 자체를 다르게" 강화 지시 | **`[현재 문단 전체]` — `observation.current_paragraph` 텍스트를 통째로 prompt body에 삽입** |
+| **3** | 이 anchor에 대해 **180초 cooldown 발동** — 모든 후속 observe가 `prediction=null reason=anchor_reject_cooldown`으로 막힘 | — (no prompt) |
+
+문단 텍스트는 **명시적 라벨 블록 (`[현재 문단 전체]: ...`)으로 prompt에
+그대로 들어갑니다** — instruction-only가 아닙니다. 구현: 
+[`generator.py:_native_retry_context_block`](generator.py) +
+[`core/prompts/proactive.py:native_retry_lead_in`](../../core/prompts/proactive.py).
 
 Constants (`orchestrator.py` 상단):
 ```python

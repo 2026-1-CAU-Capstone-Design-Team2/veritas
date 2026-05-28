@@ -6,6 +6,7 @@ hands the generator:
 
     task: ProactiveTask        # already evaluator-passed, scope chosen
     context: ContextBundle     # already anchor-local, no whole-doc search
+    observation: ProactiveObservation  # for raw prefix and paragraph text
 
 Output SSE events (consumed by ``api/services/proactive_service.py``):
 
@@ -25,10 +26,23 @@ Routing:
   task-specific lead-in pulled from :mod:`core.prompts.proactive`. All
   prompt copy lives centrally under ``core/prompts/`` — this module is
   just a router.
+
+Native retry context expansion (see services/proactive/README.md
+§"Native reject ladder"):
+
+- reject_level == 0 → ghostwrite path; LLM sees the raw editor prefix.
+- reject_level == 1 → editor_assist path; prompt body literally carries
+  the last 2-3 sentences before the cursor under a "[직전 N문장]" label.
+- reject_level >= 2 → editor_assist path; prompt body literally carries
+  ``observation.current_paragraph`` under a "[현재 문단 전체]" label.
+
+The text is injected into the prompt body, not just referenced via an
+instruction — the LLM sees the slice in plain text.
 """
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Callable, Iterator
 
 from core.prompts.proactive import lead_in_for, native_retry_lead_in
@@ -52,6 +66,50 @@ _CARD_TONE_BY_RENDER: dict[str, str] = {
 
 # Prompt templates (lead-ins, format contract) live in
 # :mod:`core.prompts.proactive` — see ``lead_in_for(task_type, surface_is_native)``.
+
+
+# Same sentence-end heuristic as context_selector — kept local so this
+# module stays self-contained for the native-retry path. Matches "." "?" "!"
+# plus full-width CJK terminators.
+_SENT_END_RE = re.compile(r"(?<=[\.\?\!。？！])\s+")
+
+
+def _split_sentences(text: str) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in _SENT_END_RE.split(text) if p.strip()]
+    return parts or [text]
+
+
+def _native_retry_context_block(
+    *,
+    observation: Any | None,
+    reject_level: int,
+    fallback_prefix: str,
+) -> tuple[str, str]:
+    """Return ``(label, text)`` for the explicit context block we inject
+    into the native retry prompt.
+
+    - reject_level >= 2 → ``observation.current_paragraph`` (full paragraph).
+      Falls back to the last few sentences if the paragraph is empty.
+    - reject_level == 1 → last 3 sentences from the prefix.
+    - reject_level == 0 → caller should not invoke this (ghostwrite path).
+    """
+    paragraph = ""
+    if observation is not None:
+        paragraph = str(getattr(observation, "current_paragraph", "") or "").strip()
+
+    if reject_level >= 2 and paragraph:
+        return ("현재 문단 전체", paragraph)
+
+    sents = _split_sentences(fallback_prefix or paragraph)
+    tail = sents[-3:] if sents else []
+    if tail:
+        return (f"직전 {len(tail)}문장", " ".join(tail))
+
+    # Last-ditch: whatever raw text we have.
+    return ("직전 문맥", (fallback_prefix or paragraph).strip())
 
 
 _ASSIST_ACTION: dict[str, str] = {
@@ -171,22 +229,36 @@ class ProactiveGenerator:
                 if not prefix.strip():
                     prefix = context.text_parts.get("current_paragraph", "")
 
-            # Native retry / post-reject path: if the orchestrator attached
-            # reject_level >= 1 or a last_rejected_text to task.metadata, we
-            # CAN'T use the plain ghostwrite system prompt — it has no way to
-            # convey "avoid this previous suggestion". Switch to editor_assist
-            # with the native_retry_lead_in template, which includes the
-            # rejected text as a negative example and an explicit instruction
-            # to vary.
+            # Native retry / post-reject path: when the orchestrator attached
+            # reject_level >= 1 (or last_rejected_text from a "다시" click)
+            # we abandon the plain ghostwrite system prompt. It can't convey
+            # "don't repeat this" — and more importantly, we want to EXPAND
+            # the context the LLM sees as the user keeps rejecting.
+            #
+            # Level 1: prompt body literally contains the last 2-3 sentences
+            #          before the cursor (extracted from the prefix).
+            # Level 2: prompt body literally contains the FULL current
+            #          paragraph (from ``observation.current_paragraph``).
+            #
+            # The point: it's not just an instruction. The paragraph text is
+            # right there in the prompt for the LLM to read.
             reject_level = int(task.metadata.get("reject_level") or 0)
             avoid_text = str(task.metadata.get("last_rejected_text") or "")
             if reject_level >= 1 or avoid_text:
-                lead_in = native_retry_lead_in(
-                    avoid_text=avoid_text, reject_level=reject_level
+                ctx_label, ctx_text = _native_retry_context_block(
+                    observation=observation,
+                    reject_level=reject_level,
+                    fallback_prefix=prefix,
+                )
+                prompt = native_retry_lead_in(
+                    avoid_text=avoid_text,
+                    reject_level=reject_level,
+                    context_label=ctx_label,
+                    context_text=ctx_text,
                 )
                 yield from self._editor_assist_iter(
                     "continue",
-                    f"{lead_in}{prefix}",
+                    prompt,
                     max_tokens=self.max_tokens_assist,
                     use_workspace=use_workspace,
                 )
