@@ -39,7 +39,8 @@ from fastapi import HTTPException
 from agent import EditorGroundingUnavailable
 
 from ..api_common import new_id, utc_now_iso
-from . import export_service
+from ..api_models import ProactiveGenerateRequest, ProactiveObserveRequest
+from . import export_service, proactive_service
 from .agent_runtime import get_runtime
 
 
@@ -216,46 +217,131 @@ def suggest_stream(
     max_tokens: int = 64,
     use_workspace: bool = True,
 ) -> Iterator[bytes]:
-    """Stream a ghost-writing continuation as SSE. Generation lives on the
-    ChatAgent, which decides whether the cursor is at a continuation moment;
-    ``use_workspace`` enables *additive* RAG grounding when the index is active.
+    """Stream a ghost-writing continuation as SSE.
+
+    Per the proactive-bandit plan (veritas_bandit_policy_implementation_guide.md
+    §16), this endpoint is now a **thin wrapper** over the unified proactive
+    pipeline:
+
+        observe(surface="native_editor") → if should_intervene → generate_stream
+
+    The bandit gates whether to suggest at all (engage policy). When it
+    picks ``no_op``, this stream emits a ``done`` with empty text so existing
+    frontend callers don't break — they just see "no suggestion this time",
+    same as if the ChatAgent decided this wasn't a continuation moment.
+
+    ``decisionId`` is included in every SSE event so the frontend can call
+    ``/api/v1/proactive/feedback`` with the same id when the user accepts
+    (TAB) or rejects (ESC) the suggestion. New frontends should prefer the
+    direct ``/api/v1/proactive/*`` routes — this wrapper exists for backward
+    compatibility with the existing native editor.
     """
     prefix = (prefix or "")[-2000:]
     suffix = (suffix or "")[:500]
     suggestion_id = new_id("sg")
 
-    yield _sse("start", {"suggestionId": suggestion_id, "workspaceId": workspace_id})
-
     if not prefix.strip() and not suffix.strip():
+        yield _sse("start", {"suggestionId": suggestion_id, "workspaceId": workspace_id})
         yield _sse("done", {"suggestionId": suggestion_id, "text": ""})
+        return
+
+    # Build a synthetic observation from the cursor context. ``current_*``
+    # fields are derived best-effort from the prefix so the bandit's primitive
+    # features have something to chew on. The full ``text`` we send is the
+    # prefix+suffix concatenation since the legacy API never carried the
+    # whole document — and that's fine, because the policy's feature
+    # extraction only ever looks at lengths, not the body.
+    text = f"{prefix}{suffix}"
+    current_paragraph = _last_paragraph(prefix) or prefix[-400:]
+    current_sentence = _last_sentence(prefix)
+    payload = ProactiveObserveRequest(
+        surface="native_editor",
+        workspaceId=workspace_id,
+        documentKey=workspace_id,  # caller didn't provide a doc-level key
+        text=text,
+        cursor=len(prefix),
+        prefix=prefix,
+        suffix=suffix,
+        currentSentence=current_sentence,
+        currentParagraph=current_paragraph,
+        previousParagraph="",
+        confidence=float(use_workspace),
+    )
+
+    try:
+        decision_dict = proactive_service.observe(payload)
+    except Exception as e:  # noqa: BLE001 — surfaced as SSE error
+        yield _sse("start", {"suggestionId": suggestion_id, "workspaceId": workspace_id})
+        yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
+        return
+
+    decision_id = str(decision_dict.get("decisionId") or "")
+    should_intervene = bool(decision_dict.get("shouldIntervene"))
+    suggestion_type = decision_dict.get("suggestionType")
+
+    yield _sse(
+        "start",
+        {
+            "suggestionId": suggestion_id,
+            "workspaceId": workspace_id,
+            "decisionId": decision_id,
+            "shouldIntervene": should_intervene,
+            "suggestionType": suggestion_type,
+            "renderMode": decision_dict.get("renderMode"),
+        },
+    )
+
+    if not should_intervene:
+        yield _sse(
+            "done",
+            {
+                "suggestionId": suggestion_id,
+                "decisionId": decision_id,
+                "text": "",
+                "shouldIntervene": False,
+            },
+        )
         return
 
     collected: list[str] = []
     try:
-        runtime = get_runtime()
-        # Additive RAG: ground only when this editor's workspace is the active
-        # index (so we never ground against the wrong one); otherwise still offer
-        # an ungrounded continuation. Whether to suggest at all is the agent's
-        # continuation-moment decision, not a grounding gate.
-        grounded = bool(use_workspace) and _workspace_is_active(workspace_id)
-        for chunk in runtime.ghostwrite_iter(
-            prefix, suffix, max_tokens=max_tokens, use_workspace=grounded
-        ):
-            if not chunk:
+        gen_payload = ProactiveGenerateRequest(decisionId=decision_id)
+        for raw in proactive_service.generate_stream(gen_payload):
+            event_name, event_payload = _parse_sse_bytes(raw)
+            if event_name == "delta":
+                chunk = str(event_payload.get("text") or "")
+                if chunk:
+                    collected.append(chunk)
+                    yield _sse("delta", {"text": chunk})
+            elif event_name == "error":
+                yield _sse("error", {"error": event_payload.get("error", "unknown")})
+                return
+            elif event_name in ("start", "target", "done"):
+                # `start`/`target` are useful diagnostics for the new frontend
+                # but the legacy ghostwriting UI only consumes delta/done.
+                # We forward `target` so an inline-diff renderer can pick it up.
+                if event_name == "target":
+                    yield _sse("target", event_payload)
                 continue
-            collected.append(chunk)
-            yield _sse("delta", {"text": chunk})
-    except Exception as e:  # noqa: BLE001 — surfaced as SSE error
+    except Exception as e:  # noqa: BLE001
         yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
         return
 
     # Preserve a single leading space (the model is told to prefix one when the
     # continuation starts a new word) so the suggestion never glues onto the
     # prefix; only trailing/newline padding is trimmed.
-    text = "".join(collected).strip("\n").rstrip()
-    if text[:1].isspace():
-        text = " " + text.lstrip()
-    yield _sse("done", {"suggestionId": suggestion_id, "text": text})
+    text_out = "".join(collected).strip("\n").rstrip()
+    if text_out[:1].isspace():
+        text_out = " " + text_out.lstrip()
+    yield _sse(
+        "done",
+        {
+            "suggestionId": suggestion_id,
+            "decisionId": decision_id,
+            "text": text_out,
+            "shouldIntervene": True,
+        },
+    )
 
 
 # ---------------------------------------------------- assist (quick actions)
@@ -333,6 +419,59 @@ def get_sources(workspace_id: str) -> dict[str, Any]:
 def _sse(event: str, payload: dict[str, Any]) -> bytes:
     body = json.dumps(payload, ensure_ascii=False)
     return f"event: {event}\ndata: {body}\n\n".encode("utf-8")
+
+
+# Cheap end-of-prefix splitters — same heuristic as the proactive context
+# selector but inlined here so the legacy wrapper doesn't reach across
+# packages for two regexes.
+_PARA_SPLIT = re.compile(r"\n{2,}")
+_SENT_SPLIT = re.compile(r"(?<=[\.\?\!。？！])\s+")
+
+
+def _last_paragraph(text: str) -> str:
+    if not text:
+        return ""
+    parts = _PARA_SPLIT.split(text)
+    for chunk in reversed(parts):
+        if chunk.strip():
+            return chunk.strip()
+    return ""
+
+
+def _last_sentence(text: str) -> str:
+    if not text:
+        return ""
+    paragraph = _last_paragraph(text)
+    sents = [s.strip() for s in _SENT_SPLIT.split(paragraph) if s.strip()]
+    return sents[-1] if sents else paragraph
+
+
+def _parse_sse_bytes(raw: bytes) -> tuple[str, dict[str, Any]]:
+    """Split one ``event:/data:`` SSE frame back into ``(name, payload)``.
+
+    The proactive service emits one frame per yield; this lets the legacy
+    wrapper forward only the events the existing native-editor frontend
+    expects. Falls back to ``("message", {})`` for malformed frames.
+    """
+    try:
+        text = raw.decode("utf-8", errors="replace")
+        name = "message"
+        data_payload: dict[str, Any] = {}
+        for line in text.split("\n"):
+            if line.startswith("event:"):
+                name = line[len("event:"):].strip() or "message"
+            elif line.startswith("data:"):
+                data_str = line[len("data:"):].strip()
+                if data_str:
+                    try:
+                        parsed = json.loads(data_str)
+                        if isinstance(parsed, dict):
+                            data_payload = parsed
+                    except json.JSONDecodeError:
+                        data_payload = {"raw": data_str}
+        return name, data_payload
+    except Exception:
+        return "message", {}
 
 
 def _iso_from_mtime(mtime: float) -> str:

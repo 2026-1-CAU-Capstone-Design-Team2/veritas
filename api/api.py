@@ -19,6 +19,7 @@ from .api_routes import (
     editor_router,
     feedback_router,
     frontend_router,
+    proactive_router,
     research_router,
     screen_monitoring_router,
     settings_router,
@@ -90,6 +91,7 @@ app.include_router(feedback_router)
 app.include_router(write_router)
 app.include_router(document_assist_router)
 app.include_router(screen_monitoring_router)
+app.include_router(proactive_router)
 app.include_router(frontend_router)
 
 

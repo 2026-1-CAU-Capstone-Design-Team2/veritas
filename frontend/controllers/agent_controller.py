@@ -203,6 +203,29 @@ class AgentController:
 			params["workspaceId"] = workspace_id
 		return api_client.get("/api/v1/screen-monitoring/events", params)
 
+	def submit_proactive_feedback(
+		self,
+		decision_id: str,
+		action: str,
+		metadata: dict[str, Any] | None = None,
+	) -> dict[str, Any]:
+		"""Send one canonical-feedback action to the proactive bandit.
+
+		``action`` is the raw surface-specific string (``tab`` / ``esc`` /
+		``retry`` / ``timeout`` for the native editor, ``copy`` /
+		``red_reject`` / ``retry`` for external cards). The backend's
+		``services.proactive.reward`` collapses it onto the canonical
+		feedback before reward shaping.
+		"""
+		return api_client.post(
+			"/api/v1/proactive/feedback",
+			{
+				"decisionId": decision_id,
+				"action": action,
+				"metadata": dict(metadata or {}),
+			},
+		)
+
 	def submit_screen_feedback(
 		self, event_id: str, intervention_type: str, action: str
 	) -> dict[str, Any]:
