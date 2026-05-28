@@ -33,8 +33,14 @@ from .candidates import PrimitiveSignals
 from .proposal_models import ProactiveTask, SurfaceCapabilities
 
 
-BASE_SHOW_THRESHOLD: float = 0.62
-THRESHOLD_FLOOR: float = 0.35
+# BASE_SHOW_THRESHOLD was 0.62 in the MVP spec. Live testing showed that with
+# realistic native_editor inputs the typical score sits at 0.62±0.06 — just
+# barely making or missing the threshold by inches. That made the decision
+# feel arbitrary ("ghost appears for 80-char paragraphs, not for 70-char").
+# Pull the floor down so a clean native case clears comfortably while still
+# leaving headroom for adaptation to *raise* the threshold after rejects.
+BASE_SHOW_THRESHOLD: float = 0.50
+THRESHOLD_FLOOR: float = 0.30
 THRESHOLD_CEIL: float = 0.90
 
 
@@ -238,7 +244,8 @@ def score_candidate(
     """Compute the 0..1 rubric score per spec §6.2. Returns the breakdown
     so the score can be reproduced from /explain."""
 
-    need = _need_signal(candidate.task_type, signals)
+    surface_is_native = anchor.surface == "native_editor"
+    need = _need_signal(candidate.task_type, signals, surface_is_native=surface_is_native)
     ctx_suff = _context_sufficiency(candidate, anchor)
     fit = _task_fit(candidate.task_type, signals, anchor)
     source = _source_support(candidate.task_type, signals)
@@ -260,24 +267,44 @@ def score_candidate(
     )
 
 
-def _need_signal(task_type: str, s: PrimitiveSignals) -> float:
-    """How urgently does the user need *this kind* of help right now?"""
+def _need_signal(
+    task_type: str,
+    s: PrimitiveSignals,
+    *,
+    surface_is_native: bool = False,
+) -> float:
+    """How urgently does the user need *this kind* of help right now?
+
+    Surface-aware where the underlying signal is structurally biased:
+    - On native_editor the orchestrator's ``idle_sec`` resets to 0 every
+      observe (debounce + text-changed), so anything that scales on idle
+      collapses to 0. The native debounce already validated the pause —
+      use a high constant baseline instead.
+    - Every task type carries a 0.4 floor so a candidate that passed the
+      hard gates doesn't get penalized into the basement just because one
+      sub-signal happens to be 0 right now.
+    """
     if task_type == "next_sentence":
-        # caret pausing at end of sentence in a non-empty paragraph
-        return _scale(s.idle_sec, lo=1.0, hi=8.0)
+        if surface_is_native:
+            return 0.7
+        return max(0.5, _scale(s.idle_sec, lo=2.0, hi=15.0))
     if task_type == "paragraph_rewrite":
-        return max(_scale(s.churn_score, lo=0.20, hi=0.70), 0.4 if s.recent_undo else 0.0)
+        return max(
+            0.4,
+            _scale(s.churn_score, lo=0.20, hi=0.70),
+            0.5 if s.recent_undo else 0.0,
+        )
     if task_type == "local_copyedit":
-        return 0.6  # presence-detected; constant once the factory chose it
+        return 0.6
     if task_type == "logic_flow_review":
-        return _scale(s.paragraph_len, lo=120, hi=500)
+        return max(0.4, _scale(s.paragraph_len, lo=120, hi=500))
     if task_type == "evidence_or_citation_prompt":
-        return max(0.4, _scale(s.evidence_need_score, lo=0.20, hi=0.80))
+        return max(0.5, _scale(s.evidence_need_score, lo=0.20, hi=0.80))
     if task_type == "recovery_or_integration_note":
-        return 0.7 if s.recent_diff_overlaps_anchor else 0.0
+        return 0.7 if s.recent_diff_overlaps_anchor else 0.4
     if task_type == "long_paragraph_split":
-        return _scale(s.paragraph_len, lo=500, hi=1200)
-    return 0.0
+        return max(0.4, _scale(s.paragraph_len, lo=500, hi=1200))
+    return 0.4
 
 
 def _context_sufficiency(candidate: ProactiveTask, anchor: ActiveAnchor) -> float:
@@ -312,27 +339,31 @@ def _context_sufficiency(candidate: ProactiveTask, anchor: ActiveAnchor) -> floa
 
 
 def _task_fit(task_type: str, s: PrimitiveSignals, anchor: ActiveAnchor) -> float:
-    """How well does the task type match the *kind* of moment this is?"""
-    # next_sentence + at end of paragraph + paragraph not empty
+    """How well does the task type match the *kind* of moment this is?
+
+    Smoothed where the previous step-function caused abrupt show/null flips
+    around an arbitrary character count.
+    """
     if task_type == "next_sentence":
-        if anchor.paragraph_text and len(anchor.paragraph_text) >= 40:
-            return 0.9
-        return 0.5
+        # Smooth ramp from 0.65 (very short paragraph) to 0.9 (≥80 chars)
+        # so a 70-char paragraph doesn't tip score below the threshold the
+        # way a hard 0.5/0.9 step did.
+        para_len = len(anchor.paragraph_text or "")
+        return max(0.65, min(0.9, 0.65 + 0.25 * (para_len / 80.0)))
     if task_type == "paragraph_rewrite":
         if s.paragraph_len >= 80 and s.churn_score >= 0.30:
             return 0.85
-        return 0.5
+        return 0.6  # was 0.5 — even without strong signal the candidate was emitted
     if task_type == "logic_flow_review":
-        # better fit when at least both neighbors exist
-        return 0.9 if (anchor.prev_paragraph and anchor.next_paragraph) else 0.6
+        return 0.9 if (anchor.prev_paragraph and anchor.next_paragraph) else 0.65
     if task_type == "local_copyedit":
         return 0.7
     if task_type == "evidence_or_citation_prompt":
         return 0.8 if s.evidence_need_score >= 0.35 else 0.6
     if task_type == "recovery_or_integration_note":
-        return 0.8 if s.recent_diff_overlaps_anchor else 0.3
+        return 0.8 if s.recent_diff_overlaps_anchor else 0.4
     if task_type == "long_paragraph_split":
-        return 0.85 if s.paragraph_len >= 700 else 0.55
+        return 0.85 if s.paragraph_len >= 700 else 0.6
     return 0.5
 
 

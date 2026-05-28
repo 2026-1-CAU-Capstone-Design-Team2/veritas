@@ -150,6 +150,34 @@ class ScoreTests(unittest.TestCase):
         ).total
         self.assertLess(high_neg, no_neg)
 
+    def test_native_next_sentence_passes_threshold_at_idle_zero(self) -> None:
+        """Regression test for the live-usage issue: native ghost ought to
+        clear the threshold even when the orchestrator's idle_sec is 0
+        (which it always is — debounce + text-changed resets it)."""
+        from services.proactive.anchors import ActiveAnchor
+
+        a = ActiveAnchor(
+            document_id="doc-x",
+            surface="native_editor",
+            cursor_index=60,
+            paragraph_text="이 문서는 충분히 긴 본문을 가집니다. 다음 문장을 작성합니다.",
+            sentence_text="다음 문장을 작성합니다.",
+            source="native_cursor",
+            confidence=0.95,
+        )
+        task = _task(
+            task_type="next_sentence",
+            anchor_id=a.anchor_id,
+            render="native_ghost",
+        )
+        breakdown = score_candidate(
+            candidate=task,
+            anchor=a,
+            signals=PrimitiveSignals(idle_sec=0.0, stable_capture_count=0, paragraph_len=60),
+        )
+        # Should comfortably clear the base threshold (0.50 after recalibration).
+        self.assertGreaterEqual(breakdown.total, BASE_SHOW_THRESHOLD + 0.10)
+
 
 class ThresholdTests(unittest.TestCase):
     def test_base_threshold_default(self) -> None:
