@@ -96,13 +96,25 @@ NATIVE_ANCHOR_REJECT_COOLDOWN_S = 180.0
 
 ### 3.3 Adaptation layer와의 관계
 
-`adaptation.py`의 JSON-persisted per-(anchor, task) cooldown은
-**native에서는 비활성화**. `apply_feedback(surface="native_editor")`일 때
-`_apply_reject` / `_apply_timeout`이 anchor cooldown 설정을 skip함
-(orchestrator의 ladder가 게이트 소유권을 가짐).
+`adaptation.py`가 관리하는 두 가지 게이트는 **native에서는 모두 비활성화**:
 
-External (Word/PPT 등)에서는 JSON 기반 cooldown 그대로 유지 — external은
-6가지 task type이 있어 한 type cooldown이 다른 type을 막지 않음.
+1. **per-(anchor, task) JSON cooldown** —
+   `apply_feedback(surface="native_editor")`일 때 `_apply_reject`/
+   `_apply_timeout`이 `anchor_cooldowns` 추가를 skip.
+2. **global task-type suppression** (`task_type_stats[t].suppressed_until`)
+   — `_apply_reject(suppress_task_type=False)`로 호출되어
+   `recent_reject_iso`에 append도 안 함. native는 `next_sentence` 하나뿐이라
+   "5번 reject 후 task type 전체 차단"이 사실상 "전부 차단"이 됨 → rule 4
+   ("타 anchor에서는 작동")와 충돌. orchestrator의 in-memory ladder가
+   **유일한** native 게이트.
+
+다른 anchor에서 native 작업을 시작하면 ladder state가 fresh이므로 `same_task_recently_rejected` / `cooldown_same_anchor_task` 모두 통과합니다. 같은 anchor로 돌아오면 ladder state 그대로.
+
+External (Word/PPT 등)에서는 JSON 기반 cooldown + task-type suppression 그대로 유지 — external은 6가지 task type이 있어 한 type suppression이 다른 type을 막지 않음.
+
+#### Legacy 잔재 청소
+
+이전 버전(pre-fix)에서는 native reject도 `recent_reject_iso`에 누적했습니다. 그 stale ISO들은 `_apply_reject`가 호출될 때만 GC되는데, native에서 더 이상 append가 안 일어나면 영원히 남게 됨. **load 시점에 `_gc_locked_internal`을 한 번 돌려 청소**합니다 ([`adaptation.py:_load_or_init`](adaptation.py)).
 
 ### 3.4 "다시" 버튼 (retry)
 

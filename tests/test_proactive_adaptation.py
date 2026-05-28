@@ -53,10 +53,66 @@ class AdaptationTests(unittest.TestCase):
                     canonical="reject",
                     task_type="paragraph_rewrite",
                     anchor_id=f"anc_{i}",
+                    # External surface — task-type suppression IS active here.
+                    surface="external_screen",
                 )
             self.assertIsNotNone(
                 mem.state.task_type_stats["paragraph_rewrite"].suppressed_until
             )
+
+    def test_native_rejects_do_not_trigger_task_type_suppression(self) -> None:
+        """Per services/proactive/README.md §3.1: native rejects must NOT
+        contribute to ``same_task_recently_rejected`` — only the in-memory
+        per-anchor ladder gates native. Moving to a fresh anchor after 3
+        rejects elsewhere should still see a clean task type."""
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = _build(Path(tmp))
+            # Way past the global threshold of 5 rejects, but all on native.
+            for i in range(10):
+                mem.apply_feedback(
+                    canonical="reject",
+                    task_type="next_sentence",
+                    anchor_id=f"anc_{i}",
+                    surface="native_editor",
+                )
+            stats = mem.state.task_type_stats.get("next_sentence")
+            self.assertIsNotNone(stats)
+            self.assertIsNone(
+                stats.suppressed_until,
+                "native rejects must not trigger global task-type suppression",
+            )
+            self.assertEqual(
+                stats.recent_reject_iso, [],
+                "native rejects must not accumulate in the global reject ring",
+            )
+
+    def test_legacy_persisted_reject_ring_is_gc_ed_on_load(self) -> None:
+        """Pre-fix sessions wrote native rejects into ``recent_reject_iso``;
+        those entries would otherwise live forever (native never writes
+        more, so runtime GC never fires for that bucket). Load must clean
+        up stale rows."""
+        with tempfile.TemporaryDirectory() as tmp:
+            mem1 = _build(Path(tmp), ws="legacy_ws")
+            # Inject 10 stale ISOs from 30+ minutes ago to simulate
+            # what an old user_adaptation.json would carry.
+            stats = mem1._ensure_task_stats("next_sentence")
+            from datetime import datetime, timedelta, timezone
+
+            stale_iso = (
+                datetime.now(timezone.utc) - timedelta(minutes=60)
+            ).isoformat().replace("+00:00", "Z")
+            stats.recent_reject_iso = [stale_iso] * 10
+            stats.suppressed_until = (
+                datetime.now(timezone.utc) - timedelta(minutes=10)
+            ).isoformat().replace("+00:00", "Z")  # also stale
+            mem1.save()
+
+            # Reopen — load should GC.
+            mem2 = _build(Path(tmp), ws="legacy_ws")
+            stats2 = mem2.state.task_type_stats.get("next_sentence")
+            self.assertIsNotNone(stats2)
+            self.assertEqual(stats2.recent_reject_iso, [])
+            self.assertIsNone(stats2.suppressed_until)
 
     def test_retry_does_not_raise_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

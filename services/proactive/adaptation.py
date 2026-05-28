@@ -326,6 +326,14 @@ class UserAdaptationMemory:
             self._state.global_stats.reject_ema = 0.0
             self._state.global_stats.retry_ema = 0.0
             self._state.global_stats.timeout_ema = 0.0
+            # GC stale task-type bookkeeping on load. Older sessions wrote
+            # to ``recent_reject_iso`` for native rejects too (before native
+            # opted out via ``suppress_task_type=False``). Those entries
+            # would otherwise still trigger same_task_recently_rejected
+            # until they age out of the 15-min window — but native never
+            # writes more rejects, so they'd never get GC'd at runtime
+            # either. Clear them here.
+            self._gc_locked_internal()
 
     def save(self) -> None:
         with self._lock:
@@ -380,10 +388,21 @@ class UserAdaptationMemory:
                 anchor_id if surface != "native_editor" else None
             )
 
+            # For native_editor the anchor ladder in orchestrator owns the
+            # per-anchor block AND the task-type block (since native has
+            # only one task type). Tell ``_apply_reject`` to skip its
+            # global task-type suppression bookkeeping there.
+            is_native = surface == "native_editor"
+
             if canonical == "accept":
                 self._apply_accept(task_type, anchor_id, changes)
             elif canonical == "reject":
-                self._apply_reject(task_type, anchor_id_for_cooldown, changes)
+                self._apply_reject(
+                    task_type,
+                    anchor_id_for_cooldown,
+                    changes,
+                    suppress_task_type=(not is_native),
+                )
             elif canonical == "retry":
                 self._apply_retry(task_type, changes)
             elif canonical == "timeout":
@@ -445,15 +464,26 @@ class UserAdaptationMemory:
         task_type: Optional[str],
         anchor_id: Optional[str],
         changes: dict[str, Any],
+        *,
+        suppress_task_type: bool = True,
     ) -> None:
         if task_type:
             stats = self._ensure_task_stats(task_type)
             stats.reject += 1
-            stats.recent_reject_iso.append(_now_iso())
-            self._gc_recent_rejects(stats)
-            if len(stats.recent_reject_iso) >= TASK_TYPE_REJECTS_FOR_SUPPRESSION:
-                stats.suppressed_until = _iso_plus(TASK_TYPE_SUPPRESSION_SECONDS)
-                changes["task_type_suppressed_until"] = stats.suppressed_until
+            # Task-type suppression is per-task GLOBAL — five rejects of
+            # ``next_sentence`` across any anchor would suppress
+            # next_sentence everywhere. For native_editor that's wrong:
+            # native has only ``next_sentence`` so a global suppression
+            # blocks every anchor, which contradicts the README's "other
+            # anchors still work" rule (§3.2). The caller (apply_feedback)
+            # sets ``suppress_task_type=False`` for native. The in-memory
+            # anchor ladder in the orchestrator is the only gate there.
+            if suppress_task_type:
+                stats.recent_reject_iso.append(_now_iso())
+                self._gc_recent_rejects(stats)
+                if len(stats.recent_reject_iso) >= TASK_TYPE_REJECTS_FOR_SUPPRESSION:
+                    stats.suppressed_until = _iso_plus(TASK_TYPE_SUPPRESSION_SECONDS)
+                    changes["task_type_suppressed_until"] = stats.suppressed_until
 
         if anchor_id and task_type:
             key = f"{anchor_id}|{task_type}"
@@ -550,30 +580,36 @@ class UserAdaptationMemory:
 
     # ---------------------------------------------------- gc
 
-    def garbage_collect(self) -> int:
-        """Drop expired anchor cooldowns and stale recent_reject_iso entries.
-        Returns the number of entries removed (operator diagnostic).
-        Called from the orchestrator periodically (cheap, holds the lock
-        briefly)."""
-        with self._lock:
-            removed = 0
-            now = _now()
-            expired = [
-                k for k, v in self._state.anchor_cooldowns.items()
-                if (when := _parse_iso(v.cooldown_until)) is None or when < now
-            ]
-            for k in expired:
-                del self._state.anchor_cooldowns[k]
+    def _gc_locked_internal(self) -> int:
+        """GC body assuming the caller already holds ``self._lock``. Drops
+        expired anchor cooldowns, ages out recent_reject_iso entries past
+        the rolling window, and clears suppressed_until past expiry.
+        """
+        removed = 0
+        now = _now()
+        expired_keys = [
+            k for k, v in self._state.anchor_cooldowns.items()
+            if (when := _parse_iso(v.cooldown_until)) is None or when < now
+        ]
+        for k in expired_keys:
+            del self._state.anchor_cooldowns[k]
+            removed += 1
+        for stats in self._state.task_type_stats.values():
+            before = len(stats.recent_reject_iso)
+            self._gc_recent_rejects(stats)
+            removed += before - len(stats.recent_reject_iso)
+            until = _parse_iso(stats.suppressed_until)
+            if until is not None and until < now:
+                stats.suppressed_until = None
                 removed += 1
-            for stats in self._state.task_type_stats.values():
-                before = len(stats.recent_reject_iso)
-                self._gc_recent_rejects(stats)
-                removed += before - len(stats.recent_reject_iso)
-                # Clear expired suppression flags
-                until = _parse_iso(stats.suppressed_until)
-                if until is not None and until < now:
-                    stats.suppressed_until = None
-                    removed += 1
+        return removed
+
+    def garbage_collect(self) -> int:
+        """Lock-acquiring wrapper for runtime callers. Returns number of
+        entries removed (operator diagnostic). Cheap; holds the lock
+        briefly."""
+        with self._lock:
+            removed = self._gc_locked_internal()
             if removed:
                 self._save_locked()
             return removed
