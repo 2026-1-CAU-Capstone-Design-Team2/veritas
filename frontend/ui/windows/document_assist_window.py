@@ -33,6 +33,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
 	QApplication,
+	QButtonGroup,
 	QFrame,
 	QGraphicsDropShadowEffect,
 	QHBoxLayout,
@@ -41,7 +42,7 @@ from PySide6.QtWidgets import (
 	QScrollArea,
 	QSizeGrip,
 	QSizePolicy,
-	QSplitter,
+	QStackedWidget,
 	QTextBrowser,
 	QTextEdit,
 	QVBoxLayout,
@@ -55,6 +56,35 @@ from ...controllers import (
 	get_screen_event_store,
 )
 from ..markdown_view import render_markdown_html
+from ...theme import build_assist_window_qss, theme
+
+
+def _rate_chip_qss(palette: dict[str, str], kind: str, *, chosen: bool = False) -> str:
+	"""Build the QSS for a like/dislike rating chip from the active palette.
+
+	``kind`` is ``"like"`` or ``"dislike"``; ``chosen`` renders the locked-in
+	(already-clicked) look. Kept inline rather than as an objectName rule because
+	the card renders in two hosts and only one carries the assist stylesheet."""
+	base = (
+		"QPushButton{background:%s;color:%s;border:1px solid %s;"
+		"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}"
+	)
+	if chosen:
+		return base % (
+			palette["chip.%s.chosen.bg" % kind],
+			palette["chip.%s.hover.fg" % kind],
+			palette["chip.%s.hover.border" % kind],
+		)
+	return (
+		base % (palette["chip.base.bg"], palette["chip.base.fg"], palette["chip.base.border"])
+	) + (
+		"QPushButton:hover{background:%s;color:%s;border-color:%s;}"
+		% (
+			palette["chip.%s.hover.bg" % kind],
+			palette["chip.%s.hover.fg" % kind],
+			palette["chip.%s.hover.border" % kind],
+		)
+	)
 
 
 def add_text_breakpoints(text: str, chunk_size: int = 24) -> str:
@@ -151,29 +181,29 @@ class ChatInputEdit(QTextEdit):
 
 
 class StatusBadge(QLabel):
-	COLORS = {
-		"working": ("#DBEAFE", "#1D4ED8", "#BFDBFE"),
-		"idle": ("#F3F4F6", "#6B7280", "#E5E7EB"),
-		"warning": ("#FEF3C7", "#B45309", "#FDE68A"),
-		"error": ("#FEE2E2", "#DC2626", "#FECACA"),
+	# tone → (bg, fg, border) theme tokens, resolved per active palette.
+	_TONE_TOKENS = {
+		"working": ("badge.working.bg", "badge.working.fg", "badge.working.border"),
+		"idle": ("badge.idle.bg", "badge.idle.fg", "badge.idle.border"),
+		"warning": ("badge.warning.bg", "badge.warning.fg", "badge.warning.border"),
+		"error": ("badge.error.bg", "badge.error.fg", "badge.error.border"),
 	}
 
 	def __init__(self, text: str, tone: str = "idle", parent: QWidget | None = None) -> None:
 		super().__init__(text, parent)
 		self.setObjectName("AssistStatusBadge")
-		bg, fg, border = self.COLORS.get(tone, self.COLORS["idle"])
+		self._tone = tone if tone in self._TONE_TOKENS else "idle"
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		bg, fg, border = self._TONE_TOKENS[self._tone]
 		self.setStyleSheet(
-			f"""
-			QLabel#AssistStatusBadge {{
-				background-color: {bg};
-				color: {fg};
-				border: 1px solid {border};
-				border-radius: 10px;
-				padding: 3px 8px;
-				font-size: 11px;
-				font-weight: 800;
-			}}
-			"""
+			"QLabel#AssistStatusBadge {"
+			f" background-color: {theme.color(bg)};"
+			f" color: {theme.color(fg)};"
+			f" border: 1px solid {theme.color(border)};"
+			" border-radius: 10px; padding: 3px 8px; font-size: 11px; font-weight: 800; }"
 		)
 
 
@@ -212,6 +242,10 @@ class WindowControlButton(QPushButton):
 		self.setFixedSize(44, 30)
 		self.setCursor(Qt.PointingHandCursor)
 		self.setFocusPolicy(Qt.NoFocus)
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		self.update()
 
 	def set_role(self, role: str) -> None:
 		self._role = role
@@ -222,7 +256,11 @@ class WindowControlButton(QPushButton):
 		painter = QPainter(self)
 		painter.setRenderHint(QPainter.Antialiasing, True)
 		hovered = self.underMouse()
-		color = QColor("#FFFFFF") if (self._role == "close" and hovered) else QColor("#3C4043")
+		color = (
+			QColor(theme.color("titlebar.winctl.glyph.on"))
+			if (self._role == "close" and hovered)
+			else QColor(theme.color("titlebar.winctl.glyph"))
+		)
 		pen = QPen(color)
 		pen.setWidthF(1.4)
 		painter.setPen(pen)
@@ -344,53 +382,10 @@ class VeritasTitleBar(QFrame):
 		super().mouseReleaseEvent(event)
 
 
-# Stylesheet for the shared title bar; appended to each window's stylesheet so
-# all three windows share one chrome look.
-VERITAS_TITLEBAR_QSS = """
-	QFrame#VeritasTitleBar {
-		background-color: #FFFFFF;
-		border-top-left-radius: 16px;
-		border-top-right-radius: 16px;
-		border-bottom: 1px solid #E5E7EB;
-	}
-	QLabel#VeritasTitleBrand { color: #111827; font-size: 13px; font-weight: 850; letter-spacing: 1px; }
-	QLabel#VeritasTitleSub { color: #6B7280; font-size: 11px; font-weight: 650; }
-	QLabel#VeritasTitleSep { color: #CBD5E1; font-size: 12px; }
-	QPushButton#WinCtlButton, QPushButton#WinCtlCloseButton {
-		background-color: transparent; border: none; border-radius: 6px;
-	}
-	QPushButton#WinCtlButton:hover { background-color: #EDEFF2; }
-	QPushButton#WinCtlCloseButton:hover { background-color: #E81123; }
-"""
-
-
-# Chat surface styling, copied from the main window so the editor's 대화 tab
-# renders identically to the main 채팅 page (both reuse ChatPanel / ChatInputBar /
-# ChatMessageBubble, but each top-level window must carry the rules itself).
-# Keep in sync with the matching rules in MainWindow._build_stylesheet.
-CHAT_QSS = """
-	QFrame#AssistPagePanel { background-color: #F8FAFC; border: 1px solid #E5E7EB; border-radius: 16px; }
-	QFrame#AssistSectionCard { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 13px; }
-	QLabel#AssistSectionTitle { color: #111827; font-size: 13px; font-weight: 850; }
-	QScrollArea#AssistScrollArea { background-color: transparent; border: none; }
-	QScrollArea#ChatScroll { background: transparent; border: none; }
-	QLabel#AssistEmptyState { background-color: #F8FAFC; border: 1px dashed #CBD5E1; border-radius: 12px; color: #6B7280; padding: 18px 14px; font-weight: 650; }
-	QPushButton#AssistCopyButton { background-color: #FFFFFF; color: #4B5563; border: 1px solid #D1D5DB; border-radius: 8px; padding: 5px 8px; font-size: 11px; font-weight: 800; }
-	QPushButton#AssistCopyButton:hover { background-color: #F3F4F6; color: #111827; }
-	QFrame#AssistUserBubble { background-color: #DBEAFE; border: 1px solid #BFDBFE; border-radius: 13px; border-top-right-radius: 4px; }
-	QFrame#AssistAiBubble { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 13px; border-top-left-radius: 4px; }
-	QLabel#AssistBubbleMeta { color: #6B7280; font-size: 10px; font-weight: 800; }
-	QTextBrowser#AssistBubbleText { color: #1F2937; font-size: 12px; font-weight: 600; background: transparent; border: none; }
-	QFrame#AssistInputBar { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 14px; }
-	QTextEdit#AssistChatInput { background-color: #F8FAFC; border: 1px solid #E5E7EB; border-radius: 11px; padding: 8px 10px; color: #111827; selection-background-color: #BFDBFE; selection-color: #111827; }
-	QTextEdit#AssistChatInput:focus { background-color: #FFFFFF; border: 1px solid #3B82F6; }
-	QPushButton#AssistSendButton { background-color: #3B82F6; border: 1px solid #2563EB; border-radius: 11px; color: #FFFFFF; font-weight: 850; }
-	QPushButton#AssistSendButton:hover { background-color: #2563EB; }
-	QPushButton#AssistModeButton { background-color: #F1F5F9; color: #475569; border: 1px solid #D1D5DB; border-radius: 11px; padding: 0px; font-size: 13px; font-weight: 800; }
-	QPushButton#AssistModeButton:hover { background-color: #E0E7FF; border-color: #818CF8; color: #3730A3; }
-	QPushButton#AssistModeButton[researchActive="true"] { background-color: #1E3A8A; border-color: #1E3A8A; color: #FFFFFF; }
-	QPushButton#AssistModeButton[researchActive="true"]:hover { background-color: #1E40AF; border-color: #1E40AF; color: #FFFFFF; }
-"""
+# The shared title-bar and chat-surface stylesheets, plus the chat-surface
+# gradient, now live in `frontend/theme/stylesheet.py` (titlebar_qss / chat_qss /
+# chat_surface_gradient) so they render light or dark from one palette. Each
+# window pulls them in via build_*_qss(theme.palette()).
 
 
 class WindowIconButton(QPushButton):
@@ -456,29 +451,6 @@ class CustomTitleBar(QFrame):
 		super().mouseReleaseEvent(event)
 
 
-# Rating chips are styled inline (not via an ancestor stylesheet): the card
-# renders in two hosts — the floating DocumentAssistWindow and the main-window
-# DocumentAssistPage — and only the former carries the assist stylesheet, so an
-# objectName rule there left the chips falling back to a dark global QPushButton
-# style with text clipped. Inline QSS travels with the widget and wins over the
-# ancestor sheet everywhere.
-_RATE_CHIP_BASE = (
-	"QPushButton{{background:#FFFFFF;color:#4B5563;border:1px solid #D1D5DB;"
-	"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}}"
-	"QPushButton:hover{{background:{hbg};color:{hfg};border-color:{hbd};}}"
-)
-_LIKE_CHIP_QSS = _RATE_CHIP_BASE.format(hbg="#ECFDF5", hfg="#047857", hbd="#6EE7B7")
-_DISLIKE_CHIP_QSS = _RATE_CHIP_BASE.format(hbg="#FEF2F2", hfg="#B91C1C", hbd="#FCA5A5")
-_LIKE_CHIP_CHOSEN_QSS = (
-	"QPushButton{background:#D1FAE5;color:#047857;border:1px solid #6EE7B7;"
-	"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}"
-)
-_DISLIKE_CHIP_CHOSEN_QSS = (
-	"QPushButton{background:#FEE2E2;color:#B91C1C;border:1px solid #FCA5A5;"
-	"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}"
-)
-
-
 class SuggestionCard(QFrame):
 	# (event_id, intervention_type, action) — action ∈ {"like","dislike","copy"}.
 	# Re-emitted up through SuggestionList so the host page can POST the reward.
@@ -500,6 +472,7 @@ class SuggestionCard(QFrame):
 		self._event_id = event_id
 		self._intervention_type = intervention_type
 		self._rated = False
+		self._rated_action: str | None = None
 
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(12, 11, 12, 11)
@@ -538,7 +511,6 @@ class SuggestionCard(QFrame):
 		self._note.setTextFormat(Qt.PlainText)
 		self._note.setTextInteractionFlags(Qt.TextSelectableByMouse)
 		self._note.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-		self._note.setStyleSheet("color:#6B7280; font-size:12px;")
 		self._note.setVisible(False)
 
 		layout.addLayout(header)
@@ -556,14 +528,12 @@ class SuggestionCard(QFrame):
 			footer.addStretch(1)
 			self._like_button = QPushButton("도움됨")
 			self._like_button.setObjectName("AssistLikeButton")
-			self._like_button.setStyleSheet(_LIKE_CHIP_QSS)
 			self._like_button.setFixedHeight(30)
 			self._like_button.setMinimumWidth(60)
 			self._like_button.setCursor(Qt.PointingHandCursor)
 			self._like_button.clicked.connect(lambda: self._on_rate("like"))
 			self._dislike_button = QPushButton("아쉬움")
 			self._dislike_button.setObjectName("AssistDislikeButton")
-			self._dislike_button.setStyleSheet(_DISLIKE_CHIP_QSS)
 			self._dislike_button.setFixedHeight(30)
 			self._dislike_button.setMinimumWidth(60)
 			self._dislike_button.setCursor(Qt.PointingHandCursor)
@@ -574,6 +544,23 @@ class SuggestionCard(QFrame):
 		else:
 			self._like_button = None
 			self._dislike_button = None
+
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		self._note.setStyleSheet(
+			f"color:{theme.color('text.secondary.gray')}; font-size:12px;"
+		)
+		palette = theme.palette()
+		if self._like_button is not None:
+			self._like_button.setStyleSheet(
+				_rate_chip_qss(palette, "like", chosen=self._rated_action == "like")
+			)
+		if self._dislike_button is not None:
+			self._dislike_button.setStyleSheet(
+				_rate_chip_qss(palette, "dislike", chosen=self._rated_action == "dislike")
+			)
 
 	def set_card_width(self, width: int) -> None:
 		self._card_width = width
@@ -615,13 +602,14 @@ class SuggestionCard(QFrame):
 		if self._rated or not self._event_id:
 			return
 		self._rated = True
+		self._rated_action = action
 		for button in (self._like_button, self._dislike_button):
 			if button is not None:
 				button.setEnabled(False)
 		if action == "like" and self._like_button is not None:
-			self._like_button.setStyleSheet(_LIKE_CHIP_CHOSEN_QSS)
+			self._like_button.setStyleSheet(_rate_chip_qss(theme.palette(), "like", chosen=True))
 		elif action == "dislike" and self._dislike_button is not None:
-			self._dislike_button.setStyleSheet(_DISLIKE_CHIP_CHOSEN_QSS)
+			self._dislike_button.setStyleSheet(_rate_chip_qss(theme.palette(), "dislike", chosen=True))
 		self.feedbackSubmitted.emit(self._event_id, self._intervention_type, action)
 
 	def set_text(self, text: str) -> None:
@@ -725,11 +713,23 @@ class SuggestionList(QFrame):
 
 	# Bubbles each card's (event_id, intervention_type, action) up to the host.
 	feedbackSubmitted = Signal(str, str, str)
+	# Emits the suggestion count whenever it changes, so a host (e.g. the assist
+	# window's view toggle) can surface the number without owning the data.
+	countChanged = Signal(int)
 
-	def __init__(self, parent: QWidget | None = None, *, hug_content: bool = False) -> None:
+	def __init__(
+		self,
+		parent: QWidget | None = None,
+		*,
+		hug_content: bool = False,
+		show_header: bool = True,
+	) -> None:
 		super().__init__(parent)
 		self.setObjectName("AssistSectionCard")
 		self._hug_content = hug_content
+		# When False the section header (title + count) is omitted — used by the
+		# assist window, where the segmented view toggle already names the panel.
+		self._show_header = show_header
 		if hug_content:
 			# Maximum: take exactly the content height when it fits, never more.
 			self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
@@ -761,6 +761,12 @@ class SuggestionList(QFrame):
 		self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
 		self.container = QWidget()
+		self.container.setObjectName("AssistScrollBody")
+		# The sky gradient is painted by the window stylesheet (QWidget#AssistScrollBody);
+		# WA_StyledBackground lets that ancestor rule fill this plain QWidget so the empty
+		# area below the cards is never a bare surface (black on translucent windows) — and
+		# it re-tints automatically on a light/dark toggle.
+		self.container.setAttribute(Qt.WA_StyledBackground, True)
 		self.container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 		self.layout = QVBoxLayout(self.container)
 		self.layout.setContentsMargins(0, 0, 0, 0)
@@ -772,9 +778,15 @@ class SuggestionList(QFrame):
 		self.empty.setAlignment(Qt.AlignCenter)
 		self.empty.setWordWrap(True)
 
-		self._root.addLayout(header)
+		if self._show_header:
+			self._root.addLayout(header)
 		self._root.addWidget(self.scroll, 1)
 		self.set_suggestions([])
+
+	def _set_count(self, count: int) -> None:
+		"""Update the count read-out and notify listeners (e.g. the view toggle)."""
+		self.count_label.setText(f"{count}개")
+		self.countChanged.emit(count)
 
 	def set_suggestions(self, suggestions: list[dict[str, str]]) -> None:
 		self._suggestions = [dict(item) for item in suggestions]
@@ -784,7 +796,7 @@ class SuggestionList(QFrame):
 		if not self._suggestions:
 			self.layout.addWidget(self.empty)
 			self.empty.show()
-			self.count_label.setText("0개")
+			self._set_count(0)
 			self.layout.addStretch(1)
 			self.schedule_width_update()
 			if self._hug_content:
@@ -813,7 +825,7 @@ class SuggestionList(QFrame):
 		# last card and trailing a blank gap under its text.
 		self.layout.addStretch(1)
 
-		self.count_label.setText(f"{len(self._suggestions)}개")
+		self._set_count(len(self._suggestions))
 		self.schedule_width_update()
 		self.schedule_scroll_to_bottom()
 		if self._hug_content:
@@ -863,7 +875,7 @@ class SuggestionList(QFrame):
 		self.layout.addWidget(card)
 		self.layout.addStretch(1)
 
-		self.count_label.setText(f"{len(self._suggestions)}개")
+		self._set_count(len(self._suggestions))
 		self.schedule_width_update()
 		self.schedule_scroll_to_bottom()
 
@@ -1015,6 +1027,7 @@ class CopyButton(QPushButton):
 		self._reset_timer.setSingleShot(True)
 		self._reset_timer.setInterval(1300)
 		self._reset_timer.timeout.connect(self._reset_state)
+		theme.themeChanged.connect(self._apply_theme)
 
 	def show_copied(self) -> None:
 		self._copied = True
@@ -1027,6 +1040,9 @@ class CopyButton(QPushButton):
 		self.setToolTip("답변 복사")
 		self.update()
 
+	def _apply_theme(self, *args) -> None:
+		self.update()
+
 	def paintEvent(self, event) -> None:  # type: ignore[override]
 		super().paintEvent(event)  # hover background from the stylesheet
 		painter = QPainter(self)
@@ -1035,7 +1051,7 @@ class CopyButton(QPushButton):
 		cx, cy = center.x() + 0.5, center.y() + 0.5
 
 		if self._copied:
-			pen = QPen(QColor("#15803D"))
+			pen = QPen(QColor(theme.color("success.fg")))
 			pen.setWidthF(1.7)
 			pen.setCapStyle(Qt.RoundCap)
 			pen.setJoinStyle(Qt.RoundJoin)
@@ -1047,7 +1063,7 @@ class CopyButton(QPushButton):
 			painter.drawPath(check)
 			return
 
-		color = QColor("#0F172A") if self.underMouse() else QColor("#94A3B8")
+		color = QColor(theme.color("text.primary")) if self.underMouse() else QColor(theme.color("text.muted"))
 		pen = QPen(color)
 		pen.setWidthF(1.4)
 		pen.setJoinStyle(Qt.RoundJoin)
@@ -1059,7 +1075,7 @@ class CopyButton(QPushButton):
 		painter.drawRoundedRect(back, 1.8, 1.8)
 		front_path = QPainterPath()
 		front_path.addRoundedRect(front, 1.8, 1.8)
-		painter.fillPath(front_path, QColor("#FFFFFF"))
+		painter.fillPath(front_path, QColor(theme.color("bubble.ai.bg")))
 		painter.drawPath(front_path)
 
 
@@ -1360,7 +1376,12 @@ class ChatPanel(QFrame):
 	_MIN_FONT_PT = 9
 	_MAX_FONT_PT = 30
 
-	def __init__(self, title_text: str = "문서 채팅", parent: QWidget | None = None) -> None:
+	def __init__(
+		self,
+		title_text: str = "문서 채팅",
+		show_title: bool = True,
+		parent: QWidget | None = None,
+	) -> None:
 		super().__init__(parent)
 		self.setObjectName("AssistSectionCard")
 		self._bubble_font_pt = self._BASE_FONT_PT
@@ -1379,6 +1400,11 @@ class ChatPanel(QFrame):
 		self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
 		self.container = QWidget()
+		self.container.setObjectName("ChatScrollBody")
+		# Painted by the window stylesheet (QWidget#ChatScrollBody) via WA_StyledBackground
+		# so the area below the messages is never a bare surface (black on translucent
+		# windows) and re-tints automatically on a light/dark toggle.
+		self.container.setAttribute(Qt.WA_StyledBackground, True)
 		self.container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 		self.layout = QVBoxLayout(self.container)
 		self.layout.setContentsMargins(0, 0, 0, 0)
@@ -1392,7 +1418,8 @@ class ChatPanel(QFrame):
 		self.empty.setWordWrap(True)
 		self.layout.insertWidget(0, self.empty)
 
-		root.addWidget(title)
+		if show_title:
+			root.addWidget(title)
 		root.addWidget(self.scroll, 1)
 		self._bubbles: list[ChatMessageBubble] = []
 		self._streaming_chunks: list[str] = []
@@ -1673,6 +1700,70 @@ class ChatInputBar(QFrame):
 		self.input.clear()
 
 
+class AssistViewToggle(QFrame):
+	"""Segmented two-way switch pinned to the top of the assist window.
+
+	Styled as a pill 'track' with a white thumb on the active segment (the
+	native segmented-control look), it flips the body between the live edit
+	suggestions ("실시간 수정 결과") and the document chat ("문서 채팅") so only
+	one surface shows at a time. The suggestions segment carries a live count.
+	"""
+
+	# Emits "suggestions" or "chat" when the active segment changes.
+	modeChanged = Signal(str)
+
+	_SUGGESTIONS_LABEL = "실시간 수정 결과"
+	_CHAT_LABEL = "문서 채팅"
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self.setObjectName("AssistViewToggle")
+
+		layout = QHBoxLayout(self)
+		layout.setContentsMargins(4, 4, 4, 4)
+		layout.setSpacing(4)
+
+		# An exclusive group gives the segments radio semantics: exactly one is
+		# ever checked, and the active one can't be toggled off by re-clicking.
+		self._group = QButtonGroup(self)
+		self._group.setExclusive(True)
+
+		self.suggestions_button = QPushButton(self._SUGGESTIONS_LABEL)
+		self.suggestions_button.setObjectName("AssistViewSegment")
+		self.suggestions_button.setCheckable(True)
+		self.suggestions_button.setChecked(True)
+		self.suggestions_button.setCursor(Qt.PointingHandCursor)
+
+		self.chat_button = QPushButton(self._CHAT_LABEL)
+		self.chat_button.setObjectName("AssistViewSegment")
+		self.chat_button.setCheckable(True)
+		self.chat_button.setCursor(Qt.PointingHandCursor)
+
+		self._group.addButton(self.suggestions_button)
+		self._group.addButton(self.chat_button)
+
+		layout.addWidget(self.suggestions_button, 1)
+		layout.addWidget(self.chat_button, 1)
+
+		self.suggestions_button.clicked.connect(lambda: self.modeChanged.emit("suggestions"))
+		self.chat_button.clicked.connect(lambda: self.modeChanged.emit("chat"))
+
+	def set_mode(self, mode: str, *, emit: bool = True) -> None:
+		"""Programmatically select a segment (e.g. to restore the last view)."""
+		is_chat = mode == "chat"
+		self.chat_button.setChecked(is_chat)
+		self.suggestions_button.setChecked(not is_chat)
+		if emit:
+			self.modeChanged.emit("chat" if is_chat else "suggestions")
+
+	def set_suggestion_count(self, count: int) -> None:
+		"""Append a live count to the suggestions segment (cleared when zero)."""
+		if count > 0:
+			self.suggestions_button.setText(f"{self._SUGGESTIONS_LABEL}  ·  {count}")
+		else:
+			self.suggestions_button.setText(self._SUGGESTIONS_LABEL)
+
+
 class DocumentAssistWindow(QWidget):
 	messageSubmitted = Signal(str)
 	visibilityChanged = Signal(bool)
@@ -1699,6 +1790,7 @@ class DocumentAssistWindow(QWidget):
 
 		self._build_ui()
 		self._apply_stylesheet()
+		theme.themeChanged.connect(lambda _m: self._apply_stylesheet())
 		self._install_chat_zoom_shortcuts()
 		# screen-monitoring 이벤트 broker 연결 — 보조창과 DocumentAssistPage가 같은 데이터 공유.
 		self._screen_store = get_screen_event_store()
@@ -1753,28 +1845,32 @@ class DocumentAssistWindow(QWidget):
 		content_layout.setContentsMargins(12, 10, 12, 8)
 		content_layout.setSpacing(10)
 
-		# A draggable divider lets the user trade height between the suggestion
-		# list and the chat, so neither caps the other at a fixed ratio.
-		self.suggestion_list = SuggestionList()
-		self.suggestion_list.setMinimumHeight(120)
-		self.chat_panel = ChatPanel()
-		self.chat_panel.setMinimumHeight(160)
+		# One surface at a time: the segmented toggle above swaps the body between
+		# the live edit suggestions and the document chat, instead of splitting the
+		# window top/bottom. The panels drop their own titles since the toggle
+		# already names the active view.
+		self.suggestion_list = SuggestionList(show_header=False)
+		self.chat_panel = ChatPanel(show_title=False)
 		self.input_bar = ChatInputBar()
 		self.input_bar.sendRequested.connect(self.on_message_submitted)
 		self.input_bar.modeChanged.connect(self._on_mode_changed)
 
-		self.content_split = QSplitter(Qt.Vertical)
-		self.content_split.setObjectName("AssistContentSplit")
-		self.content_split.setChildrenCollapsible(False)
-		self.content_split.setHandleWidth(10)
-		self.content_split.addWidget(self.suggestion_list)
-		self.content_split.addWidget(self.chat_panel)
-		self.content_split.setStretchFactor(0, 0)
-		self.content_split.setStretchFactor(1, 1)
-		self.content_split.setSizes([220, 380])
+		self.view_toggle = AssistViewToggle()
+		self.view_toggle.modeChanged.connect(self._on_view_changed)
+		self.suggestion_list.countChanged.connect(self.view_toggle.set_suggestion_count)
 
-		content_layout.addWidget(self.content_split, 1)
+		self.body_stack = QStackedWidget()
+		self.body_stack.setObjectName("AssistBodyStack")
+		self.body_stack.addWidget(self.suggestion_list)
+		self.body_stack.addWidget(self.chat_panel)
+
+		content_layout.addWidget(self.view_toggle)
+		content_layout.addWidget(self.body_stack, 1)
 		content_layout.addWidget(self.input_bar)
+
+		# Land on the live suggestions view; the chat input only belongs to chat.
+		self.body_stack.setCurrentWidget(self.suggestion_list)
+		self.input_bar.setVisible(False)
 
 		grip_row = QHBoxLayout()
 		grip_row.setContentsMargins(0, 0, 0, 0)
@@ -1836,234 +1932,8 @@ class DocumentAssistWindow(QWidget):
 		)
 
 	def _apply_stylesheet(self) -> None:
-		self.setStyleSheet(
-			"""
-			QWidget {
-				color: #111827;
-				font-family: 'Segoe UI Variable', 'Segoe UI', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
-				font-size: 13px;
-			}
-			QFrame#AssistPanel {
-				background-color: #F8FAFC;
-				border: 1px solid #E5E7EB;
-				border-radius: 16px;
-			}
-			QFrame#AssistTitleBar {
-				background-color: #FFFFFF;
-				border-top-left-radius: 16px;
-				border-top-right-radius: 16px;
-				border-bottom: 1px solid #E5E7EB;
-			}
-			QFrame#AssistContent {
-				background-color: #F8FAFC;
-				border-bottom-left-radius: 16px;
-				border-bottom-right-radius: 16px;
-			}
-			QSplitter#AssistContentSplit {
-				background-color: transparent;
-			}
-			QSplitter#AssistContentSplit::handle:vertical {
-				background-color: #E5E7EB;
-				height: 3px;
-				margin: 3px 40px;
-				border-radius: 1px;
-			}
-			QSplitter#AssistContentSplit::handle:vertical:hover {
-				background-color: #94A3B8;
-			}
-			QLabel#AssistWindowTitle {
-				color: #111827;
-				font-size: 13px;
-				font-weight: 850;
-			}
-			QLabel#AssistTitleContext {
-				color: #6B7280;
-				font-size: 11px;
-				font-weight: 650;
-			}
-			QPushButton#AssistMinimizeButton,
-			QPushButton#AssistCloseButton {
-				background-color: transparent;
-				color: #6B7280;
-				border: none;
-				border-radius: 9px;
-				font-size: 16px;
-				font-weight: 700;
-				padding: 0px;
-			}
-			QPushButton#AssistMinimizeButton:hover {
-				background-color: #F3F4F6;
-				color: #111827;
-			}
-			QPushButton#AssistCloseButton:hover {
-				background-color: #FEE2E2;
-				color: #DC2626;
-			}
-			QFrame#AssistSectionCard {
-				background-color: #FFFFFF;
-				border: 1px solid #E5E7EB;
-				border-radius: 13px;
-			}
-			QLabel#AssistSubText {
-				color: #6B7280;
-				font-size: 12px;
-				font-weight: 600;
-			}
-			QLabel#AssistSectionTitle {
-				color: #111827;
-				font-size: 13px;
-				font-weight: 850;
-			}
-			QScrollArea#AssistScrollArea {
-				background-color: transparent;
-				border: none;
-			}
-			QFrame#SuggestionCard {
-				background-color: #FFFFFF;
-				border: 1px solid #E5E7EB;
-				border-radius: 12px;
-			}
-			QLabel#SuggestionText {
-				color: #1F2937;
-				font-size: 13px;
-				font-weight: 650;
-				line-height: 1.5;
-			}
-			QLabel#AssistEmptyState {
-				background-color: #F8FAFC;
-				border: 1px dashed #CBD5E1;
-				border-radius: 12px;
-				color: #6B7280;
-				padding: 18px 14px;
-				font-weight: 650;
-			}
-			QPushButton#AssistCopyButton {
-				background-color: #FFFFFF;
-				color: #4B5563;
-				border: 1px solid #D1D5DB;
-				border-radius: 8px;
-				padding: 5px 8px;
-				font-size: 11px;
-				font-weight: 800;
-			}
-			QPushButton#AssistCopyButton:hover {
-				background-color: #F3F4F6;
-				color: #111827;
-			}
-			QFrame#AssistUserBubble {
-				background-color: #DBEAFE;
-				border: 1px solid #BFDBFE;
-				border-radius: 13px;
-				border-top-right-radius: 4px;
-			}
-			QFrame#AssistAiBubble {
-				background-color: #FFFFFF;
-				border: 1px solid #E5E7EB;
-				border-radius: 13px;
-				border-top-left-radius: 4px;
-			}
-			QLabel#AssistBubbleMeta {
-				color: #6B7280;
-				font-size: 11px;
-				font-weight: 800;
-			}
-			QTextBrowser#AssistBubbleText {
-				color: #1F2937;
-				font-size: 14px;
-				font-weight: 600;
-				background: transparent;
-				border: none;
-			}
-			QFrame#AssistInputBar {
-				background-color: #FFFFFF;
-				border: 1px solid #E5E7EB;
-				border-radius: 14px;
-			}
-			QTextEdit#AssistChatInput {
-				background-color: #F8FAFC;
-				border: 1px solid #E5E7EB;
-				border-radius: 11px;
-				padding: 8px 10px;
-				color: #111827;
-				font-size: 13px;
-				selection-background-color: #BFDBFE;
-				selection-color: #111827;
-			}
-			QTextEdit#AssistChatInput:focus {
-				background-color: #FFFFFF;
-				border: 1px solid #3B82F6;
-			}
-			QPushButton#AssistSendButton {
-				background-color: #3B82F6;
-				border: 1px solid #2563EB;
-				border-radius: 11px;
-				color: #FFFFFF;
-				font-weight: 850;
-			}
-			QPushButton#AssistSendButton:hover {
-				background-color: #2563EB;
-			}
-			QPushButton#AssistModeButton {
-				background-color: #F1F5F9;
-				color: #475569;
-				border: 1px solid #D1D5DB;
-				border-radius: 11px;
-				padding: 0px;
-				font-size: 13px;
-				font-weight: 800;
-			}
-			QPushButton#AssistModeButton:hover {
-				background-color: #E0E7FF;
-				border-color: #818CF8;
-				color: #3730A3;
-			}
-			QPushButton#AssistModeButton[researchActive="true"] {
-				background-color: #1E3A8A;
-				border-color: #1E3A8A;
-				color: #FFFFFF;
-			}
-			QPushButton#AssistModeButton[researchActive="true"]:hover {
-				background-color: #1E40AF;
-				border-color: #1E40AF;
-				color: #FFFFFF;
-			}
-			QMenu {
-				background-color: #FFFFFF;
-				border: 1px solid #CBD5E1;
-				border-radius: 8px;
-				padding: 6px;
-			}
-			QMenu::item {
-				color: #111827;
-				padding: 8px 28px 8px 12px;
-				border-radius: 6px;
-			}
-			QMenu::item:selected {
-				background-color: #EEF2FF;
-				color: #3730A3;
-			}
-			QScrollBar:vertical {
-				background: transparent;
-				width: 8px;
-				margin: 2px 0 2px 0;
-			}
-			QScrollBar::handle:vertical {
-				background: #CBD5E1;
-				border-radius: 4px;
-				min-height: 26px;
-			}
-			QScrollBar::add-line:vertical,
-			QScrollBar::sub-line:vertical {
-				height: 0px;
-			}
-			QScrollBar::add-page:vertical,
-			QScrollBar::sub-page:vertical {
-				background: transparent;
-			}
-			"""
-			+ VERITAS_TITLEBAR_QSS
-			+ CHAT_QSS
-		)
+		self.setStyleSheet(build_assist_window_qss(theme.palette()))
+
 
 	def update_assist_text(self, text: str) -> None:
 		self.suggestion_list.set_suggestions([{"category": "수정", "text": text, "tone": "working"}])
@@ -2120,6 +1990,20 @@ class DocumentAssistWindow(QWidget):
 			self.title_bar.status.setText("자료조사")
 		else:
 			self.title_bar.status.setText("● 분석 중")
+
+	def _on_view_changed(self, mode: str) -> None:
+		"""Swap the body between the suggestions and chat surfaces.
+
+		The chat input only makes sense in the chat view, so it is hidden while
+		the live edit suggestions are shown — giving the list the full height.
+		"""
+		if mode == "chat":
+			self.body_stack.setCurrentWidget(self.chat_panel)
+			self.input_bar.setVisible(True)
+			self.chat_panel.force_scroll_bottom()
+		else:
+			self.body_stack.setCurrentWidget(self.suggestion_list)
+			self.input_bar.setVisible(False)
 
 	def on_message_submitted(self, message: str) -> None:
 		# The user bubble is drawn by ChatBus subscribers (MainWindow + WritePage)

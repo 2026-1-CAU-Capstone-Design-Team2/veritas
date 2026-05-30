@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from ...components.badges import Badge
 from ...components.cards import CardWidget
+from ...theme import theme
 
 # --- Icons -----------------------------------------------------------------
 # The guide reuses the same line icons as the sidebar so each feature is
@@ -17,7 +18,6 @@ from ...components.cards import CardWidget
 # indigo accent and render onto white cards. The editor has no sidebar entry,
 # so it gets an inline pen icon drawn in the same Lucide style.
 _ICON_DIR = Path(__file__).resolve().parents[1] / "public" / "images" / "icons"
-_ICON_COLOR = "#4F46E5"
 _ICON_RENDER_SCALE = 3  # render oversized then downscale for crisp edges
 
 _PEN_SVG = (
@@ -38,16 +38,19 @@ def _icon_svg(key: str) -> str:
 	return ""
 
 
-_PIXMAP_CACHE: dict[tuple[str, int], QPixmap] = {}
+# Keyed by (icon name, size, stroke colour) so a light/dark toggle — which
+# changes the accent stroke — renders a fresh pixmap instead of returning the
+# previous mode's cached one.
+_PIXMAP_CACHE: dict[tuple[str, int, str], QPixmap] = {}
 
 
-def _icon_pixmap(key: str, size: int) -> QPixmap:
-	cache_key = (key, size)
+def _icon_pixmap(key: str, size: int, color: str) -> QPixmap:
+	cache_key = (key, size, color)
 	cached = _PIXMAP_CACHE.get(cache_key)
 	if cached is not None:
 		return cached
 
-	svg = _icon_svg(key).replace('stroke="#CBD5E1"', f'stroke="{_ICON_COLOR}"')
+	svg = _icon_svg(key).replace('stroke="#CBD5E1"', f'stroke="{color}"')
 	if not svg:
 		pixmap = QPixmap()
 		_PIXMAP_CACHE[cache_key] = pixmap
@@ -69,59 +72,62 @@ def _icon_pixmap(key: str, size: int) -> QPixmap:
 # Page-scoped styling for the few elements the global stylesheet doesn't cover.
 # Cards, titles, and body text reuse the global object names (CardWidget /
 # CardTitle / CardSecondary).
-_PAGE_QSS = """
+#
+# Rendered from a palette dict via ``%(token)s`` placeholders so the page
+# restyles live on a light/dark toggle (see frontend/theme/stylesheet.py).
+_PAGE_TMPL = """
 QLabel#GuideStageNum {
-	background-color: #4F46E5;
-	color: #FFFFFF;
+	background-color: %(accent)s;
+	color: %(text.on_accent)s;
 	border-radius: 13px;
 	font-size: 13px;
 	font-weight: 800;
 }
 QLabel#GuideStageTitle {
-	color: #0F172A;
+	color: %(text.primary)s;
 	font-size: 15px;
 	font-weight: 800;
 }
 QLabel#GuideStageDesc {
-	color: #64748B;
+	color: %(text.secondary)s;
 	font-size: 12px;
 	font-weight: 600;
 }
 QLabel#GuideIconTile {
-	background-color: #EEF2FF;
-	border: 1px solid #C7D2FE;
+	background-color: %(accent.subtle.bg)s;
+	border: 1px solid %(accent.subtle.border)s;
 	border-radius: 11px;
 }
 QLabel#GuideFeatName {
-	color: #0F172A;
+	color: %(text.primary)s;
 	font-size: 15px;
 	font-weight: 800;
 }
 QLabel#GuideFeatSub {
-	color: #64748B;
+	color: %(text.secondary)s;
 	font-size: 12px;
 	font-weight: 600;
 }
 QLabel#GuideStepNum {
-	background-color: #EEF2FF;
-	color: #3730A3;
-	border: 1px solid #C7D2FE;
+	background-color: %(accent.subtle.bg)s;
+	color: %(accent.text)s;
+	border: 1px solid %(accent.subtle.border)s;
 	border-radius: 10px;
 	font-size: 11px;
 	font-weight: 800;
 }
 QLabel#GuideStepText {
-	color: #1F2937;
+	color: %(text.body)s;
 	font-size: 13px;
 	font-weight: 600;
 }
 QFrame#GuideFlowChip {
-	background-color: #EEF2FF;
-	border: 1px solid #C7D2FE;
+	background-color: %(accent.subtle.bg)s;
+	border: 1px solid %(accent.subtle.border)s;
 	border-radius: 15px;
 }
 QLabel#GuideFlowChipText {
-	color: #3730A3;
+	color: %(accent.text)s;
 	font-size: 12px;
 	font-weight: 800;
 	background-color: transparent;
@@ -132,25 +138,30 @@ QLabel#GuideFlowChipIcon {
 	border: none;
 }
 QLabel#GuideFlowArrow {
-	color: #94A3B8;
+	color: %(text.muted)s;
 	font-size: 15px;
 	font-weight: 800;
 }
 QLabel#GuideNote {
-	background-color: #F8FAFC;
-	border: 1px solid #E2E8F0;
+	background-color: %(surface.muted)s;
+	border: 1px solid %(border)s;
 	border-radius: 10px;
-	color: #475569;
+	color: %(text.slate600)s;
 	padding: 9px 11px;
 	font-size: 12px;
 	font-weight: 700;
 }
 QLabel#GuideBullet {
-	color: #1F2937;
+	color: %(text.body)s;
 	font-size: 13px;
 	font-weight: 600;
 }
 """
+
+
+def build_guide_qss(palette: dict[str, str]) -> str:
+	"""Render the guide page's QSS from a colour palette (``theme.palette()``)."""
+	return _PAGE_TMPL % palette
 
 _INTRO_TEXT = (
 	"내 컴퓨터에서 동작하는 AI 리서치·문서 작성 도우미예요. 알아보고 싶은 주제만 적으면 "
@@ -333,7 +344,10 @@ class GuidePage(QWidget):
 
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
-		self.setStyleSheet(_PAGE_QSS)
+
+		# (QLabel, svg key, render size) for every accent-tinted guide icon, so a
+		# light/dark toggle can re-tint them in place — they are built once below.
+		self._icon_labels: list[tuple[QLabel, str, int]] = []
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
@@ -349,6 +363,15 @@ class GuidePage(QWidget):
 				root.addWidget(self._feature_card(**feature))
 		root.addWidget(self._tips_card())
 		root.addStretch(1)
+
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		self.setStyleSheet(build_guide_qss(theme.palette()))
+		accent = theme.color("accent")
+		for label, key, size in self._icon_labels:
+			label.setPixmap(_icon_pixmap(key, size, accent))
 
 	def _intro_card(self) -> CardWidget:
 		card = CardWidget()
@@ -397,7 +420,8 @@ class GuidePage(QWidget):
 
 		icon = QLabel()
 		icon.setObjectName("GuideFlowChipIcon")
-		icon.setPixmap(_icon_pixmap(icon_key, 15))
+		icon.setPixmap(_icon_pixmap(icon_key, 15, theme.color("accent")))
+		self._icon_labels.append((icon, icon_key, 15))
 		row.addWidget(icon, 0, Qt.AlignVCenter)
 
 		text = QLabel(name)
@@ -456,7 +480,8 @@ class GuidePage(QWidget):
 		icon_tile.setObjectName("GuideIconTile")
 		icon_tile.setFixedSize(40, 40)
 		icon_tile.setAlignment(Qt.AlignCenter)
-		icon_tile.setPixmap(_icon_pixmap(icon, 22))
+		icon_tile.setPixmap(_icon_pixmap(icon, 22, theme.color("accent")))
+		self._icon_labels.append((icon_tile, icon, 22))
 		header.addWidget(icon_tile, 0, Qt.AlignTop)
 
 		title_box = QVBoxLayout()

@@ -3,6 +3,8 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QWidget
 
+from ..theme import theme
+
 
 class StepNode(QFrame):
 	def __init__(self, label: str, index: int, parent: QWidget | None = None) -> None:
@@ -30,21 +32,21 @@ class StepNode(QFrame):
 		self._status = status
 		self._apply_style()
 
-	def _apply_style(self) -> None:
+	def _apply_style(self, *args) -> None:
 		if self._status == "active":
-			bg = "#F2DDC0"
-			border = "#D8A467"
-			text_color = "#B96016"
+			bg = theme.color("stepper.active.bg")
+			border = theme.color("stepper.active.border")
+			text_color = theme.color("stepper.active.text")
 			weight = 800
 		elif self._status == "done":
-			bg = "#F4E4CC"
-			border = "#D8A467"
-			text_color = "#A85A16"
+			bg = theme.color("stepper.done.bg")
+			border = theme.color("stepper.done.border")
+			text_color = theme.color("stepper.done.text")
 			weight = 700
 		else:
-			bg = "#F8FAFC"
-			border = "#E5E7EB"
-			text_color = "#94A3B8"
+			bg = theme.color("stepper.pending.bg")
+			border = theme.color("stepper.pending.border")
+			text_color = theme.color("stepper.pending.text")
 			weight = 600
 
 		self.setStyleSheet(
@@ -93,9 +95,16 @@ class WorkflowStepper(QFrame):
 				self._connectors.append(connector)
 				layout.addWidget(connector, 1)
 
+		self._current = 0
 		self.set_current_step(0)
+		# Re-tint nodes + connectors when the theme toggles.
+		theme.themeChanged.connect(self._on_theme_changed)
+
+	def _on_theme_changed(self, *args) -> None:
+		self.set_current_step(self._current)
 
 	def set_current_step(self, index: int) -> None:
+		self._current = index
 		for i, node in enumerate(self._nodes):
 			if i < index:
 				node.set_status("done")
@@ -110,9 +119,9 @@ class WorkflowStepper(QFrame):
 
 		for i, connector in enumerate(self._connectors):
 			if i < colored_count:
-				color = "#D8A467"
+				color = theme.color("stepper.connector.on")
 			else:
-				color = "#EAD5B8"
+				color = theme.color("stepper.connector.off")
 			connector.setStyleSheet(
 				f"""
 				QFrame#StepperConnector {{
