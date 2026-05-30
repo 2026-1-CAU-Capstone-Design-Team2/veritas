@@ -121,12 +121,28 @@ _MAIN_TMPL = """
 		background-color: %(button.bg.hover)s;
 	}
 
+	/* Frameless main window: the top-level widget + central root stay transparent
+	   so the translucent rounded panel (and its drop shadow) can show through. */
+	QMainWindow { background-color: transparent; }
+
 	QWidget#AppRoot {
+		background-color: transparent;
+	}
+
+	QFrame#AppPanel {
 		background-color: qlineargradient(
 			x1: 0, y1: 0, x2: 0, y2: 1,
 			stop: 0 %(bg.app.start)s,
 			stop: 1 %(bg.app.end)s
 		);
+		border-radius: 16px;
+	}
+
+	/* When maximized the panel fills the screen, so square off its corners. */
+	QFrame#AppPanel[maximized="true"] { border-radius: 0px; }
+	QFrame#VeritasTitleBar[maximized="true"] {
+		border-top-left-radius: 0px;
+		border-top-right-radius: 0px;
 	}
 
 	QFrame#Sidebar {
@@ -1453,7 +1469,7 @@ _ASSIST_TMPL = """
 
 
 def build_main_window_qss(p: dict[str, str]) -> str:
-	return _MAIN_TMPL % p
+	return (_MAIN_TMPL % p) + titlebar_qss(p)
 
 
 def build_editor_qss(p: dict[str, str]) -> str:

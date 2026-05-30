@@ -5,7 +5,9 @@ from pathlib import Path
 
 from PySide6.QtCore import (
 	QEasingCurve,
+	QEvent,
 	QParallelAnimationGroup,
+	QPoint,
 	QPointF,
 	QPropertyAnimation,
 	QSize,
@@ -17,6 +19,7 @@ from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, 
 from PySide6.QtWidgets import (
 	QApplication,
 	QFrame,
+	QGraphicsDropShadowEffect,
 	QGraphicsOpacityEffect,
 	QHBoxLayout,
 	QLabel,
@@ -51,7 +54,7 @@ from .pages.verify_page import VerifyPage
 from .pages.write_page import WritePage
 
 from .sidebar import Sidebar
-from .windows.document_assist_window import DocumentAssistWindow, render_history_html
+from .windows.document_assist_window import DocumentAssistWindow, VeritasTitleBar, render_history_html
 from .windows.editor_window import EditorWindow
 
 
@@ -200,16 +203,55 @@ class MainWindow(QMainWindow):
 	def __init__(self) -> None:
 		super().__init__()
 		self.setWindowTitle("VERITAS")
+		# Frameless + translucent: the app wears the same rounded, floating chrome
+		# as the editor / assist windows — a custom VeritasTitleBar instead of the
+		# black OS title bar — so all three windows share one look.
+		self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+		self.setAttribute(Qt.WA_TranslucentBackground, True)
+		self.setMouseTracking(True)
 		self._apply_window_icon()
 		self._apply_default_geometry()
+		self.setMinimumSize(940, 620)
+
+		# Edge-resize bookkeeping — a frameless window loses the native grips, so we
+		# drive resizing from the central widget's transparent margin (eventFilter).
+		self._resize_margin = 8
+		self._resize_edges: set[str] = set()
+		self._resize_origin: QPoint | None = None
+		self._resize_geometry = None
 
 		self.setStyleSheet(build_main_window_qss(theme.palette()))
 
 		container = QWidget()
 		container.setObjectName("AppRoot")
+		container.setMouseTracking(True)
+		container.installEventFilter(self)
 		self.setCentralWidget(container)
 
-		shell = QHBoxLayout(container)
+		self._root_layout = QVBoxLayout(container)
+		self._root_layout.setContentsMargins(10, 10, 10, 10)
+		self._root_layout.setSpacing(0)
+
+		# Rounded, shadowed panel carries the app gradient; the transparent margin
+		# around it lets the desktop show through for the floating-card look.
+		self.app_panel = QFrame()
+		self.app_panel.setObjectName("AppPanel")
+		panel_shadow = QGraphicsDropShadowEffect(self.app_panel)
+		panel_shadow.setBlurRadius(28)
+		panel_shadow.setXOffset(0)
+		panel_shadow.setYOffset(10)
+		panel_shadow.setColor(QColor(15, 23, 42, 45))
+		self.app_panel.setGraphicsEffect(panel_shadow)
+		self._root_layout.addWidget(self.app_panel)
+
+		panel_layout = QVBoxLayout(self.app_panel)
+		panel_layout.setContentsMargins(0, 0, 0, 0)
+		panel_layout.setSpacing(0)
+
+		self.title_bar = VeritasTitleBar(self)
+		panel_layout.addWidget(self.title_bar)
+
+		shell = QHBoxLayout()
 		shell.setObjectName("ShellLayout")
 		shell.setContentsMargins(20, 20, 20, 20)
 		shell.setSpacing(16)
@@ -314,6 +356,7 @@ class MainWindow(QMainWindow):
 
 		shell.addWidget(self.sidebar)
 		shell.addWidget(center_panel, 1)
+		panel_layout.addLayout(shell, 1)
 
 		# Independent top-level windows (no parent) so each gets its own taskbar
 		# button and minimises ('-') on its own; MainWindow.closeEvent closes them
@@ -357,6 +400,10 @@ class MainWindow(QMainWindow):
 		self._sync_theme_button()
 
 		self._enable_text_selection(container)
+		# Keep the title bar drag-friendly: its brand / logo labels must not grab
+		# the mouse press for text selection (which would block window dragging).
+		for title_label in self.title_bar.findChildren(QLabel):
+			title_label.setTextInteractionFlags(Qt.NoTextInteraction)
 		self._navigate("dashboard")
 
 	def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -367,6 +414,97 @@ class MainWindow(QMainWindow):
 			if window is not None:
 				window.close()
 		super().closeEvent(event)
+
+	# --------------------------------------------------------- frameless chrome
+
+	def changeEvent(self, event) -> None:  # type: ignore[override]
+		# Maximising a frameless window should fill the screen edge-to-edge: drop
+		# the floating shadow margin + rounded corners, and restore them on normal.
+		if event.type() == QEvent.WindowStateChange and hasattr(self, "title_bar"):
+			maximized = self.isMaximized()
+			if maximized:
+				self._root_layout.setContentsMargins(0, 0, 0, 0)
+			else:
+				self._root_layout.setContentsMargins(10, 10, 10, 10)
+			for widget in (self.app_panel, self.title_bar):
+				widget.setProperty("maximized", maximized)
+				widget.style().unpolish(widget)
+				widget.style().polish(widget)
+			self.title_bar.maximize_button.set_role("restore" if maximized else "max")
+		super().changeEvent(event)
+
+	def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
+		# The central widget owns the transparent margin around the panel; that ring
+		# is where an edge-resize drag begins now that the OS grips are gone.
+		if obj is self.centralWidget() and not self.isMaximized():
+			etype = event.type()
+			if etype == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+				edges = self._hit_resize_edges(event.position().toPoint())
+				if edges:
+					self._resize_edges = edges
+					self._resize_origin = event.globalPosition().toPoint()
+					self._resize_geometry = self.geometry()
+					return True
+			elif etype == QEvent.MouseMove:
+				if self._resize_origin is not None and self._resize_geometry is not None:
+					self._resize_to(event.globalPosition().toPoint())
+					return True
+				self._update_resize_cursor(event.position().toPoint())
+			elif etype == QEvent.MouseButtonRelease and self._resize_edges:
+				self._resize_edges = set()
+				self._resize_origin = None
+				self._resize_geometry = None
+				self.centralWidget().unsetCursor()
+				return True
+		return super().eventFilter(obj, event)
+
+	def _hit_resize_edges(self, pos: QPoint) -> set[str]:
+		margin = self._resize_margin
+		edges: set[str] = set()
+		if pos.x() <= margin:
+			edges.add("left")
+		elif pos.x() >= self.width() - margin:
+			edges.add("right")
+		if pos.y() <= margin:
+			edges.add("top")
+		elif pos.y() >= self.height() - margin:
+			edges.add("bottom")
+		return edges
+
+	def _update_resize_cursor(self, pos: QPoint) -> None:
+		edges = self._hit_resize_edges(pos)
+		widget = self.centralWidget()
+		if {"left", "top"} <= edges or {"right", "bottom"} <= edges:
+			widget.setCursor(Qt.SizeFDiagCursor)
+		elif {"right", "top"} <= edges or {"left", "bottom"} <= edges:
+			widget.setCursor(Qt.SizeBDiagCursor)
+		elif "left" in edges or "right" in edges:
+			widget.setCursor(Qt.SizeHorCursor)
+		elif "top" in edges or "bottom" in edges:
+			widget.setCursor(Qt.SizeVerCursor)
+		else:
+			widget.unsetCursor()
+
+	def _resize_to(self, global_pos: QPoint) -> None:
+		if self._resize_origin is None or self._resize_geometry is None:
+			return
+		delta = global_pos - self._resize_origin
+		geometry = self._resize_geometry
+		x, y, width, height = geometry.x(), geometry.y(), geometry.width(), geometry.height()
+		min_width, min_height = self.minimumWidth(), self.minimumHeight()
+		if "left" in self._resize_edges:
+			new_width = max(min_width, width - delta.x())
+			x = geometry.right() - new_width + 1
+			width = new_width
+		if "right" in self._resize_edges:
+			width = max(min_width, width + delta.x())
+		if "top" in self._resize_edges:
+			new_height = max(min_height, height - delta.y())
+			y = geometry.bottom() - new_height + 1
+			height = new_height
+		if "bottom" in self._resize_edges:
+			height = max(min_height, height + delta.y())
+		self.setGeometry(x, y, width, height)
 
 	def show_document_assist_window(self) -> None:
 		self.document_assist_window.show()
