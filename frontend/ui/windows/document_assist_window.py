@@ -56,6 +56,35 @@ from ...controllers import (
 	get_screen_event_store,
 )
 from ..markdown_view import render_markdown_html
+from ...theme import build_assist_window_qss, theme
+
+
+def _rate_chip_qss(palette: dict[str, str], kind: str, *, chosen: bool = False) -> str:
+	"""Build the QSS for a like/dislike rating chip from the active palette.
+
+	``kind`` is ``"like"`` or ``"dislike"``; ``chosen`` renders the locked-in
+	(already-clicked) look. Kept inline rather than as an objectName rule because
+	the card renders in two hosts and only one carries the assist stylesheet."""
+	base = (
+		"QPushButton{background:%s;color:%s;border:1px solid %s;"
+		"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}"
+	)
+	if chosen:
+		return base % (
+			palette["chip.%s.chosen.bg" % kind],
+			palette["chip.%s.hover.fg" % kind],
+			palette["chip.%s.hover.border" % kind],
+		)
+	return (
+		base % (palette["chip.base.bg"], palette["chip.base.fg"], palette["chip.base.border"])
+	) + (
+		"QPushButton:hover{background:%s;color:%s;border-color:%s;}"
+		% (
+			palette["chip.%s.hover.bg" % kind],
+			palette["chip.%s.hover.fg" % kind],
+			palette["chip.%s.hover.border" % kind],
+		)
+	)
 
 
 def add_text_breakpoints(text: str, chunk_size: int = 24) -> str:
@@ -152,29 +181,29 @@ class ChatInputEdit(QTextEdit):
 
 
 class StatusBadge(QLabel):
-	COLORS = {
-		"working": ("#DBEAFE", "#1D4ED8", "#BFDBFE"),
-		"idle": ("#F3F4F6", "#6B7280", "#E5E7EB"),
-		"warning": ("#FEF3C7", "#B45309", "#FDE68A"),
-		"error": ("#FEE2E2", "#DC2626", "#FECACA"),
+	# tone → (bg, fg, border) theme tokens, resolved per active palette.
+	_TONE_TOKENS = {
+		"working": ("badge.working.bg", "badge.working.fg", "badge.working.border"),
+		"idle": ("badge.idle.bg", "badge.idle.fg", "badge.idle.border"),
+		"warning": ("badge.warning.bg", "badge.warning.fg", "badge.warning.border"),
+		"error": ("badge.error.bg", "badge.error.fg", "badge.error.border"),
 	}
 
 	def __init__(self, text: str, tone: str = "idle", parent: QWidget | None = None) -> None:
 		super().__init__(text, parent)
 		self.setObjectName("AssistStatusBadge")
-		bg, fg, border = self.COLORS.get(tone, self.COLORS["idle"])
+		self._tone = tone if tone in self._TONE_TOKENS else "idle"
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		bg, fg, border = self._TONE_TOKENS[self._tone]
 		self.setStyleSheet(
-			f"""
-			QLabel#AssistStatusBadge {{
-				background-color: {bg};
-				color: {fg};
-				border: 1px solid {border};
-				border-radius: 10px;
-				padding: 3px 8px;
-				font-size: 11px;
-				font-weight: 800;
-			}}
-			"""
+			"QLabel#AssistStatusBadge {"
+			f" background-color: {theme.color(bg)};"
+			f" color: {theme.color(fg)};"
+			f" border: 1px solid {theme.color(border)};"
+			" border-radius: 10px; padding: 3px 8px; font-size: 11px; font-weight: 800; }"
 		)
 
 
@@ -213,6 +242,10 @@ class WindowControlButton(QPushButton):
 		self.setFixedSize(44, 30)
 		self.setCursor(Qt.PointingHandCursor)
 		self.setFocusPolicy(Qt.NoFocus)
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		self.update()
 
 	def set_role(self, role: str) -> None:
 		self._role = role
@@ -223,7 +256,11 @@ class WindowControlButton(QPushButton):
 		painter = QPainter(self)
 		painter.setRenderHint(QPainter.Antialiasing, True)
 		hovered = self.underMouse()
-		color = QColor("#FFFFFF") if (self._role == "close" and hovered) else QColor("#3C4043")
+		color = (
+			QColor(theme.color("titlebar.winctl.glyph.on"))
+			if (self._role == "close" and hovered)
+			else QColor(theme.color("titlebar.winctl.glyph"))
+		)
 		pen = QPen(color)
 		pen.setWidthF(1.4)
 		painter.setPen(pen)
@@ -345,64 +382,10 @@ class VeritasTitleBar(QFrame):
 		super().mouseReleaseEvent(event)
 
 
-# Stylesheet for the shared title bar; appended to each window's stylesheet so
-# all three windows share one chrome look.
-VERITAS_TITLEBAR_QSS = """
-	QFrame#VeritasTitleBar {
-		background-color: #FFFFFF;
-		border-top-left-radius: 16px;
-		border-top-right-radius: 16px;
-		border-bottom: 1px solid #E5E7EB;
-	}
-	QLabel#VeritasTitleBrand { color: #111827; font-size: 13px; font-weight: 850; letter-spacing: 1px; }
-	QLabel#VeritasTitleSub { color: #6B7280; font-size: 11px; font-weight: 650; }
-	QLabel#VeritasTitleSep { color: #CBD5E1; font-size: 12px; }
-	QPushButton#WinCtlButton, QPushButton#WinCtlCloseButton {
-		background-color: transparent; border: none; border-radius: 6px;
-	}
-	QPushButton#WinCtlButton:hover { background-color: #EDEFF2; }
-	QPushButton#WinCtlCloseButton:hover { background-color: #E81123; }
-"""
-
-
-# Soft sky-blue gradient painted behind chat bubbles and live suggestion cards.
-# The scroll body is its own widget that has to paint *something*: left
-# transparent it falls back to a bare surface that composites to BLACK on the
-# translucent assist window. Shared by ChatPanel, SuggestionList and every host's
-# AssistSectionCard rule so all chat / assist surfaces match. The literal must
-# stay in sync with the QSS copies below and in MainWindow._build_stylesheet.
-CHAT_SURFACE_GRADIENT = (
-	"qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #E3EFFB, stop:1 #F4F9FE)"
-)
-
-
-# Chat surface styling, copied from the main window so the editor's 대화 tab
-# renders identically to the main 채팅 page (both reuse ChatPanel / ChatInputBar /
-# ChatMessageBubble, but each top-level window must carry the rules itself).
-# Keep in sync with the matching rules in MainWindow._build_stylesheet.
-CHAT_QSS = """
-	QFrame#AssistPagePanel { background-color: #F8FAFC; border: 1px solid #E5E7EB; border-radius: 16px; }
-	QFrame#AssistSectionCard { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #E3EFFB, stop:1 #F4F9FE); border: 1px solid #E5E7EB; border-radius: 13px; }
-	QLabel#AssistSectionTitle { color: #111827; font-size: 13px; font-weight: 850; }
-	QScrollArea#AssistScrollArea { background-color: transparent; border: none; }
-	QScrollArea#ChatScroll { background: transparent; border: none; }
-	QLabel#AssistEmptyState { background-color: #F8FAFC; border: 1px dashed #CBD5E1; border-radius: 12px; color: #6B7280; padding: 18px 14px; font-weight: 650; }
-	QPushButton#AssistCopyButton { background-color: #FFFFFF; color: #4B5563; border: 1px solid #D1D5DB; border-radius: 8px; padding: 5px 8px; font-size: 11px; font-weight: 800; }
-	QPushButton#AssistCopyButton:hover { background-color: #F3F4F6; color: #111827; }
-	QFrame#AssistUserBubble { background-color: #DBEAFE; border: 1px solid #BFDBFE; border-radius: 13px; border-top-right-radius: 4px; }
-	QFrame#AssistAiBubble { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 13px; border-top-left-radius: 4px; }
-	QLabel#AssistBubbleMeta { color: #6B7280; font-size: 10px; font-weight: 800; }
-	QTextBrowser#AssistBubbleText { color: #1F2937; font-size: 12px; font-weight: 600; background: transparent; border: none; }
-	QFrame#AssistInputBar { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 14px; }
-	QTextEdit#AssistChatInput { background-color: #F8FAFC; border: 1px solid #E5E7EB; border-radius: 11px; padding: 8px 10px; color: #111827; selection-background-color: #BFDBFE; selection-color: #111827; }
-	QTextEdit#AssistChatInput:focus { background-color: #FFFFFF; border: 1px solid #3B82F6; }
-	QPushButton#AssistSendButton { background-color: #3B82F6; border: 1px solid #2563EB; border-radius: 11px; color: #FFFFFF; font-weight: 850; }
-	QPushButton#AssistSendButton:hover { background-color: #2563EB; }
-	QPushButton#AssistModeButton { background-color: #F1F5F9; color: #475569; border: 1px solid #D1D5DB; border-radius: 11px; padding: 0px; font-size: 13px; font-weight: 800; }
-	QPushButton#AssistModeButton:hover { background-color: #E0E7FF; border-color: #818CF8; color: #3730A3; }
-	QPushButton#AssistModeButton[researchActive="true"] { background-color: #1E3A8A; border-color: #1E3A8A; color: #FFFFFF; }
-	QPushButton#AssistModeButton[researchActive="true"]:hover { background-color: #1E40AF; border-color: #1E40AF; color: #FFFFFF; }
-"""
+# The shared title-bar and chat-surface stylesheets, plus the chat-surface
+# gradient, now live in `frontend/theme/stylesheet.py` (titlebar_qss / chat_qss /
+# chat_surface_gradient) so they render light or dark from one palette. Each
+# window pulls them in via build_*_qss(theme.palette()).
 
 
 class WindowIconButton(QPushButton):
@@ -468,29 +451,6 @@ class CustomTitleBar(QFrame):
 		super().mouseReleaseEvent(event)
 
 
-# Rating chips are styled inline (not via an ancestor stylesheet): the card
-# renders in two hosts — the floating DocumentAssistWindow and the main-window
-# DocumentAssistPage — and only the former carries the assist stylesheet, so an
-# objectName rule there left the chips falling back to a dark global QPushButton
-# style with text clipped. Inline QSS travels with the widget and wins over the
-# ancestor sheet everywhere.
-_RATE_CHIP_BASE = (
-	"QPushButton{{background:#FFFFFF;color:#4B5563;border:1px solid #D1D5DB;"
-	"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}}"
-	"QPushButton:hover{{background:{hbg};color:{hfg};border-color:{hbd};}}"
-)
-_LIKE_CHIP_QSS = _RATE_CHIP_BASE.format(hbg="#ECFDF5", hfg="#047857", hbd="#6EE7B7")
-_DISLIKE_CHIP_QSS = _RATE_CHIP_BASE.format(hbg="#FEF2F2", hfg="#B91C1C", hbd="#FCA5A5")
-_LIKE_CHIP_CHOSEN_QSS = (
-	"QPushButton{background:#D1FAE5;color:#047857;border:1px solid #6EE7B7;"
-	"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}"
-)
-_DISLIKE_CHIP_CHOSEN_QSS = (
-	"QPushButton{background:#FEE2E2;color:#B91C1C;border:1px solid #FCA5A5;"
-	"border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;}"
-)
-
-
 class SuggestionCard(QFrame):
 	# (event_id, intervention_type, action) — action ∈ {"like","dislike","copy"}.
 	# Re-emitted up through SuggestionList so the host page can POST the reward.
@@ -512,6 +472,7 @@ class SuggestionCard(QFrame):
 		self._event_id = event_id
 		self._intervention_type = intervention_type
 		self._rated = False
+		self._rated_action: str | None = None
 
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(12, 11, 12, 11)
@@ -550,7 +511,6 @@ class SuggestionCard(QFrame):
 		self._note.setTextFormat(Qt.PlainText)
 		self._note.setTextInteractionFlags(Qt.TextSelectableByMouse)
 		self._note.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-		self._note.setStyleSheet("color:#6B7280; font-size:12px;")
 		self._note.setVisible(False)
 
 		layout.addLayout(header)
@@ -568,14 +528,12 @@ class SuggestionCard(QFrame):
 			footer.addStretch(1)
 			self._like_button = QPushButton("도움됨")
 			self._like_button.setObjectName("AssistLikeButton")
-			self._like_button.setStyleSheet(_LIKE_CHIP_QSS)
 			self._like_button.setFixedHeight(30)
 			self._like_button.setMinimumWidth(60)
 			self._like_button.setCursor(Qt.PointingHandCursor)
 			self._like_button.clicked.connect(lambda: self._on_rate("like"))
 			self._dislike_button = QPushButton("아쉬움")
 			self._dislike_button.setObjectName("AssistDislikeButton")
-			self._dislike_button.setStyleSheet(_DISLIKE_CHIP_QSS)
 			self._dislike_button.setFixedHeight(30)
 			self._dislike_button.setMinimumWidth(60)
 			self._dislike_button.setCursor(Qt.PointingHandCursor)
@@ -586,6 +544,23 @@ class SuggestionCard(QFrame):
 		else:
 			self._like_button = None
 			self._dislike_button = None
+
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		self._note.setStyleSheet(
+			f"color:{theme.color('text.secondary.gray')}; font-size:12px;"
+		)
+		palette = theme.palette()
+		if self._like_button is not None:
+			self._like_button.setStyleSheet(
+				_rate_chip_qss(palette, "like", chosen=self._rated_action == "like")
+			)
+		if self._dislike_button is not None:
+			self._dislike_button.setStyleSheet(
+				_rate_chip_qss(palette, "dislike", chosen=self._rated_action == "dislike")
+			)
 
 	def set_card_width(self, width: int) -> None:
 		self._card_width = width
@@ -627,13 +602,14 @@ class SuggestionCard(QFrame):
 		if self._rated or not self._event_id:
 			return
 		self._rated = True
+		self._rated_action = action
 		for button in (self._like_button, self._dislike_button):
 			if button is not None:
 				button.setEnabled(False)
 		if action == "like" and self._like_button is not None:
-			self._like_button.setStyleSheet(_LIKE_CHIP_CHOSEN_QSS)
+			self._like_button.setStyleSheet(_rate_chip_qss(theme.palette(), "like", chosen=True))
 		elif action == "dislike" and self._dislike_button is not None:
-			self._dislike_button.setStyleSheet(_DISLIKE_CHIP_CHOSEN_QSS)
+			self._dislike_button.setStyleSheet(_rate_chip_qss(theme.palette(), "dislike", chosen=True))
 		self.feedbackSubmitted.emit(self._event_id, self._intervention_type, action)
 
 	def set_text(self, text: str) -> None:
@@ -786,11 +762,11 @@ class SuggestionList(QFrame):
 
 		self.container = QWidget()
 		self.container.setObjectName("AssistScrollBody")
-		# Paint the sky gradient on the scroll body itself so the empty area below
-		# the cards is never a bare (black on translucent windows) surface.
-		self.container.setStyleSheet(
-			f"QWidget#AssistScrollBody {{ background: {CHAT_SURFACE_GRADIENT}; }}"
-		)
+		# The sky gradient is painted by the window stylesheet (QWidget#AssistScrollBody);
+		# WA_StyledBackground lets that ancestor rule fill this plain QWidget so the empty
+		# area below the cards is never a bare surface (black on translucent windows) — and
+		# it re-tints automatically on a light/dark toggle.
+		self.container.setAttribute(Qt.WA_StyledBackground, True)
 		self.container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 		self.layout = QVBoxLayout(self.container)
 		self.layout.setContentsMargins(0, 0, 0, 0)
@@ -1051,6 +1027,7 @@ class CopyButton(QPushButton):
 		self._reset_timer.setSingleShot(True)
 		self._reset_timer.setInterval(1300)
 		self._reset_timer.timeout.connect(self._reset_state)
+		theme.themeChanged.connect(self._apply_theme)
 
 	def show_copied(self) -> None:
 		self._copied = True
@@ -1063,6 +1040,9 @@ class CopyButton(QPushButton):
 		self.setToolTip("답변 복사")
 		self.update()
 
+	def _apply_theme(self, *args) -> None:
+		self.update()
+
 	def paintEvent(self, event) -> None:  # type: ignore[override]
 		super().paintEvent(event)  # hover background from the stylesheet
 		painter = QPainter(self)
@@ -1071,7 +1051,7 @@ class CopyButton(QPushButton):
 		cx, cy = center.x() + 0.5, center.y() + 0.5
 
 		if self._copied:
-			pen = QPen(QColor("#15803D"))
+			pen = QPen(QColor(theme.color("success.fg")))
 			pen.setWidthF(1.7)
 			pen.setCapStyle(Qt.RoundCap)
 			pen.setJoinStyle(Qt.RoundJoin)
@@ -1083,7 +1063,7 @@ class CopyButton(QPushButton):
 			painter.drawPath(check)
 			return
 
-		color = QColor("#0F172A") if self.underMouse() else QColor("#94A3B8")
+		color = QColor(theme.color("text.primary")) if self.underMouse() else QColor(theme.color("text.muted"))
 		pen = QPen(color)
 		pen.setWidthF(1.4)
 		pen.setJoinStyle(Qt.RoundJoin)
@@ -1095,7 +1075,7 @@ class CopyButton(QPushButton):
 		painter.drawRoundedRect(back, 1.8, 1.8)
 		front_path = QPainterPath()
 		front_path.addRoundedRect(front, 1.8, 1.8)
-		painter.fillPath(front_path, QColor("#FFFFFF"))
+		painter.fillPath(front_path, QColor(theme.color("bubble.ai.bg")))
 		painter.drawPath(front_path)
 
 
@@ -1421,11 +1401,10 @@ class ChatPanel(QFrame):
 
 		self.container = QWidget()
 		self.container.setObjectName("ChatScrollBody")
-		# Paint the sky gradient on the scroll body itself so the area below the
-		# messages is never a bare (black on translucent windows) surface.
-		self.container.setStyleSheet(
-			f"QWidget#ChatScrollBody {{ background: {CHAT_SURFACE_GRADIENT}; }}"
-		)
+		# Painted by the window stylesheet (QWidget#ChatScrollBody) via WA_StyledBackground
+		# so the area below the messages is never a bare surface (black on translucent
+		# windows) and re-tints automatically on a light/dark toggle.
+		self.container.setAttribute(Qt.WA_StyledBackground, True)
 		self.container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 		self.layout = QVBoxLayout(self.container)
 		self.layout.setContentsMargins(0, 0, 0, 0)
@@ -1811,6 +1790,7 @@ class DocumentAssistWindow(QWidget):
 
 		self._build_ui()
 		self._apply_stylesheet()
+		theme.themeChanged.connect(lambda _m: self._apply_stylesheet())
 		self._install_chat_zoom_shortcuts()
 		# screen-monitoring 이벤트 broker 연결 — 보조창과 DocumentAssistPage가 같은 데이터 공유.
 		self._screen_store = get_screen_event_store()
@@ -1952,250 +1932,8 @@ class DocumentAssistWindow(QWidget):
 		)
 
 	def _apply_stylesheet(self) -> None:
-		self.setStyleSheet(
-			"""
-			QWidget {
-				color: #111827;
-				font-family: 'Segoe UI Variable', 'Segoe UI', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
-				font-size: 13px;
-			}
-			QFrame#AssistPanel {
-				background-color: #F8FAFC;
-				border: 1px solid #E5E7EB;
-				border-radius: 16px;
-			}
-			QFrame#AssistTitleBar {
-				background-color: #FFFFFF;
-				border-top-left-radius: 16px;
-				border-top-right-radius: 16px;
-				border-bottom: 1px solid #E5E7EB;
-			}
-			QFrame#AssistContent {
-				background-color: #F8FAFC;
-				border-bottom-left-radius: 16px;
-				border-bottom-right-radius: 16px;
-			}
-			QStackedWidget#AssistBodyStack {
-				background-color: transparent;
-			}
-			QFrame#AssistViewToggle {
-				background-color: #EEF1F6;
-				border: 1px solid #E2E8F0;
-				border-radius: 13px;
-			}
-			QPushButton#AssistViewSegment {
-				background-color: transparent;
-				color: #64748B;
-				border: 1px solid transparent;
-				border-radius: 10px;
-				padding: 8px 10px;
-				font-size: 13px;
-				font-weight: 800;
-			}
-			QPushButton#AssistViewSegment:hover {
-				color: #334155;
-			}
-			QPushButton#AssistViewSegment:checked {
-				background-color: #FFFFFF;
-				color: #1D4ED8;
-				border: 1px solid #DCE3EC;
-			}
-			QPushButton#AssistViewSegment:checked:hover {
-				color: #1D4ED8;
-			}
-			QLabel#AssistWindowTitle {
-				color: #111827;
-				font-size: 13px;
-				font-weight: 850;
-			}
-			QLabel#AssistTitleContext {
-				color: #6B7280;
-				font-size: 11px;
-				font-weight: 650;
-			}
-			QPushButton#AssistMinimizeButton,
-			QPushButton#AssistCloseButton {
-				background-color: transparent;
-				color: #6B7280;
-				border: none;
-				border-radius: 9px;
-				font-size: 16px;
-				font-weight: 700;
-				padding: 0px;
-			}
-			QPushButton#AssistMinimizeButton:hover {
-				background-color: #F3F4F6;
-				color: #111827;
-			}
-			QPushButton#AssistCloseButton:hover {
-				background-color: #FEE2E2;
-				color: #DC2626;
-			}
-			QFrame#AssistSectionCard {
-				background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #E3EFFB, stop:1 #F4F9FE);
-				border: 1px solid #E5E7EB;
-				border-radius: 13px;
-			}
-			QLabel#AssistSubText {
-				color: #6B7280;
-				font-size: 12px;
-				font-weight: 600;
-			}
-			QLabel#AssistSectionTitle {
-				color: #111827;
-				font-size: 13px;
-				font-weight: 850;
-			}
-			QScrollArea#AssistScrollArea {
-				background-color: transparent;
-				border: none;
-			}
-			QFrame#SuggestionCard {
-				background-color: #FFFFFF;
-				border: 1px solid #E5E7EB;
-				border-radius: 12px;
-			}
-			QLabel#SuggestionText {
-				color: #1F2937;
-				font-size: 13px;
-				font-weight: 650;
-				line-height: 1.5;
-			}
-			QLabel#AssistEmptyState {
-				background-color: #F8FAFC;
-				border: 1px dashed #CBD5E1;
-				border-radius: 12px;
-				color: #6B7280;
-				padding: 18px 14px;
-				font-weight: 650;
-			}
-			QPushButton#AssistCopyButton {
-				background-color: #FFFFFF;
-				color: #4B5563;
-				border: 1px solid #D1D5DB;
-				border-radius: 8px;
-				padding: 5px 8px;
-				font-size: 11px;
-				font-weight: 800;
-			}
-			QPushButton#AssistCopyButton:hover {
-				background-color: #F3F4F6;
-				color: #111827;
-			}
-			QFrame#AssistUserBubble {
-				background-color: #DBEAFE;
-				border: 1px solid #BFDBFE;
-				border-radius: 13px;
-				border-top-right-radius: 4px;
-			}
-			QFrame#AssistAiBubble {
-				background-color: #FFFFFF;
-				border: 1px solid #E5E7EB;
-				border-radius: 13px;
-				border-top-left-radius: 4px;
-			}
-			QLabel#AssistBubbleMeta {
-				color: #6B7280;
-				font-size: 11px;
-				font-weight: 800;
-			}
-			QTextBrowser#AssistBubbleText {
-				color: #1F2937;
-				font-size: 14px;
-				font-weight: 600;
-				background: transparent;
-				border: none;
-			}
-			QFrame#AssistInputBar {
-				background-color: #FFFFFF;
-				border: 1px solid #E5E7EB;
-				border-radius: 14px;
-			}
-			QTextEdit#AssistChatInput {
-				background-color: #F8FAFC;
-				border: 1px solid #E5E7EB;
-				border-radius: 11px;
-				padding: 8px 10px;
-				color: #111827;
-				font-size: 13px;
-				selection-background-color: #BFDBFE;
-				selection-color: #111827;
-			}
-			QTextEdit#AssistChatInput:focus {
-				background-color: #FFFFFF;
-				border: 1px solid #3B82F6;
-			}
-			QPushButton#AssistSendButton {
-				background-color: #3B82F6;
-				border: 1px solid #2563EB;
-				border-radius: 11px;
-				color: #FFFFFF;
-				font-weight: 850;
-			}
-			QPushButton#AssistSendButton:hover {
-				background-color: #2563EB;
-			}
-			QPushButton#AssistModeButton {
-				background-color: #F1F5F9;
-				color: #475569;
-				border: 1px solid #D1D5DB;
-				border-radius: 11px;
-				padding: 0px;
-				font-size: 13px;
-				font-weight: 800;
-			}
-			QPushButton#AssistModeButton:hover {
-				background-color: #E0E7FF;
-				border-color: #818CF8;
-				color: #3730A3;
-			}
-			QPushButton#AssistModeButton[researchActive="true"] {
-				background-color: #1E3A8A;
-				border-color: #1E3A8A;
-				color: #FFFFFF;
-			}
-			QPushButton#AssistModeButton[researchActive="true"]:hover {
-				background-color: #1E40AF;
-				border-color: #1E40AF;
-				color: #FFFFFF;
-			}
-			QMenu {
-				background-color: #FFFFFF;
-				border: 1px solid #CBD5E1;
-				border-radius: 8px;
-				padding: 6px;
-			}
-			QMenu::item {
-				color: #111827;
-				padding: 8px 28px 8px 12px;
-				border-radius: 6px;
-			}
-			QMenu::item:selected {
-				background-color: #EEF2FF;
-				color: #3730A3;
-			}
-			QScrollBar:vertical {
-				background: transparent;
-				width: 8px;
-				margin: 2px 0 2px 0;
-			}
-			QScrollBar::handle:vertical {
-				background: #CBD5E1;
-				border-radius: 4px;
-				min-height: 26px;
-			}
-			QScrollBar::add-line:vertical,
-			QScrollBar::sub-line:vertical {
-				height: 0px;
-			}
-			QScrollBar::add-page:vertical,
-			QScrollBar::sub-page:vertical {
-				background: transparent;
-			}
-			"""
-			+ VERITAS_TITLEBAR_QSS
-			+ CHAT_QSS
-		)
+		self.setStyleSheet(build_assist_window_qss(theme.palette()))
+
 
 	def update_assist_text(self, text: str) -> None:
 		self.suggestion_list.set_suggestions([{"category": "수정", "text": text, "tone": "working"}])
