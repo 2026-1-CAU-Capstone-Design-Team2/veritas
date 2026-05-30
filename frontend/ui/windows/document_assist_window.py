@@ -33,6 +33,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
 	QApplication,
+	QButtonGroup,
 	QFrame,
 	QGraphicsDropShadowEffect,
 	QHBoxLayout,
@@ -41,7 +42,7 @@ from PySide6.QtWidgets import (
 	QScrollArea,
 	QSizeGrip,
 	QSizePolicy,
-	QSplitter,
+	QStackedWidget,
 	QTextBrowser,
 	QTextEdit,
 	QVBoxLayout,
@@ -364,13 +365,24 @@ VERITAS_TITLEBAR_QSS = """
 """
 
 
+# Soft sky-blue gradient painted behind chat bubbles and live suggestion cards.
+# The scroll body is its own widget that has to paint *something*: left
+# transparent it falls back to a bare surface that composites to BLACK on the
+# translucent assist window. Shared by ChatPanel, SuggestionList and every host's
+# AssistSectionCard rule so all chat / assist surfaces match. The literal must
+# stay in sync with the QSS copies below and in MainWindow._build_stylesheet.
+CHAT_SURFACE_GRADIENT = (
+	"qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #E3EFFB, stop:1 #F4F9FE)"
+)
+
+
 # Chat surface styling, copied from the main window so the editor's 대화 tab
 # renders identically to the main 채팅 page (both reuse ChatPanel / ChatInputBar /
 # ChatMessageBubble, but each top-level window must carry the rules itself).
 # Keep in sync with the matching rules in MainWindow._build_stylesheet.
 CHAT_QSS = """
 	QFrame#AssistPagePanel { background-color: #F8FAFC; border: 1px solid #E5E7EB; border-radius: 16px; }
-	QFrame#AssistSectionCard { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 13px; }
+	QFrame#AssistSectionCard { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #E3EFFB, stop:1 #F4F9FE); border: 1px solid #E5E7EB; border-radius: 13px; }
 	QLabel#AssistSectionTitle { color: #111827; font-size: 13px; font-weight: 850; }
 	QScrollArea#AssistScrollArea { background-color: transparent; border: none; }
 	QScrollArea#ChatScroll { background: transparent; border: none; }
@@ -725,11 +737,23 @@ class SuggestionList(QFrame):
 
 	# Bubbles each card's (event_id, intervention_type, action) up to the host.
 	feedbackSubmitted = Signal(str, str, str)
+	# Emits the suggestion count whenever it changes, so a host (e.g. the assist
+	# window's view toggle) can surface the number without owning the data.
+	countChanged = Signal(int)
 
-	def __init__(self, parent: QWidget | None = None, *, hug_content: bool = False) -> None:
+	def __init__(
+		self,
+		parent: QWidget | None = None,
+		*,
+		hug_content: bool = False,
+		show_header: bool = True,
+	) -> None:
 		super().__init__(parent)
 		self.setObjectName("AssistSectionCard")
 		self._hug_content = hug_content
+		# When False the section header (title + count) is omitted — used by the
+		# assist window, where the segmented view toggle already names the panel.
+		self._show_header = show_header
 		if hug_content:
 			# Maximum: take exactly the content height when it fits, never more.
 			self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
@@ -761,6 +785,12 @@ class SuggestionList(QFrame):
 		self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
 		self.container = QWidget()
+		self.container.setObjectName("AssistScrollBody")
+		# Paint the sky gradient on the scroll body itself so the empty area below
+		# the cards is never a bare (black on translucent windows) surface.
+		self.container.setStyleSheet(
+			f"QWidget#AssistScrollBody {{ background: {CHAT_SURFACE_GRADIENT}; }}"
+		)
 		self.container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 		self.layout = QVBoxLayout(self.container)
 		self.layout.setContentsMargins(0, 0, 0, 0)
@@ -772,9 +802,15 @@ class SuggestionList(QFrame):
 		self.empty.setAlignment(Qt.AlignCenter)
 		self.empty.setWordWrap(True)
 
-		self._root.addLayout(header)
+		if self._show_header:
+			self._root.addLayout(header)
 		self._root.addWidget(self.scroll, 1)
 		self.set_suggestions([])
+
+	def _set_count(self, count: int) -> None:
+		"""Update the count read-out and notify listeners (e.g. the view toggle)."""
+		self.count_label.setText(f"{count}개")
+		self.countChanged.emit(count)
 
 	def set_suggestions(self, suggestions: list[dict[str, str]]) -> None:
 		self._suggestions = [dict(item) for item in suggestions]
@@ -784,7 +820,7 @@ class SuggestionList(QFrame):
 		if not self._suggestions:
 			self.layout.addWidget(self.empty)
 			self.empty.show()
-			self.count_label.setText("0개")
+			self._set_count(0)
 			self.layout.addStretch(1)
 			self.schedule_width_update()
 			if self._hug_content:
@@ -813,7 +849,7 @@ class SuggestionList(QFrame):
 		# last card and trailing a blank gap under its text.
 		self.layout.addStretch(1)
 
-		self.count_label.setText(f"{len(self._suggestions)}개")
+		self._set_count(len(self._suggestions))
 		self.schedule_width_update()
 		self.schedule_scroll_to_bottom()
 		if self._hug_content:
@@ -863,7 +899,7 @@ class SuggestionList(QFrame):
 		self.layout.addWidget(card)
 		self.layout.addStretch(1)
 
-		self.count_label.setText(f"{len(self._suggestions)}개")
+		self._set_count(len(self._suggestions))
 		self.schedule_width_update()
 		self.schedule_scroll_to_bottom()
 
@@ -1360,7 +1396,12 @@ class ChatPanel(QFrame):
 	_MIN_FONT_PT = 9
 	_MAX_FONT_PT = 30
 
-	def __init__(self, title_text: str = "문서 채팅", parent: QWidget | None = None) -> None:
+	def __init__(
+		self,
+		title_text: str = "문서 채팅",
+		show_title: bool = True,
+		parent: QWidget | None = None,
+	) -> None:
 		super().__init__(parent)
 		self.setObjectName("AssistSectionCard")
 		self._bubble_font_pt = self._BASE_FONT_PT
@@ -1379,6 +1420,12 @@ class ChatPanel(QFrame):
 		self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
 		self.container = QWidget()
+		self.container.setObjectName("ChatScrollBody")
+		# Paint the sky gradient on the scroll body itself so the area below the
+		# messages is never a bare (black on translucent windows) surface.
+		self.container.setStyleSheet(
+			f"QWidget#ChatScrollBody {{ background: {CHAT_SURFACE_GRADIENT}; }}"
+		)
 		self.container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 		self.layout = QVBoxLayout(self.container)
 		self.layout.setContentsMargins(0, 0, 0, 0)
@@ -1392,7 +1439,8 @@ class ChatPanel(QFrame):
 		self.empty.setWordWrap(True)
 		self.layout.insertWidget(0, self.empty)
 
-		root.addWidget(title)
+		if show_title:
+			root.addWidget(title)
 		root.addWidget(self.scroll, 1)
 		self._bubbles: list[ChatMessageBubble] = []
 		self._streaming_chunks: list[str] = []
@@ -1673,6 +1721,70 @@ class ChatInputBar(QFrame):
 		self.input.clear()
 
 
+class AssistViewToggle(QFrame):
+	"""Segmented two-way switch pinned to the top of the assist window.
+
+	Styled as a pill 'track' with a white thumb on the active segment (the
+	native segmented-control look), it flips the body between the live edit
+	suggestions ("실시간 수정 결과") and the document chat ("문서 채팅") so only
+	one surface shows at a time. The suggestions segment carries a live count.
+	"""
+
+	# Emits "suggestions" or "chat" when the active segment changes.
+	modeChanged = Signal(str)
+
+	_SUGGESTIONS_LABEL = "실시간 수정 결과"
+	_CHAT_LABEL = "문서 채팅"
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self.setObjectName("AssistViewToggle")
+
+		layout = QHBoxLayout(self)
+		layout.setContentsMargins(4, 4, 4, 4)
+		layout.setSpacing(4)
+
+		# An exclusive group gives the segments radio semantics: exactly one is
+		# ever checked, and the active one can't be toggled off by re-clicking.
+		self._group = QButtonGroup(self)
+		self._group.setExclusive(True)
+
+		self.suggestions_button = QPushButton(self._SUGGESTIONS_LABEL)
+		self.suggestions_button.setObjectName("AssistViewSegment")
+		self.suggestions_button.setCheckable(True)
+		self.suggestions_button.setChecked(True)
+		self.suggestions_button.setCursor(Qt.PointingHandCursor)
+
+		self.chat_button = QPushButton(self._CHAT_LABEL)
+		self.chat_button.setObjectName("AssistViewSegment")
+		self.chat_button.setCheckable(True)
+		self.chat_button.setCursor(Qt.PointingHandCursor)
+
+		self._group.addButton(self.suggestions_button)
+		self._group.addButton(self.chat_button)
+
+		layout.addWidget(self.suggestions_button, 1)
+		layout.addWidget(self.chat_button, 1)
+
+		self.suggestions_button.clicked.connect(lambda: self.modeChanged.emit("suggestions"))
+		self.chat_button.clicked.connect(lambda: self.modeChanged.emit("chat"))
+
+	def set_mode(self, mode: str, *, emit: bool = True) -> None:
+		"""Programmatically select a segment (e.g. to restore the last view)."""
+		is_chat = mode == "chat"
+		self.chat_button.setChecked(is_chat)
+		self.suggestions_button.setChecked(not is_chat)
+		if emit:
+			self.modeChanged.emit("chat" if is_chat else "suggestions")
+
+	def set_suggestion_count(self, count: int) -> None:
+		"""Append a live count to the suggestions segment (cleared when zero)."""
+		if count > 0:
+			self.suggestions_button.setText(f"{self._SUGGESTIONS_LABEL}  ·  {count}")
+		else:
+			self.suggestions_button.setText(self._SUGGESTIONS_LABEL)
+
+
 class DocumentAssistWindow(QWidget):
 	messageSubmitted = Signal(str)
 	visibilityChanged = Signal(bool)
@@ -1753,28 +1865,32 @@ class DocumentAssistWindow(QWidget):
 		content_layout.setContentsMargins(12, 10, 12, 8)
 		content_layout.setSpacing(10)
 
-		# A draggable divider lets the user trade height between the suggestion
-		# list and the chat, so neither caps the other at a fixed ratio.
-		self.suggestion_list = SuggestionList()
-		self.suggestion_list.setMinimumHeight(120)
-		self.chat_panel = ChatPanel()
-		self.chat_panel.setMinimumHeight(160)
+		# One surface at a time: the segmented toggle above swaps the body between
+		# the live edit suggestions and the document chat, instead of splitting the
+		# window top/bottom. The panels drop their own titles since the toggle
+		# already names the active view.
+		self.suggestion_list = SuggestionList(show_header=False)
+		self.chat_panel = ChatPanel(show_title=False)
 		self.input_bar = ChatInputBar()
 		self.input_bar.sendRequested.connect(self.on_message_submitted)
 		self.input_bar.modeChanged.connect(self._on_mode_changed)
 
-		self.content_split = QSplitter(Qt.Vertical)
-		self.content_split.setObjectName("AssistContentSplit")
-		self.content_split.setChildrenCollapsible(False)
-		self.content_split.setHandleWidth(10)
-		self.content_split.addWidget(self.suggestion_list)
-		self.content_split.addWidget(self.chat_panel)
-		self.content_split.setStretchFactor(0, 0)
-		self.content_split.setStretchFactor(1, 1)
-		self.content_split.setSizes([220, 380])
+		self.view_toggle = AssistViewToggle()
+		self.view_toggle.modeChanged.connect(self._on_view_changed)
+		self.suggestion_list.countChanged.connect(self.view_toggle.set_suggestion_count)
 
-		content_layout.addWidget(self.content_split, 1)
+		self.body_stack = QStackedWidget()
+		self.body_stack.setObjectName("AssistBodyStack")
+		self.body_stack.addWidget(self.suggestion_list)
+		self.body_stack.addWidget(self.chat_panel)
+
+		content_layout.addWidget(self.view_toggle)
+		content_layout.addWidget(self.body_stack, 1)
 		content_layout.addWidget(self.input_bar)
+
+		# Land on the live suggestions view; the chat input only belongs to chat.
+		self.body_stack.setCurrentWidget(self.suggestion_list)
+		self.input_bar.setVisible(False)
 
 		grip_row = QHBoxLayout()
 		grip_row.setContentsMargins(0, 0, 0, 0)
@@ -1859,17 +1975,33 @@ class DocumentAssistWindow(QWidget):
 				border-bottom-left-radius: 16px;
 				border-bottom-right-radius: 16px;
 			}
-			QSplitter#AssistContentSplit {
+			QStackedWidget#AssistBodyStack {
 				background-color: transparent;
 			}
-			QSplitter#AssistContentSplit::handle:vertical {
-				background-color: #E5E7EB;
-				height: 3px;
-				margin: 3px 40px;
-				border-radius: 1px;
+			QFrame#AssistViewToggle {
+				background-color: #EEF1F6;
+				border: 1px solid #E2E8F0;
+				border-radius: 13px;
 			}
-			QSplitter#AssistContentSplit::handle:vertical:hover {
-				background-color: #94A3B8;
+			QPushButton#AssistViewSegment {
+				background-color: transparent;
+				color: #64748B;
+				border: 1px solid transparent;
+				border-radius: 10px;
+				padding: 8px 10px;
+				font-size: 13px;
+				font-weight: 800;
+			}
+			QPushButton#AssistViewSegment:hover {
+				color: #334155;
+			}
+			QPushButton#AssistViewSegment:checked {
+				background-color: #FFFFFF;
+				color: #1D4ED8;
+				border: 1px solid #DCE3EC;
+			}
+			QPushButton#AssistViewSegment:checked:hover {
+				color: #1D4ED8;
 			}
 			QLabel#AssistWindowTitle {
 				color: #111827;
@@ -1900,7 +2032,7 @@ class DocumentAssistWindow(QWidget):
 				color: #DC2626;
 			}
 			QFrame#AssistSectionCard {
-				background-color: #FFFFFF;
+				background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #E3EFFB, stop:1 #F4F9FE);
 				border: 1px solid #E5E7EB;
 				border-radius: 13px;
 			}
@@ -2120,6 +2252,20 @@ class DocumentAssistWindow(QWidget):
 			self.title_bar.status.setText("자료조사")
 		else:
 			self.title_bar.status.setText("● 분석 중")
+
+	def _on_view_changed(self, mode: str) -> None:
+		"""Swap the body between the suggestions and chat surfaces.
+
+		The chat input only makes sense in the chat view, so it is hidden while
+		the live edit suggestions are shown — giving the list the full height.
+		"""
+		if mode == "chat":
+			self.body_stack.setCurrentWidget(self.chat_panel)
+			self.input_bar.setVisible(True)
+			self.chat_panel.force_scroll_bottom()
+		else:
+			self.body_stack.setCurrentWidget(self.suggestion_list)
+			self.input_bar.setVisible(False)
 
 	def on_message_submitted(self, message: str) -> None:
 		# The user bubble is drawn by ChatBus subscribers (MainWindow + WritePage)

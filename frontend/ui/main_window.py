@@ -589,7 +589,10 @@ class MainWindow(QMainWindow):
 		self.setGeometry(x, y, width, height)
 
 	def _add_page(self, route: str, widget: QWidget) -> None:
-		page_widget = widget if isinstance(widget, WritePage) else self._wrap_page_with_scroll(widget)
+		# WritePage 와 DraftPage 는 고정 헤더/내비 + 내부 스크롤 본문을 스스로 관리한다.
+		# 이들을 PageScroll 로 한 번 더 감싸면 스크롤 안에 스크롤(이중 스크롤)이 생기므로
+		# 감싸지 않고, 나머지 페이지만 표준 외부 스크롤로 감싼다.
+		page_widget = widget if isinstance(widget, (WritePage, DraftPage)) else self._wrap_page_with_scroll(widget)
 		index = self.pages.addWidget(page_widget)
 		self.route_to_index[route] = index
 
@@ -851,7 +854,7 @@ class MainWindow(QMainWindow):
 		}
 
 		QFrame#AssistSectionCard {
-			background-color: #FFFFFF;
+			background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #E3EFFB, stop:1 #F4F9FE);
 			border: 1px solid #E5E7EB;
 			border-radius: 13px;
 		}

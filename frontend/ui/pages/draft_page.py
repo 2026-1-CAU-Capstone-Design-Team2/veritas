@@ -112,7 +112,21 @@ _TEXT_SUFFIXES = {".md", ".markdown", ".txt", ".rst", ".log"}
 # 계열로 통일. guide_page._PAGE_QSS 와 동일하게 페이지 루트에만 적용해 다른 화면에
 # 영향이 없도록 격리한다. (전역 PrimaryButton/GhostButton 은 그대로 재사용)
 _DRAFT_QSS = """
+/* 다른 화면과 동일한 폰트로 통일 — _DRAFT_QSS 가 페이지 루트에만 적용되므로
+   전역(main_window) 과 같은 폰트 패밀리를 텍스트 위젯에 다시 명시한다. 배경 속성이
+   없는 폰트 전용 규칙이라 컨테이너 배경에는 영향이 없다. */
+QLabel, QPushButton, QToolButton, QLineEdit, QPlainTextEdit, QTextEdit, QCheckBox {
+	font-family: 'Segoe UI Variable', 'Segoe UI', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
+}
+
 QWidget#DraftScrollInner, QScrollArea#DraftScroll, QScrollArea#DraftScroll > QWidget > QWidget {
+	background: transparent;
+}
+
+/* 라벨을 감싸는 순수 컨테이너 — 전역 QWidget 배경(#F6F8FC)을 물려받아 라벨 뒤에
+   회색 박스로 비치지 않도록 투명 처리. id 선택자로 한정해 자식 위젯 배경
+   (예: Segmented 선택 강조, 입력창)에는 영향을 주지 않는다. */
+QWidget#DotStep, QWidget#FieldBox, QWidget#ResultBody {
 	background: transparent;
 }
 
@@ -141,10 +155,6 @@ QLabel#StatusPill {
 	color: #6B7280; background-color: #FFFFFF; border: 1px solid #D1D5DB;
 	border-radius: 11px; padding: 3px 10px; font-size: 11px; font-weight: 700;
 	letter-spacing: 0.6px;
-}
-QLabel#WorkspacePill {
-	color: #1F2937; background-color: #F8FAFC; border: 1px solid #E5E7EB;
-	border-radius: 14px; padding: 4px 12px; font-size: 12px; font-weight: 600;
 }
 
 QFrame#DraftCard {
@@ -470,6 +480,9 @@ class WritingOptions(QWidget):
 
 	def _field(self, label: str, widget: QWidget) -> QWidget:
 		holder = QWidget()
+		# 라벨 뒤 회색 박스 방지 — _DRAFT_QSS 의 QWidget#FieldBox 규칙으로 투명 처리.
+		# id 선택자라 자식 위젯(Segmented 선택 강조·입력창) 배경에는 영향이 없다.
+		holder.setObjectName("FieldBox")
 		v = QVBoxLayout(holder)
 		v.setContentsMargins(0, 0, 0, 0)
 		v.setSpacing(6)
@@ -851,6 +864,8 @@ class DotStepper(QWidget):
 
 	def _step(self, num: int, label: str, state: str) -> QWidget:
 		holder = QWidget()
+		# 스텝 라벨 뒤 회색 박스 방지 — _DRAFT_QSS 의 QWidget#DotStep 규칙으로 투명 처리.
+		holder.setObjectName("DotStep")
 		row = QHBoxLayout(holder)
 		row.setContentsMargins(0, 0, 0, 0)
 		row.setSpacing(8)
@@ -961,11 +976,6 @@ class DraftPage(QWidget):
 		self._mode_pill.setObjectName("StatusPill")
 		top.addWidget(self._mode_pill, 0, Qt.AlignVCenter)
 		top.addStretch(1)
-
-		self.workspace_label = QLabel(f"워크스페이스 · {self._workspace_id}")
-		self.workspace_label.setObjectName("WorkspacePill")
-		self.workspace_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-		top.addWidget(self.workspace_label, 0, Qt.AlignVCenter)
 
 		self.restart_button = AppButton("처음부터", variant="ghost")
 		self.restart_button.clicked.connect(self._reset)
@@ -1486,6 +1496,8 @@ class DraftPage(QWidget):
 		card_layout.addWidget(toolbar)
 
 		body = QWidget()
+		# 결과 카드 본문 — 메타/안내 라벨 뒤 회색 박스 방지(_DRAFT_QSS QWidget#ResultBody).
+		body.setObjectName("ResultBody")
 		body_layout = QVBoxLayout(body)
 		body_layout.setContentsMargins(28, 22, 28, 24)
 		body_layout.setSpacing(12)
@@ -2068,11 +2080,10 @@ class DraftPage(QWidget):
 		self._show_source()
 
 	# ------------------------------------------------------------------ 외부 API
-	def set_workspace_by_name(self, workspace_name: str) -> None:
+	def set_workspace_by_name(self, _workspace_name: str) -> None:
 		# 사이드바가 갱신한 부트스트랩 캐시와 id 를 동기화 → 현재 보이는 워크스페이스
-		# 기준으로 초안을 생성한다.
+		# 기준으로 초안을 생성한다. (헤더의 워크스페이스 표시는 제거됨 — 사이드바가 담당)
 		self._workspace_id = current_workspace_id()
-		self.workspace_label.setText(f"워크스페이스 · {workspace_name or self._workspace_id}")
 		# 초안과 저장 설정은 만들어진 워크스페이스에 속하므로, 전환 시 위저드를 처음으로.
 		self._reset()
 
