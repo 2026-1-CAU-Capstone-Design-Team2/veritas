@@ -60,19 +60,6 @@ class MemoryStore:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-    def read_jsonl_tail(self, path: Path, limit: int = 50) -> list[dict[str, Any]]:
-        """Read the last ``limit`` valid JSONL rows without loading the whole file."""
-        limit = int(limit)
-        if limit <= 0 or not path.exists():
-            return []
-        rows: list[dict[str, Any]] = []
-        for line in self._read_tail_lines(path, limit):
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                continue
-        return rows
-
     def read_jsonl(self, path: Path) -> list[dict[str, Any]]:
         """Read every valid JSONL row from a file."""
         if not path.exists():
@@ -84,52 +71,6 @@ class MemoryStore:
             except Exception:
                 continue
         return rows
-
-    def _read_tail_lines(
-        self,
-        path: Path,
-        limit: int,
-        *,
-        chunk_size: int = 64 * 1024,
-    ) -> list[str]:
-        """Read the last ``limit`` text lines from the end of a file."""
-        if limit <= 0:
-            return []
-        with path.open("rb") as f:
-            f.seek(0, 2)
-            pos = f.tell()
-            buffer = b""
-            lines: list[bytes] = []
-            while pos > 0 and len(lines) <= limit:
-                read_size = min(chunk_size, pos)
-                pos -= read_size
-                f.seek(pos)
-                buffer = f.read(read_size) + buffer
-                lines = buffer.splitlines()
-            if pos > 0 and lines:
-                lines = lines[1:]
-        return [line.decode("utf-8", errors="ignore") for line in lines[-limit:]]
-
-    def write_jsonl_atomic(self, path: Path, rows: list[dict[str, Any]]) -> None:
-        """Rewrite a JSONL file via temp file + atomic replace."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-        try:
-            with tmp.open("w", encoding="utf-8") as f:
-                for row in rows:
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            tmp.replace(path)
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
-
-    def truncate(self, path: Path) -> None:
-        """Make a file empty."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
 
     def _connect(self) -> sqlite3.Connection:
         """Open a new unmanaged SQLite connection.

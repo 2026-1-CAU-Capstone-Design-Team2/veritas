@@ -180,17 +180,6 @@ class MemoryRuntimePr1Tests(unittest.TestCase):
                 queue.append_event(role=MemoryRole.USER, content="m-3", source="test")
                 self.assertEqual(queue.total_fifo_tokens(), 4)
 
-    def test_jsonl_tail_reads_from_end_without_read_text(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            store = MemoryStore(Path(tmp))
-            for index in range(100):
-                store.append_jsonl(store.summaries_path, {"id": str(index), "content": f"m-{index}"})
-
-            with patch.object(Path, "read_text", side_effect=AssertionError("full read")):
-                rows = store.read_jsonl_tail(store.summaries_path, limit=3)
-
-            self.assertEqual([row["content"] for row in rows], ["m-97", "m-98", "m-99"])
-
     def test_fifo_append_uses_sqlite_without_jsonl_mirror(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp))

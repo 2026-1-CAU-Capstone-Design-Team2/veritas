@@ -257,6 +257,14 @@ class AgentRuntime:
                 server.stop()
             except Exception:
                 pass
+        # Close the reused memory.sqlite3 connection so WAL/SHM sidecar files are
+        # checkpointed and removed instead of relying on __del__ GC at exit.
+        memory_runtime = getattr(self, "memory_runtime", None)
+        if memory_runtime is not None:
+            try:
+                memory_runtime.close()
+            except Exception:
+                pass
 
     def set_llm_parallel(self, value: int) -> int:
         """Apply the parallel-decoding concurrency to the shared LLM client.
