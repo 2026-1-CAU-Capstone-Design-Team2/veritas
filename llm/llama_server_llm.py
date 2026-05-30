@@ -227,6 +227,43 @@ class LLMClient:
                 return n_ctx
         return default
 
+    def tokenize_count(self, text: str, *, timeout_sec: float = 0.5) -> int | None:
+        """Return llama-server's token count for text, or None if unavailable."""
+        text = str(text or "")
+        if not text:
+            return 0
+
+        payload = {"content": text, "add_special": False}
+        urls = (
+            f"http://{self._chat_host}:{self._chat_port}/tokenize",
+            f"http://{self._chat_host}:{self._chat_port}/v1/tokenize",
+        )
+        for url in urls:
+            try:
+                response = httpx.post(url, json=payload, timeout=timeout_sec)
+                if response.status_code >= 400:
+                    continue
+                token_count = self._parse_tokenize_response(response.json())
+                if token_count is not None:
+                    return token_count
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _parse_tokenize_response(payload: Any) -> int | None:
+        if isinstance(payload, dict):
+            for key in ("tokens", "input_ids"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return len(value)
+            value = payload.get("count")
+            if isinstance(value, int):
+                return max(0, value)
+        if isinstance(payload, list):
+            return len(payload)
+        return None
+
     def ask(
         self,
         system_prompt: str,

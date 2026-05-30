@@ -45,6 +45,25 @@ class MemoryAwareLLMClient:
     def iter_call(self, req: CallRequest) -> Iterator[str]:
         """prepare → raw.iter_chat → commit (streaming). 스트리밍 중 tool 호출은 raw가 비-stream으로 폴백."""
         prepared = self.memory_runtime.prepare(req)
+        tools, tool_runner = self._memory_tools(req)
+        if tools:
+            text = self.raw.chat(
+                prepared.messages,
+                reasoning=False,
+                stream=False,
+                stream_label=prepared.stream_label,
+                sampling_params=prepared.sampling_params,
+                extra_sampling_params=prepared.extra_sampling_params,
+                timeout_sec=prepared.timeout_sec,
+                force_json=prepared.constraints.json_strict,
+                tools=tools,
+                tool_runner=tool_runner,
+            )
+            self.memory_runtime.commit(prepared, text)
+            if text:
+                yield text
+            return
+
         chunks: list[str] = []
         for chunk in self.raw.iter_chat(
             prepared.messages,
@@ -104,6 +123,10 @@ class MemoryAwareLLMClient:
         result = self.raw.refresh_model_info()
         try:
             self.memory_runtime.update_n_ctx(int(getattr(self.raw, "n_ctx", 0) or 0))
+        except Exception:
+            pass
+        try:
+            self.memory_runtime.token_counter.reset_remote()
         except Exception:
             pass
         return result

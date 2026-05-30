@@ -20,8 +20,8 @@ class MemoryBudget:
     recall_tokens: int = 1200
     archival_tokens: int = 1200
 
-    warning_ratio: float = 0.70
-    flush_ratio: float = 1.00
+    warning_ratio: float = 0.60
+    flush_ratio: float = 0.80
 
     @property
     def usable_prompt_tokens(self) -> int:

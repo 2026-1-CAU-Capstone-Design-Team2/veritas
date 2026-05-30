@@ -10,10 +10,12 @@ from typing import Any
 
 from core.memory.budget import MemoryBudget
 from core.memory.models import MemoryRole
+from core.memory.policy import ProfilePolicyDispatcher
 from core.memory.request import CallConstraints, CallRequest
 from services.memory_tools_funcs.context_builder import build_messages
 from services.memory_tools_funcs.external_context.archival_storage import ArchivalStorage
 from services.memory_tools_funcs.external_context.recall_storage import RecallStorage
+from services.memory_tools_funcs.main_context.heuristic_memory import extract_explicit_facts
 from services.memory_tools_funcs.main_context.queue_manage import QueueManager, utc_now_iso
 from services.memory_tools_funcs.main_context.working_context import WorkingContextManager
 from services.memory_tools_funcs.store import MemoryStore
@@ -50,13 +52,14 @@ class MemoryRuntime:
         self.workspace_root = Path(workspace_root)
         self.max_context_tokens = int(max_context_tokens)
 
-        self.token_counter = TokenCounter()
-        self.store = MemoryStore(self.workspace_root)
-        self.recall = RecallStorage(self.store)
-        self.archival = ArchivalStorage(self.store)
+        self.token_counter = TokenCounter(raw_llm)
+        self.store = MemoryStore(self.workspace_root, reuse_connection=True)
+        self.recall = RecallStorage(self.store, self.token_counter)
+        self.archival = ArchivalStorage(self.store, self.token_counter)
         self.working = WorkingContextManager(self.store, self.token_counter)
         self.queue = QueueManager(self.store, self.token_counter, self.recall)
         self.summarizer = MemorySummarizer(raw_llm)
+        self.policy_dispatcher = ProfilePolicyDispatcher()
 
         # bg flush 동시성 제어. 동시 flush 1개로 제한, 다음 prepare는 옛 summary로 진행.
         self._flush_lock = threading.Lock()
@@ -64,12 +67,17 @@ class MemoryRuntime:
 
     def configure_workspace(self, workspace_root: Path) -> None:
         """workspace 전환 시 storage 핸들을 새 디렉토리로 교체한다."""
+        self.store.close()
         self.workspace_root = Path(workspace_root)
-        self.store = MemoryStore(self.workspace_root)
-        self.recall = RecallStorage(self.store)
-        self.archival = ArchivalStorage(self.store)
+        self.store = MemoryStore(self.workspace_root, reuse_connection=True)
+        self.recall = RecallStorage(self.store, self.token_counter)
+        self.archival = ArchivalStorage(self.store, self.token_counter)
         self.working = WorkingContextManager(self.store, self.token_counter)
         self.queue = QueueManager(self.store, self.token_counter, self.recall)
+
+    def close(self) -> None:
+        """Release runtime-owned storage resources."""
+        self.store.close()
 
     def update_n_ctx(self, max_context_tokens: int) -> None:
         """모델 스왑 후 n_ctx를 갱신한다."""
@@ -84,12 +92,13 @@ class MemoryRuntime:
             current_request_tokens=self.token_counter.count(req.user_content),
         )
 
-        self._log_invocation(invocation_id, req, budget)
+        if not req.constraints.no_record:
+            self._log_invocation(invocation_id, req, budget)
 
         # flush_pressure 감지 시 즉시 flush 안 함. 이번 호출은 옛 summary로 진행하고,
         # commit() 끝난 뒤 background thread로 처리 (1세대 stale 감수).
         flush_pending = (
-            not req.constraints.latency_critical
+            self._should_record(req.constraints)
             and self.queue.is_flush_pressure(budget)
         )
 
@@ -100,15 +109,25 @@ class MemoryRuntime:
             store=self.store,
             working=self.working,
             queue=self.queue,
+            archival=self.archival,
+            retrieval_policy=self.policy_dispatcher.retrieval_for(req.profile),
         )
 
         if self._should_record(req.constraints):
+            record_content = req.record_content or req.user_content
             self.queue.append_event(
                 role=MemoryRole.USER,
-                content=req.user_content,
+                content=record_content,
                 source=req.stream_label or req.method_hint,
                 metadata={"invocation_id": invocation_id},
             )
+            for fact in extract_explicit_facts(record_content):
+                self.working.append_fact(
+                    fact,
+                    source="heuristic",
+                    tags=["explicit_user"],
+                    max_tokens=budget.working_context_tokens,
+                )
 
         return PreparedCall(
             invocation_id=invocation_id,
@@ -119,7 +138,11 @@ class MemoryRuntime:
             sampling_params=req.sampling_params,
             extra_sampling_params=req.extra_sampling_params,
             timeout_sec=req.timeout_sec,
-            metadata={"method_hint": req.method_hint, "flush_pending": flush_pending},
+            metadata={
+                "method_hint": req.method_hint,
+                "profile": req.profile,
+                "flush_pending": flush_pending,
+            },
         )
 
     def commit(self, prepared: PreparedCall, assistant_text: str) -> None:
@@ -135,7 +158,7 @@ class MemoryRuntime:
                 )
 
         if prepared.metadata.get("flush_pending"):
-            self._maybe_launch_bg_flush()
+            self._maybe_launch_bg_flush(str(prepared.metadata.get("profile") or "chat"))
 
     @staticmethod
     def _should_record(constraints: CallConstraints) -> bool:
@@ -166,7 +189,9 @@ class MemoryRuntime:
                     "json_strict": req.constraints.json_strict,
                     "latency_critical": req.constraints.latency_critical,
                     "no_record": req.constraints.no_record,
+                    "inject_memory_context": req.constraints.inject_memory_context,
                 },
+                "profile": req.profile,
                 "use_history": req.use_history,
                 "system_tokens": budget.system_tokens,
                 "request_tokens": budget.current_request_tokens,
@@ -174,28 +199,36 @@ class MemoryRuntime:
             },
         )
 
-    def _maybe_launch_bg_flush(self) -> None:
+    def _maybe_launch_bg_flush(self, profile: str = "chat") -> None:
         """이미 flush 진행 중이면 skip. 아니면 daemon thread로 fire-and-forget 시작."""
         with self._flush_lock:
             if self._flush_in_progress:
                 return
             self._flush_in_progress = True
-        t = threading.Thread(target=self._bg_flush_worker, name="memory-bg-flush", daemon=True)
+        t = threading.Thread(
+            target=self._bg_flush_worker,
+            args=(profile,),
+            name="memory-bg-flush",
+            daemon=True,
+        )
         t.start()
 
-    def _bg_flush_worker(self) -> None:
+    def _bg_flush_worker(self, profile: str = "chat") -> None:
         """bg thread 본체. _flush_fifo를 실행하고 lock 풀어준다."""
         try:
-            self._flush_fifo()
+            self._flush_fifo(profile=profile)
         except Exception as e:
             print(f"[memory][bg_flush][warn] {type(e).__name__}: {e}")
         finally:
             with self._flush_lock:
                 self._flush_in_progress = False
 
-    def _flush_fifo(self) -> None:
+    def _flush_fifo(self, *, profile: str = "chat") -> None:
         """FIFO 오래된 prefix를 evict하고 summary로 압축한다."""
-        evicted_rows = self.queue.select_evicted_rows(keep_tail=20)
+        evicted_rows = self.queue.select_evicted_rows(
+            budget=MemoryBudget(max_context_tokens=self.max_context_tokens),
+            eviction_policy=self.policy_dispatcher.eviction_for(profile),
+        )
         if not evicted_rows:
             return
 
@@ -208,4 +241,4 @@ class MemoryRuntime:
             evicted_messages=evicted_text,
         )
         if summary:
-            self.queue.reset_fifo_with_summary(summary)
+            self.queue.reset_fifo_with_summary(summary, evicted_rows=evicted_rows)

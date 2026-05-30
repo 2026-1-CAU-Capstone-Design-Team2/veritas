@@ -1,31 +1,32 @@
-"""의도 저장된 사실의 영구 보관소."""
+"""Archival memory storage backed by SQLite FTS5."""
 
 from __future__ import annotations
 
-from typing import Any
-
 from core.memory.models import MemoryItem
+from services.memory_tools_funcs.external_context.fts_memory_store import FtsMemoryStore
 from services.memory_tools_funcs.store import MemoryStore
+from services.memory_tools_funcs.token_counter import TokenCounter
 
 
-class ArchivalStorage:
-    """archival/items.jsonl insert/tail."""
+class ArchivalStorage(FtsMemoryStore):
+    """Persistent archival storage for durable memory records."""
 
-    def __init__(self, store: MemoryStore) -> None:
-        self.store = store
-
-    def insert(self, item: MemoryItem) -> None:
-        """record를 영구 보관한다."""
-        self.store.append_jsonl(
-            self.store.archival_path,
-            self.store.item_to_dict(item),
+    def __init__(
+        self,
+        store: MemoryStore,
+        token_counter: TokenCounter | None = None,
+    ) -> None:
+        super().__init__(
+            store=store,
+            legacy_path=store.archival_path,
+            legacy_db_path=store.archival_db_path,
+            table_name="archival_items",
+            fts_name="archival_fts",
+            default_tier="archival",
+            migration_key="archival_migrated",
+            token_counter=token_counter,
         )
 
-    def tail(self, limit: int = 50) -> list[dict[str, Any]]:
-        """최근 limit개를 반환한다."""
-        return self.store.read_jsonl_tail(self.store.archival_path, limit=limit)
-
-    def search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
-        """(미구현) semantic search — 항상 빈 list."""
-        del query, limit
-        return []
+    def insert(self, item: MemoryItem) -> None:
+        """Insert an archival item into SQLite."""
+        self.add(item)

@@ -7,6 +7,7 @@ import threading
 from datetime import datetime
 from typing import Any, Callable, Iterator
 
+from core.memory.request import CallConstraints, CallRequest
 from core.prompts import (
     ASSIST_GROUNDED_USER_TEMPLATE,
     ASSIST_PLAIN_USER_TEMPLATE,
@@ -581,7 +582,7 @@ class ChatAgent:
         doc_context: str = "",
     ) -> Iterator[str]:
         prompt = TOOL_CHAT_FINAL_PROMPT_TEMPLATE.format(
-            history=self._format_recent_history(),
+            history=self._prompt_history_for_final_answer(),
             question=question,
             tool_results=self._format_tool_results(tool_outputs),
         )
@@ -590,13 +591,24 @@ class ChatAgent:
             system_prompt += CHAT_DOCUMENT_BLOCK_TEMPLATE.format(doc=doc_context)
         collected: list[str] = []
         try:
-            for chunk in self.llm.iter_ask(
-                system_prompt,
-                prompt,
-                reasoning=False,
-                stream_label="chat:final" if tool_outputs else "chat",
-                timeout_sec=self.FINAL_ANSWER_TIMEOUT_SEC,
-            ):
+            if self._supports_memory_calls():
+                stream = self.llm.iter_call(
+                    self._chat_call_request(
+                        system_prompt=system_prompt,
+                        prompt=prompt,
+                        record_content=question,
+                        stream_label="chat:final" if tool_outputs else "chat",
+                    )
+                )
+            else:
+                stream = self.llm.iter_ask(
+                    system_prompt,
+                    prompt,
+                    reasoning=False,
+                    stream_label="chat:final" if tool_outputs else "chat",
+                    timeout_sec=self.FINAL_ANSWER_TIMEOUT_SEC,
+                )
+            for chunk in stream:
                 if not chunk:
                     continue
                 collected.append(chunk)
@@ -614,6 +626,56 @@ class ChatAgent:
         self.chat_history.append((question, answer))
         if self.rag_service is not None:
             self.rag_service.chat_history = list(self.chat_history)
+
+    def _supports_memory_calls(self) -> bool:
+        return callable(getattr(self.llm, "call", None)) and callable(
+            getattr(self.llm, "iter_call", None)
+        )
+
+    def _prompt_history_for_final_answer(self) -> str:
+        if self._supports_memory_calls():
+            return "(Recent conversation is provided through the memory runtime.)"
+        return self._format_recent_history()
+
+    """
+        _chat_call_request : CallRequest 객체를 생성
+        {
+            task_instruction=system_prompt : LLM 주입 시스템 프롬프트, 대화의 맥락과 제약 조건을 설정
+            user_content=prompt : LLM 주입 사용자 프롬프트로, LLM이 답변을 생성하는 데 필요한 정보와 지시사항을 포함
+            record_content=record_content : LLM의 call 메서드에서 기록되는 콘텐츠
+            constraints=CallConstraints() : LLM의 call 메서드에서 사용되는 제약 조건으
+            use_history=True : LLM의 call 메서드에서 대화 기록을 사용할지 여부를 나타내는 플래그
+            stream_label=stream_label : LLM의 call 메서드에서 사용되는 스트림 레이블
+            method_hint="chat_final" : LLM의 call 메서드에서 사용되는 메서드 힌트
+            timeout_sec=self.FINAL_ANSWER_TIMEOUT_SEC : LLM의 call 메서드에서 사용되는 타임아웃 시간
+            enable_memory_tools=False : 스트리밍 유지를 위해 self-edit 도구 비활성 (deterministic 주입이 대체)
+        }
+        CallRequest 객체는 LLM의 call 메서드에서 사용되며, 대화의 맥락과 제약 조건을 포함
+    """
+    def _chat_call_request(
+        self,
+        *,
+        system_prompt: str,
+        prompt: str,
+        record_content: str,
+        stream_label: str,
+    ) -> CallRequest:
+        return CallRequest(
+            task_instruction=system_prompt,
+            user_content=prompt,
+            record_content=record_content,
+            constraints=CallConstraints(),
+            use_history=True,
+            stream_label=stream_label,
+            method_hint="chat_final",
+            timeout_sec=self.FINAL_ANSWER_TIMEOUT_SEC,
+            # Memory self-edit tools force iter_call into a non-stream tool path
+            # (llama-server can't stream + call tools), which would break the
+            # streaming chat answer. Deterministic recall/archival injection plus
+            # heuristic fact extraction already cover the chat path, so tools are
+            # left off here to keep streaming alive.
+            enable_memory_tools=False,
+        )
 
     def _format_recent_history(self) -> str:
         if not self.chat_history:
@@ -786,19 +848,31 @@ class ChatAgent:
         stream: bool = False,
     ) -> str:
         prompt = TOOL_CHAT_FINAL_PROMPT_TEMPLATE.format(
-            history=self._format_recent_history(),
+            history=self._prompt_history_for_final_answer(),
             question=question,
             tool_results=self._format_tool_results(tool_outputs),
         )
+        stream_label = "chat:final" if tool_outputs else "chat"
+        system_prompt = self._chat_system_prompt()
         try:
-            answer = self.llm.ask(
-                self._chat_system_prompt(),
-                prompt,
-                reasoning=False,
-                stream=stream,
-                stream_label="chat:final" if tool_outputs else "chat",
-                timeout_sec=self.FINAL_ANSWER_TIMEOUT_SEC,
-            )
+            if self._supports_memory_calls() and not stream:
+                answer = self.llm.call(
+                    self._chat_call_request(
+                        system_prompt=system_prompt,
+                        prompt=prompt,
+                        record_content=question,
+                        stream_label=stream_label,
+                    )
+                )
+            else:
+                answer = self.llm.ask(
+                    system_prompt,
+                    prompt,
+                    reasoning=False,
+                    stream=stream,
+                    stream_label=stream_label,
+                    timeout_sec=self.FINAL_ANSWER_TIMEOUT_SEC,
+                )
         except Exception as e:
             answer = f"[chat][error] failed to generate answer: {e}"
             print(answer)

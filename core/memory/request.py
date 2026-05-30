@@ -18,6 +18,8 @@ class CallConstraints:
     latency_critical: bool = False
     # True면 invocation log 외 모든 기록을 생략한다.
     no_record: bool = False
+    # False면 working/summary/FIFO memory context를 prompt에 넣지 않는다.
+    inject_memory_context: bool = True
 
 
 @dataclass(frozen=True)
@@ -26,8 +28,10 @@ class CallRequest:
 
     task_instruction: str
     user_content: str
+    record_content: str = ""
     constraints: CallConstraints = field(default_factory=CallConstraints)
     use_history: bool = True
+    profile: str = "chat"
     stream_label: str = ""
     method_hint: str = "call"
     sampling_params: dict[str, Any] | None = None
@@ -35,5 +39,5 @@ class CallRequest:
     timeout_sec: float | None = None
 
     # True면 wrapper가 raw_llm.chat에 memory self-edit tool schema를 함께 전달한다.
-    # LLM이 working_context_append/replace, recall_search를 호출할 수 있게 된다.
+    # LLM이 working_context_append/replace, recall_search, archival_*를 호출할 수 있게 된다.
     enable_memory_tools: bool = False

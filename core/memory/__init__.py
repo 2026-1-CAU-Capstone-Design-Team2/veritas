@@ -11,6 +11,11 @@ from core.memory.models import (
 from core.memory.policy import (
     EvictionDecision,
     EvictionPolicy,
+    FIFOTailEvictionPolicy,
+    FixedKRetrievalPolicy,
+    ImportanceAwareEvictionPolicy,
+    ProfilePolicyDispatcher,
+    ProfilePolicySet,
     RetrievalDecision,
     RetrievalPolicy,
 )
@@ -26,6 +31,11 @@ __all__ = [
     "MemoryTier",
     "EvictionDecision",
     "EvictionPolicy",
+    "FIFOTailEvictionPolicy",
+    "FixedKRetrievalPolicy",
+    "ImportanceAwareEvictionPolicy",
+    "ProfilePolicyDispatcher",
+    "ProfilePolicySet",
     "RetrievalDecision",
     "RetrievalPolicy",
     "CallConstraints",

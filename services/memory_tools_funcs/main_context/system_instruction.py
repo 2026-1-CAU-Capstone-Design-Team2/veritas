@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from core.prompts.gateway import COMMON_GATEWAY_INSTRUCTIONS, JSON_STRICT_SUFFIX
 from core.prompts.memory import (
+    ARCHIVAL_CONTEXT_BLOCK_TEMPLATE,
     FIFO_SUMMARY_BLOCK_TEMPLATE,
     MEMORY_PRESSURE_SYSTEM_MESSAGE,
+    RECALL_CONTEXT_BLOCK_TEMPLATE,
     WORKING_CONTEXT_BLOCK_TEMPLATE,
 )
 
@@ -15,6 +17,8 @@ def assemble_system_message(
     task_instruction: str,
     working_context: str = "",
     fifo_summary: str = "",
+    recall_context: str = "",
+    archival_context: str = "",
     memory_pressure: bool = False,
     json_strict: bool = False,
 ) -> str:
@@ -32,6 +36,16 @@ def assemble_system_message(
     summary = (fifo_summary or "").strip()
     if summary:
         parts.append(FIFO_SUMMARY_BLOCK_TEMPLATE.format(fifo_summary=summary).strip())
+
+    recall = (recall_context or "").strip()
+    if recall:
+        parts.append(RECALL_CONTEXT_BLOCK_TEMPLATE.format(recall_context=recall).strip())
+
+    archival = (archival_context or "").strip()
+    if archival:
+        parts.append(
+            ARCHIVAL_CONTEXT_BLOCK_TEMPLATE.format(archival_context=archival).strip()
+        )
 
     if memory_pressure:
         parts.append(MEMORY_PRESSURE_SYSTEM_MESSAGE.strip())
