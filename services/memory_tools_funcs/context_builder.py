@@ -7,6 +7,7 @@ from typing import Any
 from core.memory.budget import MemoryBudget
 from core.memory.policy import FixedKRetrievalPolicy, RetrievalDecision, RetrievalPolicy
 from core.memory.request import CallRequest
+from services.memory_tools_funcs.debug import mem_debug
 from services.memory_tools_funcs.external_context.archival_storage import ArchivalStorage
 from services.memory_tools_funcs.main_context.queue_manage import QueueManager
 from services.memory_tools_funcs.main_context.system_instruction import assemble_system_message
@@ -46,6 +47,12 @@ def build_messages(
         cap = min(budget.working_context_tokens, remaining_tokens)
         working_context = _trim_to_tokens(working.load(), token_counter, cap)
         remaining_tokens -= token_counter.count(working_context)
+        if working_context:
+            mem_debug(
+                "context",
+                f"working injected ({token_counter.count(working_context)} tokens, "
+                f"cap={cap}, remaining={remaining_tokens})",
+            )
 
     fifo_summary = ""
     if req.use_history and memory_allowed and not c.grounded and remaining_tokens > 0:
@@ -54,6 +61,12 @@ def build_messages(
             cap = min(budget.fifo_tokens, remaining_tokens)
             fifo_summary = _trim_to_tokens(summary, token_counter, cap)
             remaining_tokens -= token_counter.count(fifo_summary)
+            if fifo_summary:
+                mem_debug(
+                    "context",
+                    f"summary injected ({token_counter.count(fifo_summary)} tokens, "
+                    f"cap={cap}, remaining={remaining_tokens})",
+                )
 
     # Dedup baseline must be the FIFO rows that are ACTUALLY injected as history.
     # FIFO is only added to the prompt when use_history is True (see below), so
@@ -75,15 +88,21 @@ def build_messages(
 
     recall_context = ""
     if retrieval_decision.recall_limit > 0 and remaining_tokens > 0:
-        recall_rows = (
-            _dedupe_memory_rows(
-                queue.recall.search(query, limit=max(retrieval_decision.recall_limit * 3, retrieval_decision.recall_limit)),
-                exclude_ids=excluded_ids,
-                exclude_contents=excluded_contents,
-                limit=retrieval_decision.recall_limit,
-            )
+        recall_raw_hits = (
+            queue.recall.search(query, limit=max(retrieval_decision.recall_limit * 3, retrieval_decision.recall_limit))
             if query
             else []
+        )
+        recall_rows = _dedupe_memory_rows(
+            recall_raw_hits,
+            exclude_ids=excluded_ids,
+            exclude_contents=excluded_contents,
+            limit=retrieval_decision.recall_limit,
+        )
+        mem_debug(
+            "retrieval",
+            f"recall query={query!r} limit={retrieval_decision.recall_limit} "
+            f"raw_hits={len(recall_raw_hits)} after_dedup={len(recall_rows)}",
         )
         if recall_rows:
             raw_recall = _format_memory_rows(recall_rows)
@@ -93,24 +112,40 @@ def build_messages(
             recall_ids, recall_contents = _memory_row_keys(recall_rows)
             excluded_ids.update(recall_ids)
             excluded_contents.update(recall_contents)
+            mem_debug(
+                "retrieval",
+                f"recall injected {len(recall_rows)} rows "
+                f"({token_counter.count(recall_context)} tokens, cap={cap}, remaining={remaining_tokens})",
+            )
 
     archival_context = ""
     if archival is not None and retrieval_decision.archival_limit > 0 and remaining_tokens > 0:
-        archival_rows = (
-            _dedupe_memory_rows(
-                archival.search(query, limit=max(retrieval_decision.archival_limit * 3, retrieval_decision.archival_limit)),
-                exclude_ids=excluded_ids,
-                exclude_contents=excluded_contents,
-                limit=retrieval_decision.archival_limit,
-            )
+        archival_raw_hits = (
+            archival.search(query, limit=max(retrieval_decision.archival_limit * 3, retrieval_decision.archival_limit))
             if query
             else []
+        )
+        archival_rows = _dedupe_memory_rows(
+            archival_raw_hits,
+            exclude_ids=excluded_ids,
+            exclude_contents=excluded_contents,
+            limit=retrieval_decision.archival_limit,
+        )
+        mem_debug(
+            "retrieval",
+            f"archival query={query!r} limit={retrieval_decision.archival_limit} "
+            f"raw_hits={len(archival_raw_hits)} after_dedup={len(archival_rows)}",
         )
         if archival_rows:
             raw_archival = _format_memory_rows(archival_rows)
             cap = min(budget.archival_tokens, remaining_tokens)
             archival_context = _trim_to_tokens(raw_archival, token_counter, cap)
             remaining_tokens -= token_counter.count(archival_context)
+            mem_debug(
+                "retrieval",
+                f"archival injected {len(archival_rows)} rows "
+                f"({token_counter.count(archival_context)} tokens, cap={cap}, remaining={remaining_tokens})",
+            )
 
     warn_pressure = memory_allowed and queue.is_warning_pressure(budget)
     system_msg = assemble_system_message(

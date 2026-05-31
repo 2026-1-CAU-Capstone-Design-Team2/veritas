@@ -677,6 +677,35 @@ class ChatAgent:
             enable_memory_tools=False,
         )
 
+    def _screen_call_request(
+        self,
+        *,
+        system_prompt: str,
+        prompt: str,
+        record_content: str,
+        stream_label: str,
+    ) -> CallRequest:
+        """Build a read-only memory request for a screen intervention answer.
+
+        Screen interventions are read-only consumers of memory: recall / archival /
+        working context are injected so the assist can use the user's recent work
+        context, but the screen turn itself is NOT recorded (``no_record=True``).
+        The screen poller fires periodically, so recording every intervention would
+        flood FIFO/recall with low-signal turns and pollute the chat memory.
+        """
+        return CallRequest(
+            task_instruction=system_prompt,
+            user_content=prompt,
+            record_content=record_content,
+            constraints=CallConstraints(no_record=True),
+            use_history=True,
+            profile="chat",
+            stream_label=stream_label,
+            method_hint="screen_context",
+            timeout_sec=self.SCREEN_INTERVENTION_TIMEOUT_SEC,
+            enable_memory_tools=False,
+        )
+
     def _format_recent_history(self) -> str:
         if not self.chat_history:
             return "(No previous conversation)"
@@ -970,7 +999,7 @@ class ChatAgent:
                     intervention_type, SCREEN_SCENARIO_GUIDANCE_DEFAULT
                 )
             prompt = SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE.format(
-                history=self._format_recent_history(),
+                history=self._prompt_history_for_final_answer(),
                 app_context=self._pretty_payload(
                     intervention.get("app_context") or intervention.get("app") or {}
                 ),
@@ -993,7 +1022,18 @@ class ChatAgent:
             screen_trace(f"LLM user prompt:\n{prompt}")
             try:
                 if stream:
-                    answer = self._stream_screen_answer(prompt, intervention, system_prompt)
+                    answer = self._stream_screen_answer(
+                        prompt, intervention, system_prompt, record_content=query
+                    )
+                elif self._supports_memory_calls():
+                    answer = self.llm.call(
+                        self._screen_call_request(
+                            system_prompt=system_prompt,
+                            prompt=prompt,
+                            record_content=query,
+                            stream_label="screen_context",
+                        )
+                    )
                 else:
                     answer = self.llm.ask(
                         system_prompt,
@@ -1015,23 +1055,42 @@ class ChatAgent:
             return answer.strip()
 
     def _stream_screen_answer(
-        self, prompt: str, intervention: dict[str, Any], system_prompt: str
+        self,
+        prompt: str,
+        intervention: dict[str, Any],
+        system_prompt: str,
+        *,
+        record_content: str = "",
     ) -> str:
         """Consume the screen-intervention answer as a token stream, pushing
         cumulative partial text to the answer callback (done=False) so the UI
         renders it incrementally. Returns the full accumulated text; the loop
         emits the final done=True update. Partial emits are throttled by char
-        count so the event buffer is not hammered per token."""
+        count so the event buffer is not hammered per token.
+
+        Reads memory (recall/working) through ``iter_call`` when the wrapper
+        supports it, but never records the screen turn (no_record)."""
+        if self._supports_memory_calls():
+            stream = self.llm.iter_call(
+                self._screen_call_request(
+                    system_prompt=system_prompt,
+                    prompt=prompt,
+                    record_content=record_content,
+                    stream_label="screen_context",
+                )
+            )
+        else:
+            stream = self.llm.iter_ask(
+                system_prompt,
+                prompt,
+                reasoning=False,
+                stream_label="screen_context",
+                timeout_sec=self.SCREEN_INTERVENTION_TIMEOUT_SEC,
+            )
         chunks: list[str] = []
         last_emit_len = 0
         min_emit_chars = 12
-        for chunk in self.llm.iter_ask(
-            system_prompt,
-            prompt,
-            reasoning=False,
-            stream_label="screen_context",
-            timeout_sec=self.SCREEN_INTERVENTION_TIMEOUT_SEC,
-        ):
+        for chunk in stream:
             if not chunk:
                 continue
             chunks.append(chunk)

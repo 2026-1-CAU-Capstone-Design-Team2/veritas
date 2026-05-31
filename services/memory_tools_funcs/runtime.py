@@ -13,6 +13,7 @@ from core.memory.models import MemoryRole
 from core.memory.policy import ProfilePolicyDispatcher
 from core.memory.request import CallConstraints, CallRequest
 from services.memory_tools_funcs.context_builder import build_messages
+from services.memory_tools_funcs.debug import mem_debug, mem_debug_enabled
 from services.memory_tools_funcs.external_context.archival_storage import ArchivalStorage
 from services.memory_tools_funcs.external_context.recall_storage import RecallStorage
 from services.memory_tools_funcs.main_context.heuristic_memory import extract_explicit_facts
@@ -92,6 +93,22 @@ class MemoryRuntime:
             current_request_tokens=self.token_counter.count(req.user_content),
         )
 
+        if mem_debug_enabled():
+            c = req.constraints
+            mem_debug(
+                "prepare",
+                f"id={invocation_id[:8]} profile={req.profile} method={req.method_hint} "
+                f"use_history={req.use_history} "
+                f"constraints[grounded={c.grounded},json_strict={c.json_strict},"
+                f"latency_critical={c.latency_critical},no_record={c.no_record},"
+                f"inject_memory_context={c.inject_memory_context}] "
+                f"budget[usable={budget.usable_prompt_tokens},system={budget.system_tokens},"
+                f"request={budget.current_request_tokens}] "
+                f"fifo_tokens={self.queue.total_fifo_tokens()} "
+                f"pressure[warn={self.queue.is_warning_pressure(budget)},"
+                f"flush={self.queue.is_flush_pressure(budget)}]",
+            )
+
         if not req.constraints.no_record:
             self._log_invocation(invocation_id, req, budget)
 
@@ -113,6 +130,16 @@ class MemoryRuntime:
             retrieval_policy=self.policy_dispatcher.retrieval_for(req.profile),
         )
 
+        if mem_debug_enabled():
+            system_len = len(messages[0]["content"]) if messages else 0
+            history_msgs = max(0, len(messages) - 2)  # minus system + current user
+            mem_debug(
+                "context",
+                f"id={invocation_id[:8]} messages={len(messages)} "
+                f"system_chars={system_len} history_msgs={history_msgs} "
+                f"system_tokens={self.token_counter.count(messages[0]['content']) if messages else 0}",
+            )
+
         if self._should_record(req.constraints):
             record_content = req.record_content or req.user_content
             self.queue.append_event(
@@ -121,6 +148,11 @@ class MemoryRuntime:
                 source=req.stream_label or req.method_hint,
                 metadata={"invocation_id": invocation_id},
             )
+            mem_debug(
+                "prepare",
+                f"id={invocation_id[:8]} recorded USER turn "
+                f"({self.token_counter.count(record_content)} tokens)",
+            )
             for fact in extract_explicit_facts(record_content):
                 self.working.append_fact(
                     fact,
@@ -128,6 +160,13 @@ class MemoryRuntime:
                     tags=["explicit_user"],
                     max_tokens=budget.working_context_tokens,
                 )
+                mem_debug("working", f"id={invocation_id[:8]} heuristic fact appended: {fact!r}")
+        elif mem_debug_enabled():
+            mem_debug(
+                "prepare",
+                f"id={invocation_id[:8]} turn NOT recorded "
+                f"(no_record/json_strict/latency_critical)",
+            )
 
         return PreparedCall(
             invocation_id=invocation_id,
@@ -147,6 +186,7 @@ class MemoryRuntime:
 
     def commit(self, prepared: PreparedCall, assistant_text: str) -> None:
         """LLM 응답을 ASSISTANT turn으로 기록하고, flush가 마킹돼 있으면 bg launch."""
+        inv = prepared.invocation_id[:8]
         if self._should_record(prepared.constraints):
             text = str(assistant_text or "").strip()
             if text:
@@ -156,8 +196,14 @@ class MemoryRuntime:
                     source=prepared.stream_label or prepared.metadata.get("method_hint", "assistant"),
                     metadata={"invocation_id": prepared.invocation_id},
                 )
+                mem_debug(
+                    "commit",
+                    f"id={inv} recorded ASSISTANT turn "
+                    f"({self.token_counter.count(text)} tokens)",
+                )
 
         if prepared.metadata.get("flush_pending"):
+            mem_debug("commit", f"id={inv} flush_pending=True -> launching background flush")
             self._maybe_launch_bg_flush(str(prepared.metadata.get("profile") or "chat"))
 
     @staticmethod
@@ -225,13 +271,20 @@ class MemoryRuntime:
 
     def _flush_fifo(self, *, profile: str = "chat") -> None:
         """FIFO 오래된 prefix를 evict하고 summary로 압축한다."""
+        fifo_before = self.queue.fifo.count() if mem_debug_enabled() else 0
         evicted_rows = self.queue.select_evicted_rows(
             budget=MemoryBudget(max_context_tokens=self.max_context_tokens),
             eviction_policy=self.policy_dispatcher.eviction_for(profile),
         )
         if not evicted_rows:
+            mem_debug("flush", f"profile={profile} no rows to evict (skip)")
             return
 
+        mem_debug(
+            "flush",
+            f"profile={profile} evicting {len(evicted_rows)} rows "
+            f"(FIFO {fifo_before} rows before compaction)",
+        )
         previous_summary = self.store.load_latest_summary()
         evicted_text = "\n".join(
             f"{row.get('role')}: {row.get('content')}" for row in evicted_rows
@@ -242,3 +295,10 @@ class MemoryRuntime:
         )
         if summary:
             self.queue.reset_fifo_with_summary(summary, evicted_rows=evicted_rows)
+            mem_debug(
+                "flush",
+                f"profile={profile} summary written ({self.token_counter.count(summary)} tokens), "
+                f"FIFO now {self.queue.fifo.count() if mem_debug_enabled() else 0} rows",
+            )
+        else:
+            mem_debug("flush", f"profile={profile} summarizer returned empty -> FIFO unchanged")

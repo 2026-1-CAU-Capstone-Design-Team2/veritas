@@ -265,6 +265,13 @@ class AgentRuntime:
                 memory_runtime.close()
             except Exception:
                 pass
+        # Flush + close the optional memory trace file (--mem-debug-file).
+        try:
+            from services.memory_tools_funcs.debug import close_debug_file
+
+            close_debug_file()
+        except Exception:
+            pass
 
     def set_llm_parallel(self, value: int) -> int:
         """Apply the parallel-decoding concurrency to the shared LLM client.

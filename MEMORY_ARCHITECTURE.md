@@ -578,6 +578,7 @@ Workspace lifecycle:
 
 - `MemoryRuntime.configure_workspace()` closes the previous store connection before constructing the next workspace store.
 - `MemoryRuntime.close()` releases the runtime-owned SQLite handle.
+- `AgentRuntime.shutdown()` calls `memory_runtime.close()` at process exit so the WAL/SHM sidecar files are checkpointed and removed instead of relying on `__del__` GC (which is not guaranteed to run on a hard Windows process kill).
 - Legacy split DB import still uses independent short-lived connections because those files are migration inputs, not runtime storage.
 
 Coverage:
