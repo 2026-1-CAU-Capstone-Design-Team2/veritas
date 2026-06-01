@@ -10,6 +10,10 @@ import httpx
 from openai import OpenAI
 
 
+DEFAULT_AUTOSURVEY_OPENAI_MODEL = "gpt-5-mini"
+_SERVICE_TIERS = {"default", "flex", "priority"}
+
+
 class OpenAIChatLLMClient:
     """Chat-only OpenAI API client for AutoSurvey generation.
 
@@ -33,9 +37,10 @@ class OpenAIChatLLMClient:
         self,
         *,
         api_key: str,
-        model: str = "gpt-5.4-mini",
+        model: str = DEFAULT_AUTOSURVEY_OPENAI_MODEL,
         n_ctx: int = 400_000,
         max_parallel: int = 2,
+        service_tier: str | None = None,
         trace_latency: bool = True,
         stream_summary: bool = False,
         client: Any | None = None,
@@ -43,9 +48,10 @@ class OpenAIChatLLMClient:
         if client is None and not str(api_key or "").strip():
             raise ValueError("OpenAIChatLLMClient requires an API key.")
         self.client = client or OpenAI(api_key=api_key)
-        self.model = str(model or "gpt-5.4-mini").strip()
+        self.model = str(model or DEFAULT_AUTOSURVEY_OPENAI_MODEL).strip()
         self.n_ctx = max(1, int(n_ctx))
         self.max_parallel = max(1, int(max_parallel))
+        self.service_tier = self._normalize_service_tier(service_tier)
         self.trace_latency = bool(trace_latency)
         self.stream_summary = bool(stream_summary)
 
@@ -132,7 +138,7 @@ class OpenAIChatLLMClient:
                 timeout_sec=timeout_sec,
             )
             request_kwargs["stream"] = True
-            chunks = self.client.chat.completions.create(**request_kwargs)
+            chunks = self._create_completion(request_kwargs)
             text = self._consume_stream(chunks, stream_label=stream_label)
         else:
             text = self._ask_with_optional_tools(
@@ -281,7 +287,7 @@ class OpenAIChatLLMClient:
                     f"tools={len(tool_schemas) if tools_enabled else 0} "
                     f"messages={len(messages)}"
                 )
-                response = self.client.chat.completions.create(**request_kwargs)
+                response = self._create_completion(request_kwargs)
                 print("[openai][response] received")
             except Exception as exc:
                 if tools_enabled:
@@ -351,20 +357,68 @@ class OpenAIChatLLMClient:
         if tools:
             request_kwargs["tools"] = tools
             request_kwargs["tool_choice"] = "auto"
+        if self.service_tier:
+            request_kwargs["service_tier"] = self.service_tier
         if timeout_sec is not None:
             request_kwargs["timeout"] = self._request_timeout(timeout_sec)
         return request_kwargs
 
+    def _normalize_service_tier(self, service_tier: str | None) -> str | None:
+        tier = str(service_tier or "").strip().lower()
+        if not tier or tier == "auto":
+            return None
+        if tier not in _SERVICE_TIERS:
+            raise ValueError(
+                "OpenAI service_tier must be one of: auto, default, flex, priority."
+            )
+        return tier
+
+    def _create_completion(self, request_kwargs: dict[str, Any]) -> Any:
+        try:
+            return self.client.chat.completions.create(**request_kwargs)
+        except Exception as exc:
+            if "service_tier" not in request_kwargs or not self._is_service_tier_error(exc):
+                raise
+            fallback_kwargs = dict(request_kwargs)
+            tier = fallback_kwargs.pop("service_tier", "")
+            print(
+                "[openai][service-tier] "
+                f"tier={tier} rejected; retrying with default project tier"
+            )
+            return self.client.chat.completions.create(**fallback_kwargs)
+
+    def _is_service_tier_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "service_tier" in text or "service tier" in text
+
     def _clean_sampling_params(self, params: dict[str, Any]) -> dict[str, Any]:
-        allowed = {
-            "temperature",
-            "top_p",
-            "presence_penalty",
-            "frequency_penalty",
-            "max_tokens",
-            "max_completion_tokens",
+        if self._uses_fixed_sampling_defaults():
+            allowed = {
+                "max_tokens",
+                "max_completion_tokens",
+            }
+        else:
+            allowed = {
+                "temperature",
+                "top_p",
+                "presence_penalty",
+                "frequency_penalty",
+                "max_tokens",
+                "max_completion_tokens",
+            }
+        return {
+            key: value
+            for key, value in params.items()
+            if key in allowed and value is not None
         }
-        return {key: value for key, value in params.items() if key in allowed and value is not None}
+
+    def _uses_fixed_sampling_defaults(self) -> bool:
+        normalized = self.model.strip().lower()
+        return (
+            normalized == "gpt-5"
+            or normalized.startswith("gpt-5-")
+            or normalized.startswith("gpt-5.")
+        )
 
     def _request_timeout(self, timeout_sec: float) -> httpx.Timeout:
         timeout = max(float(timeout_sec), 1.0)

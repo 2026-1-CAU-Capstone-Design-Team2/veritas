@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from .openai_chat_llm import OpenAIChatLLMClient
+from .openai_chat_llm import (
+    DEFAULT_AUTOSURVEY_OPENAI_MODEL,
+    OpenAIChatLLMClient,
+)
 
 
 _LOCAL_PROVIDERS = {"", "local", "llama", "llama-server", "llama_server"}
@@ -39,12 +42,16 @@ def build_autosurvey_llm(default_llm: Any):
     ).strip()
     if not api_key:
         raise RuntimeError(
-            "VERITAS_AUTOSURVEY_LLM_PROVIDER=openai requires OPENAI_API_KEY."
+            "VERITAS_AUTOSURVEY_LLM_PROVIDER=openai requires OPENAI_API_KEY "
+            "or a saved OpenAI API key in Settings."
         )
 
-    model = os.getenv("VERITAS_AUTOSURVEY_OPENAI_MODEL", "gpt-5.4-mini").strip()
+    model = os.getenv(
+        "VERITAS_AUTOSURVEY_OPENAI_MODEL",
+        DEFAULT_AUTOSURVEY_OPENAI_MODEL,
+    ).strip()
     if not model:
-        model = "gpt-5.4-mini"
+        model = DEFAULT_AUTOSURVEY_OPENAI_MODEL
     n_ctx = _env_int(
         "VERITAS_AUTOSURVEY_OPENAI_N_CTX",
         _default_n_ctx_for_model(model),
@@ -59,17 +66,20 @@ def build_autosurvey_llm(default_llm: Any):
         "VERITAS_AUTOSURVEY_OPENAI_STREAM_SUMMARY",
         bool(getattr(default_llm, "stream_summary", False)),
     )
+    service_tier = os.getenv("VERITAS_AUTOSURVEY_OPENAI_SERVICE_TIER", "").strip()
     trace_latency = os.getenv("VERITAS_TRACE_LATENCY", "1") != "0"
 
     print(
         "[autosurvey][llm] provider=openai "
-        f"model={model} n_ctx={n_ctx} max_parallel={max_parallel}"
+        f"model={model} n_ctx={n_ctx} max_parallel={max_parallel} "
+        f"service_tier={service_tier or 'auto'}"
     )
     return OpenAIChatLLMClient(
         api_key=api_key,
         model=model,
         n_ctx=n_ctx,
         max_parallel=max_parallel,
+        service_tier=service_tier,
         trace_latency=trace_latency,
         stream_summary=stream_summary,
     )

@@ -9,18 +9,29 @@ from types import SimpleNamespace
 from unittest import mock
 
 from llm.autosurvey_llm_factory import build_autosurvey_llm
-from llm.openai_chat_llm import OpenAIChatLLMClient
+from llm.openai_chat_llm import (
+    DEFAULT_AUTOSURVEY_OPENAI_MODEL,
+    OpenAIChatLLMClient,
+)
 from tools.loader import build_registry
 from workflows import AutoSurveyConfig
 
 
 class _FakeCompletions:
-    def __init__(self, responses: list[str]) -> None:
+    def __init__(
+        self,
+        responses: list[str],
+        *,
+        fail_on_service_tier: bool = False,
+    ) -> None:
         self._responses = list(responses)
         self.calls: list[dict] = []
+        self.fail_on_service_tier = fail_on_service_tier
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
+        if self.fail_on_service_tier and "service_tier" in kwargs:
+            raise RuntimeError("Unsupported service_tier for this model")
         if not self._responses:
             raise AssertionError("unexpected OpenAI call")
         content = self._responses.pop(0)
@@ -34,8 +45,16 @@ class _FakeCompletions:
 
 
 class _FakeOpenAIClient:
-    def __init__(self, responses: list[str]) -> None:
-        self.completions = _FakeCompletions(responses)
+    def __init__(
+        self,
+        responses: list[str],
+        *,
+        fail_on_service_tier: bool = False,
+    ) -> None:
+        self.completions = _FakeCompletions(
+            responses,
+            fail_on_service_tier=fail_on_service_tier,
+        )
         self.chat = SimpleNamespace(completions=self.completions)
 
 
@@ -142,6 +161,64 @@ class OpenAIChatLLMClientTests(unittest.TestCase):
                 self.assertNotIn("extra_body", request)
                 self.assertNotIn("/no_think", request["messages"][1]["content"])
 
+    def test_gpt5_family_omits_unsupported_sampling_overrides(self) -> None:
+        fake = _FakeOpenAIClient(['{"ok": true}'])
+        client = OpenAIChatLLMClient(
+            api_key="",
+            client=fake,
+            model="gpt-5-mini",
+            trace_latency=False,
+        )
+
+        self.assertEqual(client.ask_json("system", "user", max_retries=0), {"ok": True})
+
+        request = fake.completions.calls[-1]
+        self.assertNotIn("temperature", request)
+        self.assertNotIn("top_p", request)
+        self.assertNotIn("presence_penalty", request)
+        self.assertNotIn("frequency_penalty", request)
+
+    def test_openai_service_tier_is_forwarded_when_configured(self) -> None:
+        fake = _FakeOpenAIClient(["ok"])
+        client = OpenAIChatLLMClient(
+            api_key="",
+            client=fake,
+            model="gpt-5-mini",
+            service_tier="priority",
+            trace_latency=False,
+        )
+
+        self.assertEqual(client.ask("system", "user"), "ok")
+        self.assertEqual(fake.completions.calls[-1]["service_tier"], "priority")
+
+    def test_openai_service_tier_auto_is_not_sent(self) -> None:
+        fake = _FakeOpenAIClient(["ok"])
+        client = OpenAIChatLLMClient(
+            api_key="",
+            client=fake,
+            model="gpt-5-mini",
+            service_tier="auto",
+            trace_latency=False,
+        )
+
+        self.assertEqual(client.ask("system", "user"), "ok")
+        self.assertNotIn("service_tier", fake.completions.calls[-1])
+
+    def test_openai_service_tier_rejection_falls_back_to_default(self) -> None:
+        fake = _FakeOpenAIClient(["ok"], fail_on_service_tier=True)
+        client = OpenAIChatLLMClient(
+            api_key="",
+            client=fake,
+            model="gpt-5-mini",
+            service_tier="priority",
+            trace_latency=False,
+        )
+
+        self.assertEqual(client.ask("system", "user"), "ok")
+        self.assertEqual(len(fake.completions.calls), 2)
+        self.assertEqual(fake.completions.calls[0]["service_tier"], "priority")
+        self.assertNotIn("service_tier", fake.completions.calls[1])
+
     def test_map_parallel_preserves_order_and_raises_input_order_error(self) -> None:
         client, _fake = self._client([])
         client.max_parallel = 3
@@ -195,8 +272,27 @@ class AutoSurveyLLMFactoryTests(unittest.TestCase):
             {
                 "VERITAS_AUTOSURVEY_LLM_PROVIDER": "openai",
                 "OPENAI_API_KEY": "sk-test",
+            },
+            clear=True,
+        ), mock.patch(
+            "llm.autosurvey_llm_factory._load_persisted_settings",
+            return_value={},
+        ):
+            client = build_autosurvey_llm(_FakeLLM())
+        self.assertIsInstance(client, OpenAIChatLLMClient)
+        self.assertEqual(client.model, DEFAULT_AUTOSURVEY_OPENAI_MODEL)
+        self.assertEqual(client.n_ctx, 400_000)
+        self.assertEqual(client.max_parallel, 1)
+
+    def test_openai_provider_env_overrides_model_defaults(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VERITAS_AUTOSURVEY_LLM_PROVIDER": "openai",
+                "OPENAI_API_KEY": "sk-test",
                 "VERITAS_AUTOSURVEY_OPENAI_MODEL": "gpt-5.5",
                 "VERITAS_AUTOSURVEY_OPENAI_MAX_PARALLEL": "3",
+                "VERITAS_AUTOSURVEY_OPENAI_SERVICE_TIER": "priority",
             },
             clear=True,
         ), mock.patch(
@@ -208,6 +304,7 @@ class AutoSurveyLLMFactoryTests(unittest.TestCase):
         self.assertEqual(client.model, "gpt-5.5")
         self.assertEqual(client.n_ctx, 1_050_000)
         self.assertEqual(client.max_parallel, 3)
+        self.assertEqual(client.service_tier, "priority")
 
     def test_persisted_ui_key_enables_openai_when_env_provider_is_absent(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
@@ -219,6 +316,7 @@ class AutoSurveyLLMFactoryTests(unittest.TestCase):
         ):
             client = build_autosurvey_llm(_FakeLLM())
         self.assertIsInstance(client, OpenAIChatLLMClient)
+        self.assertEqual(client.model, DEFAULT_AUTOSURVEY_OPENAI_MODEL)
         self.assertEqual(client.max_parallel, 4)
 
 

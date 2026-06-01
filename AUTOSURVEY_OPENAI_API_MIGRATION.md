@@ -9,8 +9,9 @@ up the implementation without re-discovering the same architecture.
 
 ## Goal
 
-Use an OpenAI API model, usually `gpt-5.4-mini`, for the AutoSurvey research
-pipeline:
+Use an OpenAI API model for the AutoSurvey research pipeline. The current
+development-test default is `gpt-5-mini`; use `gpt-5.4-mini` explicitly when a
+higher-quality benchmark baseline is more important than repeated-run cost:
 
 ```text
 term grounding -> query plan -> web fetch -> document cleanup
@@ -148,7 +149,7 @@ class OpenAIChatLLMClient:
         self,
         *,
         api_key: str,
-        model: str = "gpt-5.4-mini",
+        model: str = "gpt-5-mini",
         n_ctx: int = 400_000,
         max_parallel: int = 2,
         trace_latency: bool = True,
@@ -189,16 +190,18 @@ Suggested variables:
 ```text
 VERITAS_AUTOSURVEY_LLM_PROVIDER=local|openai
 OPENAI_API_KEY=...
-VERITAS_AUTOSURVEY_OPENAI_MODEL=gpt-5.4-mini
+VERITAS_AUTOSURVEY_OPENAI_MODEL=gpt-5-mini
 VERITAS_AUTOSURVEY_OPENAI_MAX_PARALLEL=2
 VERITAS_AUTOSURVEY_OPENAI_N_CTX=400000
+VERITAS_AUTOSURVEY_OPENAI_SERVICE_TIER=auto|default|flex|priority
 ```
 
 Do not store API keys in repository files. Do not write keys into run outputs,
 logs, progress events, or frontend state.
 
-For `gpt-5.5`, use `n_ctx=1050000`. For `gpt-5.4-mini`, use `n_ctx=400000`.
-These values should be treated as configurable because model specs can change.
+For `gpt-5.5`, use `n_ctx=1050000`. For `gpt-5-mini` and `gpt-5.4-mini`, use
+`n_ctx=400000`. These values should be treated as configurable because model
+specs can change.
 
 ### 3. Add a small factory
 
@@ -224,9 +227,10 @@ def build_autosurvey_llm(default_llm):
 
     return OpenAIChatLLMClient(
         api_key=api_key,
-        model=os.getenv("VERITAS_AUTOSURVEY_OPENAI_MODEL", "gpt-5.4-mini"),
+        model=os.getenv("VERITAS_AUTOSURVEY_OPENAI_MODEL", "gpt-5-mini"),
         n_ctx=int(os.getenv("VERITAS_AUTOSURVEY_OPENAI_N_CTX", "400000")),
         max_parallel=int(os.getenv("VERITAS_AUTOSURVEY_OPENAI_MAX_PARALLEL", "2")),
+        service_tier=os.getenv("VERITAS_AUTOSURVEY_OPENAI_SERVICE_TIER", ""),
         trace_latency=os.getenv("VERITAS_TRACE_LATENCY", "1") != "0",
     )
 ```
@@ -340,7 +344,8 @@ VERITAS_AUTOSURVEY_FETCH_MAX_CHARS=100000
 Recommended defaults:
 
 - local llama-server: keep `25_000`.
-- `gpt-5.4-mini`: start with `100_000`.
+- `gpt-5-mini`: start with `100_000` for development tests.
+- `gpt-5.4-mini`: start with `100_000` for higher-quality baselines.
 - `gpt-5.5`: start with `100_000` or `200_000`.
 
 Why not unlimited:
@@ -401,7 +406,8 @@ but the pipeline must still deliver image inputs.
 
 Cost-effective model policy:
 
-- Default AutoSurvey generation: `gpt-5.4-mini`.
+- Default AutoSurvey generation for development tests: `gpt-5-mini`.
+- Higher-quality benchmark baseline: `gpt-5.4-mini`.
 - Optional high-quality final report only: `gpt-5.4` or `gpt-5.5`.
 
 This can be added later by giving `FinalReportTool` a separate `final_llm`, or
@@ -418,7 +424,9 @@ model availability can change.
 Official references:
 
 - Pricing: https://developers.openai.com/api/docs/pricing
+- `gpt-5-mini`: https://developers.openai.com/api/docs/models/gpt-5-mini
 - `gpt-5.4-mini`: https://developers.openai.com/api/docs/models/gpt-5.4-mini
+- `gpt-5.4-nano`: https://developers.openai.com/api/docs/models/gpt-5.4-nano
 - `gpt-5.5`: https://developers.openai.com/api/docs/models/gpt-5.5
 - Image input guide: https://developers.openai.com/api/docs/guides/images-vision
 - Prepaid billing: https://help.openai.com/en/articles/8264778
@@ -426,14 +434,19 @@ Official references:
 
 As reviewed on 2026-06-01:
 
+- `gpt-5-mini`: 400K context, text+image input, text output. It is cheaper
+  than `gpt-5.4-mini` and fits the current input-heavy development-test
+  workload well enough to catch pipeline and prompt regressions.
 - `gpt-5.4-mini`: 400K context, text+image input, text output.
 - `gpt-5.5`: 1,050K context, text+image input, text output.
-- `gpt-5.4-mini` was much cheaper than `gpt-5.5`, and is likely the better
-  default for repeated AutoSurvey runs.
+- `gpt-5.4-mini` remains the better quality baseline for benchmark reporting.
+- `gpt-5.4-nano` is cheaper than `gpt-5-mini`, but the quality risk is higher
+  for planning and final synthesis while the input-price savings are modest
+  for this pipeline.
 
 For the current 15-document workflow:
 
-- Typical LLM calls: about 25 per completed survey.
+- Typical LLM calls: about 22-30 per completed survey before retries.
 - Dominant calls:
   - 15 document cleanup calls.
   - 4 batch summary calls.
@@ -441,18 +454,37 @@ For the current 15-document workflow:
   - 1 final report call.
 - Current code no longer runs final per-document LLM summaries at the end;
   cleanup writes document metadata and batch summaries feed final synthesis.
+- With `VERITAS_AUTOSURVEY_FETCH_MAX_CHARS=100000`, one fetched page can be
+  roughly 40K input tokens under the code's conservative 2.5 chars/token
+  heuristic. The same document is typically consumed once by cleanup and once
+  again inside a batch-summary prompt.
 
 Rough live-test budgeting:
 
 - Mock/unit tests: no API spend.
-- 3-document smoke test on `gpt-5.4-mini`: about USD 1-3 reserve.
-- 15-document demo on `gpt-5.4-mini`: about USD 2-5 reserve depending on fetch
-  cap and output verbosity.
-- 15-document demo with image observations: reserve about USD 5-10.
-- Development session with repeated runs: USD 20 is a reasonable starting
-  credit; USD 50 gives safer room for mistakes and retries.
+- 3-document smoke test on `gpt-5-mini`: about USD 0.10-0.50 reserve.
+- 15-document demo on `gpt-5-mini`: about USD 0.50-2.00 reserve depending on
+  fetch cap, output verbosity, retries, and page length.
+- The same 15-document demo on `gpt-5.4-mini` is roughly 3x higher on input
+  tokens and over 2x higher on output tokens.
+- Development session with repeated runs: USD 10 is a reasonable starting
+  credit for `gpt-5-mini`; use a higher cap before benchmark sweeps.
 
 These are estimates, not guarantees. Add telemetry before doing many runs.
+
+Latency policy:
+
+- Keep `llmParallel` at 5 for OpenAI smoke tests when rate limits allow it;
+  document cleanup is independent per document, so this improves wall time
+  without changing prompts or model quality.
+- For faster runs with the same model and prompts, set
+  `VERITAS_AUTOSURVEY_OPENAI_SERVICE_TIER=priority`. This can reduce API
+  latency but uses priority pricing when the project supports that tier.
+  If the API rejects the requested tier for a model/project, the adapter retries
+  once with the default project tier so the run can continue.
+- Do not reduce `fetch_max_chars`, switch to nano, or lower reasoning/summary
+  budgets when the goal is "no quality loss"; those are cost/latency tradeoffs,
+  not quality-preserving optimizations.
 
 ## Telemetry and Safety Controls
 
@@ -477,6 +509,7 @@ Recommended controls:
 VERITAS_AUTOSURVEY_OPENAI_DAILY_USD_LIMIT=...
 VERITAS_AUTOSURVEY_OPENAI_RUN_USD_LIMIT=...
 VERITAS_AUTOSURVEY_OPENAI_MAX_PARALLEL=2
+VERITAS_AUTOSURVEY_OPENAI_SERVICE_TIER=auto
 VERITAS_AUTOSURVEY_FETCH_MAX_CHARS=100000
 VERITAS_AUTOSURVEY_MAX_IMAGES_PER_DOC=2
 ```
@@ -529,8 +562,9 @@ Environment:
 ```powershell
 $env:VERITAS_AUTOSURVEY_LLM_PROVIDER="openai"
 $env:OPENAI_API_KEY="..."
-$env:VERITAS_AUTOSURVEY_OPENAI_MODEL="gpt-5.4-mini"
-$env:VERITAS_AUTOSURVEY_OPENAI_MAX_PARALLEL="2"
+$env:VERITAS_AUTOSURVEY_OPENAI_MODEL="gpt-5-mini"
+$env:VERITAS_AUTOSURVEY_OPENAI_MAX_PARALLEL="5"
+$env:VERITAS_AUTOSURVEY_OPENAI_SERVICE_TIER="priority"
 $env:VERITAS_AUTOSURVEY_FETCH_MAX_CHARS="100000"
 ```
 
@@ -579,4 +613,3 @@ Then run a 15-document demo.
 - [ ] Run a local-provider regression test.
 - [ ] Run a 3-document OpenAI smoke test.
 - [ ] Run a 15-document OpenAI demo.
-
