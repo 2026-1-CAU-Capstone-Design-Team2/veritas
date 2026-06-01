@@ -39,5 +39,5 @@ class CallRequest:
     timeout_sec: float | None = None
 
     # True면 wrapper가 raw_llm.chat에 memory self-edit tool schema를 함께 전달한다.
-    # LLM이 working_context_append/replace, recall_search, archival_*를 호출할 수 있게 된다.
+    # LLM이 working_context_append/replace, recall_search를 호출할 수 있게 된다.
     enable_memory_tools: bool = False

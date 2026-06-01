@@ -4,6 +4,14 @@
 대상 브랜치: `feat/59-memory`
 목표 환경: 로컬 Qwen3.5 4B-9B GGUF + `llama-server`
 
+> **NOTE (변경 이력)**: archival tier는 제거되었다. 원래 의도는 LLM이
+> `archival_insert` tool로 durable long-term fact를 능동 저장하는 것이었으나,
+> production에서 `enable_memory_tools=False`로 잠겨 있어 write 경로가 없는
+> dead capability였다. 본 문서의 archival 관련 도표·표·코드 인용은 이전 상태
+> 기록 목적으로만 남겨두며, 현재 코드에는 archival_items 테이블, ArchivalStorage,
+> archival_insert/archival_search tool, archival_limit policy 모두 존재하지
+> 않는다. 현 시스템은 working / FIFO / recall / summary 4계층이다.
+
 이 문서는 현재 메모리 레이어의 실제 구현 기준 설명이다. 핵심 방향은 MemGPT식 계층을 유지하되, 작은 로컬 모델에서 불안정한 tool-call 의존을 줄이고, SQLite를 워크스페이스 단위 단일 저장소로 사용해 장기 대화의 컨텍스트 초과와 JSONL 풀스캔 문제를 피하는 것이다.
 
 ## 1. 한 줄 구조

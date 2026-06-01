@@ -13,7 +13,6 @@ class MemoryTier(str, Enum):
     WORKING = "working"
     FIFO = "fifo"
     RECALL = "recall"
-    ARCHIVAL = "archival"
     SUMMARY = "summary"
 
 

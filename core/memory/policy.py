@@ -20,10 +20,9 @@ class EvictionDecision:
 
 @dataclass
 class RetrievalDecision:
-    """Recall/archival retrieval limits for one call."""
+    """Recall retrieval limits for one call."""
 
     recall_limit: int = 0
-    archival_limit: int = 0
     reason: str = ""
 
 
@@ -40,7 +39,7 @@ class EvictionPolicy(Protocol):
 
 
 class RetrievalPolicy(Protocol):
-    """Protocol for recall/archival retrieval limits."""
+    """Protocol for recall retrieval limits."""
 
     def decide_retrieval(
         self,
@@ -113,9 +112,7 @@ class FixedKRetrievalPolicy:
     """Deterministic fixed top-k retrieval limits."""
 
     recall_limit: int = 3
-    archival_limit: int = 2
     recall_scan_limit: int = 8
-    archival_scan_limit: int = 6
 
     def decide_retrieval(
         self,
@@ -127,7 +124,6 @@ class FixedKRetrievalPolicy:
             return RetrievalDecision(reason="empty_query")
         return RetrievalDecision(
             recall_limit=max(0, int(self.recall_limit)),
-            archival_limit=max(0, int(self.archival_limit)),
             reason="fixed_k",
         )
 
@@ -160,29 +156,28 @@ class ProfilePolicyDispatcher:
     def _default_profiles() -> dict[str, ProfilePolicySet]:
         chat = ProfilePolicySet(
             eviction=FIFOTailEvictionPolicy(keep_tail=20),
-            retrieval=FixedKRetrievalPolicy(recall_limit=3, archival_limit=2),
+            retrieval=FixedKRetrievalPolicy(recall_limit=3),
         )
         grounded = ProfilePolicySet(
             eviction=FIFOTailEvictionPolicy(keep_tail=20),
-            retrieval=FixedKRetrievalPolicy(recall_limit=0, archival_limit=0),
+            retrieval=FixedKRetrievalPolicy(recall_limit=0),
         )
         return {
             "chat": chat,
             "autosurvey": ProfilePolicySet(
                 eviction=FIFOTailEvictionPolicy(keep_tail=20),
-                retrieval=FixedKRetrievalPolicy(recall_limit=2, archival_limit=1),
+                retrieval=FixedKRetrievalPolicy(recall_limit=2),
             ),
             "editor": ProfilePolicySet(
                 eviction=FIFOTailEvictionPolicy(keep_tail=20),
-                retrieval=FixedKRetrievalPolicy(recall_limit=1, archival_limit=1),
+                retrieval=FixedKRetrievalPolicy(recall_limit=1),
             ),
             "verify": grounded,
-            # RAG answers are document-grounded, but recall is allowed as a small
-            # secondary context (e.g. "what did I ask earlier"). Archival stays 0:
-            # injecting durable long-term facts into a strict doc-grounded answer
-            # would dilute the "answer only from these documents" contract.
+            # RAG answers are document-grounded, but recall is allowed as a
+            # small secondary context (e.g. "what did I ask earlier"). The
+            # RAG_SYSTEM_PROMPT still enforces "answer only from documents".
             "rag": ProfilePolicySet(
                 eviction=FIFOTailEvictionPolicy(keep_tail=20),
-                retrieval=FixedKRetrievalPolicy(recall_limit=2, archival_limit=0),
+                retrieval=FixedKRetrievalPolicy(recall_limit=2),
             ),
         }

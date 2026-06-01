@@ -14,7 +14,6 @@ from core.memory.policy import ProfilePolicyDispatcher
 from core.memory.request import CallConstraints, CallRequest
 from services.memory_tools_funcs.context_builder import build_messages
 from services.memory_tools_funcs.debug import mem_debug, mem_debug_enabled
-from services.memory_tools_funcs.external_context.archival_storage import ArchivalStorage
 from services.memory_tools_funcs.external_context.recall_storage import RecallStorage
 from services.memory_tools_funcs.main_context.heuristic_memory import extract_explicit_facts
 from services.memory_tools_funcs.main_context.queue_manage import QueueManager, utc_now_iso
@@ -56,7 +55,6 @@ class MemoryRuntime:
         self.token_counter = TokenCounter(raw_llm)
         self.store = MemoryStore(self.workspace_root, reuse_connection=True)
         self.recall = RecallStorage(self.store, self.token_counter)
-        self.archival = ArchivalStorage(self.store, self.token_counter)
         self.working = WorkingContextManager(self.store, self.token_counter)
         self.queue = QueueManager(self.store, self.token_counter, self.recall)
         self.summarizer = MemorySummarizer(raw_llm)
@@ -72,7 +70,6 @@ class MemoryRuntime:
         self.workspace_root = Path(workspace_root)
         self.store = MemoryStore(self.workspace_root, reuse_connection=True)
         self.recall = RecallStorage(self.store, self.token_counter)
-        self.archival = ArchivalStorage(self.store, self.token_counter)
         self.working = WorkingContextManager(self.store, self.token_counter)
         self.queue = QueueManager(self.store, self.token_counter, self.recall)
 
@@ -225,7 +222,6 @@ class MemoryRuntime:
             store=self.store,
             working=self.working,
             queue=self.queue,
-            archival=self.archival,
             retrieval_policy=self.policy_dispatcher.retrieval_for(req.profile),
         )
 

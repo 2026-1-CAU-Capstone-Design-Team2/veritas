@@ -61,7 +61,6 @@ class MemoryRuntimePr1Tests(unittest.TestCase):
             workspace = Path(tmp) / "api"
             store = MemoryStore(workspace)
             self.assertFalse(store.memory_dir.exists())
-            self.assertFalse(store.archival_dir.exists())
 
             runtime = MemoryRuntime(
                 raw_llm=_FakeRawLLM(),
@@ -243,18 +242,6 @@ class MemoryRuntimePr1Tests(unittest.TestCase):
                         token_count=3,
                     )
                 )
-                runtime.archival.insert(
-                    MemoryItem(
-                        id="archival-alpha",
-                        tier=MemoryTier.ARCHIVAL,
-                        role=MemoryRole.USER,
-                        content="alpha archival durable fact",
-                        source="test",
-                        created_at="2026-05-29T00:00:00+00:00",
-                        token_count=4,
-                    )
-                )
-
                 chat_prepared = runtime.prepare(
                     CallRequest(
                         task_instruction="system",
@@ -276,13 +263,12 @@ class MemoryRuntimePr1Tests(unittest.TestCase):
 
                 chat_system = str(chat_prepared.messages[0]["content"])
                 rag_system = str(rag_prepared.messages[0]["content"])
-                # chat profile pulls both recall and archival.
+                # Both profiles pull recall — secondary context that the
+                # answer LLM can use without violating RAG's grounding rule
+                # (RAG_SYSTEM_PROMPT still enforces "answer only from documents"
+                # for content questions).
                 self.assertIn("Retrieved Recall Context", chat_system)
-                self.assertIn("Retrieved Archival Context", chat_system)
-                # rag profile pulls recall (secondary context) but NOT archival —
-                # durable long-term facts stay out of a strict document-grounded answer.
                 self.assertIn("Retrieved Recall Context", rag_system)
-                self.assertNotIn("Retrieved Archival Context", rag_system)
             finally:
                 runtime.close()
 
@@ -333,7 +319,7 @@ class MemoryRuntimePr1Tests(unittest.TestCase):
                 for tool in raw.chat_tools
             }
             self.assertIn("working_context_append", tool_names)
-            self.assertIn("archival_insert", tool_names)
+            self.assertIn("recall_search", tool_names)
             runtime.close()
 
 

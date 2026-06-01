@@ -6,30 +6,12 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from core.memory.models import MemoryItem, MemoryRole, MemoryTier
-from services.memory_tools_funcs.external_context.archival_storage import ArchivalStorage
+from core.memory.models import MemoryRole
 from services.memory_tools_funcs.external_context.recall_storage import RecallStorage
 from services.memory_tools_funcs.main_context.fifo_storage import FifoStorage
 from services.memory_tools_funcs.main_context.queue_manage import QueueManager, utc_now_iso
 from services.memory_tools_funcs.store import MemoryStore
 from services.memory_tools_funcs.token_counter import TokenCounter
-
-
-def _item(
-    item_id: str,
-    content: str,
-    *,
-    tier: MemoryTier,
-) -> MemoryItem:
-    return MemoryItem(
-        id=item_id,
-        tier=tier,
-        role=MemoryRole.USER,
-        content=content,
-        source="test",
-        created_at=utc_now_iso(),
-        token_count=3,
-    )
 
 
 class UnifiedSqliteMemoryTests(unittest.TestCase):
@@ -38,16 +20,12 @@ class UnifiedSqliteMemoryTests(unittest.TestCase):
             store = MemoryStore(Path(tmp))
             counter = TokenCounter()
             recall = RecallStorage(store)
-            archival = ArchivalStorage(store)
             queue = QueueManager(store, counter, recall)
 
             queue.append_event(
                 role=MemoryRole.USER,
                 content="alpha fifo recall turn",
                 source="test",
-            )
-            archival.insert(
-                _item("archival-alpha", "alpha archival durable note", tier=MemoryTier.ARCHIVAL)
             )
             store.append_summary("alpha compacted summary", created_at=utc_now_iso())
             store.save_working_records(
@@ -66,7 +44,6 @@ class UnifiedSqliteMemoryTests(unittest.TestCase):
             self.assertTrue(store.db_path.exists())
             self.assertFalse(store.fifo_db_path.exists())
             self.assertFalse(store.recall_db_path.exists())
-            self.assertFalse(store.archival_db_path.exists())
             self.assertFalse(store.summaries_path.exists())
             self.assertFalse(store.working_path.exists())
 
@@ -83,8 +60,6 @@ class UnifiedSqliteMemoryTests(unittest.TestCase):
                     "fifo_items",
                     "recall_items",
                     "recall_fts",
-                    "archival_items",
-                    "archival_fts",
                     "summaries",
                     "working",
                     "migration_meta",
@@ -92,10 +67,6 @@ class UnifiedSqliteMemoryTests(unittest.TestCase):
             )
             self.assertEqual(queue.recent_rows(limit=1)[0]["content"], "alpha fifo recall turn")
             self.assertEqual(recall.search("alpha fifo", limit=1)[0]["content"], "alpha fifo recall turn")
-            self.assertEqual(
-                archival.search("alpha durable", limit=1)[0]["content"],
-                "alpha archival durable note",
-            )
             self.assertEqual(store.load_latest_summary(), "alpha compacted summary")
             self.assertEqual(store.load_working_records()[0]["text"], "alpha working fact")
 
@@ -129,27 +100,16 @@ class UnifiedSqliteMemoryTests(unittest.TestCase):
                 "alpha old recall row",
                 "recall",
             )
-            self._seed_fts_legacy_db(
-                store.archival_db_path,
-                "archival_items",
-                "archival-old",
-                "alpha old archival row",
-                "archival",
-            )
 
             queue = QueueManager(store, TokenCounter(), RecallStorage(store))
-            archival = ArchivalStorage(store)
 
             self.assertEqual(queue.recent_rows(limit=1)[0]["id"], "fifo-old")
             self.assertEqual(queue.recall.search("old recall", limit=1)[0]["id"], "recall-old")
-            self.assertEqual(archival.search("old archival", limit=1)[0]["id"], "archival-old")
             self.assertTrue(store.db_path.exists())
             self.assertFalse(store.fifo_db_path.exists())
             self.assertFalse(store.recall_db_path.exists())
-            self.assertFalse(store.archival_db_path.exists())
             self.assertTrue(Path(f"{store.fifo_db_path}.migrated").exists())
             self.assertTrue(Path(f"{store.recall_db_path}.migrated").exists())
-            self.assertTrue(Path(f"{store.archival_db_path}.migrated").exists())
 
     def _seed_fts_legacy_db(
         self,

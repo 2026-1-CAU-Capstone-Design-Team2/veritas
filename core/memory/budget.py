@@ -18,7 +18,6 @@ class MemoryBudget:
     working_context_tokens: int = 1200
     fifo_tokens: int = 1800
     recall_tokens: int = 1200
-    archival_tokens: int = 1200
 
     warning_ratio: float = 0.60
     flush_ratio: float = 0.80

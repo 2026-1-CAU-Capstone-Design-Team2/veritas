@@ -3,7 +3,7 @@
 Guards that the document-grounded RAG path is a full memory citizen: it routes
 through the MemoryRuntime (call/iter_call), records its turns to FIFO/recall
 (no_record=False), and uses profile="rag" so recall rides along as secondary
-context while archival stays out (document grounding kept primary).
+context (RAG_SYSTEM_PROMPT still keeps documents as primary evidence).
 """
 from __future__ import annotations
 

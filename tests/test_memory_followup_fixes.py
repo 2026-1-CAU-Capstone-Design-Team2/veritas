@@ -10,7 +10,6 @@ from core.memory.budget import MemoryBudget
 from core.memory.models import MemoryItem, MemoryRole, MemoryTier
 from core.memory.request import CallRequest
 from services.memory_tools_funcs.context_builder import build_messages
-from services.memory_tools_funcs.external_context.archival_storage import ArchivalStorage
 from services.memory_tools_funcs.external_context.recall_storage import RecallStorage
 from services.memory_tools_funcs.main_context.fifo_storage import FifoStorage
 from services.memory_tools_funcs.main_context.queue_manage import QueueManager, utc_now_iso
@@ -23,18 +22,6 @@ def _recall_item(item_id: str, content: str) -> MemoryItem:
     return MemoryItem(
         id=item_id,
         tier=MemoryTier.RECALL,
-        role=MemoryRole.USER,
-        content=content,
-        source="test",
-        created_at=utc_now_iso(),
-        token_count=3,
-    )
-
-
-def _archival_item(item_id: str, content: str) -> MemoryItem:
-    return MemoryItem(
-        id=item_id,
-        tier=MemoryTier.ARCHIVAL,
         role=MemoryRole.USER,
         content=content,
         source="test",
@@ -128,29 +115,6 @@ class SearchScanTests(unittest.TestCase):
             store.read_jsonl = counting_read  # type: ignore[method-assign]
             try:
                 results = recall.search("alpha", limit=3)
-            finally:
-                store.read_jsonl = real_read  # type: ignore[method-assign]
-
-            self.assertTrue(results)
-            self.assertEqual(scan_calls["n"], 0)
-
-    def test_archival_search_does_not_full_scan_when_unchanged(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            store = MemoryStore(Path(tmp))
-            archival = ArchivalStorage(store)
-            for index in range(10):
-                archival.insert(_archival_item(f"a{index}", f"alpha durable {index}"))
-
-            scan_calls = {"n": 0}
-            real_read = store.read_jsonl
-
-            def counting_read(path):
-                scan_calls["n"] += 1
-                return real_read(path)
-
-            store.read_jsonl = counting_read  # type: ignore[method-assign]
-            try:
-                results = archival.search("alpha", limit=3)
             finally:
                 store.read_jsonl = real_read  # type: ignore[method-assign]
 

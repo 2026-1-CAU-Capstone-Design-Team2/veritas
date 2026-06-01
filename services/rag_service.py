@@ -440,8 +440,8 @@ class RAGService:
         """Build the memory-engaged request for a grounded RAG answer.
 
         - profile="rag": the ProfilePolicyDispatcher allows a small recall pull
-          (recall_limit=2) and no archival, so working/recall ride along as
-          secondary context while documents stay the primary evidence.
+          (recall_limit=2), so working/recall ride along as secondary context
+          while documents stay the primary evidence.
         - grounded=False so working context is allowed; the RAG_SYSTEM_PROMPT in
           task_instruction keeps "answer only from the documents" in force.
         - record_content=question so the FIFO/recall turn stores the clean user

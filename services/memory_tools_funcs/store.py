@@ -22,7 +22,6 @@ class MemoryStore:
         self.workspace_root = Path(workspace_root)
         self.reuse_connection = bool(reuse_connection)
         self.memory_dir = self.workspace_root / "memory"
-        self.archival_dir = self.memory_dir / "archival"
 
         self.db_path = self.memory_dir / "memory.sqlite3"
 
@@ -33,8 +32,6 @@ class MemoryStore:
         self.recall_path = self.memory_dir / "recall_storage.jsonl"
         self.recall_db_path = self.memory_dir / "recall.sqlite3"
         self.summaries_path = self.memory_dir / "summaries.jsonl"
-        self.archival_path = self.archival_dir / "items.jsonl"
-        self.archival_db_path = self.archival_dir / "archival.sqlite3"
 
         self.invocations_path = self.memory_dir / "invocations.jsonl"
         self._db_lock = threading.RLock()

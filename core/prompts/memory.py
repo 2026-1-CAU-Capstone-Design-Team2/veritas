@@ -22,13 +22,6 @@ RECALL_CONTEXT_BLOCK_TEMPLATE = """\
 """
 
 
-# archival search results injected into system context.
-ARCHIVAL_CONTEXT_BLOCK_TEMPLATE = """\
-### Retrieved Archival Context ###
-{archival_context}
-"""
-
-
 # FIFO 누적이 warning_ratio 초과 시 추가되는 경고.
 MEMORY_PRESSURE_SYSTEM_MESSAGE = """\
 ### Memory Pressure Alert ###
