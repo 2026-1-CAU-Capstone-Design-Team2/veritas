@@ -19,6 +19,7 @@ from ...api_common import STATE
 from ...components.buttons import AppButton
 from ...components.cards import CardWidget
 from ...controllers import AgentController
+from ...theme import theme
 from .research_page import DocCountStepper
 
 
@@ -65,18 +66,22 @@ class _CollapsibleHeader(QPushButton):
 		self.setCursor(Qt.PointingHandCursor)
 		self.setFocusPolicy(Qt.NoFocus)
 		self.setFixedHeight(30)
-		self.setStyleSheet(
-			"QPushButton#AdvancedToggleHeader {"
-			" background-color: transparent; border: none; text-align: left;"
-			" padding: 0px; color: #0F172A; font-size: 14px; font-weight: 800; }"
-			"QPushButton#AdvancedToggleHeader:hover { color: #4F46E5; }"
-		)
+		# Surface colours come from the app stylesheet (#AdvancedToggleHeader); the
+		# hand-painted chevron repaints itself on a theme toggle.
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		self.update()
 
 	def paintEvent(self, event) -> None:  # type: ignore[override]
 		super().paintEvent(event)  # title text + hover colour from the stylesheet
 		painter = QPainter(self)
 		painter.setRenderHint(QPainter.Antialiasing, True)
-		color = QColor("#4F46E5") if self.underMouse() else QColor("#475569")
+		color = (
+			QColor(theme.color("accent"))
+			if self.underMouse()
+			else QColor(theme.color("text.slate600"))
+		)
 		pen = QPen(color)
 		pen.setWidthF(2.0)
 		pen.setCapStyle(Qt.RoundCap)
@@ -186,10 +191,46 @@ class SettingsPage(QWidget):
 		root.setContentsMargins(0, 0, 0, 0)
 		root.setSpacing(14)
 
+		root.addWidget(self._build_appearance_card())
 		root.addWidget(self._build_model_card())
 		root.addWidget(self._build_local_access_card())
 		root.addWidget(self._build_advanced_section())
 		root.addStretch(1)
+
+	def _build_appearance_card(self) -> CardWidget:
+		card = CardWidget("다크모드")
+
+		subtitle = QLabel("라이트 모드와 다크 모드를 선택합니다. 상단 헤더의 토글로도 전환할 수 있습니다.")
+		subtitle.setObjectName("PageSubtitle")
+		subtitle.setWordWrap(True)
+		card.layout.addWidget(subtitle)
+
+		toggle_row = QHBoxLayout()
+		toggle_row.setSpacing(8)
+		self._theme_group = QButtonGroup(self)
+		self._theme_group.setExclusive(True)
+		self._theme_buttons: dict[str, QPushButton] = {}
+		for label, mode in (("Light Mode", "light"), ("Dark Mode", "dark")):
+			button = QPushButton(label)
+			button.setObjectName("SettingsModelToggle")
+			button.setCheckable(True)
+			button.setCursor(Qt.PointingHandCursor)
+			button.clicked.connect(lambda _checked=False, m=mode: theme.set_mode(m))
+			self._theme_group.addButton(button)
+			self._theme_buttons[mode] = button
+			toggle_row.addWidget(button)
+		toggle_row.addStretch(1)
+		card.layout.addLayout(toggle_row)
+
+		self._sync_theme_buttons()
+		# Reflect changes made from the header toggle too.
+		theme.themeChanged.connect(self._sync_theme_buttons)
+		return card
+
+	def _sync_theme_buttons(self, *args) -> None:
+		button = self._theme_buttons.get(theme.mode())
+		if button is not None:
+			button.setChecked(True)
 
 	def _build_model_card(self) -> CardWidget:
 		card = CardWidget("모델 설정")
@@ -440,13 +481,13 @@ class SettingsPage(QWidget):
 
 	def _subsection_title(self, text: str) -> QLabel:
 		label = QLabel(text)
-		label.setStyleSheet("font-size: 13px; font-weight: 800; color: #0F172A;")
+		label.setObjectName("SettingsSubsectionTitle")
 		return label
 
 	def _divider(self) -> QFrame:
 		line = QFrame()
+		line.setObjectName("SettingsDivider")
 		line.setFixedHeight(1)
-		line.setStyleSheet("background-color: #E2E8F0; border: none;")
 		return line
 
 	def _load_model_settings(self) -> None:

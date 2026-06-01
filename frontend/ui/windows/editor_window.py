@@ -71,9 +71,8 @@ from ...controllers import (
     get_job_manager,
 )
 from ..markdown_view import render_markdown_html
+from ...theme import build_editor_qss, theme
 from .document_assist_window import (
-    CHAT_QSS,
-    VERITAS_TITLEBAR_QSS,
     ChatInputBar,
     ChatPanel,
     TypingIndicator,
@@ -81,8 +80,6 @@ from .document_assist_window import (
     render_history_html,
 )
 
-
-GHOST_COLOR = "#9AA0A6"
 
 # Window-control glyphs. The previous plain-text symbols (－ ▢ ×) render as tofu
 # in the UI font; these are the standard Private-Use codepoints in Windows'
@@ -305,7 +302,7 @@ class MarkdownSourceEdit(QTextEdit):
     @staticmethod
     def _ghost_format() -> QTextCharFormat:
         fmt = QTextCharFormat()
-        fmt.setForeground(QColor(GHOST_COLOR))
+        fmt.setForeground(QColor(theme.color("editor.ghost")))
         return fmt
 
     # -- ghost state ----------------------------------------------------------
@@ -793,6 +790,7 @@ class EditorWindow(QWidget):
 
         self._build_ui()
         self._apply_stylesheet()
+        theme.themeChanged.connect(self._on_theme_changed)
         self._wire_timers()
         self._install_shortcuts()
         self._set_view_mode("split")
@@ -936,6 +934,10 @@ class EditorWindow(QWidget):
         layout.setContentsMargins(10, 5, 10, 5)
         layout.setSpacing(4)
 
+        # Painter-drawn toolbar icons carry a baked-in colour, so they are tracked
+        # and repainted in the new ink colour whenever the theme toggles.
+        self._tool_icon_buttons: list[tuple[QPushButton, str]] = []
+
         def add_sep() -> None:
             sep = QFrame()
             sep.setObjectName("EditorToolSep")
@@ -958,9 +960,10 @@ class EditorWindow(QWidget):
             button.setCursor(Qt.PointingHandCursor)
             button.setToolTip(tooltip)
             button.setFixedSize(30, 28)
-            button.setIcon(editor_tool_icon(icon_kind))
+            button.setIcon(editor_tool_icon(icon_kind, color=theme.color("editor.text.tertiary")))
             button.setIconSize(QSize(18, 18))
             button.clicked.connect(lambda checked=False, h=handler: h())
+            self._tool_icon_buttons.append((button, icon_kind))
             layout.addWidget(button)
 
         # Left-panel (문서 개요) show/hide toggle, mirroring its position.
@@ -1994,145 +1997,18 @@ class EditorWindow(QWidget):
     # ------------------------------------------------------------ stylesheet
 
     def _apply_stylesheet(self) -> None:
-        self.setStyleSheet(
-            """
-            QWidget {
-                font-family: 'Pretendard', 'Segoe UI Variable', 'Segoe UI', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
-                font-size: 13px;
-                color: #202124;
-            }
-            QFrame#EditorPanel { background-color: #ffffff; border: 1px solid #dadce0; border-radius: 12px; }
-            QFrame#EditorTitleBar {
-                background-color: #f8f9fa; border-top-left-radius: 12px; border-top-right-radius: 12px;
-                border-bottom: 1px solid #e8eaed;
-            }
-            QLabel#EditorDocTitle { font-size: 14px; font-weight: 700; color: #202124; }
-            QLabel#EditorSaveStatus { font-size: 11px; font-weight: 600; color: #5f6368; }
-            QPushButton#EditorWinButton, QPushButton#EditorCloseButton {
-                background-color: transparent; color: #5f6368; border: none; border-radius: 6px;
-                font-size: 14px; font-weight: 700;
-            }
-            QPushButton#EditorWinButton:hover { background-color: #e8eaed; color: #202124; }
-            QPushButton#EditorCloseButton:hover { background-color: #fce8e6; color: #d93025; }
-            QFrame#EditorMenuRow { background-color: #ffffff; border-bottom: 1px solid #f1f3f4; }
-            QToolButton#EditorMenuButton {
-                background-color: transparent; color: #3c4043; border: none; border-radius: 6px;
-                padding: 5px 9px; font-weight: 600;
-            }
-            QToolButton#EditorMenuButton:hover { background-color: #f1f3f4; }
-            QToolButton#EditorMenuButton::menu-indicator { image: none; width: 0; }
-            QToolButton#EditorExportButton {
-                background-color: #0b57d0; color: #ffffff; border: none; border-radius: 8px;
-                padding: 6px 14px; font-weight: 700;
-            }
-            QToolButton#EditorExportButton:hover { background-color: #1967d2; }
-            QToolButton#EditorExportButton::menu-indicator { image: none; width: 0; }
-            QFrame#EditorToolbar { background-color: #ffffff; border-bottom: 1px solid #e8eaed; }
-            QPushButton#EditorToolButton {
-                background-color: #ffffff; color: #3c4043; border: 1px solid #e8eaed; border-radius: 6px;
-                padding: 0px 9px; font-weight: 700; min-width: 22px;
-            }
-            QPushButton#EditorToolButton:hover { background-color: #f1f3f4; border-color: #dadce0; }
-            QPushButton#EditorIconButton {
-                background-color: #ffffff; border: 1px solid #e8eaed; border-radius: 6px; padding: 0px;
-            }
-            QPushButton#EditorIconButton:hover { background-color: #f1f3f4; border-color: #dadce0; }
-            QToolButton#EditorStyleButton {
-                background-color: #ffffff; color: #3c4043; border: 1px solid #e8eaed; border-radius: 6px;
-                padding: 3px 10px; font-weight: 600;
-            }
-            QToolButton#EditorStyleButton:hover { background-color: #f1f3f4; border-color: #dadce0; }
-            QToolButton#EditorStyleButton::menu-indicator { image: none; width: 0; }
-            QFrame#EditorToolSep { background-color: #e8eaed; }
-            QPushButton#ViewToggleButton {
-                background-color: #ffffff; color: #5f6368; border: 1px solid #dadce0; border-radius: 6px;
-                padding: 3px 12px; font-weight: 600;
-            }
-            QPushButton#ViewToggleButton:checked { background-color: #e8f0fe; color: #0b57d0; border-color: #0b57d0; }
-            QPushButton#PanelToggleButton {
-                background-color: #ffffff; color: #5f6368; border: 1px solid #dadce0; border-radius: 6px;
-                padding: 3px 10px; font-weight: 600;
-            }
-            QPushButton#PanelToggleButton:checked { background-color: #e8f0fe; color: #0b57d0; border-color: #0b57d0; }
-            QPushButton#PanelToggleButton:hover { background-color: #f1f3f4; }
-            QSplitter#EditorMainSplit::handle { background-color: #e8eaed; }
-            QSplitter#CenterSplit { background-color: #f6f7f9; }
-            QSplitter#CenterSplit::handle { background-color: #f6f7f9; }
-            QFrame#EditorCanvas { background-color: #f6f7f9; }
-            QFrame#EditorPage { background-color: #ffffff; border: 1px solid #e8eaed; border-radius: 4px; }
-            QTextEdit#EditorSource {
-                background-color: #ffffff; color: #202124; border: none; border-radius: 4px;
-                padding: 30px 40px; font-size: 15px;
-                selection-background-color: #d3e3fd; selection-color: #202124;
-            }
-            QTextBrowser#EditorPreview {
-                background-color: #ffffff; color: #202124; border: none; border-radius: 4px; padding: 24px 32px;
-            }
-            QFrame#OutlinePanel, QFrame#AssistPanel { background-color: #ffffff; }
-            QFrame#OutlinePanel { border-right: 1px solid #e8eaed; }
-            QFrame#AssistPanel { border-left: 1px solid #e8eaed; }
-            QLabel#PanelHeaderTitle { font-size: 13px; font-weight: 800; color: #202124; }
-            QLabel#PanelHint { font-size: 11px; color: #80868b; }
-            QLabel#PanelEmpty { font-size: 12px; color: #9aa0a6; padding: 18px; }
-            QPushButton#PanelHeaderClose {
-                background-color: transparent; color: #5f6368; border: none; border-radius: 6px; font-weight: 700;
-            }
-            QPushButton#PanelHeaderClose:hover { background-color: #e8eaed; color: #202124; }
-            QListWidget#OutlineList, QListWidget#HistoryList {
-                background-color: #ffffff; border: 1px solid #e8eaed; border-radius: 8px; padding: 4px;
-            }
-            QListWidget#OutlineList::item, QListWidget#HistoryList::item { padding: 6px 8px; border-radius: 6px; color: #3c4043; }
-            QListWidget#OutlineList::item:hover, QListWidget#HistoryList::item:hover { background-color: #f1f3f4; }
-            QListWidget#OutlineList::item:selected, QListWidget#HistoryList::item:selected { background-color: #e8f0fe; color: #0b57d0; }
-            QTabWidget#AssistTabs::pane { border: 1px solid #e8eaed; border-radius: 8px; top: -1px; }
-            QTabBar::tab {
-                background-color: #f1f3f4; color: #5f6368; padding: 6px 14px; border-top-left-radius: 8px;
-                border-top-right-radius: 8px; font-weight: 600; margin-right: 2px;
-            }
-            QTabBar::tab:selected { background-color: #ffffff; color: #0b57d0; border: 1px solid #e8eaed; border-bottom: none; }
-            QPushButton#QuickActionButton {
-                background-color: #ffffff; color: #3c4043; border: 1px solid #dadce0; border-radius: 8px;
-                padding: 9px 12px; font-weight: 600; text-align: left;
-            }
-            QPushButton#QuickActionButton:hover { background-color: #f8f9fa; border-color: #0b57d0; color: #0b57d0; }
-            QTextEdit#AssistResult {
-                background-color: #f8f9fa; color: #202124; border: 1px solid #e8eaed; border-radius: 8px; padding: 10px;
-            }
-            QTextEdit#AssistChatInput {
-                background-color: #f8f9fa; border: 1px solid #dadce0; border-radius: 10px; padding: 8px 10px; color: #202124;
-            }
-            QTextEdit#AssistChatInput:focus { background-color: #ffffff; border-color: #0b57d0; }
-            QPushButton#PrimaryButton {
-                background-color: #0b57d0; color: #ffffff; border: none; border-radius: 8px; padding: 8px 14px; font-weight: 700;
-            }
-            QPushButton#PrimaryButton:hover { background-color: #1967d2; }
-            QPushButton#GhostButton {
-                background-color: #ffffff; color: #3c4043; border: 1px solid #dadce0; border-radius: 8px; padding: 8px 12px; font-weight: 600;
-            }
-            QPushButton#GhostButton:hover { background-color: #f1f3f4; }
-            QFrame#GhostChip { background-color: #202124; border-radius: 8px; }
-            QPushButton#GhostChipButton {
-                background-color: transparent; color: #e8eaed; border: none; padding: 2px 6px; font-size: 11px; font-weight: 600;
-            }
-            QPushButton#GhostChipButton:hover { color: #ffffff; }
-            QFrame#GhostGenChip { background-color: #f1f3f4; border: 1px solid #e0e3e7; border-radius: 10px; }
-            QLabel#GhostGenLabel { color: #5f6368; font-size: 11px; font-weight: 600; background: transparent; }
-            QFrame#EditorStatusBar {
-                background-color: #f8f9fa; border-top: 1px solid #e8eaed;
-                border-bottom-left-radius: 12px; border-bottom-right-radius: 12px;
-            }
-            QLabel#EditorStatusItem { font-size: 11px; font-weight: 600; color: #5f6368; }
-            QMenu { background-color: #ffffff; border: 1px solid #dadce0; border-radius: 8px; padding: 6px; }
-            QMenu::item { color: #202124; padding: 7px 26px 7px 12px; border-radius: 6px; }
-            QMenu::item:selected { background-color: #e8f0fe; color: #0b57d0; }
-            QScrollBar:vertical { background: transparent; width: 9px; margin: 2px; }
-            QScrollBar::handle:vertical { background: #bdc1c6; border-radius: 4px; min-height: 28px; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-            """
-            + VERITAS_TITLEBAR_QSS
-            + CHAT_QSS
-        )
+        self.setStyleSheet(build_editor_qss(theme.palette()))
+
+    def _retint_tool_icons(self) -> None:
+        """Repaint the painter-drawn toolbar icons in the active ink colour."""
+        ink = theme.color("editor.text.tertiary")
+        for button, kind in getattr(self, "_tool_icon_buttons", []):
+            button.setIcon(editor_tool_icon(kind, color=ink))
+
+    def _on_theme_changed(self, _mode: str) -> None:
+        self._apply_stylesheet()
+        self._retint_tool_icons()
+
 
 
 if __name__ == "__main__":

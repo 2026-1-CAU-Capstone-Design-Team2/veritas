@@ -21,11 +21,74 @@ from db.db import get_connection, init_db
 from ...api_common import ApiError, load_bootstrap_state
 from ...components.cards import CardWidget
 from ...controllers import AgentController, get_job_manager
+from ...theme import theme
 
 # Stored timestamps are written by the backend with SQLite ``datetime('now')``
 # or as ISO-8601 strings with a trailing ``Z`` — both UTC. The dashboard shows
 # them in Korean Standard Time (UTC+9).
 _KST = timezone(timedelta(hours=9))
+
+
+class _DashboardActionButton(QPushButton):
+	"""A small pill action button (rename / delete / open) on the dashboard.
+
+	These buttons are created and destroyed per data-refresh, so each instance
+	owns its own theme handling: ``_apply_theme`` is a bound method on the button
+	and ``themeChanged`` connects to it, which Qt auto-disconnects when the button
+	is destroyed. Subclasses supply the semantic colour tokens via class
+	attributes; only the colours differ between them.
+	"""
+
+	# (foreground, border, hover background, hover border) theme tokens.
+	_FG = ""
+	_BORDER = ""
+	_HOVER_BG = ""
+	_HOVER_BORDER = ""
+
+	def __init__(self, text: str, object_name: str, parent: QWidget | None = None) -> None:
+		super().__init__(text, parent)
+		self.setObjectName(object_name)
+		self.setCursor(Qt.PointingHandCursor)
+		self.setFixedHeight(28)
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		name = self.objectName()
+		self.setStyleSheet(
+			f"QPushButton#{name} {{"
+			f" background-color: {theme.color('surface')}; color: {theme.color(self._FG)};"
+			f" border: 1px solid {theme.color(self._BORDER)}; border-radius: 8px;"
+			" padding: 4px 10px; font-size: 11px; font-weight: 800;"
+			"}"
+			f"QPushButton#{name}:hover {{"
+			f" background-color: {theme.color(self._HOVER_BG)}; border-color: {theme.color(self._HOVER_BORDER)};"
+			"}"
+			f"QPushButton#{name}:disabled {{"
+			f" color: {theme.color('text.muted.gray')}; border-color: {theme.color('border.gray')};"
+			"}"
+		)
+
+
+class _WorkspaceRenameButton(_DashboardActionButton):
+	_FG = "action.edit.fg"
+	_BORDER = "action.edit.border"
+	_HOVER_BG = "action.edit.hover.bg"
+	_HOVER_BORDER = "action.edit.hover.border"
+
+
+class _WorkspaceDeleteButton(_DashboardActionButton):
+	_FG = "action.delete.fg"
+	_BORDER = "action.delete.border"
+	_HOVER_BG = "action.delete.hover.bg"
+	_HOVER_BORDER = "action.delete.hover.border"
+
+
+class _DraftOpenButton(_DashboardActionButton):
+	_FG = "action.open.fg"
+	_BORDER = "action.open.border"
+	_HOVER_BG = "action.open.hover.bg"
+	_HOVER_BORDER = "action.open.hover.border"
 
 
 class DashboardPage(QWidget):
@@ -161,41 +224,9 @@ class DashboardPage(QWidget):
 	def _create_workspace_row(self, workspace_id: str, name: str, last_worked_at: str) -> QHBoxLayout:
 		row = self._create_text_row(name, f"생성 일자: {self._format_created_at(last_worked_at)}")
 
-		rename_button = QPushButton("이름 변경")
-		rename_button.setObjectName("DashboardWorkspaceRenameButton")
-		rename_button.setCursor(Qt.PointingHandCursor)
-		rename_button.setFixedHeight(28)
-		rename_button.setStyleSheet(
-			"QPushButton#DashboardWorkspaceRenameButton {"
-			" background-color: #FFFFFF; color: #047857;"
-			" border: 1px solid #6EE7B7; border-radius: 8px;"
-			" padding: 4px 10px; font-size: 11px; font-weight: 800;"
-			"}"
-			"QPushButton#DashboardWorkspaceRenameButton:hover {"
-			" background-color: #D1FAE5; border-color: #34D399;"
-			"}"
-			"QPushButton#DashboardWorkspaceRenameButton:disabled {"
-			" color: #9CA3AF; border-color: #E5E7EB;"
-			"}"
-		)
+		rename_button = _WorkspaceRenameButton("이름 변경", "DashboardWorkspaceRenameButton")
 
-		delete_button = QPushButton("삭제")
-		delete_button.setObjectName("DashboardWorkspaceDeleteButton")
-		delete_button.setCursor(Qt.PointingHandCursor)
-		delete_button.setFixedHeight(28)
-		delete_button.setStyleSheet(
-			"QPushButton#DashboardWorkspaceDeleteButton {"
-			" background-color: #FFFFFF; color: #B91C1C;"
-			" border: 1px solid #FCA5A5; border-radius: 8px;"
-			" padding: 4px 10px; font-size: 11px; font-weight: 800;"
-			"}"
-			"QPushButton#DashboardWorkspaceDeleteButton:hover {"
-			" background-color: #FEE2E2; border-color: #F87171;"
-			"}"
-			"QPushButton#DashboardWorkspaceDeleteButton:disabled {"
-			" color: #9CA3AF; border-color: #E5E7EB;"
-			"}"
-		)
+		delete_button = _WorkspaceDeleteButton("삭제", "DashboardWorkspaceDeleteButton")
 		if not workspace_id:
 			rename_button.setEnabled(False)
 			rename_button.setToolTip("워크스페이스 ID가 없어 이름을 변경할 수 없습니다.")
@@ -356,23 +387,7 @@ class DashboardPage(QWidget):
 
 	def _create_draft_row(self, title: str, detail: str, workspace_id: str, draft_path: str) -> QHBoxLayout:
 		row = self._create_text_row(title, detail)
-		open_button = QPushButton("열기")
-		open_button.setObjectName("DashboardDraftOpenButton")
-		open_button.setCursor(Qt.PointingHandCursor)
-		open_button.setFixedHeight(28)
-		open_button.setStyleSheet(
-			"QPushButton#DashboardDraftOpenButton {"
-			" background-color: #FFFFFF; color: #1D4ED8;"
-			" border: 1px solid #93C5FD; border-radius: 8px;"
-			" padding: 4px 10px; font-size: 11px; font-weight: 800;"
-			"}"
-			"QPushButton#DashboardDraftOpenButton:hover {"
-			" background-color: #EFF6FF; border-color: #60A5FA;"
-			"}"
-			"QPushButton#DashboardDraftOpenButton:disabled {"
-			" color: #9CA3AF; border-color: #E5E7EB;"
-			"}"
-		)
+		open_button = _DraftOpenButton("열기", "DashboardDraftOpenButton")
 		if draft_path and Path(draft_path).exists():
 			open_button.setToolTip(f"글쓰기 창에서 열기: {title}")
 			open_button.clicked.connect(

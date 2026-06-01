@@ -33,6 +33,7 @@ from ...components.buttons import AppButton
 from ...components.cards import CardWidget
 from ...components.progress import ResearchProgressBar
 from ...controllers import AgentController, JobCategory, get_job_manager
+from ...theme import theme
 
 # Bounds for the user-configurable "max documents to research" control.
 # The default mirrors the backend VERITAS_MAX_DOCS fallback (15).
@@ -78,12 +79,19 @@ class CircleGlyphButton(QToolButton):
 	) -> None:
 		super().__init__(parent)
 		self._glyph = glyph  # "plus" | "minus" | "cross"
-		self._color = QColor(color)
-		self._hover_color = QColor(hover_color)
-		self._disabled_color = QColor("#CBD5E1")
+		# Glyph colours are stored as theme *token* names and resolved at paint
+		# time, so the stroke follows a live light/dark toggle. The circle
+		# background/border + hover state still come from the stylesheet.
+		self._color_token = color
+		self._hover_color_token = hover_color
+		self._disabled_color_token = "border.strong"
 		self.setFixedSize(diameter, diameter)
 		self.setCursor(Qt.PointingHandCursor)
 		self.setFocusPolicy(Qt.NoFocus)
+		theme.themeChanged.connect(self._on_theme_changed)
+
+	def _on_theme_changed(self, *args) -> None:
+		self.update()
 
 	def enterEvent(self, event) -> None:  # type: ignore[override]
 		super().enterEvent(event)
@@ -98,11 +106,11 @@ class CircleGlyphButton(QToolButton):
 		painter = QPainter(self)
 		painter.setRenderHint(QPainter.Antialiasing, True)
 		if not self.isEnabled():
-			color = self._disabled_color
+			color = QColor(theme.color(self._disabled_color_token))
 		elif self.underMouse():
-			color = self._hover_color
+			color = QColor(theme.color(self._hover_color_token))
 		else:
-			color = self._color
+			color = QColor(theme.color(self._color_token))
 		pen = QPen(color)
 		pen.setWidthF(max(1.7, self.width() * 0.075))
 		pen.setCapStyle(Qt.RoundCap)
@@ -154,7 +162,7 @@ class DocCountStepper(QFrame):
 		layout.setContentsMargins(6, 6, 6, 6)
 		layout.setSpacing(6)
 
-		self._minus = CircleGlyphButton("minus", "#4F46E5", "#4338CA", 32)
+		self._minus = CircleGlyphButton("minus", "accent", "accent.hover", 32)
 		self._minus.setObjectName("StepperButton")
 		self._minus.setToolTip("문서 수 줄이기")
 		self._minus.clicked.connect(lambda: self._step(-1))
@@ -175,7 +183,7 @@ class DocCountStepper(QFrame):
 		self._unit_label.setObjectName("StepperUnit")
 		self._unit_label.setAlignment(Qt.AlignCenter)
 
-		self._plus = CircleGlyphButton("plus", "#4F46E5", "#4338CA", 32)
+		self._plus = CircleGlyphButton("plus", "accent", "accent.hover", 32)
 		self._plus.setObjectName("StepperButton")
 		self._plus.setToolTip("문서 수 늘리기")
 		self._plus.clicked.connect(lambda: self._step(1))
@@ -229,22 +237,32 @@ class InfoTile(QFrame):
 	def __init__(self, label: str, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("ResearchInfoTile")
-		self.setStyleSheet(
-			"QFrame#ResearchInfoTile { background-color: #F8FAFC; border: 1px solid #E2E8F0; "
-			"border-radius: 10px; padding: 8px 12px; }"
-		)
 		self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(0, 0, 0, 0)
 		layout.setSpacing(2)
 		self._label = QLabel(label)
-		self._label.setStyleSheet("color: #6B7280; font-size: 10px; font-weight: 700; letter-spacing: 0.4px;")
 		self._value = QLabel("-")
 		self._value.setWordWrap(True)
 		self._value.setTextInteractionFlags(Qt.TextSelectableByMouse)
-		self._value.setStyleSheet("color: #0F172A; font-size: 13px; font-weight: 700;")
 		layout.addWidget(self._label)
 		layout.addWidget(self._value)
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		self.setStyleSheet(
+			f"QFrame#ResearchInfoTile {{ background-color: {theme.color('surface.muted')}; "
+			f"border: 1px solid {theme.color('border')}; "
+			"border-radius: 10px; padding: 8px 12px; }"
+		)
+		self._label.setStyleSheet(
+			f"color: {theme.color('text.secondary.gray')}; font-size: 10px; "
+			"font-weight: 700; letter-spacing: 0.4px;"
+		)
+		self._value.setStyleSheet(
+			f"color: {theme.color('text.primary')}; font-size: 13px; font-weight: 700;"
+		)
 
 	def set_value(self, value: str) -> None:
 		# Break long unbreakable values (e.g. a workspace path) so the tile can
@@ -269,18 +287,24 @@ class LinkLabel(QLabel):
 		# Break the URL into wrappable chunks: a word-wrap QLabel cannot break a
 		# spaceless URL, so without this its minimum width is the full string
 		# and it stretches the document row (and the result pane) horizontally.
-		display = html.escape(_soft_break_long_tokens(self._url), quote=False)
-		# Rich text is only used for the underline + color; the click handler
-		# does not rely on Qt parsing an <a> tag.
-		self.setText(
-			f'<span style="color:#2563EB; text-decoration:underline;">{display}</span>'
-		)
+		self._display = html.escape(_soft_break_long_tokens(self._url), quote=False)
 		self.setTextFormat(Qt.RichText)
 		self.setTextInteractionFlags(Qt.NoTextInteraction)
 		self.setWordWrap(True)
 		self.setCursor(Qt.PointingHandCursor)
 		self.setToolTip(self._url)
 		self.setStyleSheet("font-size: 11px;")
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		# Rich text is only used for the underline + color; the click handler
+		# does not rely on Qt parsing an <a> tag. Re-set on a theme toggle so
+		# the link colour follows the active palette.
+		self.setText(
+			f'<span style="color:{theme.color("link")}; text-decoration:underline;">'
+			f'{self._display}</span>'
+		)
 
 	def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
 		if event.button() == Qt.LeftButton and self._url:
@@ -317,11 +341,6 @@ class DocumentBar(QFrame):
 	) -> None:
 		super().__init__(parent)
 		self.setObjectName("ResearchDocumentBar")
-		self.setStyleSheet(
-			"QFrame#ResearchDocumentBar { background-color: #FFFFFF; border: 1px solid #E2E8F0; "
-			"border-radius: 10px; }"
-			"QFrame#ResearchDocumentBar:hover { border-color: #C7D2FE; }"
-		)
 		self.doc_id = str(doc_id or "")
 		self._summary_path: Path | None = None
 		self._failed = False
@@ -336,11 +355,10 @@ class DocumentBar(QFrame):
 
 		safe_title = title if title else "Untitled"
 		title_text = _soft_break_long_tokens(f"{index}. {safe_title}")
-		title_label = QLabel(title_text)
-		title_label.setWordWrap(True)
-		title_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-		title_label.setStyleSheet("color: #0F172A; font-size: 13px; font-weight: 700;")
-		text_column.addWidget(title_label)
+		self._title_label = QLabel(title_text)
+		self._title_label.setWordWrap(True)
+		self._title_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+		text_column.addWidget(self._title_label)
 
 		if url:
 			text_column.addWidget(LinkLabel(url))
@@ -349,16 +367,11 @@ class DocumentBar(QFrame):
 
 		self._open_button = QPushButton(self)
 		self._open_button.setCursor(Qt.PointingHandCursor)
-		self._open_button.setStyleSheet(
-			"QPushButton { background-color: #EEF2FF; color: #3730A3; "
-			"border: 1px solid #C7D2FE; border-radius: 8px; padding: 6px 10px; "
-			"font-size: 11px; font-weight: 800; }"
-			"QPushButton:hover { background-color: #E0E7FF; border-color: #818CF8; }"
-			"QPushButton:disabled { background-color: #F3F4F6; color: #9CA3AF; "
-			"border-color: #E5E7EB; }"
-		)
 		self._open_button.clicked.connect(self._on_open_clicked)
 		layout.addWidget(self._open_button, 0, Qt.AlignTop)
+
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
 
 		# Render initial state. If a path was passed (e.g. when reconstructing
 		# from a completed job), we honor it immediately; otherwise the button
@@ -367,6 +380,51 @@ class DocumentBar(QFrame):
 			self.set_summary_ready(summary_path)
 		else:
 			self._apply_pending_state()
+
+	def _apply_theme(self, *args) -> None:
+		"""(Re)apply every palette-derived style so the row follows a theme
+		toggle. Dispatches to the failed-state styling once the document's
+		summarization has been marked failed."""
+		self._title_label.setStyleSheet(
+			f"color: {theme.color('text.primary')}; font-size: 13px; font-weight: 700;"
+		)
+		if self._failed:
+			self._apply_failed_styles()
+		else:
+			self._apply_default_styles()
+
+	def _apply_default_styles(self) -> None:
+		self.setStyleSheet(
+			f"QFrame#ResearchDocumentBar {{ background-color: {theme.color('surface')}; "
+			f"border: 1px solid {theme.color('border')}; border-radius: 10px; }}"
+			f"QFrame#ResearchDocumentBar:hover {{ border-color: {theme.color('accent.subtle.border')}; }}"
+		)
+		self._open_button.setStyleSheet(
+			f"QPushButton {{ background-color: {theme.color('accent.subtle.bg')}; "
+			f"color: {theme.color('accent.text')}; "
+			f"border: 1px solid {theme.color('accent.subtle.border')}; border-radius: 8px; "
+			"padding: 6px 10px; font-size: 11px; font-weight: 800; }"
+			f"QPushButton:hover {{ background-color: {theme.color('accent.subtle.bg.hover')}; "
+			f"border-color: {theme.color('accent.border.checked')}; }}"
+			f"QPushButton:disabled {{ background-color: {theme.color('surface.muted2')}; "
+			f"color: {theme.color('text.muted.gray')}; "
+			f"border-color: {theme.color('border.gray')}; }}"
+		)
+
+	def _apply_failed_styles(self) -> None:
+		self._open_button.setStyleSheet(
+			f"QPushButton {{ background-color: {theme.color('danger.bg2')}; "
+			f"color: {theme.color('danger.fg')}; "
+			f"border: 1px solid {theme.color('danger.border2')}; border-radius: 8px; "
+			"padding: 6px 10px; font-size: 11px; font-weight: 800; }"
+			f"QPushButton:disabled {{ background-color: {theme.color('danger.bg2')}; "
+			f"color: {theme.color('danger.fg')}; "
+			f"border-color: {theme.color('danger.border2')}; }}"
+		)
+		self.setStyleSheet(
+			f"QFrame#ResearchDocumentBar {{ background-color: {theme.color('danger.bg')}; "
+			f"border: 1px solid {theme.color('danger.border2')}; border-radius: 10px; }}"
+		)
 
 	def set_summary_ready(self, summary_path: Path) -> None:
 		"""Mark this document's summary as available and enable the open button."""
@@ -387,17 +445,7 @@ class DocumentBar(QFrame):
 		self._open_button.setEnabled(False)
 		self._open_button.setText("요약 실패")
 		self._open_button.setToolTip(reason or "요약에 실패했습니다.")
-		self._open_button.setStyleSheet(
-			"QPushButton { background-color: #FEE2E2; color: #B91C1C; "
-			"border: 1px solid #FCA5A5; border-radius: 8px; padding: 6px 10px; "
-			"font-size: 11px; font-weight: 800; }"
-			"QPushButton:disabled { background-color: #FEE2E2; color: #B91C1C; "
-			"border-color: #FCA5A5; }"
-		)
-		self.setStyleSheet(
-			"QFrame#ResearchDocumentBar { background-color: #FEF2F2; "
-			"border: 1px solid #FCA5A5; border-radius: 10px; }"
-		)
+		self._apply_failed_styles()
 
 	def is_summary_ready(self) -> bool:
 		"""True once this document has been summarized (doc_summarized event)."""
@@ -572,7 +620,7 @@ class ResearchPage(QWidget):
 		reference_label = QLabel("레퍼런스 사이트")
 		reference_label.setObjectName("CardPrimary")
 
-		add_url_btn = CircleGlyphButton("plus", "#FFFFFF", "#FFFFFF", 30)
+		add_url_btn = CircleGlyphButton("plus", "text.on_accent", "text.on_accent", 30)
 		add_url_btn.setObjectName("RoundAddButton")
 		add_url_btn.setToolTip("레퍼런스 URL 추가")
 		add_url_btn.clicked.connect(lambda: self.add_reference_url())
@@ -685,10 +733,8 @@ class ResearchPage(QWidget):
 		result_card.layout.addLayout(self.documents_container)
 
 		self.result_empty = QLabel("조사 실행 후 agent 결과가 여기에 표시됩니다.")
-		self.result_empty.setStyleSheet(
-			"color: #6B7280; background-color: #F8FAFC; border: 1px dashed #CBD5E1; "
-			"border-radius: 10px; padding: 24px; font-weight: 600;"
-		)
+		self._apply_result_empty_theme()
+		theme.themeChanged.connect(self._apply_result_empty_theme)
 		self.result_empty.setAlignment(Qt.AlignCenter)
 		self.result_empty.setWordWrap(True)
 		result_card.layout.addWidget(self.result_empty)
@@ -717,7 +763,7 @@ class ResearchPage(QWidget):
 		url_input.setPlaceholderText("https://example.com/report")
 		url_input.setText(url)
 
-		remove_btn = CircleGlyphButton("cross", "#64748B", "#B91C1C", 26)
+		remove_btn = CircleGlyphButton("cross", "text.secondary", "danger.fg", 26)
 		remove_btn.setObjectName("UrlRemoveButton")
 		remove_btn.setToolTip("URL 삭제")
 		remove_btn.clicked.connect(lambda _checked=False, target=row: self._remove_reference_url(target))
@@ -1236,6 +1282,14 @@ class ResearchPage(QWidget):
 				widget.setParent(None)
 				widget.deleteLater()
 		self._doc_bars.clear()
+
+	def _apply_result_empty_theme(self, *args) -> None:
+		self.result_empty.setStyleSheet(
+			f"color: {theme.color('text.secondary.gray')}; "
+			f"background-color: {theme.color('surface.muted')}; "
+			f"border: 1px dashed {theme.color('border.strong')}; "
+			"border-radius: 10px; padding: 24px; font-weight: 600;"
+		)
 
 	def _show_message(self, text: str) -> None:
 		self._clear_documents()
