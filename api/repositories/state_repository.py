@@ -121,14 +121,6 @@ def get_draft(draft_id: str) -> dict[str, Any] | None:
     return STATE["drafts"].get(draft_id)
 
 
-def get_or_create_chat_history(session_id: str) -> list[dict[str, Any]]:
-    return STATE["chat_sessions"].setdefault(session_id, [])
-
-
-def get_chat_history(session_id: str) -> list[dict[str, Any]]:
-    return STATE["chat_sessions"].get(session_id, [])
-
-
 def get_document(workspace_id: str) -> dict[str, Any] | None:
     return STATE["documents"].get(workspace_id)
 

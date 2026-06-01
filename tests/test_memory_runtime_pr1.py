@@ -77,6 +77,7 @@ class MemoryRuntimePr1Tests(unittest.TestCase):
     def test_fifo_compaction_preserves_tail_and_late_appends(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp))
+            self.addCleanup(store.close)
             recall = RecallStorage(store)
             queue = QueueManager(store, TokenCounter(), recall)
 
@@ -152,6 +153,7 @@ class MemoryRuntimePr1Tests(unittest.TestCase):
     def test_pressure_counts_fifo_rows_beyond_legacy_tail_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp))
+            self.addCleanup(store.close)
             recall = RecallStorage(store)
             queue = QueueManager(store, TokenCounter(), recall)
 
@@ -168,6 +170,7 @@ class MemoryRuntimePr1Tests(unittest.TestCase):
     def test_fifo_token_total_is_cached_and_updates_on_append(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp))
+            self.addCleanup(store.close)
             recall = RecallStorage(store)
             queue = QueueManager(store, TokenCounter(), recall)
 
@@ -183,6 +186,7 @@ class MemoryRuntimePr1Tests(unittest.TestCase):
     def test_fifo_append_uses_sqlite_without_jsonl_mirror(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp))
+            self.addCleanup(store.close)
             recall = RecallStorage(store)
             queue = QueueManager(store, TokenCounter(), recall)
 
@@ -196,6 +200,7 @@ class MemoryRuntimePr1Tests(unittest.TestCase):
     def test_fifo_migrates_legacy_jsonl_to_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp))
+            self.addCleanup(store.close)
             row = store.item_to_dict(
                 MemoryItem(
                     id="legacy-fifo",
@@ -226,40 +231,60 @@ class MemoryRuntimePr1Tests(unittest.TestCase):
                 workspace_root=Path(tmp),
                 max_context_tokens=8192,
             )
-            runtime.recall.append(
-                MemoryItem(
-                    id="recall-alpha",
-                    tier=MemoryTier.RECALL,
-                    role=MemoryRole.USER,
-                    content="alpha profile memory",
-                    source="test",
-                    created_at="2026-05-29T00:00:00+00:00",
-                    token_count=3,
+            try:
+                runtime.recall.append(
+                    MemoryItem(
+                        id="recall-alpha",
+                        tier=MemoryTier.RECALL,
+                        role=MemoryRole.USER,
+                        content="alpha profile memory",
+                        source="test",
+                        created_at="2026-05-29T00:00:00+00:00",
+                        token_count=3,
+                    )
                 )
-            )
+                runtime.archival.insert(
+                    MemoryItem(
+                        id="archival-alpha",
+                        tier=MemoryTier.ARCHIVAL,
+                        role=MemoryRole.USER,
+                        content="alpha archival durable fact",
+                        source="test",
+                        created_at="2026-05-29T00:00:00+00:00",
+                        token_count=4,
+                    )
+                )
 
-            chat_prepared = runtime.prepare(
-                CallRequest(
-                    task_instruction="system",
-                    user_content="what is alpha?",
-                    record_content="alpha",
-                    constraints=CallConstraints(no_record=True),
-                    profile="chat",
+                chat_prepared = runtime.prepare(
+                    CallRequest(
+                        task_instruction="system",
+                        user_content="what is alpha?",
+                        record_content="alpha",
+                        constraints=CallConstraints(no_record=True),
+                        profile="chat",
+                    )
                 )
-            )
-            rag_prepared = runtime.prepare(
-                CallRequest(
-                    task_instruction="system",
-                    user_content="what is alpha?",
-                    record_content="alpha",
-                    constraints=CallConstraints(no_record=True),
-                    profile="rag",
+                rag_prepared = runtime.prepare(
+                    CallRequest(
+                        task_instruction="system",
+                        user_content="what is alpha?",
+                        record_content="alpha",
+                        constraints=CallConstraints(no_record=True),
+                        profile="rag",
+                    )
                 )
-            )
 
-            self.assertIn("Retrieved Recall Context", str(chat_prepared.messages[0]["content"]))
-            self.assertNotIn("Retrieved Recall Context", str(rag_prepared.messages[0]["content"]))
-            runtime.close()
+                chat_system = str(chat_prepared.messages[0]["content"])
+                rag_system = str(rag_prepared.messages[0]["content"])
+                # chat profile pulls both recall and archival.
+                self.assertIn("Retrieved Recall Context", chat_system)
+                self.assertIn("Retrieved Archival Context", chat_system)
+                # rag profile pulls recall (secondary context) but NOT archival —
+                # durable long-term facts stay out of a strict document-grounded answer.
+                self.assertIn("Retrieved Recall Context", rag_system)
+                self.assertNotIn("Retrieved Archival Context", rag_system)
+            finally:
+                runtime.close()
 
     def test_memory_aware_refresh_resets_token_counter_remote_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

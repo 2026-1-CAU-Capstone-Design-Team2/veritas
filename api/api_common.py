@@ -31,7 +31,6 @@ STATE: dict[str, Any] = {
     "recent_documents": [],
     "verify_results": [],
     "drafts": {},
-    "chat_sessions": {},
     "documents": {},
     "feedback_sessions": {},
     "feedback_files": {},

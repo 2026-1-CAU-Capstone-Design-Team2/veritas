@@ -84,6 +84,105 @@ class MemoryRuntime:
         """모델 스왑 후 n_ctx를 갱신한다."""
         self.max_context_tokens = int(max_context_tokens)
 
+    # Cap on the read-side projection used to render workspace chat history
+    # in the UI. The workspace memory.sqlite3 recall tier preserves every
+    # turn (FIFO eviction does not touch recall), so this only bounds the
+    # number of rows pulled into one fetch — far above any realistic
+    # conversation length.
+    CHAT_HISTORY_PROJECTION_LIMIT = 1_000
+
+    def history_as_chat_items(self, *, limit: int | None = None) -> list[dict[str, str]]:
+        """Project the recall tier into the UI-shaped chat-history list.
+
+        Yields ``{"role": "user"|"assistant", "text": "..."}`` items in
+        chronological order, filtering out non-conversational rows (screen
+        interventions are not recorded; tool-call markers, system entries,
+        and empty content are skipped). This is the read-side path used by
+        ``draft_chat_service`` to render the chat panel, replacing the
+        legacy ``chat_history.json`` per-workspace JSON file.
+        """
+        cap = int(limit if limit is not None else self.CHAT_HISTORY_PROJECTION_LIMIT)
+        try:
+            rows = self.recall.tail(limit=cap)
+        except Exception:
+            return []
+        items: list[dict[str, str]] = []
+        for row in rows:
+            role = str(row.get("role") or "").lower()
+            if role not in {"user", "assistant"}:
+                continue
+            text = str(row.get("content") or "").strip()
+            if not text:
+                continue
+            items.append({"role": role, "text": text})
+        return items
+
+    def import_legacy_chat_items(self, items: list[dict[str, Any]]) -> int:
+        """One-shot import of a legacy ``chat_history.json`` payload.
+
+        Used during workspace bootstrap to lift the pre-memory JSON log into
+        the workspace memory.sqlite3 (FIFO + recall) once, so the new
+        read-side projection (``history_as_chat_items``) surfaces the user's
+        prior conversations after the storage cut-over. Idempotency is the
+        caller's responsibility — :class:`AgentRuntime` runs this only when
+        the recall tier is empty and then renames the JSON file out of the
+        way so the import never repeats.
+
+        Returns the number of valid ``{role, text}`` rows imported.
+        """
+        imported = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role_raw = str(item.get("role") or "").lower()
+            if role_raw == "user":
+                role = MemoryRole.USER
+            elif role_raw == "assistant":
+                role = MemoryRole.ASSISTANT
+            else:
+                continue
+            text = str(item.get("text") or item.get("content") or "").strip()
+            if not text:
+                continue
+            self.queue.append_event(
+                role=role,
+                content=text,
+                source=str(item.get("source") or "legacy_chat_history"),
+                metadata={"imported_from": "chat_history.json"},
+            )
+            imported += 1
+        return imported
+
+    NO_HISTORY_TEXT = "(No previous conversation)"
+
+    def recent_history_text(self, *, turns: int) -> str:
+        """Flat "role: content" block of the FIFO tail, for prompts that do
+        NOT go through prepare/commit and therefore receive no chat-message
+        injection from the runtime — currently the tool-routing call (raw
+        passthrough on MemoryAwareLLMClient) and the RAG query rewrite.
+
+        ``turns`` is the number of (user, assistant) pairs requested; the
+        underlying FIFO row count is ``turns * 2``. Returns
+        ``NO_HISTORY_TEXT`` when nothing is recorded or the FIFO read fails.
+
+        Centralizes what used to be duplicated between ChatAgent and
+        RAGService so both surfaces share one definition of "recent
+        history".
+        """
+        try:
+            rows = self.queue.recent_rows(limit=max(0, int(turns)) * 2)
+        except Exception:
+            return self.NO_HISTORY_TEXT
+        if not rows:
+            return self.NO_HISTORY_TEXT
+        parts: list[str] = []
+        for row in rows:
+            role = str(row.get("role") or "user")
+            content = " ".join(str(row.get("content") or "").split())
+            if content:
+                parts.append(f"{role}: {content}")
+        return "\n".join(parts) if parts else self.NO_HISTORY_TEXT
+
     def prepare(self, req: CallRequest) -> PreparedCall:
         """CallRequest를 받아 messages[]를 만들고 USER turn을 기록한다."""
         invocation_id = str(uuid.uuid4())

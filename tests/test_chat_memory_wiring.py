@@ -60,9 +60,12 @@ class _StreamingRawLLM:
 
 class ChatMemoryWiringTests(unittest.TestCase):
     def test_non_stream_final_answer_uses_call_request(self) -> None:
+        # The agent no longer keeps a parallel chat_history list; conversation
+        # turns are recorded inside MemoryAwareLLMClient.call via prepare/commit.
+        # This test asserts the CallRequest shape — the contract the memory
+        # wrapper consumes — without seeding any legacy history.
         llm = _MemoryLLM()
         agent = ChatAgent(llm=llm, rag_service=None, tool_registry=None)
-        agent.chat_history.append(("old question", "old answer"))
 
         answer = agent._answer_from_current_turn(
             question="current question",
@@ -80,18 +83,15 @@ class ChatMemoryWiringTests(unittest.TestCase):
         self.assertFalse(req.enable_memory_tools)
         self.assertEqual(req.record_content, "current question")
         self.assertIn("current question", req.user_content)
-        self.assertNotIn("old question", req.user_content)
 
     def test_stream_final_answer_uses_iter_call_request(self) -> None:
         llm = _MemoryLLM()
         agent = ChatAgent(llm=llm, rag_service=None, tool_registry=None)
-        agent.chat_history.append(("old question", "old answer"))
 
         chunks = list(
             agent._stream_final_answer(
                 question="current question",
                 tool_outputs=[],
-                history_question="current question",
             )
         )
 
@@ -103,7 +103,6 @@ class ChatMemoryWiringTests(unittest.TestCase):
         self.assertFalse(req.enable_memory_tools)
         self.assertEqual(req.record_content, "current question")
         self.assertIn("current question", req.user_content)
-        self.assertNotIn("old question", req.user_content)
 
     def test_stream_final_answer_streams_chunks_through_real_wrapper(self) -> None:
         # Regression guard for the streaming regression: with the real
@@ -123,7 +122,6 @@ class ChatMemoryWiringTests(unittest.TestCase):
                 agent._stream_final_answer(
                     question="hi",
                     tool_outputs=[],
-                    history_question="hi",
                 )
             )
 

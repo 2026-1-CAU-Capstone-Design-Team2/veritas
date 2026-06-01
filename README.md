@@ -62,8 +62,8 @@ RAG over generated markdown outputs, and schema-driven chat tool use.
   (`DocumentAssistWindow`) both subscribe to the bus and stay in sync — the
   same user/assistant bubbles appear in both views and chunk-by-chunk streaming
   updates happen simultaneously. Backend-side, `document_assist_service` was
-  unified to route through `draft_chat_service`, so both panels share the same
-  `chat_history.json` per workspace.
+  unified to route through `draft_chat_service`, so both panels project the
+  same workspace memory (`memory.sqlite3` recall tier) for history rendering.
 - AutoSurvey emits live progress events. `AutoSurveyWorkflow` accepts a
   `progress_callback` and emits at term grounding, query plan (initial/replan),
   per-query web search, per-URL fetch, batch summarize, and final report. The
@@ -510,8 +510,9 @@ indexed into RAG when `rag_service` and `run_store_service` are available.
 3. Let the LLM decide whether to call at most one tool by default.
 4. Execute the selected tool through ToolRegistry.
 5. Ask the LLM to synthesize a final answer from the current message and tool result.
-6. Append exactly one (user, assistant) pair to chat history.
-7. Mirror chat history into RAGService.chat_history.
+6. The memory runtime records the (user, assistant) turn into the workspace
+   FIFO + recall (memory.sqlite3) via prepare/commit inside the wrapped LLM
+   call. The agent keeps no parallel turn log.
 ```
 
 Tool outputs are not dumped directly to the user unless the final-answer prompt

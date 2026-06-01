@@ -177,5 +177,12 @@ class ProfilePolicyDispatcher:
                 retrieval=FixedKRetrievalPolicy(recall_limit=1, archival_limit=1),
             ),
             "verify": grounded,
-            "rag": grounded,
+            # RAG answers are document-grounded, but recall is allowed as a small
+            # secondary context (e.g. "what did I ask earlier"). Archival stays 0:
+            # injecting durable long-term facts into a strict doc-grounded answer
+            # would dilute the "answer only from these documents" contract.
+            "rag": ProfilePolicySet(
+                eviction=FIFOTailEvictionPolicy(keep_tail=20),
+                retrieval=FixedKRetrievalPolicy(recall_limit=2, archival_limit=0),
+            ),
         }

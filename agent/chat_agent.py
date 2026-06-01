@@ -95,10 +95,13 @@ class ChatAgent:
     """General chat orchestration with schema-driven tool use.
 
     Responsibilities:
-    - maintain chat history and append exactly one assistant answer per user turn;
     - expose a stage-specific allowlist of high-level tools to the LLM;
     - collect tool results, then ask the LLM to synthesize a final user-facing answer;
     - avoid hard-coded keyword/regex routing for tool selection.
+
+    Conversation memory is owned by MemoryRuntime (FIFO + recall in SQLite);
+    every memory-engaged chat call records its turn through prepare/commit, so
+    the agent itself keeps no parallel in-memory turn log.
 
     Tool selection is delegated to the LLM using the system prompt and tool schema
     descriptions. Execution constraints such as tool allowlists and per-tool caps
@@ -166,7 +169,6 @@ class ChatAgent:
         # Workspace id doubles as the research subject (the run dir is named after
         # it), so start-phase suggestions can be grounded in the actual topic.
         self.screen_workspace_id = screen_workspace_id
-        self.chat_history: list[tuple[str, str]] = []
         self._conversation_lock = threading.RLock()
         self._screen_stop_event = threading.Event()
         self._screen_monitor_thread: threading.Thread | None = None
@@ -192,7 +194,6 @@ class ChatAgent:
             answer = self.rag_service.answer(
                 question, stream=stream, use_history=True, doc_context=doc_context
             )
-            self._append_history(question, answer)
             return answer
 
     def ask_auto(self, question: str, *, stream: bool = False) -> str:
@@ -202,38 +203,30 @@ class ChatAgent:
             if explicit_command:
                 command, command_text = explicit_command
                 if command == "screen" and command_text.lower() in {"debug", "raw"}:
-                    answer = self._run_screen_debug_command()
-                    self._append_history(question, answer)
-                    return answer
+                    return self._run_screen_debug_command()
                 if command == "rag" and self.rag_service is not None:
                     # Strict grounded RAG — same path as the frontend RAG mode.
                     # Avoids the permissive tool-synthesis answer that would fill
                     # off-corpus questions with general knowledge.
                     if not command_text:
-                        answer = "RAG 질문을 입력해 주세요. 예: /rag <질문>"
-                        self._append_history(question, answer)
-                        return answer
+                        return "RAG 질문을 입력해 주세요. 예: /rag <질문>"
                     return self.ask_rag(command_text, stream=stream)
                 tool_outputs = self._run_explicit_tool_command(
                     command=command,
                     command_text=command_text,
                 )
-                answer = self._answer_from_current_turn(
+                return self._answer_from_current_turn(
                     question=command_text or question,
                     tool_outputs=tool_outputs,
                     stream=stream,
                 )
-                self._append_history(question, answer)
-                return answer
 
             tool_outputs = self._collect_tool_outputs(question)
-            answer = self._answer_from_current_turn(
+            return self._answer_from_current_turn(
                 question=question,
                 tool_outputs=tool_outputs,
                 stream=stream,
             )
-            self._append_history(question, answer)
-            return answer
 
     def ask_explicit_tool(self, command: str, question: str, *, stream: bool = False) -> str:
         """Run the same forced tool path used by CLI slash commands.
@@ -251,18 +244,17 @@ class ChatAgent:
                 command=normalized_command,
                 command_text=command_text,
             )
-            answer = self._answer_from_current_turn(
+            return self._answer_from_current_turn(
                 question=command_text,
                 tool_outputs=tool_outputs,
                 stream=stream,
             )
-            self._append_history(command_text, answer)
-            return answer
 
     def ask_auto_iter(self, question: str, doc_context: str = "") -> Iterator[str]:
         """Generator variant of ask_auto. Tool decision runs non-streaming,
-        the final answer is streamed as chunks, and history is updated when
-        the stream completes.
+        and the final answer is streamed as chunks. The memory runtime records
+        the user/assistant turn inside ``MemoryAwareLLMClient.iter_call`` —
+        the agent itself no longer keeps a parallel turn log.
         """
         with self._conversation_lock:
             explicit_command = self._parse_explicit_command(question)
@@ -270,16 +262,13 @@ class ChatAgent:
                 command, command_text = explicit_command
                 if command == "screen" and command_text.lower() in {"debug", "raw"}:
                     answer = self._run_screen_debug_command()
-                    self._append_history(question, answer)
                     if answer:
                         yield answer
                     return
                 if command == "rag" and self.rag_service is not None:
                     # Strict grounded RAG — same path as the frontend RAG mode.
                     if not command_text:
-                        msg = "RAG 질문을 입력해 주세요. 예: /rag <질문>"
-                        self._append_history(question, msg)
-                        yield msg
+                        yield "RAG 질문을 입력해 주세요. 예: /rag <질문>"
                         return
                     yield from self.ask_rag_iter(command_text, doc_context=doc_context)
                     return
@@ -291,7 +280,6 @@ class ChatAgent:
                 yield from self._stream_final_answer(
                     question=question_text,
                     tool_outputs=tool_outputs,
-                    history_question=question,
                     doc_context=doc_context,
                 )
                 return
@@ -300,7 +288,6 @@ class ChatAgent:
             yield from self._stream_final_answer(
                 question=question,
                 tool_outputs=tool_outputs,
-                history_question=question,
                 doc_context=doc_context,
             )
 
@@ -320,7 +307,6 @@ class ChatAgent:
             yield from self._stream_final_answer(
                 question=command_text,
                 tool_outputs=tool_outputs,
-                history_question=command_text,
                 doc_context=doc_context,
             )
 
@@ -332,28 +318,23 @@ class ChatAgent:
         one-shot path rather than a permissive general-knowledge answer.
         """
         with self._conversation_lock:
-            collected: list[str] = []
             try:
                 for chunk in self.rag_service.iter_answer(
                     question, use_history=True, doc_context=doc_context
                 ):
-                    collected.append(chunk)
                     yield chunk
             except AttributeError:
                 # Defensive: older rag_service without iter_answer — one-shot.
-                answer = self.rag_service.answer(
+                yield self.rag_service.answer(
                     question, stream=False, use_history=True, doc_context=doc_context
                 )
-                collected.append(answer)
-                yield answer
-            self._append_history(question, "".join(collected))
 
     # -- editor (standalone writer) surfaces ---------------------------------
     # Power the editor window's ghost-writing / quick actions / chat. They reuse
     # this agent's workspace-bound rag_service for grounding (the same RAG index
     # ask_rag uses) but generate with the editor prompts, and deliberately do
-    # NOT touch chat_history — the editor is a separate surface from the chat
-    # panel, so its turns must not pollute the conversation log.
+    # NOT engage the memory runtime — the editor is a separate surface from the
+    # chat panel, so its turns must not pollute the conversation log.
 
     # Quick actions split into two disjoint groups. The forced ones (다시 쓰기 /
     # 다음 문장 제안) are hard-gated on workspace grounding — they retrieve and
@@ -578,18 +559,18 @@ class ChatAgent:
         *,
         question: str,
         tool_outputs: list[dict[str, str]],
-        history_question: str,
         doc_context: str = "",
     ) -> Iterator[str]:
+        # No {history} slot: recent turns ride in as separate chat messages
+        # via MemoryAwareLLMClient.iter_call (or are simply absent in the
+        # legacy raw fallback when memory isn't engaged).
         prompt = TOOL_CHAT_FINAL_PROMPT_TEMPLATE.format(
-            history=self._prompt_history_for_final_answer(),
             question=question,
             tool_results=self._format_tool_results(tool_outputs),
         )
         system_prompt = self._chat_system_prompt()
         if doc_context:
             system_prompt += CHAT_DOCUMENT_BLOCK_TEMPLATE.format(doc=doc_context)
-        collected: list[str] = []
         try:
             if self._supports_memory_calls():
                 stream = self.llm.iter_call(
@@ -611,31 +592,33 @@ class ChatAgent:
             for chunk in stream:
                 if not chunk:
                     continue
-                collected.append(chunk)
                 yield chunk
         except Exception as e:
             error_text = f"[chat][error] failed to generate answer: {e}"
             print(error_text)
-            collected.append(error_text)
             yield error_text
-
-        final_text = "".join(collected).strip()
-        self._append_history(history_question, final_text)
-
-    def _append_history(self, question: str, answer: str) -> None:
-        self.chat_history.append((question, answer))
-        if self.rag_service is not None:
-            self.rag_service.chat_history = list(self.chat_history)
 
     def _supports_memory_calls(self) -> bool:
         return callable(getattr(self.llm, "call", None)) and callable(
             getattr(self.llm, "iter_call", None)
         )
 
-    def _prompt_history_for_final_answer(self) -> str:
-        if self._supports_memory_calls():
-            return "(Recent conversation is provided through the memory runtime.)"
-        return self._format_recent_history()
+    def _recent_history_text(self) -> str:
+        """Flat recent-turn block from memory FIFO, used by the tool-routing
+        prompt (``_build_tool_decision_prompt``). The final-answer and
+        screen-intervention prompts no longer take a ``{history}`` slot —
+        recent turns ride in as separate chat messages via
+        ``MemoryAwareLLMClient`` — so this helper is only needed for the
+        prompts that go through the raw passthrough (tool routing on
+        ``collect_tool_outputs``).
+
+        Thin wrapper over :meth:`MemoryRuntime.recent_history_text` so this
+        surface and RAGService share a single definition of "recent history".
+        """
+        memory_runtime = getattr(self.llm, "memory_runtime", None)
+        if memory_runtime is None:
+            return "(No previous conversation)"
+        return memory_runtime.recent_history_text(turns=self.max_history_turns)
 
     """
         _chat_call_request : CallRequest 객체를 생성
@@ -706,22 +689,17 @@ class ChatAgent:
             enable_memory_tools=False,
         )
 
-    def _format_recent_history(self) -> str:
-        if not self.chat_history:
-            return "(No previous conversation)"
-        recent = self.chat_history[-self.max_history_turns :]
-        parts: list[str] = []
-        for i, (user_q, assistant_a) in enumerate(recent, start=1):
-            parts.append(f"Turn {i} User: {user_q}")
-            parts.append(f"Turn {i} Assistant: {assistant_a}")
-        return "\n".join(parts)
-
     def _chat_system_prompt(self) -> str:
         return TOOL_CHAT_SYSTEM_PROMPT.format(base_system_prompt=SYSTEM_PROMPT)
 
     def _build_tool_decision_prompt(self, question: str) -> str:
+        # Tool routing goes through ``raw.collect_tool_outputs`` (legacy
+        # passthrough on MemoryAwareLLMClient), so the memory runtime does NOT
+        # inject FIFO/recall as separate chat messages for this call. Read the
+        # recent turns from the FIFO directly and paste them into the prompt —
+        # otherwise the routing LLM sees zero conversational context.
         return TOOL_CHAT_USER_PROMPT_TEMPLATE.format(
-            history=self._format_recent_history(),
+            history=self._recent_history_text(),
             question=question,
         )
 
@@ -876,8 +854,10 @@ class ChatAgent:
         tool_outputs: list[dict[str, str]],
         stream: bool = False,
     ) -> str:
+        # No {history} slot: recent turns ride in as separate chat messages
+        # via MemoryAwareLLMClient.call (or are simply absent in the legacy
+        # raw fallback when memory isn't engaged).
         prompt = TOOL_CHAT_FINAL_PROMPT_TEMPLATE.format(
-            history=self._prompt_history_for_final_answer(),
             question=question,
             tool_results=self._format_tool_results(tool_outputs),
         )
@@ -998,8 +978,10 @@ class ChatAgent:
                 scenario_guidance = SCREEN_SCENARIO_GUIDANCE.get(
                     intervention_type, SCREEN_SCENARIO_GUIDANCE_DEFAULT
                 )
+            # No {history} slot: recent chat turns ride in as separate chat
+            # messages via MemoryAwareLLMClient.call/iter_call. Working/recall
+            # context is injected into the system message by prepare().
             prompt = SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE.format(
-                history=self._prompt_history_for_final_answer(),
                 app_context=self._pretty_payload(
                     intervention.get("app_context") or intervention.get("app") or {}
                 ),
@@ -1050,8 +1032,10 @@ class ChatAgent:
             if not str(answer or "").strip():
                 answer = "[screen_context][warn] LLM returned an empty screen assist answer."
             screen_trace(f"answer event={event_id} chars={len(str(answer or '').strip())}")
-            history_question = self._screen_history_question(intervention)
-            self._append_history(history_question, answer)
+            # Screen interventions intentionally do NOT record into chat memory
+            # (CallConstraints.no_record=True in _screen_call_request) — the
+            # screen poller fires periodically and recording every assist would
+            # flood FIFO/recall with low-signal turns.
             return answer.strip()
 
     def _stream_screen_answer(
@@ -1365,19 +1349,6 @@ class ChatAgent:
         return detect_korean_style(sample[:3000]) or (
             "뚜렷한 문체 단서가 없으면 화면 텍스트의 언어와 어조를 그대로 따르세요."
         )
-
-    def _screen_history_question(self, intervention: dict[str, Any]) -> str:
-        app = intervention.get("app_context") or intervention.get("app") or {}
-        writing = intervention.get("writing_context") or {}
-        title = app.get("title") if isinstance(app, dict) else ""
-        focused = writing.get("focused_sentence") if isinstance(writing, dict) else ""
-        focused_text = " ".join(str(focused or "").split()).strip()
-        title_text = " ".join(str(title or "").split()).strip()
-        if focused_text:
-            return f"[screen_context] {focused_text[:200]}"
-        if title_text:
-            return f"[screen_context] active window: {title_text[:200]}"
-        return "[screen_context] proactive intervention"
 
     def _screen_workspace_topic_label(self) -> str:
         """Human-readable research subject from the workspace id (its run dir name),
