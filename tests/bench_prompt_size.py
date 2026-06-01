@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 
 from core.memory.budget import MemoryBudget
+from core.memory.models import MemoryRole
 from core.memory.policy import ProfilePolicyDispatcher
 from core.memory.request import CallConstraints, CallRequest
 from services.memory_tools_funcs.context_builder import build_messages
@@ -21,8 +22,6 @@ from services.memory_tools_funcs.external_context.recall_storage import RecallSt
 from services.memory_tools_funcs.main_context.queue_manage import QueueManager
 from services.memory_tools_funcs.main_context.working_context import WorkingContextManager
 from services.memory_tools_funcs.store import MemoryStore
-from services.memory_tools_funcs.summerizer import MemorySummarizer
-from core.memory.models import MemoryRole
 
 
 class _CharCounter:
@@ -30,13 +29,6 @@ class _CharCounter:
     상대 비교(현재 vs naive)에는 충분."""
     def count(self, text: str) -> int:
         return max(1, len(str(text or "")) // 4)
-
-
-class _FakeLLM:
-    """build_messages는 LLM을 직접 안 부름 — flush 같이 호출하는 경로에서만 필요.
-    이번 bench는 build_messages만 호출하므로 stub만 있으면 됨."""
-    def ask(self, *args, **kwargs) -> str:
-        return ""
 
 
 def _simulate_turns(n_pairs: int) -> list[tuple[MemoryRole, str]]:

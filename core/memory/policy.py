@@ -112,7 +112,6 @@ class FixedKRetrievalPolicy:
     """Deterministic fixed top-k retrieval limits."""
 
     recall_limit: int = 3
-    recall_scan_limit: int = 8
 
     def decide_retrieval(
         self,

@@ -99,13 +99,13 @@ class ChatAgent:
     - collect tool results, then ask the LLM to synthesize a final user-facing answer;
     - avoid hard-coded keyword/regex routing for tool selection.
 
-    Tool selection is delegated to the LLM using the system prompt and tool schema
-    descriptions. Execution constraints such as tool allowlists and per-tool caps
-    remain enforced by code.
-
     Conversation memory is owned by MemoryRuntime (FIFO + recall in SQLite);
     every memory-engaged chat call records its turn through prepare/commit, so
     the agent itself keeps no parallel in-memory turn log.
+
+    Tool selection is delegated to the LLM using the system prompt and tool schema
+    descriptions. Execution constraints such as tool allowlists and per-tool caps
+    remain enforced by code.
     """
 
     DEFAULT_OPTIONAL_TOOL_NAMES = (
@@ -654,7 +654,7 @@ class ChatAgent:
             timeout_sec=self.FINAL_ANSWER_TIMEOUT_SEC,
             # Memory self-edit tools force iter_call into a non-stream tool path
             # (llama-server can't stream + call tools), which would break the
-            # streaming chat answer. Deterministic recall injection plus
+            # streaming chat answer. Deterministic recall/archival injection plus
             # heuristic fact extraction already cover the chat path, so tools are
             # left off here to keep streaming alive.
             enable_memory_tools=False,
@@ -670,7 +670,7 @@ class ChatAgent:
     ) -> CallRequest:
         """Build a read-only memory request for a screen intervention answer.
 
-        Screen interventions are read-only consumers of memory: recall /
+        Screen interventions are read-only consumers of memory: recall / archival /
         working context are injected so the assist can use the user's recent work
         context, but the screen turn itself is NOT recorded (``no_record=True``).
         The screen poller fires periodically, so recording every intervention would

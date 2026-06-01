@@ -159,22 +159,6 @@ class FtsMemoryStore:
         return [self._sqlite_row_to_dict(row) for row in rows]
 
     @classmethod
-    def _query_terms(cls, text: str) -> set[str]:
-        """Extract the same content-bearing terms ``_fts_query`` uses for
-        matching, so the reranker compares apples to apples (post-particle-
-        stripping, post-stopword, length-filtered)."""
-        raw = re.findall(r"[\w가-힣]+", str(text or "").lower())
-        out: set[str] = set()
-        for tok in raw:
-            stem = cls._strip_particle(tok)
-            if len(stem) < cls._MIN_FTS_TERM_LEN:
-                continue
-            if stem in cls._KO_STOPWORDS:
-                continue
-            out.add(stem)
-        return out
-
-    @classmethod
     def _rerank(
         cls, query: str, candidates: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
@@ -186,9 +170,9 @@ class FtsMemoryStore:
         intersection), so short Korean keywords like "주가" / "전망" and
         compound-noun prefixes like "삼성" correctly hit rows that store
         "목표주가는" / "삼성전자" — the same gap the LIKE fallback covers
-        in retrieval. Using `_like_terms` (2-char floor) instead of
-        `_query_terms` (3-char floor) keeps the reranker and the LIKE
-        fallback aligned on what counts as a content token.
+        in retrieval. Using ``_like_terms`` (2-char floor) keeps the
+        reranker and the LIKE fallback aligned on what counts as a
+        content token.
 
         Falls back to the BM25 + LIKE order when the query carries no
         scoreable terms (all stopwords / particles only).
@@ -484,18 +468,23 @@ class FtsMemoryStore:
 
     @classmethod
     def _strip_particle(cls, token: str) -> str:
-        """Remove a trailing Korean postposition aggressively, leaving the
-        length filtering to the caller (``_fts_query`` keeps ``≥3`` for
-        trigram, ``_like_terms`` keeps ``≥2`` for substring). Stripping
-        early — not deferring to a length floor here — is what makes
-        "삼성에" reduce to "삼성" so the LIKE fallback can recover
-        compound-noun prefixes ("삼성전자"). Safe on non-Korean tokens:
-        they don't end with any entry in :attr:`_KO_PARTICLES`."""
+        """Remove a trailing Korean postposition when the remaining stem is
+        long enough to be a real noun (≥ :attr:`_MIN_LIKE_TERM_LEN` = 2).
+
+        Without that lower bound on the stem, 2-char Korean nouns that happen
+        to end in a particle character are wrongly split — "주가" → "주",
+        "결과" → "결", "치과" → "치" — because ``endswith("가")`` /
+        ``endswith("과")`` matches even when there's no real particle. The
+        ≥2 floor keeps "주가" intact while still stripping "삼성에" → "삼성"
+        and "리스크와" → "리스크".
+
+        Safe on non-Korean tokens: they don't end with any entry in
+        :attr:`_KO_PARTICLES` so the loop falls through unchanged."""
         if len(token) < 2:
             return token
         for particle in cls._KO_PARTICLES:
             stem_len = len(token) - len(particle)
-            if stem_len >= 1 and token.endswith(particle):
+            if stem_len >= cls._MIN_LIKE_TERM_LEN and token.endswith(particle):
                 return token[: -len(particle)]
         return token
 
