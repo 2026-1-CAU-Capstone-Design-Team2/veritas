@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
+from core.knowledge_models import PrivacyLabel, SourceScope
 from core.prompts import (
     QUERY_REWRITE_PROMPT,
     QUERY_REWRITE_SYSTEM_PROMPT,
@@ -49,7 +50,12 @@ class RAGService:
     def clear_index(self) -> None:
         self.vector_store.clear()
 
-    def get_document_count(self) -> int:
+    def get_document_count(self, *, source_scope_filter: str | None = None) -> int:
+        if source_scope_filter in {"local", "external"}:
+            try:
+                return len(self.vector_store.get_all(where={"source_scope": source_scope_filter}))
+            except Exception:
+                return 0
         return self.vector_store.get_document_count()
 
     def close(self) -> None:
@@ -139,6 +145,26 @@ class RAGService:
             contents.append(chunk)
             metadatas.append(chunk_metadata)
 
+    def _clear_external_index(self) -> None:
+        """Replace external AutoSurvey chunks without deleting local corpus chunks."""
+        try:
+            local_chunks = self.vector_store.get_all(where={"source_scope": SourceScope.LOCAL.value})
+        except Exception:
+            local_chunks = []
+        if not local_chunks:
+            self.clear_index()
+            return
+        try:
+            all_chunks = self.vector_store.get_all()
+        except Exception:
+            all_chunks = []
+        external_ids = [
+            str(item.get("doc_id") or "")
+            for item in all_chunks
+            if (item.get("metadata") or {}).get("source_scope") != SourceScope.LOCAL.value
+        ]
+        self.vector_store.delete_documents([doc_id for doc_id in external_ids if doc_id])
+
     def index_autosurvey_output(self, clean_md_dir: Path, index_path: Path | None = None, clear_first: bool = True) -> int:
         """Index a workspace's clean Markdown documents for RAG.
 
@@ -148,7 +174,7 @@ class RAGService:
         stay a separate UX layer and are not indexed here.
         """
         if clear_first:
-            self.clear_index()
+            self._clear_external_index()
 
         metadata_map: dict[str, dict[str, str]] = {}
         if index_path and index_path.exists():
@@ -184,7 +210,16 @@ class RAGService:
             self._append_chunked_document(
                 base_doc_id=doc_id,
                 content=content,
-                metadata=metadata_map.get(doc_id, {}),
+                metadata={
+                    **metadata_map.get(doc_id, {}),
+                    "workspace_id": self._workspace_id_from_path(clean_md_dir),
+                    "source_id": doc_id,
+                    "source_scope": SourceScope.EXTERNAL.value,
+                    "source_kind": "web_page",
+                    "privacy_label": PrivacyLabel.PUBLIC_WEB.value,
+                    "display_path": metadata_map.get(doc_id, {}).get("domain")
+                    or metadata_map.get(doc_id, {}).get("url", ""),
+                },
                 doc_ids=doc_ids,
                 contents=contents,
                 metadatas=metadatas,
@@ -208,7 +243,7 @@ class RAGService:
 
     def index_all_markdown(self, base_dir: Path, clear_first: bool = True) -> int:
         if clear_first:
-            self.clear_index()
+            self._clear_external_index()
 
         doc_ids: list[str] = []
         contents: list[str] = []
@@ -217,7 +252,7 @@ class RAGService:
         md_files = sorted(
             p for p in base_dir.rglob("*.md")
             if p.is_file()
-            and "chromadb" not in p.parts
+            and not self._is_private_or_generated_markdown(p, base_dir)
             and not any(part.startswith(".") for part in p.parts)
         )
 
@@ -246,7 +281,13 @@ class RAGService:
                 content=content,
                 metadata={
                     "type": "markdown",
+                    "workspace_id": self._workspace_id_from_path(base_dir),
+                    "source_id": base_doc_id,
+                    "source_scope": SourceScope.EXTERNAL.value,
+                    "source_kind": "markdown",
+                    "privacy_label": PrivacyLabel.PUBLIC_WEB.value,
                     "source_folder": parent_folder,
+                    "display_path": file_path,
                     "file_path": file_path,
                     "file_name": md_file.name,
                 },
@@ -271,6 +312,20 @@ class RAGService:
         print(f"[rag] Indexed {len(doc_ids)} chunks")
         return len(doc_ids)
 
+    def _is_private_or_generated_markdown(self, path: Path, base_dir: Path) -> bool:
+        try:
+            rel_parts = path.relative_to(base_dir).parts
+        except ValueError:
+            rel_parts = path.parts
+        blocked = {
+            "chromadb",
+            "knowledge",
+            "local",
+            "drafts",
+            "verification",
+        }
+        return any(part.lower() in blocked or part == "__pycache__" for part in rel_parts)
+
     def _rewrite_query_with_context(self, question: str) -> str:
         if not self.chat_history:
             return question
@@ -288,14 +343,81 @@ class RAGService:
         print(f"[rag] Rewritten query: {rewritten}")
         return rewritten if rewritten else question
 
-    def retrieve(self, query: str, use_history: bool = True) -> list[dict[str, Any]]:
+    def retrieve(
+        self,
+        query: str,
+        use_history: bool = True,
+        *,
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
+    ) -> list[dict[str, Any]]:
         search_query = self._rewrite_query_with_context(query) if use_history else query
         query_embedding = self.llm.embed(search_query)
-        return self.vector_store.query(
+        where = self._scope_where(source_scope_filter)
+        results = self.vector_store.query(
             query_text=search_query,
             query_embedding=query_embedding,
             n_results=self.n_results,
+            where=where,
         )
+        results = self._filter_retrieved_scope(
+            results,
+            source_scope_filter=source_scope_filter,
+            include_private_local=include_private_local,
+        )
+        if any((item.get("metadata") or {}).get("source_scope") == SourceScope.LOCAL.value for item in results):
+            self._ensure_local_generation_allowed()
+        return results
+
+    def _workspace_id_from_path(self, path: Path) -> str:
+        try:
+            parts = Path(path).resolve().parts
+            if "runs" in parts:
+                index = parts.index("runs")
+                if index + 1 < len(parts):
+                    return parts[index + 1]
+        except Exception:
+            pass
+        parent = Path(path).resolve()
+        for name in ("clean_md", "summary", "chromadb"):
+            if parent.name == name:
+                return parent.parent.name
+        return parent.name
+
+    def _scope_where(self, source_scope_filter: str) -> dict[str, Any] | None:
+        scope = str(source_scope_filter or "all").strip().lower()
+        if scope in {"local", "external"}:
+            return {"source_scope": scope}
+        return None
+
+    def _filter_retrieved_scope(
+        self,
+        documents: list[dict[str, Any]],
+        *,
+        source_scope_filter: str,
+        include_private_local: bool,
+    ) -> list[dict[str, Any]]:
+        scope = str(source_scope_filter or "all").strip().lower()
+        filtered: list[dict[str, Any]] = []
+        for item in documents:
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            item_scope = str(metadata.get("source_scope") or SourceScope.EXTERNAL.value)
+            privacy = str(metadata.get("privacy_label") or "")
+            if scope in {"local", "external"} and item_scope != scope:
+                continue
+            if not include_private_local and privacy == PrivacyLabel.LOCAL_PRIVATE.value:
+                continue
+            filtered.append(item)
+        return filtered
+
+    def _ensure_local_generation_allowed(self) -> None:
+        module_name = type(self.llm).__module__.lower()
+        class_name = type(self.llm).__name__.lower()
+        if "openai" in module_name or "openai" in class_name:
+            raise RuntimeError(
+                "Local private retrieval context requires a local LLM. "
+                "Refusing to send local corpus chunks to an external provider."
+            )
 
     def _strip_weak_evidence_sections(self, content: str) -> str:
         """Remove metadata-like sections that are useful for retrieval but weak as answer evidence."""
@@ -383,7 +505,13 @@ class RAGService:
         return "\n\n---\n\n".join(parts)
 
     def _grounded_user_prompt(
-        self, question: str, *, use_history: bool, doc_context: str = ""
+        self,
+        question: str,
+        *,
+        use_history: bool,
+        doc_context: str = "",
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
     ) -> str:
         """Build the strict-RAG user prompt for a question.
 
@@ -401,7 +529,15 @@ class RAGService:
         off-topic by distance (measured: on-topic and cross-topic best
         distances overlap), so a numeric threshold would drop on-topic hits.
         """
-        retrieved = self.retrieve(question, use_history=use_history)
+        retrieve_kwargs = {"use_history": use_history}
+        if source_scope_filter != "all" or include_private_local is not True:
+            retrieve_kwargs.update(
+                {
+                    "source_scope_filter": source_scope_filter,
+                    "include_private_local": include_private_local,
+                }
+            )
+        retrieved = self.retrieve(question, **retrieve_kwargs)
         history = self._format_recent_history()
         context = self.format_retrieved_documents(retrieved) if retrieved else ""
         draft_block = (
@@ -430,9 +566,15 @@ class RAGService:
         use_history: bool = True,
         *,
         doc_context: str = "",
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
     ) -> str:
         user_prompt = self._grounded_user_prompt(
-            question, use_history=use_history, doc_context=doc_context
+            question,
+            use_history=use_history,
+            doc_context=doc_context,
+            source_scope_filter=source_scope_filter,
+            include_private_local=include_private_local,
         )
         return self.llm.ask(
             RAG_SYSTEM_PROMPT,
@@ -443,7 +585,13 @@ class RAGService:
         )
 
     def iter_answer(
-        self, question: str, *, use_history: bool = True, doc_context: str = ""
+        self,
+        question: str,
+        *,
+        use_history: bool = True,
+        doc_context: str = "",
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
     ) -> Iterator[str]:
         """Streaming counterpart of :meth:`answer` — yields chunks for SSE.
 
@@ -454,7 +602,11 @@ class RAGService:
         tool-synthesis prompt.
         """
         user_prompt = self._grounded_user_prompt(
-            question, use_history=use_history, doc_context=doc_context
+            question,
+            use_history=use_history,
+            doc_context=doc_context,
+            source_scope_filter=source_scope_filter,
+            include_private_local=include_private_local,
         )
         yield from self.llm.iter_ask(
             RAG_SYSTEM_PROMPT,

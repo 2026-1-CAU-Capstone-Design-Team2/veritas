@@ -340,7 +340,13 @@ class AgentRuntime:
         return self.chat_agent.ask_auto_iter(message)
 
     def answer_chat_selection_iter(
-        self, message: str, mode: str, doc_context: str = ""
+        self,
+        message: str,
+        mode: str,
+        doc_context: str = "",
+        *,
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
     ) -> Iterator[str]:
         normalized_mode = str(mode or "research").strip().lower()
         if normalized_mode in {"research", "autosurvey"}:
@@ -353,7 +359,12 @@ class AgentRuntime:
             # path: when the active workspace's index has nothing relevant to the
             # question (e.g. it is about another workspace's topic), the model
             # says so instead of answering from general knowledge.
-            return self.chat_agent.ask_rag_iter(message, doc_context=doc_context)
+            return self.chat_agent.ask_rag_iter(
+                message,
+                doc_context=doc_context,
+                source_scope_filter=source_scope_filter,
+                include_private_local=include_private_local,
+            )
         return self.chat_agent.ask_auto_iter(message, doc_context=doc_context)
 
     # -- proactive bandit -----------------------------------------------------
@@ -446,7 +457,14 @@ class AgentRuntime:
             return self.chat_agent.ask_rag(message, stream=False)
         return self.chat_agent.ask_auto(message, stream=False)
 
-    def answer_chat_selection(self, message: str, mode: str) -> str:
+    def answer_chat_selection(
+        self,
+        message: str,
+        mode: str,
+        *,
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
+    ) -> str:
         """Answer a frontend chat turn where the mode selector is authoritative.
 
         The chat UI's "자료조사" and "RAG" choices are equivalent to entering
@@ -460,7 +478,12 @@ class AgentRuntime:
             self._ensure_rag_index(require_documents=False)
             # Strict grounded RAG (see answer_chat_selection_iter) — refuses
             # off-corpus questions rather than answering from general knowledge.
-            return self.chat_agent.ask_rag(message, stream=False)
+            return self.chat_agent.ask_rag(
+                message,
+                stream=False,
+                source_scope_filter=source_scope_filter,
+                include_private_local=include_private_local,
+            )
         return self.chat_agent.ask_auto(message, stream=False)
 
     def _load_workspace_chat_history(self) -> list[tuple[str, str]]:
@@ -713,7 +736,7 @@ class AgentRuntime:
         workspace_paths.cleanup_empty_api_dir(self.output_root)
 
     def _ensure_rag_index(self, *, require_documents: bool) -> None:
-        if self.rag_service.get_document_count() > 0:
+        if self.rag_service.get_document_count(source_scope_filter="external") > 0:
             return
 
         clean_md_dir = self.run_store_service.clean_md_dir

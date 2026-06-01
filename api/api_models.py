@@ -62,6 +62,8 @@ class ChatMessageRequest(BaseModel):
     workspaceId: str
     message: str
     mode: Literal["research", "autosurvey", "rag"] = "research"
+    sourceScopeFilter: Literal["external", "local", "all"] = "all"
+    includePrivateLocal: bool = True
     # Optional editor-surface extras. Defaults keep the main chat request
     # unchanged; the editor's 문서 대화 sends the open document as additive
     # context and tags its turns so both surfaces share one chat log.
@@ -98,6 +100,8 @@ class DocumentAssistChatRequest(BaseModel):
     workspaceId: str
     message: str
     mode: Literal["research", "autosurvey", "rag"] = "research"
+    sourceScopeFilter: Literal["external", "local", "all"] = "all"
+    includePrivateLocal: bool = True
 
 
 class EditorSuggestRequest(BaseModel):
@@ -228,6 +232,16 @@ class ScreenFeedbackRequest(BaseModel):
     eventId: str
     action: str
     interventionType: str | None = None
+
+
+class LocalCorpusIndexRequest(BaseModel):
+    workspaceId: str
+    roots: list[str] = Field(default_factory=list)
+    clearLocalFirst: bool = False
+
+
+class LocalCorpusDeleteRequest(BaseModel):
+    sourceIds: list[str] = Field(default_factory=list)
 
 
 # ---- Proactive bandit (native_editor + external_screen unified) ----

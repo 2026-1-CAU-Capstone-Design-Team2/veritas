@@ -36,6 +36,12 @@ from .models import (
     VerificationArtifacts,
     VerificationConfig,
 )
+from core.knowledge_models import SourceScope
+from core.verification_crosscheck_models import (
+    CrossCheckArtifact,
+    CrossCheckClaim,
+    CrossCheckRelation,
+)
 from .reliability import (
     ReliabilityItem,
     ReliabilityMentionDTO,
@@ -48,6 +54,7 @@ _META_FILE = "meta.json"
 _SECTIONS_FILE = "sections.json"
 _CONSENSUS_FILE = "consensus.json"
 _RELIABILITY_FILE = "reliability.json"
+_CROSSCHECK_FILE = "crosscheck.json"
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +157,8 @@ class VerificationPersistence:
                 directory / _RELIABILITY_FILE,
                 _serialize_reliability_result(artifacts.reliability),
             )
+        if artifacts.crosscheck is not None and "crosscheck" in completed_tasks:
+            _write_json(directory / _CROSSCHECK_FILE, _serialize_crosscheck_result(artifacts.crosscheck))
 
         _write_json(
             directory / _META_FILE,
@@ -184,6 +193,10 @@ class VerificationPersistence:
         reliability_payload = _read_json(directory / _RELIABILITY_FILE)
         if reliability_payload is not None:
             artifacts.reliability = _deserialize_reliability_result(reliability_payload)
+
+        crosscheck_payload = _read_json(directory / _CROSSCHECK_FILE)
+        if crosscheck_payload is not None:
+            artifacts.crosscheck = _deserialize_crosscheck_result(crosscheck_payload)
 
         return artifacts, meta
 
@@ -312,6 +325,45 @@ def _deserialize_reliability_result(payload: dict) -> ReliabilityResult:
         for k, v in (payload.get("distribution") or {}).items()
     }
     return ReliabilityResult(items=items, distribution=distribution)
+
+
+def _serialize_crosscheck_result(result: CrossCheckArtifact) -> dict:
+    return _to_jsonable(result)
+
+
+def _deserialize_crosscheck_result(payload: dict) -> CrossCheckArtifact:
+    claims: list[CrossCheckClaim] = []
+    for item in payload.get("claims", []):
+        if not isinstance(item, dict):
+            continue
+        claims.append(
+            CrossCheckClaim(
+                claim_id=str(item.get("claim_id") or item.get("claimId") or ""),
+                source_id=str(item.get("source_id") or item.get("sourceId") or ""),
+                source_scope=SourceScope(str(item.get("source_scope") or item.get("sourceScope") or "external")),
+                text=str(item.get("text") or ""),
+                claim_type=str(item.get("claim_type") or item.get("claimType") or "general"),
+                evidence_span=str(item.get("evidence_span") or item.get("evidenceSpan") or ""),
+                metadata=item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
+            )
+        )
+    relations = [
+        CrossCheckRelation(
+            claim_a=str(item.get("claim_a") or item.get("claimA") or ""),
+            claim_b=str(item.get("claim_b") or item.get("claimB") or ""),
+            relation=str(item.get("relation") or ""),
+            severity=str(item.get("severity") or ""),
+            reason=str(item.get("reason") or ""),
+        )
+        for item in payload.get("relations", [])
+        if isinstance(item, dict)
+    ]
+    flags = [
+        dict(item)
+        for item in payload.get("flags", [])
+        if isinstance(item, dict)
+    ]
+    return CrossCheckArtifact(claims=claims, relations=relations, flags=flags)
 
 
 __all__ = ["VerificationPersistence"]

@@ -216,6 +216,11 @@ def get_summary(workspace_id: str | None) -> dict[str, Any]:
         "conflictCount": (
             len(artifacts.consensus.conflicts) if artifacts.consensus else 0
         ),
+        "crosscheckFlagCount": (
+            len(getattr(artifacts.crosscheck, "flags", []) or [])
+            if getattr(artifacts, "crosscheck", None)
+            else 0
+        ),
         # Flow outline summary — the section panel reads this directly.
         "flowSource": (
             artifacts.sections.flow_source if artifacts.sections else "empty"

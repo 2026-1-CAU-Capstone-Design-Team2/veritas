@@ -29,6 +29,12 @@ import numpy as np
 
 from services.run_store_tool_funcs.path_manager import RunPathManager
 
+from core.knowledge_models import (
+    KnowledgeSourceRecord,
+    PrivacyLabel,
+    SourceKind,
+    SourceScope,
+)
 from .indexing.dense_index import l2_normalize
 from core.models import ParsedDocRecord
 
@@ -149,6 +155,9 @@ class ArtifactLoader:
         """
         return self._paths(workspace).summary_dir
 
+    def workspace_root_for(self, workspace: str | Path) -> Path:
+        return self._paths(workspace).root
+
     @staticmethod
     def _read_json(path: Path) -> dict:
         if not path.exists():
@@ -232,6 +241,51 @@ class ArtifactLoader:
 
         docs.sort(key=lambda d: d.doc_id)
         return docs
+
+    def load_knowledge_sources(self, workspace: str | Path) -> list[KnowledgeSourceRecord]:
+        path = self.workspace_root_for(workspace) / "knowledge" / "sources.json"
+        raw = self._read_json(path)
+        items = raw if isinstance(raw, list) else raw.get("sources", []) if isinstance(raw, dict) else []
+        sources: list[KnowledgeSourceRecord] = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                sources.append(
+                    KnowledgeSourceRecord(
+                        source_id=str(item.get("source_id") or item.get("sourceId") or ""),
+                        workspace_id=str(item.get("workspace_id") or item.get("workspaceId") or ""),
+                        source_scope=SourceScope(str(item.get("source_scope") or item.get("sourceScope") or "local")),
+                        source_kind=SourceKind(str(item.get("source_kind") or item.get("sourceKind") or "unknown")),
+                        title=str(item.get("title") or ""),
+                        canonical_uri=str(item.get("canonical_uri") or item.get("canonicalUri") or ""),
+                        display_path=str(item.get("display_path") or item.get("displayPath") or ""),
+                        privacy_label=PrivacyLabel(str(item.get("privacy_label") or item.get("privacyLabel") or "local_private")),
+                        content_hash=str(item.get("content_hash") or item.get("contentHash") or ""),
+                        created_at=str(item.get("created_at") or item.get("createdAt") or ""),
+                        modified_at=str(item.get("modified_at") or item.get("modifiedAt") or ""),
+                        parser_version=str(item.get("parser_version") or item.get("parserVersion") or ""),
+                        status=str(item.get("status") or "indexed"),
+                        metadata=item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
+                    )
+                )
+            except Exception:
+                continue
+        return [source for source in sources if source.source_scope == SourceScope.LOCAL and source.source_id]
+
+    def load_local_documents(self, workspace: str | Path) -> dict[str, str]:
+        root = self.workspace_root_for(workspace)
+        sources = self.load_knowledge_sources(workspace)
+        documents: dict[str, str] = {}
+        for source in sources:
+            path = root / "local" / "extracted_md" / f"{source.source_id}.md"
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception:
+                text = ""
+            if text.strip():
+                documents[source.source_id] = text
+        return documents
 
     def load_key_points(self, workspace: str | Path) -> list[KeyPointRecord]:
         """Key Points + Reliability Notes from every kept doc, as claim units."""

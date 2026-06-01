@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
-from ...api_common import STATE
+from ...api_common import STATE, current_workspace_id
 from ...components.buttons import AppButton
 from ...components.cards import CardWidget
 from ...controllers import AgentController
@@ -159,6 +159,25 @@ class _ModelSwitchWorker(QObject):
 			self.done.emit(False, str(exc))
 
 
+class _LocalAccessWorker(QObject):
+	done = Signal(bool, str, dict)
+
+	def __init__(self, workspace_id: str, folder_paths: list[str]) -> None:
+		super().__init__()
+		self._workspace_id = workspace_id
+		self._folder_paths = list(folder_paths)
+
+	def run(self) -> None:
+		try:
+			payload = AgentController().update_local_access(
+				self._folder_paths,
+				self._workspace_id,
+			)
+			self.done.emit(True, "", payload)
+		except Exception as exc:
+			self.done.emit(False, str(exc), {})
+
+
 class SettingsPage(QWidget):
 	defaultWorkspaceChanged = Signal(str)
 
@@ -191,6 +210,8 @@ class SettingsPage(QWidget):
 		autosurvey_openai_defaults.setdefault("apiKeyPreview", "")
 		self._settings.setdefault("llmParallel", DEFAULT_LLM_PARALLEL)
 		self._model_buttons: dict[str, QPushButton] = {}
+		self._local_access_thread: QThread | None = None
+		self._local_access_worker: _LocalAccessWorker | None = None
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
@@ -317,12 +338,12 @@ class SettingsPage(QWidget):
 		remove_button.clicked.connect(self._remove_selected_folder)
 		clear_button = AppButton("전체 비우기", variant="ghost")
 		clear_button.clicked.connect(self._clear_local_folders)
-		save_button = AppButton("폴더 설정 저장")
-		save_button.clicked.connect(self._save_local_access_settings)
+		self._local_access_save_button = AppButton("폴더 설정 저장")
+		self._local_access_save_button.clicked.connect(self._save_local_access_settings)
 		action_row.addWidget(add_button)
 		action_row.addWidget(remove_button)
 		action_row.addWidget(clear_button)
-		action_row.addWidget(save_button)
+		action_row.addWidget(self._local_access_save_button)
 		card.layout.addLayout(action_row)
 
 		self.local_folder_status = QLabel()
@@ -688,10 +709,44 @@ class SettingsPage(QWidget):
 		self._save_local_access_settings()
 
 	def _save_local_access_settings(self) -> None:
+		if self._local_access_thread is not None:
+			return
 		folder_paths = self._folder_paths()
 		self._settings["localAccess"] = {
 			"folderPaths": folder_paths,
 		}
+		self._local_access_save_button.setEnabled(False)
+		self._update_local_folder_status("로컬 접근 폴더를 저장하고 인덱싱하는 중입니다...")
+		self._local_access_thread = QThread(self)
+		self._local_access_worker = _LocalAccessWorker(current_workspace_id(), folder_paths)
+		self._local_access_worker.moveToThread(self._local_access_thread)
+		self._local_access_thread.started.connect(self._local_access_worker.run)
+		self._local_access_worker.done.connect(self._on_local_access_saved)
+		self._local_access_thread.start()
+
+	def _on_local_access_saved(self, success: bool, message: str, payload: dict) -> None:
+		thread = self._local_access_thread
+		self._local_access_thread = None
+		self._local_access_worker = None
+		if thread is not None:
+			thread.quit()
+			thread.wait(2000)
+		self._local_access_save_button.setEnabled(True)
+		if not success:
+			self._update_local_folder_status(f"로컬 접근 폴더 저장 실패: {message}")
+			return
+		local_access = payload.get("localAccess") if isinstance(payload, dict) else None
+		if isinstance(local_access, dict):
+			self._settings["localAccess"] = local_access
+		local_corpus = payload.get("localCorpus") if isinstance(payload, dict) else None
+		if isinstance(local_corpus, dict):
+			indexed = int(local_corpus.get("indexedCount") or 0)
+			skipped = int(local_corpus.get("skippedCount") or 0)
+			failed = int(local_corpus.get("failedCount") or 0)
+			self._update_local_folder_status(
+				f"로컬 접근 폴더 저장 및 인덱싱 완료: 신규 {indexed}, 건너뜀 {skipped}, 실패 {failed}"
+			)
+			return
 		self._update_local_folder_status("로컬 접근 폴더 설정이 저장되었습니다.")
 
 	def _folder_paths(self) -> list[str]:

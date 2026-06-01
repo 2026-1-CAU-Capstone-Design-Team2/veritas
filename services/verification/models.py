@@ -256,6 +256,7 @@ class VerificationArtifacts:
     # ``reliability/`` sub-package into this module (and creating a cycle).
     # Real type: ``services.verification.reliability.ReliabilityResult``.
     reliability: Any | None = None
+    crosscheck: Any | None = None
     config_hash: str = ""
 
 

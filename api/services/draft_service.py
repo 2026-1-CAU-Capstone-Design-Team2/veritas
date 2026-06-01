@@ -47,6 +47,7 @@ from core.prompts import (
 )
 
 from db import activity_repository as activity
+from services.knowledge import KnowledgePackBuilder, RetrievalService
 
 from ..api_common import utc_now_iso
 from . import draft_forms
@@ -156,8 +157,14 @@ def _render_and_persist(workspace_id: str, number: int, record: dict[str, Any]) 
     runtime = get_runtime()
     budget = _knowledge_budget(runtime)
     selected_doc_ids = record.get("selectedDocIds")
-    knowledge = _gather_knowledge(
+    external_knowledge = _gather_knowledge(
         workspace_id, char_budget=budget, selected_doc_ids=selected_doc_ids
+    )
+    knowledge_pack = _gather_knowledge_pack(workspace_id, record, runtime=runtime)
+    knowledge = _merge_knowledge_blocks(
+        external_knowledge,
+        knowledge_pack.global_context,
+        char_budget=budget,
     )
     print(
         f"[draft] workspace={workspace_id} draft={number} "
@@ -180,11 +187,13 @@ def _render_and_persist(workspace_id: str, number: int, record: dict[str, Any]) 
     title = _title_from_content(content) or record.get("docType") or f"초안 {number}"
     record["title"] = title
     record["hasKnowledgeBase"] = bool(knowledge)
+    record["hasLocalKnowledgeBase"] = bool(knowledge_pack.global_context)
     record["updatedAt"] = utc_now_iso()
 
     md_path = _draft_md_path(workspace_id, number)
     md_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.write_text(content, encoding="utf-8")
+    source_map_path = _write_source_map(workspace_id, number, knowledge_pack.source_map)
     _write_settings(workspace_id, number, record)
 
     settings_path = _settings_path(workspace_id, number)
@@ -200,6 +209,8 @@ def _render_and_persist(workspace_id: str, number: int, record: dict[str, Any]) 
         "settingsPath": str(settings_path),
         "draftFileName": md_path.name,
         "draftPath": str(md_path),
+        "sourceMapFileName": source_map_path.name,
+        "sourceMapPath": str(source_map_path),
     }
 
 
@@ -317,6 +328,120 @@ def _append_within_budget(parts: list[str], block: str, used: int, budget: int) 
     if remaining > 500:
         parts.append(block[:remaining])
     return budget
+
+
+def _gather_knowledge_pack(workspace_id: str, record: dict[str, Any], *, runtime: Any):
+    from core.draft_knowledge_models import DraftKnowledgePack
+
+    outline = [str(item).strip() for item in (record.get("outline") or []) if str(item).strip()]
+    if not outline:
+        return DraftKnowledgePack(global_context="", section_packs=[], source_map={})
+
+    sources_path = _workspace_dir(workspace_id) / "knowledge" / "sources.json"
+    if not sources_path.exists():
+        return DraftKnowledgePack(global_context="", section_packs=[], source_map={})
+    if _is_external_llm(runtime.llm):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Local private corpus evidence is available, but draft generation "
+                "is not using a local LLM. Refusing to send local file context to "
+                "an external provider."
+            ),
+        )
+
+    vector_store, should_close = _open_workspace_vector_store(runtime, workspace_id)
+    retrieval = RetrievalService(
+        llm=runtime.llm,
+        vector_store=vector_store,
+    )
+    builder = KnowledgePackBuilder(
+        retrieval_service=retrieval,
+        workspace_root=_workspace_dir(workspace_id),
+    )
+    query_hint = "\n".join(
+        part
+        for part in (
+            str(record.get("docType") or ""),
+            str(record.get("keyPoints") or ""),
+            str(record.get("audience") or ""),
+        )
+        if part.strip()
+    )
+    try:
+        return builder.build_for_outline(
+            workspace_id,
+            outline,
+            query_hint=query_hint,
+            include_external=False,
+            include_local=True,
+        )
+    finally:
+        if should_close:
+            try:
+                vector_store.close()
+            except Exception:
+                pass
+
+
+def _merge_knowledge_blocks(
+    external_knowledge: str,
+    local_knowledge: str,
+    *,
+    char_budget: int,
+) -> str:
+    external_knowledge = (external_knowledge or "").strip()
+    local_knowledge = (local_knowledge or "").strip()
+    if not local_knowledge:
+        return external_knowledge[:char_budget]
+    if not external_knowledge:
+        return local_knowledge[:char_budget]
+
+    local_budget = max(2000, int(char_budget * 0.4))
+    external_budget = max(2000, char_budget - local_budget)
+    external_block = external_knowledge[:external_budget].strip()
+    local_block = local_knowledge[:local_budget].strip()
+    return (
+        f"{external_block}\n\n"
+        "=== local_private_evidence ===\n"
+        f"{local_block}"
+    ).strip()[:char_budget]
+
+
+def _is_external_llm(llm: Any) -> bool:
+    module_name = type(llm).__module__.lower()
+    class_name = type(llm).__name__.lower()
+    return "openai" in module_name or "openai" in class_name
+
+
+def _open_workspace_vector_store(runtime: Any, workspace_id: str):
+    workspace_dir = _workspace_dir(workspace_id)
+    if (
+        getattr(runtime, "workspace_id", None) == workspace_id
+        and getattr(runtime, "rag_service", None) is not None
+    ):
+        return runtime.rag_service.vector_store, False
+
+    chromadb_dir = workspace_dir / "chromadb"
+    if not chromadb_dir.exists():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Local private corpus metadata exists, but its vector index is missing. "
+                "Re-index the local corpus before generating a draft with local evidence."
+            ),
+        )
+    try:
+        from storage.vector_store import VectorStore
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail=f"Local corpus vector store is unavailable: {exc}",
+        ) from exc
+    return VectorStore(
+        persist_dir=chromadb_dir,
+        collection_name="research_docs",
+    ), True
 
 
 def _resolve_doc_filter(
@@ -597,6 +722,20 @@ def _write_settings(workspace_id: str, number: int, record: dict[str, Any]) -> N
     path = _settings_path(workspace_id, number)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _write_source_map(
+    workspace_id: str,
+    number: int,
+    source_map: dict[str, Any],
+) -> Path:
+    path = _drafts_dir(workspace_id) / f"draft_{int(number)}_source_map.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(source_map or {}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _read_text(path: Path) -> str:

@@ -220,3 +220,38 @@ class VectorStore:
         """Delete specific documents by ID."""
         if doc_ids:
             self.collection.delete(ids=doc_ids)
+
+    def delete_where(self, where: dict[str, Any]) -> None:
+        """Delete documents matching a metadata filter."""
+        if not where:
+            return
+        try:
+            raw = self.collection.get(where=where, include=["metadatas"])
+        except Exception:
+            return
+        ids = raw.get("ids") or []
+        if ids:
+            self.collection.delete(ids=list(ids))
+
+    def get_all(self, where: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Return all stored documents, optionally filtered by metadata."""
+        try:
+            raw = self.collection.get(
+                where=where,
+                include=["documents", "metadatas"],
+            )
+        except Exception:
+            return []
+        ids = raw.get("ids") or []
+        documents = raw.get("documents") or []
+        metadatas = raw.get("metadatas") or []
+        items: list[dict[str, Any]] = []
+        for index, doc_id in enumerate(ids):
+            items.append(
+                {
+                    "doc_id": doc_id,
+                    "content": documents[index] if index < len(documents) else "",
+                    "metadata": metadatas[index] if index < len(metadatas) else {},
+                }
+            )
+        return items

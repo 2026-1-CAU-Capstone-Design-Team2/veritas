@@ -55,7 +55,14 @@ def regenerate_draft(draft_id: str, prompt: str) -> dict[str, Any]:
     return {"draftId": draft_id, "content": draft["content"]}
 
 
-def send_chat_message(workspace_id: str, message: str, mode: str = "research") -> dict[str, str]:
+def send_chat_message(
+    workspace_id: str,
+    message: str,
+    mode: str = "research",
+    *,
+    source_scope_filter: str = "all",
+    include_private_local: bool = True,
+) -> dict[str, str]:
     message_text = message.strip()
     if not message_text:
         raise HTTPException(status_code=422, detail="message must not be empty")
@@ -66,7 +73,12 @@ def send_chat_message(workspace_id: str, message: str, mode: str = "research") -
     history.append({"role": "user", "text": message})
     runtime = get_runtime()
     runtime.set_workspace(workspace_id)
-    assistant_text = runtime.answer_chat_selection(message_text, mode)
+    assistant_text = runtime.answer_chat_selection(
+        message_text,
+        mode,
+        source_scope_filter=source_scope_filter,
+        include_private_local=include_private_local,
+    )
     history.append({"role": "assistant", "text": assistant_text})
     _save_workspace_chat_history(workspace_id, history)
     return {"messageId": message_id, "assistant": assistant_text, "mode": mode}
@@ -78,6 +90,8 @@ def send_chat_message_stream(
     mode: str = "research",
     doc_text: str = "",
     source: str = "chat",
+    source_scope_filter: str = "all",
+    include_private_local: bool = True,
 ) -> Iterator[bytes]:
     """Stream the assistant response as SSE events.
 
@@ -113,7 +127,11 @@ def send_chat_message_stream(
     collected: list[str] = []
     try:
         for chunk in runtime.answer_chat_selection_iter(
-            message_text, mode, doc_context=doc_context
+            message_text,
+            mode,
+            doc_context=doc_context,
+            source_scope_filter=source_scope_filter,
+            include_private_local=include_private_local,
         ):
             if not chunk:
                 continue
