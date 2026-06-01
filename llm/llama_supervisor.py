@@ -33,9 +33,9 @@ from pathlib import Path
 # llama-server flag profile. The hardware-adaptable knobs (-ngl / -c / -np) are
 # read from env at spawn time so a machine without an NVIDIA GPU or with little
 # memory can recover without a code change.
-_DEFAULT_NGL = "99"
-_DEFAULT_CTX = "90000"
-_DEFAULT_NP = "5"
+_DEFAULT_NGL = "-1"
+_DEFAULT_CTX = "50000"
+_DEFAULT_NP = "1"
 
 
 def _flag(env_name: str, default: str) -> str:
@@ -46,11 +46,11 @@ def _flag(env_name: str, default: str) -> str:
 def _common_args() -> list[str]:
     """Common llama-server flags, with per-machine overrides read from env:
 
-      VERITAS_LLAMA_NGL → -ngl  GPU layers to offload (0 = CPU-only)  [99]
-      VERITAS_LLAMA_CTX → -c    total context window                 [90000]
-      VERITAS_LLAMA_NP  → -np   parallel decode slots                [5]
+      VERITAS_LLAMA_NGL → -ngl  GPU layers to offload (0 = CPU-only)  [-1]
+      VERITAS_LLAMA_CTX → -c    total context window                 [50000]
+      VERITAS_LLAMA_NP  → -np   parallel decode slots                [1]
 
-    ``-ngl 99`` (full GPU offload) + a 90k context are fine defaults on a GPU
+    ``-ngl -1`` (auto) + a 50k context are fine defaults on a GPU
     box, but can make llama-server *exit on load* on a machine with no NVIDIA
     GPU / little memory. The env overrides let such a machine fall back (e.g.
     ``VERITAS_LLAMA_NGL=0`` for CPU-only, ``VERITAS_LLAMA_CTX=8192`` for low
@@ -58,11 +58,12 @@ def _common_args() -> list[str]:
     """
     return [
         "-ngl", _flag("VERITAS_LLAMA_NGL", _DEFAULT_NGL),
-        "-ub", "2048",
-        "-b", "2048",
+        "-ub", "1024",
+        "-b", "1024",
         "-np", _flag("VERITAS_LLAMA_NP", _DEFAULT_NP),
         "--cont-batching",
         "-c", _flag("VERITAS_LLAMA_CTX", _DEFAULT_CTX),
+        "-fa", "on",
     ]
 
 

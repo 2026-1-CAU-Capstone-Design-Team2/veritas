@@ -33,6 +33,7 @@ class AutoSurveyWorkflow:
         self.max_docs = self._config.max_docs
         self.collect_batch_size = self._config.collect_batch_size
         self.scout_docs = self._config.scout_docs
+        self.fetch_max_chars = self._config.fetch_max_chars
         self._progress_callback = progress_callback
 
     def _emit_progress(
@@ -814,7 +815,7 @@ class AutoSurveyWorkflow:
         fetch_result = self.registry.get("fetch_webpage").run(
             url=url,
             timeout_sec=15,
-            max_chars=25000,
+            max_chars=self.fetch_max_chars,
         )
         if not fetch_result.success:
             error_id = self.run_store_service.write_fetch_error_note(

@@ -165,10 +165,15 @@ class SettingsResearchMethodRequest(BaseModel):
     planCount: int = Field(default=5, ge=1, le=9999)
 
 
+class SettingsAutosurveyOpenAIRequest(BaseModel):
+    apiKey: str = ""
+    clear: bool = False
+
+
 class SettingsLlmParallelRequest(BaseModel):
-    # 병렬 디코딩 동시 요청 수 (LLMClient.max_parallel). Matches llama-server's
-    # -np slot count. 1 = serial. Hard-bounded 1..5 to match the settings UI
-    # stepper and to keep low-spec machines from oversubscribing the server.
+    # 병렬 디코딩/문서별 동시 요청 수. Local LLM에서는 LLMClient.max_parallel
+    # and llama-server -np slot count에 대응하고, OpenAI AutoSurvey에서는
+    # OpenAIChatLLMClient.max_parallel로 새 research run에 적용된다.
     value: int = Field(default=1, ge=1, le=5)
 
 

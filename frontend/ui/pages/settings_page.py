@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
 	QFrame,
 	QHBoxLayout,
 	QLabel,
+	QLineEdit,
 	QListWidget,
 	QProgressBar,
 	QPushButton,
@@ -184,6 +185,10 @@ class SettingsPage(QWidget):
 		research_defaults = self._settings.setdefault("research", {})
 		research_defaults.setdefault("sampleCount", DEFAULT_RESEARCH_SAMPLE_COUNT)
 		research_defaults.setdefault("planCount", DEFAULT_RESEARCH_PLAN_COUNT)
+		autosurvey_openai_defaults = self._settings.setdefault("autosurveyOpenAI", {})
+		autosurvey_openai_defaults.setdefault("provider", "local")
+		autosurvey_openai_defaults.setdefault("apiKeySet", False)
+		autosurvey_openai_defaults.setdefault("apiKeyPreview", "")
 		self._settings.setdefault("llmParallel", DEFAULT_LLM_PARALLEL)
 		self._model_buttons: dict[str, QPushButton] = {}
 
@@ -332,9 +337,59 @@ class SettingsPage(QWidget):
 		"""고급 설정: a collapsed-by-default card holding the less-used settings —
 		the document-tool registry and the AutoSurvey research pacing."""
 		section = CollapsibleSection("고급 설정", expanded=False)
+		section.add_widget(self._build_openai_api_key_section())
+		section.add_widget(self._divider())
 		section.add_widget(self._build_research_method_section())
 		section.add_widget(self._divider())
 		section.add_widget(self._build_llm_parallel_section())
+		return section
+
+	def _build_openai_api_key_section(self) -> QWidget:
+		section = QWidget()
+		layout = QVBoxLayout(section)
+		layout.setContentsMargins(0, 0, 0, 0)
+		layout.setSpacing(12)
+
+		layout.addWidget(self._subsection_title("OpenAI API"))
+
+		subtitle = QLabel(
+			"AutoSurvey 자료 조사 파이프라인에서 OpenAI GPT API를 사용할 때 적용할 API key입니다. "
+			"저장된 key는 화면에 다시 표시하지 않습니다."
+		)
+		subtitle.setObjectName("PageSubtitle")
+		subtitle.setWordWrap(True)
+		layout.addWidget(subtitle)
+
+		self.openai_api_key_input = QLineEdit()
+		self.openai_api_key_input.setObjectName("SettingsInput")
+		self.openai_api_key_input.setEchoMode(QLineEdit.Password)
+		self.openai_api_key_input.setMinimumWidth(280)
+		self.openai_api_key_input.setPlaceholderText("sk-...")
+		layout.addWidget(
+			self._research_param_row(
+				"API key",
+				"저장하면 AutoSurvey LLM provider가 OpenAI로 활성화됩니다. 삭제하면 로컬 LLM으로 돌아갑니다.",
+				self.openai_api_key_input,
+			)
+		)
+
+		action_row = QHBoxLayout()
+		action_row.setSpacing(8)
+		action_row.addStretch(1)
+		clear_button = AppButton("삭제", variant="ghost")
+		clear_button.clicked.connect(self._clear_openai_api_key_settings)
+		save_button = AppButton("API key 저장")
+		save_button.clicked.connect(self._save_openai_api_key_settings)
+		action_row.addWidget(clear_button)
+		action_row.addWidget(save_button)
+		layout.addLayout(action_row)
+
+		self.openai_api_key_status = QLabel()
+		self.openai_api_key_status.setObjectName("SettingsStatus")
+		self.openai_api_key_status.setWordWrap(True)
+		layout.addWidget(self.openai_api_key_status)
+
+		self._load_openai_api_key_settings()
 		return section
 
 	def _build_research_method_section(self) -> QWidget:
@@ -415,7 +470,7 @@ class SettingsPage(QWidget):
 		subtitle = QLabel(
 			"문서 정제·요약 등 LLM 호출을 동시에 몇 개까지 처리할지 설정합니다. "
 			"값을 올리면 자료조사 속도가 빨라지지만 로컬 LLM 서버 메모리를 더 사용합니다. "
-			"LLM 서버의 병렬 슬롯 수(-np)와 맞추는 것이 좋습니다."
+			"OpenAI API 사용 시에도 같은 값으로 문서별 동시 요청 수를 제한합니다."
 		)
 		subtitle.setObjectName("PageSubtitle")
 		subtitle.setWordWrap(True)
@@ -641,6 +696,66 @@ class SettingsPage(QWidget):
 
 	def _folder_paths(self) -> list[str]:
 		return [self.folder_list.item(index).text() for index in range(self.folder_list.count())]
+
+	def _load_openai_api_key_settings(self) -> None:
+		autosurvey_openai = self._settings.get("autosurveyOpenAI", {})
+		if not isinstance(autosurvey_openai, dict):
+			autosurvey_openai = {}
+		api_key_set = bool(autosurvey_openai.get("apiKeySet"))
+		preview = str(autosurvey_openai.get("apiKeyPreview") or "").strip()
+		if api_key_set and preview:
+			self.openai_api_key_input.setPlaceholderText(f"저장됨 ({preview})")
+		elif api_key_set:
+			self.openai_api_key_input.setPlaceholderText("저장됨")
+		else:
+			self.openai_api_key_input.setPlaceholderText("sk-...")
+		self.openai_api_key_input.clear()
+		self._update_openai_api_key_status()
+
+	def _save_openai_api_key_settings(self) -> None:
+		api_key = self.openai_api_key_input.text().strip()
+		current = self._settings.get("autosurveyOpenAI", {})
+		has_existing_key = bool(current.get("apiKeySet")) if isinstance(current, dict) else False
+		if not api_key:
+			if has_existing_key:
+				self._update_openai_api_key_status("새 key를 입력하지 않아 기존 key를 유지합니다.")
+			else:
+				self._update_openai_api_key_status("저장할 OpenAI API key를 입력해 주세요.")
+			return
+		try:
+			payload = AgentController().update_autosurvey_openai_api_key(api_key)
+		except Exception as e:
+			self._update_openai_api_key_status(f"저장 중 오류가 발생했습니다: {e}")
+			return
+		autosurvey_openai = payload.get("autosurveyOpenAI", {})
+		if isinstance(autosurvey_openai, dict):
+			self._settings["autosurveyOpenAI"] = autosurvey_openai
+		self._load_openai_api_key_settings()
+		self._update_openai_api_key_status("OpenAI API key가 저장되었습니다.")
+
+	def _clear_openai_api_key_settings(self) -> None:
+		try:
+			payload = AgentController().update_autosurvey_openai_api_key(clear=True)
+		except Exception as e:
+			self._update_openai_api_key_status(f"삭제 중 오류가 발생했습니다: {e}")
+			return
+		autosurvey_openai = payload.get("autosurveyOpenAI", {})
+		if isinstance(autosurvey_openai, dict):
+			self._settings["autosurveyOpenAI"] = autosurvey_openai
+		self._load_openai_api_key_settings()
+		self._update_openai_api_key_status("OpenAI API key가 삭제되었습니다. AutoSurvey는 로컬 LLM을 사용합니다.")
+
+	def _update_openai_api_key_status(self, prefix: str | None = None) -> None:
+		autosurvey_openai = self._settings.get("autosurveyOpenAI", {})
+		if not isinstance(autosurvey_openai, dict):
+			autosurvey_openai = {}
+		lead = f"{prefix} · " if prefix else ""
+		if autosurvey_openai.get("apiKeySet"):
+			preview = str(autosurvey_openai.get("apiKeyPreview") or "").strip()
+			suffix = f" ({preview})" if preview else ""
+			self.openai_api_key_status.setText(f"{lead}OpenAI 사용 중 · API key 등록됨{suffix}")
+		else:
+			self.openai_api_key_status.setText(f"{lead}로컬 LLM 사용 중 · 등록된 OpenAI API key 없음")
 
 	def _load_research_method_settings(self) -> None:
 		research_settings = self._settings.get("research", {})

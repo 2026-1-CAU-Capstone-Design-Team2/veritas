@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter, Query
 
 from ..api_models import (
+    SettingsAutosurveyOpenAIRequest,
     SettingsDocumentToolsRequest,
     SettingsEmbeddingModelRequest,
     SettingsLlmParallelRequest,
@@ -59,6 +60,14 @@ async def settings_document_tools_update(payload: SettingsDocumentToolsRequest) 
 @router.put("/api/v1/settings/research-method")
 async def settings_research_method_update(payload: SettingsResearchMethodRequest) -> dict[str, Any]:
     return settings_service.update_research_method(payload.sampleCount, payload.planCount)
+
+
+@router.put("/api/v1/settings/autosurvey-openai")
+async def settings_autosurvey_openai_update(payload: SettingsAutosurveyOpenAIRequest) -> dict[str, Any]:
+    return settings_service.update_autosurvey_openai(
+        payload.apiKey,
+        clear=payload.clear,
+    )
 
 
 @router.put("/api/v1/settings/llm-parallel")

@@ -200,7 +200,30 @@ def get_ui_state() -> dict[str, Any]:
 
 def get_settings() -> dict[str, Any]:
     _ensure_settings_loaded()
-    return STATE["settings"]
+    return _public_settings(STATE["settings"])
+
+
+def _public_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    public = deepcopy(settings)
+    autosurvey_openai = public.setdefault("autosurveyOpenAI", {})
+    if not isinstance(autosurvey_openai, dict):
+        autosurvey_openai = {}
+        public["autosurveyOpenAI"] = autosurvey_openai
+    api_key = str(autosurvey_openai.pop("apiKey", "") or "").strip()
+    autosurvey_openai["provider"] = str(
+        autosurvey_openai.get("provider") or ("openai" if api_key else "local")
+    )
+    autosurvey_openai["apiKeySet"] = bool(api_key)
+    autosurvey_openai["apiKeyPreview"] = _api_key_preview(api_key)
+    return public
+
+
+def _api_key_preview(api_key: str) -> str:
+    if not api_key:
+        return ""
+    if len(api_key) <= 8:
+        return "*" * len(api_key)
+    return f"{api_key[:3]}...{api_key[-4:]}"
 
 
 def set_model_settings(model_id: str) -> dict[str, Any]:
@@ -285,6 +308,34 @@ def set_research_method_settings(sample_count: int, plan_count: int) -> dict[str
     }
     _persist_settings()
     return STATE["settings"]["research"]
+
+
+def set_autosurvey_openai_settings(
+    *,
+    api_key: str = "",
+    clear: bool = False,
+) -> dict[str, Any]:
+    _ensure_settings_loaded()
+    config = STATE["settings"].setdefault("autosurveyOpenAI", {})
+    if not isinstance(config, dict):
+        config = {}
+        STATE["settings"]["autosurveyOpenAI"] = config
+
+    if clear:
+        config.pop("apiKey", None)
+        config["provider"] = "local"
+    else:
+        cleaned_key = str(api_key or "").strip()
+        if cleaned_key:
+            config["apiKey"] = cleaned_key
+            config["provider"] = "openai"
+        elif not str(config.get("apiKey") or "").strip():
+            config["provider"] = "local"
+
+    config.pop("apiKeySet", None)
+    config.pop("apiKeyPreview", None)
+    _persist_settings()
+    return _public_settings(STATE["settings"])["autosurveyOpenAI"]
 
 
 def set_llm_parallel_settings(value: int) -> int:

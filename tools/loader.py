@@ -22,6 +22,8 @@ def build_registry(
     llm,
     run_root: str | Path,
     *,
+    autosurvey_llm=None,
+    embedding_llm=None,
     batch_size: int = 5,
     max_context: int = 16384,
     enable_screen_context: bool = True,
@@ -47,6 +49,8 @@ def build_registry(
 
     registry = ToolRegistry()
     run_store_service = RunStoreService(run_root)
+    research_llm = autosurvey_llm or llm
+    dense_llm = embedding_llm or llm
 
     registry.register(
         WebSearchTool(
@@ -69,7 +73,7 @@ def build_registry(
     registry.register(
         TermGroundingTool(
             schema=load_schema(TOOLS_DIR / "term_grounding_tool" / "tool_schema.json"),
-            llm=llm,
+            llm=research_llm,
             tool_registry=registry,
         )
     )
@@ -77,7 +81,7 @@ def build_registry(
     registry.register(
         QueryPlanTool(
             schema=load_schema(TOOLS_DIR / "query_plan_tool" / "tool_schema.json"),
-            llm=llm,
+            llm=research_llm,
             run_store_service=run_store_service,
             tool_registry=registry,
         )
@@ -86,7 +90,7 @@ def build_registry(
     registry.register(
         DocumentSummarizeTool(
             schema=load_schema(TOOLS_DIR / "document_summarize_tool" / "tool_schema.json"),
-            llm=llm,
+            llm=research_llm,
             run_store_service=run_store_service,
             batch_size=batch_size,
             max_context=max_context,
@@ -100,7 +104,7 @@ def build_registry(
     registry.register(
         DocumentCleanupTool(
             schema=load_schema(TOOLS_DIR / "document_cleanup_tool" / "tool_schema.json"),
-            llm=llm,
+            llm=research_llm,
             run_store_service=run_store_service,
         )
     )
@@ -108,7 +112,7 @@ def build_registry(
     registry.register(
         FinalReportTool(
             schema=load_schema(TOOLS_DIR / "final_report_tool" / "tool_schema.json"),
-            llm=llm,
+            llm=research_llm,
             run_store_service=run_store_service,
         )
     )
@@ -124,7 +128,7 @@ def build_registry(
     )
 
     rag_service = RAGService(
-        llm=llm,
+        llm=dense_llm,
         vector_store=VectorStore(
             persist_dir=Path(run_root) / "chromadb",
             collection_name="research_docs",

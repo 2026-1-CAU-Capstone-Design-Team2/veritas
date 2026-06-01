@@ -11,6 +11,7 @@ from typing import Any, Iterator
 from fastapi import HTTPException
 
 from agent import ChatAgent
+from llm.autosurvey_llm_factory import build_autosurvey_llm
 from llm.llama_server_llm import LLMClient
 from llm.llama_supervisor import LlamaServer
 from services.proactive.generator import ProactiveGenerator
@@ -507,8 +508,12 @@ class AgentRuntime:
             workspaceId=self.workspace_id,
             instruction=instruction,
         )
+        autosurvey_llm = build_autosurvey_llm(self.llm)
         self._research_progress.emit("term_grounding", "주제어 추출 중...")
-        workspace_name, grounding = self._grounding_workspace_from_request(request)
+        workspace_name, grounding = self._grounding_workspace_from_request(
+            request,
+            llm=autosurvey_llm,
+        )
         workspace_dir = self._reserve_workspace_dir(workspace_name)
         # Make the new workspace visible to the rest of the system *immediately*.
         # The frontend's Research page, sidebar, and chat panels can switch to
@@ -533,6 +538,8 @@ class AgentRuntime:
         registry, run_store_service, rag_service = build_registry(
             llm=self.llm,
             run_root=workspace_dir,
+            autosurvey_llm=autosurvey_llm,
+            embedding_llm=self.llm,
             batch_size=autosurvey_config.collect_batch_size,
             max_context=int(os.getenv("VERITAS_MAX_CONTEXT", "16384")),
             enable_screen_context=False,
@@ -617,9 +624,15 @@ class AgentRuntime:
             "workflow_result": self._compact_workflow_result(result),
         }
 
-    def _grounding_workspace_from_request(self, request: str) -> tuple[str, dict[str, Any] | None]:
+    def _grounding_workspace_from_request(
+        self,
+        request: str,
+        *,
+        llm=None,
+    ) -> tuple[str, dict[str, Any] | None]:
         return workspace_paths.extract_workspace_name_from_request(
-            request, llm=self.llm
+            request,
+            llm=llm or self.llm,
         )
 
     def _reserve_workspace_dir(self, workspace_name: str) -> Path:
