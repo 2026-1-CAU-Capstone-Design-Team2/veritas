@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -223,3 +223,40 @@ class ScreenFeedbackRequest(BaseModel):
     eventId: str
     action: str
     interventionType: str | None = None
+
+
+# ---- Proactive bandit (native_editor + external_screen unified) ----
+#
+# These mirror ``services.proactive.models.ProactiveObservation`` /
+# ``ProactiveDecision`` but live separately because the API layer must keep
+# the HTTP schema decoupled from the policy core. The orchestrator does the
+# mapping in ``api/services/proactive_service.py``.
+
+
+class ProactiveObserveRequest(BaseModel):
+    surface: Literal["native_editor", "external_screen"]
+    workspaceId: str
+    documentKey: str = ""
+    documentId: str = ""
+    sourceApp: str = ""
+    windowTitle: str = ""
+    text: str = ""
+    cursor: int | None = None
+    prefix: str = ""
+    suffix: str = ""
+    currentSentence: str = ""
+    currentParagraph: str = ""
+    previousParagraph: str = ""
+    changedText: str = ""
+    confidence: float = 0.0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProactiveGenerateRequest(BaseModel):
+    decisionId: str
+
+
+class ProactiveFeedbackRequest(BaseModel):
+    decisionId: str
+    action: str
+    metadata: dict[str, Any] = Field(default_factory=dict)

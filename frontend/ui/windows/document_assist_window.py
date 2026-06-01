@@ -452,7 +452,10 @@ class CustomTitleBar(QFrame):
 
 
 class SuggestionCard(QFrame):
-	# (event_id, intervention_type, action) — action ∈ {"like","dislike","copy"}.
+	# (event_id, intervention_type, action). For proactive bandit cards the
+	# ``event_id`` is a ``pd_*`` decision id and ``action`` is the canonical
+	# surface-specific string (``copy`` / ``red_reject`` / ``retry``). For
+	# legacy screen events the action is still ``{"like","dislike","copy"}``.
 	# Re-emitted up through SuggestionList so the host page can POST the reward.
 	feedbackSubmitted = Signal(str, str, str)
 
@@ -472,6 +475,11 @@ class SuggestionCard(QFrame):
 		self._event_id = event_id
 		self._intervention_type = intervention_type
 		self._rated = False
+		# Proactive bandit decisions are ``pd_*``-prefixed. For those we render
+		# the spec §17.3 button row (복사 / 거절 / 다시) and emit canonical
+		# feedback actions; legacy screen events keep the 도움됨 / 아쉬움 UI
+		# until task 12 migrates the screen pipeline onto proactive too.
+		self._is_proactive = bool(event_id and event_id.startswith("pd_"))
 		self._rated_action: str | None = None
 
 		layout = QVBoxLayout(self)
@@ -518,32 +526,68 @@ class SuggestionCard(QFrame):
 		layout.addWidget(self._note)
 		self._apply_parsed(text)
 
-		# Like/dislike live on their own footer row, not in the header: a screen
-		# intervention card can be narrow, and crowding badge + copy + two rating
-		# chips into one row overflowed/clipped them. Only screen interventions
-		# (which carry an event_id) get rated; manual editor suggestions do not.
+		# Footer row (rating chips). Lives on its own row, not in the header: a
+		# screen intervention card can be narrow, and crowding badge + copy +
+		# two rating chips into one row overflowed/clipped them. Manual editor
+		# suggestions (no event_id) get no footer.
+		self._like_button = None
+		self._dislike_button = None
+		self._retry_button = None
+		self._wrong_anchor_button = None
 		if event_id:
 			footer = QHBoxLayout()
 			footer.setSpacing(6)
 			footer.addStretch(1)
-			self._like_button = QPushButton("도움됨")
-			self._like_button.setObjectName("AssistLikeButton")
-			self._like_button.setFixedHeight(30)
-			self._like_button.setMinimumWidth(60)
-			self._like_button.setCursor(Qt.PointingHandCursor)
-			self._like_button.clicked.connect(lambda: self._on_rate("like"))
-			self._dislike_button = QPushButton("아쉬움")
-			self._dislike_button.setObjectName("AssistDislikeButton")
-			self._dislike_button.setFixedHeight(30)
-			self._dislike_button.setMinimumWidth(60)
-			self._dislike_button.setCursor(Qt.PointingHandCursor)
-			self._dislike_button.clicked.connect(lambda: self._on_rate("dislike"))
-			footer.addWidget(self._like_button)
-			footer.addWidget(self._dislike_button)
+			if self._is_proactive:
+				# Rule-based card layout — 복사 (accept) on the header,
+				# 거절 (red_reject) + 다시 (retry) + "현재 위치와 관련 없음"
+				# (wrong_anchor) in the footer. wrong_anchor is the
+				# operator's way to tell the system "the suggestion didn't
+				# target where I'm editing" without poisoning the task_type
+				# preference EMA.
+				self._wrong_anchor_button = QPushButton("위치 다름")
+				self._wrong_anchor_button.setObjectName("AssistWrongAnchorButton")
+				self._wrong_anchor_button.setStyleSheet(_DISLIKE_CHIP_QSS)
+				self._wrong_anchor_button.setFixedHeight(30)
+				self._wrong_anchor_button.setMinimumWidth(70)
+				self._wrong_anchor_button.setCursor(Qt.PointingHandCursor)
+				self._wrong_anchor_button.setToolTip("현재 편집 위치와 관련 없는 제안일 때")
+				self._wrong_anchor_button.clicked.connect(lambda: self._on_rate("wrong_anchor"))
+				self._dislike_button = QPushButton("거절")
+				self._dislike_button.setObjectName("AssistRejectButton")
+				self._dislike_button.setStyleSheet(_DISLIKE_CHIP_QSS)
+				self._dislike_button.setFixedHeight(30)
+				self._dislike_button.setMinimumWidth(60)
+				self._dislike_button.setCursor(Qt.PointingHandCursor)
+				self._dislike_button.clicked.connect(lambda: self._on_rate("red_reject"))
+				self._retry_button = QPushButton("다시")
+				self._retry_button.setObjectName("AssistRetryButton")
+				self._retry_button.setStyleSheet(_LIKE_CHIP_QSS)
+				self._retry_button.setFixedHeight(30)
+				self._retry_button.setMinimumWidth(60)
+				self._retry_button.setCursor(Qt.PointingHandCursor)
+				self._retry_button.clicked.connect(lambda: self._on_rate("retry"))
+				footer.addWidget(self._wrong_anchor_button)
+				footer.addWidget(self._dislike_button)
+				footer.addWidget(self._retry_button)
+			else:
+				self._like_button = QPushButton("도움됨")
+				self._like_button.setObjectName("AssistLikeButton")
+				self._like_button.setStyleSheet(_LIKE_CHIP_QSS)
+				self._like_button.setFixedHeight(30)
+				self._like_button.setMinimumWidth(60)
+				self._like_button.setCursor(Qt.PointingHandCursor)
+				self._like_button.clicked.connect(lambda: self._on_rate("like"))
+				self._dislike_button = QPushButton("아쉬움")
+				self._dislike_button.setObjectName("AssistDislikeButton")
+				self._dislike_button.setStyleSheet(_DISLIKE_CHIP_QSS)
+				self._dislike_button.setFixedHeight(30)
+				self._dislike_button.setMinimumWidth(60)
+				self._dislike_button.setCursor(Qt.PointingHandCursor)
+				self._dislike_button.clicked.connect(lambda: self._on_rate("dislike"))
+				footer.addWidget(self._like_button)
+				footer.addWidget(self._dislike_button)
 			layout.addLayout(footer)
-		else:
-			self._like_button = None
-			self._dislike_button = None
 
 		self._apply_theme()
 		theme.themeChanged.connect(self._apply_theme)
@@ -591,25 +635,38 @@ class SuggestionCard(QFrame):
 
 	def _on_copy(self) -> None:
 		self._copy_text(self._copy_value)
-		# Copy is a weak positive signal: the user took the suggestion even if
-		# they never click 도움됨. Only report it for real screen interventions.
+		# Copy is the spec's external-card accept signal. Emit for any card
+		# that carries an event_id — proactive cards map ``copy → accept`` via
+		# the canonical layer, legacy ones store it as a weak positive.
 		if self._event_id:
 			self.feedbackSubmitted.emit(self._event_id, self._intervention_type, "copy")
 
 	def _on_rate(self, action: str) -> None:
-		# One explicit rating per card; lock the pair after the first click so a
-		# single intervention contributes one clean like/dislike reward.
-		if self._rated or not self._event_id:
+		# One explicit rating per card. Lock the pair (or trio, for proactive
+		# cards) after the first click so a single intervention contributes one
+		# clean reward — the proactive `retry` is the one exception: the user
+		# may want to keep cycling, and the backend creates a fresh decisionId
+		# on each cycle, so we don't lock there.
+		if not self._event_id:
 			return
-		self._rated = True
-		self._rated_action = action
-		for button in (self._like_button, self._dislike_button):
-			if button is not None:
-				button.setEnabled(False)
+		if self._rated and action != "retry":
+			return
+		if action != "retry":
+			self._rated = True
+			for button in (
+				self._like_button,
+				self._dislike_button,
+				self._retry_button,
+				self._wrong_anchor_button,
+			):
+				if button is not None:
+					button.setEnabled(False)
 		if action == "like" and self._like_button is not None:
-			self._like_button.setStyleSheet(_rate_chip_qss(theme.palette(), "like", chosen=True))
-		elif action == "dislike" and self._dislike_button is not None:
-			self._dislike_button.setStyleSheet(_rate_chip_qss(theme.palette(), "dislike", chosen=True))
+			self._like_button.setStyleSheet(_LIKE_CHIP_CHOSEN_QSS)
+		elif action in ("dislike", "red_reject") and self._dislike_button is not None:
+			self._dislike_button.setStyleSheet(_DISLIKE_CHIP_CHOSEN_QSS)
+		elif action == "wrong_anchor" and self._wrong_anchor_button is not None:
+			self._wrong_anchor_button.setStyleSheet(_DISLIKE_CHIP_CHOSEN_QSS)
 		self.feedbackSubmitted.emit(self._event_id, self._intervention_type, action)
 
 	def set_text(self, text: str) -> None:

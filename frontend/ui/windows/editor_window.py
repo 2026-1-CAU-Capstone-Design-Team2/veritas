@@ -240,7 +240,10 @@ class MarkdownSourceEdit(QTextEdit):
 
     ghostAccepted = Signal()
     ghostDismissed = Signal()
-    ghostRetryRequested = Signal()
+    # Carries the ghost text the user was looking at when they hit "다시" so
+    # the backend can pass it to the LLM as a "do NOT repeat this" hint.
+    # See services/proactive/README.md §"Native reject ladder".
+    ghostRetryRequested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -402,8 +405,12 @@ class MarkdownSourceEdit(QTextEdit):
             self.ghostDismissed.emit()
 
     def _request_retry(self) -> None:
+        # Snapshot the ghost text BEFORE _reset_ghost wipes ``self._ghost_text``.
+        # The signal carries it to ``_on_ghost_retry`` which forwards it to the
+        # backend as the "previous rejected suggestion" the LLM must avoid.
+        prev_text = self._ghost_text or ""
         self._reset_ghost()
-        self.ghostRetryRequested.emit()
+        self.ghostRetryRequested.emit(prev_text)
 
     def accept_ghost(self) -> None:
         if not self._ghost_text:
@@ -757,6 +764,16 @@ class EditorWindow(QWidget):
         # Quick-action target: (start, end, is_insert) — where 본문에 대치 writes.
         self._assist_target: tuple[int, int, bool] | None = None
 
+        # Proactive bandit feedback wiring (see services/proactive/*).
+        # When the backend's /editor/suggest wrapper rolls intervene, the SSE
+        # start event carries ``decisionId`` — we cache it here so TAB / ESC /
+        # 다시 / inactivity can map onto /api/v1/proactive/feedback.
+        self._active_decision_id: str | None = None
+        self._active_decision_intervened: bool = False
+        self._proactive_timeout_timer = QTimer(self)
+        self._proactive_timeout_timer.setSingleShot(True)
+        self._proactive_timeout_timer.timeout.connect(self._on_proactive_timeout)
+
         # 문서 대화 shares the main chat's conversation through the app-wide
         # ChatBus + the persisted workspace chat history; mode mirrors the 채팅
         # page (rag/research). The open document is sent as additive context.
@@ -1051,7 +1068,11 @@ class EditorWindow(QWidget):
         self.editor.textChanged.connect(self._on_text_changed)
         self.editor.ghostAccepted.connect(self._on_ghost_accepted)
         self.editor.ghostDismissed.connect(self._on_ghost_resolved)
-        self.editor.ghostRetryRequested.connect(self._fire_suggestion)
+        # Retry: send canonical `retry` to the proactive bandit BEFORE firing
+        # the next suggestion cycle, so the bandit's feedback log reflects the
+        # actual user intent (rather than recording an immediate timeout when
+        # the old ghost evaporates).
+        self.editor.ghostRetryRequested.connect(self._on_ghost_retry)
 
         self.preview = QTextBrowser()
         self.preview.setObjectName("EditorPreview")
@@ -1247,11 +1268,69 @@ class EditorWindow(QWidget):
             self._suggest_timer.start()
 
     def _on_ghost_resolved(self) -> None:
+        self._submit_proactive_feedback("esc")
         self._invalidate_suggestion()
 
     def _on_ghost_accepted(self) -> None:
+        self._submit_proactive_feedback("tab")
         self._invalidate_suggestion()
         self.assist_panel.add_history("고스트 제안 수락")
+
+    def _on_ghost_retry(self, prev_text: str = "") -> None:
+        """User hit the 다시 chip. Record retry feedback (with the previous
+        ghost text so the backend can pass it to the LLM as a "don't repeat
+        this" hint) then start a fresh suggestion cycle.
+        """
+        self._submit_proactive_feedback(
+            "retry",
+            metadata={"generated_text": prev_text} if prev_text else None,
+        )
+        self._fire_suggestion()
+
+    def _on_proactive_timeout(self) -> None:
+        """No TAB / ESC / 다시 within the spec horizon — submit ``timeout``.
+
+        The user can still keep typing past this point; the next observe()
+        will create a fresh decision. We only emit if there is still a
+        cached decisionId (the user hasn't already resolved it).
+        """
+        self._submit_proactive_feedback("timeout")
+
+    def _submit_proactive_feedback(
+        self,
+        raw_action: str,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        """Fire-and-forget proactive feedback for the cached decision.
+
+        ``metadata`` is forwarded to ``/api/v1/proactive/feedback``. The
+        ``retry`` and ``reject`` paths include ``generated_text`` so the
+        backend's per-anchor reject ladder can record the previous (rejected)
+        suggestion text — the LLM gets it back as a "don't repeat this"
+        instruction on the next observe at the same anchor.
+
+        Always clears the cached id afterwards so we never double-submit.
+        """
+        decision_id = self._active_decision_id
+        self._proactive_timeout_timer.stop()
+        if not decision_id:
+            return
+        self._active_decision_id = None
+        intervened = self._active_decision_intervened
+        self._active_decision_intervened = False
+        if not intervened and raw_action != "cancelled":
+            # The bandit chose no_op — there's no rendered suggestion the
+            # user could have accepted, so we don't pollute the feedback log
+            # with an "esc" the user never actually saw.
+            return
+        controller = AgentController()
+        get_job_manager().run_detached(
+            controller.submit_proactive_feedback,
+            decision_id,
+            raw_action,
+            metadata,
+            on_error=lambda err: print(f"[proactive_feedback][warn] {err}"),
+        )
 
     def _update_counts(self) -> None:
         text = self.editor.document_text()
@@ -1335,6 +1414,11 @@ class EditorWindow(QWidget):
         token = self._suggest_token
         self._suggest_anchor = pos
         self._suggest_prev_char = prefix[-1] if prefix else ""
+        # Clear any stale decisionId before the new cycle — the previous
+        # ghost has already been accepted / dismissed / retried by now.
+        self._active_decision_id = None
+        self._active_decision_intervened = False
+        self._proactive_timeout_timer.stop()
         partial: list[str] = []
         worker = EditorSuggestWorker(self._workspace_id, prefix, suffix, 64, self._use_workspace_rag, self)
 
@@ -1342,6 +1426,22 @@ class EditorWindow(QWidget):
             if token == self._suggest_token:
                 # Show the "작성 중" indicator at the caret until the first token.
                 self.editor.set_generating()
+
+        def on_proactive_started(info: dict) -> None:
+            # Cache the bandit decisionId so TAB/ESC/다시 can map to feedback.
+            # ``shouldIntervene=False`` is the no-op branch: the wrapper still
+            # carries a decisionId (for telemetry) but generation produces no
+            # text, so we don't arm the 20s timeout.
+            if token != self._suggest_token:
+                return
+            self._active_decision_id = str(info.get("decisionId") or "") or None
+            self._active_decision_intervened = bool(info.get("shouldIntervene"))
+            if self._active_decision_id and self._active_decision_intervened:
+                # Frontend-side timeout — matches spec §11.3 (20s for ghost,
+                # 30s for inline diff). Backend has its own sweeper as a
+                # fallback for cases where the window is closed mid-stream.
+                horizon_ms = 20_000 if (info.get("renderMode") or "") == "native_ghost" else 30_000
+                self._proactive_timeout_timer.start(horizon_ms)
 
         def on_delta(chunk: str) -> None:
             if token != self._suggest_token:
@@ -1368,6 +1468,7 @@ class EditorWindow(QWidget):
                 self.editor.clear_ghost()
 
         worker.started_stream.connect(on_start)
+        worker.proactive_started.connect(on_proactive_started)
         worker.delta.connect(on_delta)
         worker.completed.connect(on_completed)
         worker.failed.connect(on_failed)
