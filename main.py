@@ -5,11 +5,12 @@ from pathlib import Path
 
 from agent import ChatAgent
 from core.stdio_utf8 import force_utf8_stdio
+from llm.autosurvey_llm_factory import build_autosurvey_llm
 from llm.llama_server_llm import LLMClient
 from services.rag_service import RAGService
 from tools.loader import build_registry, load_schema
 from tools.autosurvey_tool import AutoSurveyTool
-from workflows import AutoSurveyWorkflow
+from workflows import AutoSurveyConfig, AutoSurveyWorkflow
 
 
 def parse_args() -> argparse.Namespace:
@@ -194,11 +195,19 @@ def main() -> None:
         trace_latency=not args.no_trace_latency,
         max_parallel=args.parallel,
     )
+    autosurvey_llm = build_autosurvey_llm(llm)
+    autosurvey_config = AutoSurveyConfig.from_env(
+        max_docs=args.max_docs,
+        collect_batch_size=args.batch_size,
+        scout_docs=args.scout_docs,
+    )
 
     registry, run_store_service, rag_service = build_registry(
         llm=llm,
         run_root=output_dir,
-        batch_size=args.batch_size,
+        autosurvey_llm=autosurvey_llm,
+        embedding_llm=llm,
+        batch_size=autosurvey_config.collect_batch_size,
         max_context=args.max_context,
         enable_screen_context=not args.no_screen_context,
         screen_interval_sec=args.screen_interval,
@@ -208,9 +217,7 @@ def main() -> None:
     workflow = AutoSurveyWorkflow(
         registry=registry,
         run_store_service=run_store_service,
-        max_docs=args.max_docs,
-        collect_batch_size=args.batch_size,
-        scout_docs=args.scout_docs,
+        config=autosurvey_config,
     )
     register_chat_workflow_tools(
         registry=registry,

@@ -59,16 +59,24 @@ def update_research_method(sample_count: int, plan_count: int) -> dict[str, Any]
     return {"research": research, "updated": True}
 
 
+def update_autosurvey_openai(api_key: str = "", *, clear: bool = False) -> dict[str, Any]:
+    autosurvey_openai = repo.set_autosurvey_openai_settings(
+        api_key=api_key,
+        clear=clear,
+    )
+    return {"autosurveyOpenAI": autosurvey_openai, "updated": True}
+
+
 def update_llm_parallel(value: int) -> dict[str, Any]:
     """Persist the parallel-decoding concurrency and apply it to the live
     shared LLM client.
 
     ``LLMClient.map_parallel`` reads ``max_parallel`` at call time, so updating
-    the attribute on the already-constructed runtime client takes effect on the
-    next batch (cleanup / summarize / embeddings) without a restart. The live
-    apply is best-effort: if the runtime has not been built yet the persisted
-    STATE value is what matters, and a runtime built later still starts from the
-    env default (the UI re-applies on the next save).
+    the attribute on the already-constructed local runtime client takes effect
+    on the next batch (cleanup / summarize / embeddings) without a restart.
+    OpenAI AutoSurvey clients are built per research run and read the persisted
+    ``llmParallel`` value unless ``VERITAS_AUTOSURVEY_OPENAI_MAX_PARALLEL``
+    explicitly overrides it.
     """
     parallel = repo.set_llm_parallel_settings(value)
     try:

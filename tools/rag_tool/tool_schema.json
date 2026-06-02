@@ -14,6 +14,17 @@
           "type": "boolean",
           "default": false,
           "description": "Whether to use recent chat history to rewrite the query before retrieval. Set true only when the current question explicitly depends on previous turns."
+        },
+        "source_scope_filter": {
+          "type": "string",
+          "enum": ["external", "local", "all"],
+          "default": "all",
+          "description": "Filter retrieval to AutoSurvey external sources, local private corpus files, or both."
+        },
+        "include_private_local": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether local_private chunks may be included. Generation must stay on the local LLM when true and local chunks are retrieved."
         }
       },
       "required": ["query"]

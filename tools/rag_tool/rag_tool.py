@@ -21,12 +21,24 @@ class RAGSearchTool(BaseTool):
     def name(self) -> str:
         return "rag_search"
 
-    def run(self, query: str | None = None, use_history: bool = True, **_: Any) -> ToolResult:
+    def run(
+        self,
+        query: str | None = None,
+        use_history: bool = True,
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
+        **_: Any,
+    ) -> ToolResult:
         if not query or not str(query).strip():
             return ToolResult(success=False, error="`query` is required for rag_search.")
 
         try:
-            documents = self.rag_service.retrieve(str(query).strip(), use_history=use_history)
+            documents = self.rag_service.retrieve(
+                str(query).strip(),
+                use_history=use_history,
+                source_scope_filter=source_scope_filter,
+                include_private_local=include_private_local,
+            )
             return ToolResult(success=True, data={"documents": documents})
         except Exception as e:
             return ToolResult(success=False, error=f"RAG search failed: {e}")

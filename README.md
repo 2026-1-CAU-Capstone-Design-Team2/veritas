@@ -1,192 +1,11 @@
-# Veritas
+# VERITAS
 
-Veritas is a local research assistant that combines an AutoSurvey workflow, local
-RAG over generated markdown outputs, and schema-driven chat tool use.
+> **로컬에서 동작하는 AI 리서치 · 문서 작성 어시스턴트**
+> 웹 자료조사, 보고서 초안 작성, 근거 정합성 검증, 작성 중 능동형 보조까지 — 데이터를 외부로 보내지 않고 내 PC 안에서 처리합니다.
 
-## 2026-05 UI/API Integration Notes
+VERITAS는 *Veritas(라틴어 "진실")* 라는 이름 그대로, **수집한 근거에 끝까지 책임지는 글쓰기**를 목표로 합니다. 기본 구성은 로컬 GGUF 모델(llama.cpp)만으로 동작하므로 API 키도, 데이터 유출 걱정도 없습니다. 필요한 경우에만 자료조사 단계에 한해 OpenAI API를 선택적으로 연결해 속도를 높일 수 있습니다.
 
-- API/CLI entrypoints now use separate OpenAI-compatible servers by default:
-  chat completions on `127.0.0.1:8080`, embeddings on `127.0.0.1:8081`.
-- `launcher.py` is the future `veritas-launcher.exe` entrypoint. On first run it
-  checks `%LOCALAPPDATA%\VERITAS\models\llm` and
-  `%LOCALAPPDATA%\VERITAS\models\embedding`, offers the Qwen3.5 GGUF choices,
-  downloads missing models from Hugging Face with progress, then starts the two
-  `llama-server` processes, the FastAPI server, and the PySide UI.
-  The embedding server is started with `--embeddings`; without that flag
-  `POST /api/v1/verify/jobs` can fail when the verification pipeline first
-  calls `/v1/embeddings`.
-  By default child-process logs are written to `%LOCALAPPDATA%\VERITAS\logs`.
-  For development, run `python launcher.py --console-logs` or set
-  `VERITAS_LOG_MODE=console` to stream llama-server/API/UI logs into the same
-  terminal. If a server is already running on ports 8000/8080/8081, the
-  launcher reuses it and cannot attach to that old process's stdout; stop the
-  existing process first to see live logs from a fresh launch.
-- The frontend Research page runs `/api/v1/research/jobs` on a Qt worker thread
-  so the UI stays responsive during long AutoSurvey runs.
-- Completed research jobs return document titles/links from `summary/index.json`,
-  document counts, indexed chunk count, elapsed seconds, `finalPath`, and the
-  final markdown report.
-- The frontend Document page loads the latest AutoSurvey `final.md` through the
-  documents API and renders it as markdown.
-- Each AutoSurvey API run is stored as its own folder under `runs/`. The API
-  performs a lightweight term-grounding pass first, then creates the workspace
-  folder from the first `grounded_terms` string before ChromaDB opens any files.
-- Runs subdirectories are treated as UI workspaces. The sidebar workspace
-  dropdown refreshes from `/api/v1/workspaces`, which scans `runs/`.
-
-### 2026-05-13 Proactive assistance + streaming UX
-
-- Proactive screen-monitoring is now reachable from the API/UI. `AgentRuntime`
-  exposes `start_screen_monitoring`, `stop_screen_monitoring`,
-  `screen_monitoring_status`, and `get_screen_events_since`; these are wired to
-  `POST /api/v1/screen-monitoring/start`, `POST /api/v1/screen-monitoring/stop`,
-  `GET /api/v1/screen-monitoring/status`, and
-  `GET /api/v1/screen-monitoring/events?since=<seq>&limit=<n>`.
-- The proactive intervention loop is started automatically when the floating
-  "AI 보조창" (DocumentAssistWindow) is shown and stopped when it is hidden.
-  Generated screen-assist answers land in a runtime-side ring buffer; the
-  frontend `ScreenEventPollWorker` (QThread) polls every ~3s and renders new
-  answers as cards in the assist window's `SuggestionList`.
-- Chat is fully asynchronous. The OpenAI streaming path is exposed via
-  `LLMClient.iter_ask`, threaded through `ChatAgent.ask_auto_iter` /
-  `ask_explicit_tool_iter` / `ask_rag_iter`, and surfaced over Server-Sent
-  Events at `POST /api/v1/chat/messages/stream` and
-  `POST /api/v1/document-assist/chat/messages/stream`. The events are
-  `start` / `delta` / `done` / `error`.
-- `frontend/controllers/chat_bus.py` introduces a `ChatBus` singleton plus a
-  `ChatStreamWorker(QThread)`. Sending a chat message from any panel goes
-  through the bus; the main thread returns immediately (no UI freeze) and the
-  bus broadcasts `userMessageQueued`, `assistantStreamStarted`, `assistantChunk`,
-  `assistantCompleted`, and `assistantFailed`.
-- The main chat page (`WritePage`) and the floating assist window
-  (`DocumentAssistWindow`) both subscribe to the bus and stay in sync — the
-  same user/assistant bubbles appear in both views and chunk-by-chunk streaming
-  updates happen simultaneously. Backend-side, `document_assist_service` was
-  unified to route through `draft_chat_service`, so both panels project the
-  same workspace memory (`memory.sqlite3` recall tier) for history rendering.
-- AutoSurvey emits live progress events. `AutoSurveyWorkflow` accepts a
-  `progress_callback` and emits at term grounding, query plan (initial/replan),
-  per-query web search, per-URL fetch, batch summarize, and final report. The
-  runtime keeps a `_research_progress` ring buffer exposed at
-  `GET /api/v1/research/progress?since=<seq>&limit=<n>`. The Research page runs
-  `ResearchProgressPoller(QThread)` and displays the latest single line in
-  gray, replaced live as the agent acts (ChatGPT/Claude style).
-- The Research result card was redesigned: a colored status pill (green
-  `● 완료`, red `● 오류` with a click-to-open `QMessageBox`, blue `● 진행 중`),
-  three info tiles (`작업 이름` / `저장 경로` / `수집된 문서 수`), and one
-  `DocumentBar` per collected document. Each bar shows the title, a clickable
-  URL hyperlink (uses `QDesktopServices.openUrl`, auto-prepends `https://`
-  when the URL has no scheme), and a `doc_NNN.md ↗` button that opens the
-  corresponding `summary/doc_<docId>.md` in the OS default viewer.
-- AutoSurvey runs now publish the new workspace **immediately after
-  term-grounding** instead of at completion. `AgentRuntime.run_autosurvey`
-  calls a new `_publish_new_workspace` step right after
-  `_reserve_workspace_dir`: it writes `summary/request.txt` (so the
-  directory passes `_scan_run_workspaces`' "has any research evidence"
-  filter even before the first document lands), upserts the workspace
-  row + `current_workspace_id` into the in-memory catalog and the
-  SQLite `app_state`, and emits a new `workspace_created` progress
-  event with `{ workspaceId, name, path }`. The Research page picks up
-  the event and updates the info tiles (작업 이름 / 저장 경로) plus
-  emits a light `workspaceCreated` signal that `MainWindow` routes to
-  `sidebar.set_current_workspace(name)` and, crucially, to clearing
-  the chat panels — `WritePage.chat_panel.clear_messages()` and
-  `DocumentAssistWindow.hydrate_history([])` — so the previous
-  workspace's chat history doesn't bleed into the new workspace's
-  context. This signal intentionally does *not* trigger the heavy
-  `_on_workspace_changed` cascade so the live `DocumentBar` timeline
-  in the Research page survives the workspace adoption.
-- Workspace lifecycle is now consistent across the on-disk `runs/`
-  directory and the local SQLite DB at `%LOCALAPPDATA%/VERITAS/veritas.db`.
-  `db/workspace_sync.py` exposes two helpers:
-  `reconcile_workspaces_with_disk(runs_root)` runs at both app launches
-  (PySide `frontend/ui/main.py` and `AgentRuntime.__init__`) and prunes DB
-  rows whose backing folder is gone — so workspaces a user manually
-  removed from `runs/` while the app was offline no longer linger in the
-  dashboard's "최근 작업". `delete_workspace(workspace_id, runs_root)`
-  performs the user-initiated delete: it switches the runtime off the
-  target workspace if it was active, removes `runs/<id>/`, and drops
-  rows from `workspaces` / `documents` / `activity_logs` / `app_state`
-  in one transaction. Demo seed rows (whose recorded `path` is outside
-  `runs_root`) are deliberately preserved by both helpers.
-- The dashboard "최근 작업 워크스페이스" panel now renders a red 삭제
-  button on each row. Clicking it opens a confirmation popup
-  ("{workspace_name} 워크스페이스가 삭제됩니다. 계속 하시겠습니까?" with
-  예 / 아니오), and on confirmation calls
-  `DELETE /api/v1/workspaces/{workspaceId}` which delegates to
-  `db.workspace_sync.delete_workspace` and reloads the bootstrap state so
-  the sidebar dropdown also drops the workspace.
-- `AgentRuntime` no longer materializes a `runs/api/` directory when a real
-  workspace already exists. At boot it scans `runs/` for the most-recently
-  modified directory that contains real research evidence (a `final.md`, a
-  `summary/index.json`, or any `doc_*.md`) and attaches to that workspace
-  directly. The `runs/api/` slot is only used as a one-time scratch home
-  for the very first session before any research has been produced; it is
-  also removed on boot, and again whenever `set_workspace` transitions off
-  of it, when it has no meaningful content. `set_workspace("default")` is
-  resolved to the same most-recent workspace, so a stale "default" id
-  coming from the frontend doesn't accidentally recreate the directory.
-- The Research result card clears its in-memory `_doc_bars` map at the
-  start of `_load_existing_result` so that switching workspaces does not
-  reconcile workspace B's documents on top of workspace A's leftover bars.
-  Bar identity is by `doc_id`, which is workspace-relative ("001" in
-  workspace A is a different document from "001" in workspace B), so the
-  reconciliation pass — which is correct for live updates within a single
-  run — has to be reset across workspace boundaries.
-- Frontend async dispatch and operation mutex go through a single
-  `frontend/controllers/job_manager.py` `JobManager` singleton. Every
-  long-running call to the backend (AutoSurvey, chat, draft, feedback
-  analyze, workspace switch, ...) is tagged with a
-  `JobCategory` constant and submitted via `JobManager.submit(category, fn,
-  ...)` which runs `fn` on a worker `QThread` and emits `busy_changed` on
-  state transitions. A central block matrix (`_BLOCKS_THIS` in `job_manager.py`)
-  encodes which categories block which: e.g. `RESEARCH` blocks `CHAT`,
-  `DRAFT`, `FEEDBACK`, `DOC_ANALYZE`, and `WORKSPACE_SWITCH`. Views connect
-  to `JobManager.busy_changed` once and disable their inputs via
-  `is_blocked(category)` — so while AutoSurvey is running the chat input
-  bars (in `WritePage` and the floating `DocumentAssistWindow`), the
-  workspace-switch button in the sidebar, the draft "초안 생성" button, and
-  the feedback upload button are all greyed out automatically and cannot
-  be invoked. The existing `ChatStreamWorker` reuses the same mutex via
-  `JobManager.register/unregister(CHAT)`, so chat streams and JobManager-
-  submitted operations participate in the same exclusion model. Adding a
-  new heavy operation is now a single-place change: pick a `JobCategory`,
-  call `submit(...)`, and the UI gating falls out automatically from
-  `_BLOCKS_THIS`.
-- FastAPI handlers that perform synchronous blocking work (`POST /research/jobs`,
-  `POST /workspaces/switch`, `POST /chat/messages`, `POST /draft/generate`,
-  `POST /draft/{id}/regenerate`, `POST /document-assist/analyze`,
-  `POST /document-assist/chat/messages`, `POST /feedback/analyze`,
-  `POST /screen-monitoring/{start,stop}`) are declared as plain `def`, not
-  `async def`. FastAPI dispatches `def` handlers to its thread pool instead of
-  running them on the event loop, so a long-running call (AutoSurvey, LLM
-  inference, registry rebuild) cannot freeze every other request. Without
-  this, the progress poller, workspace switch, and page-refresh calls all
-  queued behind the in-flight research job and the UI appeared frozen.
-- Collected-document bars stream in live as `AutoSurveyWorkflow` runs.
-  `_fetch_one` emits a `doc_fetched` progress event after a non-duplicate
-  record is committed, carrying `{doc_id, title, url, final_url, domain}`;
-  `run_summarize` emits one `doc_summarized` event per successfully summarized
-  doc with the absolute `summary_path`. The Research page (controller) owns a
-  `_doc_bars: dict[doc_id → DocumentBar]` model: `doc_fetched` creates the bar
-  in pending state (greyed-out "요약 대기 중" button) and `doc_summarized`
-  flips it to ready via the single mutation method `DocumentBar.set_summary_ready`.
-  The final job response is then reconciled in `_reconcile_documents` so any
-  bars that polling missed are appended and any pending bars get their summary
-  path filled in.
-- The Document page now renders `final.md` through Python's `markdown` library
-  (`tables` / `fenced_code` / `sane_lists` / `nl2br` extensions) and calls
-  `QTextEdit.setHtml`, because Qt's built-in `setMarkdown` has known GFM-table
-  rendering bugs (alignment row mis-parsed, tables breaking when adjacent to
-  other blocks). `frontend/ui/markdown_view.py` falls back to `setMarkdown` if
-  the optional `markdown` package is missing.
-
-The project is built around one principle:
-
-```text
-Intent decisions belong to the LLM through prompts and tool schemas.
-Code should enforce execution boundaries, not route by user-message keywords.
-```
+---
 
 ## Current Alignment Notes
 
@@ -279,8 +98,11 @@ python main.py "research topic" --output-dir ./output --phase all
 # Full AutoSurvey with a required reference site
 python main.py "research topic site:https://example.com" --output-dir ./output --phase all
 
-# General chat with schema-driven tool use
-python main.py --output-dir ./output --phase chat
+- **로컬 우선(Local-first)** — LLM 추론·임베딩·검색·저장이 모두 사용자 PC에서 실행됩니다. 외부로 나가는 것은 자료조사를 위한 웹 검색뿐입니다.
+- **데스크톱 앱** — PySide6(Qt6) 기반 GUI와 FastAPI 백엔드가 HTTP로 통신합니다.
+- **워크스페이스 중심** — 하나의 주제 = 하나의 워크스페이스. 수집 문서·요약·검증 결과·초안이 한 폴더에 모입니다.
+- **내 문서도 근거로** — 로컬 폴더를 연결하면 내 PC의 문서(PDF·DOCX·XLSX 등)도 채팅·초안·검증의 근거로 활용됩니다. 로컬 문서는 외부 API로 절대 전송되지 않습니다.
+- **검증 가능한 리서치** — 단순 요약이 아니라, 보고서의 근거 정합성·출처 합의·신뢰도를 알고리즘으로 재검증합니다.
 
 # Strict document-grounded RAG chat
 python main.py --output-dir ./output --phase rag
@@ -292,29 +114,19 @@ python main.py --output-dir ./output --phase summarize
 python main.py --output-dir ./output --phase final
 ```
 
-If `--phase all` is used without an instruction but markdown files already exist
-under `--output-dir`, Veritas enters schema-driven chat mode. Otherwise an
-instruction is required.
-
-## AutoSurvey Flow
-
-The full workflow in `AutoSurveyWorkflow.run_all()` is:
-
-```text
-1. Save the user request and reset query state.
-2. Run term_grounding.
-3. Extract explicit `site:` reference-site constraints, if present.
-4. Fetch and batch-summarize reference-site URLs directly when possible.
-5. Build the initial query plan from the request, grounded terms, and reference sites.
-6. Add site-scoped search queries for each reference site.
-7. Run a scout collection cycle.
-8. Batch-summarize scout documents.
-9. Replan if batch summaries reveal relevant gaps.
-10. Continue collect -> batch-summarize -> replan until max_docs or no queries remain.
-11. Per-document summaries: summarize every collected clean_md once (after the loop).
-12. Write the final report.
-13. Index clean_md into ChromaDB for RAG.
-```
+| 기능 | 설명 |
+|---|---|
+| 🔍 **자료조사 (AutoSurvey)** | 주제어 추출 → 검색 계획 → 웹 수집 → 요약 → 부족분(gap) 분석 → 재계획을 반복하는 **자율 리서치 파이프라인**. 결과를 마크다운 보고서(`final.md`)로 산출하고, 진행 상황을 실시간으로 보여줍니다. |
+| 💬 **근거 기반 채팅 (RAG)** | 수집한 문서를 ChromaDB에 벡터 색인하고, 그 근거 위에서만 답하는 RAG 채팅. 토큰 단위 스트리밍 응답. |
+| 📂 **로컬 문서 연결 (Local Corpus)** | 지정한 로컬 폴더의 문서(`.md` `.txt` `.pdf` `.docx` `.xlsx` `.csv`)를 자동 스캔·색인해 RAG·초안·검증의 근거로 활용. 파일이 바뀐 부분만 증분 재색인하며, 로컬 문서는 외부 LLM으로 전송되지 않습니다. |
+| ✅ **정합성 검증 (Verify)** | 보고서를 **임베딩 + IR/NLP 알고리즘**(BM25·RRF·커뮤니티 탐지·PageRank)과 **LLM 신뢰도 판정**으로 재검증. 섹션별 근거, 출처 간 합의/충돌, 문서별 신뢰도를 산출합니다. 로컬 문서가 등록된 경우 **Cross-check**가 내부 문서와 웹 출처를 비교해 수치 불일치·모순을 탐지하고, 검증 페이지에 불일치 건별로 "내부 주장 vs 외부 주장 + 출처"를 표시합니다. |
+| 📝 **초안 작성 (Draft)** | 워크스페이스 지식베이스(웹 + 로컬 문서)를 근거로, 선택한 **양식·목차·톤**에 맞춰 실제 문서(주간 보고, 회의록, 사업 제안서 등)를 생성. 기존 양식 파일(.docx/.hwp/.pdf)에서 구조만 추출해 템플릿으로 재사용 가능. |
+| 🪄 **AI 보조창 + 화면 모니터링** | 떠 있는 보조 창이 활성 윈도우(워드·파워포인트·에디터)의 텍스트를 OCR/UI Automation으로 읽어, 작성 맥락을 감지하고 **룰 기반 파이프라인**으로 먼저 제안합니다. (Windows 전용) |
+| ⌨️ **인라인 문장 예측** | 작성 중 커서 앞뒤 맥락을 바탕으로 다음 문장을 예측해 제안(SSE). |
+| 🗂 **피드백 분석** | 업로드한 문서(PDF·DOCX·PPTX·HWP 등)를 분석해 약점과 개선안을 제시. |
+| 📤 **문서 내보내기** | 산출물을 Markdown / DOCX / HTML / PDF 로 내보내기(pandoc 기반). |
+| ⚡ **OpenAI 가속 (선택)** | 자료조사(AutoSurvey) 단계에만 OpenAI API를 선택적으로 사용해 조사 속도를 높일 수 있습니다. 채팅·RAG·임베딩·로컬 문서 처리는 항상 로컬에서 수행됩니다. |
+| 📊 **대시보드 · 설정** | 워크스페이스·문서 통계, 모델 라이브 전환, 로컬 접근 폴더 등록, OpenAI API key 관리. |
 
 Batch summary and per-document summary are independent consumers of each
 document's clean Markdown (`clean_md/<doc_id>.md`), not a chain. Batch summary
@@ -337,7 +149,20 @@ final_report        Produces the final markdown report.
 `query_plan` owns search-query generation. `term_grounding` only anchors the
 planner with important terms.
 
-## Reference Sites
+| 영역 | 사용 기술 |
+|---|---|
+| **LLM 추론 (로컬)** | [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` (OpenAI 호환 API) · GGUF 양자화 모델 |
+| **언어 모델** | Qwen3.5 (0.8B / 2B / 4B / 9B, 사용자 선택) — 채팅 포트 `8080` |
+| **임베딩 모델** | Granite Embedding 97M Multilingual R2 — 임베딩 포트 `8081` |
+| **LLM 추론 (선택)** | OpenAI API (`gpt-5-mini` 등) — AutoSurvey 조사 단계 전용 |
+| **백엔드** | Python · [FastAPI](https://fastapi.tiangolo.com/) · Uvicorn |
+| **데스크톱 UI** | [PySide6](https://doc.qt.io/qtforpython/) (Qt6) |
+| **벡터 검색** | [ChromaDB](https://www.trychroma.com/) (워크스페이스별 PersistentClient) |
+| **로컬 메타DB** | SQLite (`%LOCALAPPDATA%/VERITAS/veritas.db`) |
+| **웹 리서치** | [ddgs](https://pypi.org/project/ddgs/) (DuckDuckGo 검색) · [Crawl4AI](https://github.com/unclecode/crawl4ai) (HTTP 크롤링 → 정제 마크다운) |
+| **검증 / NLP** | NumPy · NetworkX · rank-bm25 · scikit-learn · [Kiwi](https://github.com/bab2min/kiwipiepy) (한국어 형태소 분석) |
+| **문서 입출력** | pypdf · python-docx · python-pptx · openpyxl(XLSX) · olefile(HWP) · markdown · [pypandoc](https://pypi.org/project/pypandoc/) |
+| **화면 캡처 (Windows)** | pywin32 · uiautomation · winsdk · Pillow |
 
 If the user request contains one or more `site:` constraints, AutoSurvey treats
 them as required reference sources:
@@ -357,7 +182,15 @@ site:docs.python.org/3 research topic
 This is intentionally implemented in workflow code because it is an explicit
 source constraint from the user, not an LLM intent guess.
 
-## Web Search Provider
+```
+표현(Presentation)   frontend/             PySide6 UI · 컨트롤러 · HTTP 클라이언트
+경계(API)            api/                  FastAPI 라우터 · API 서비스 · 리포지토리
+오케스트레이션        agent/  workflows/     대화 루프 / 결정론적 조사 파이프라인
+역량(Capability)     tools/                호출 가능한 단위 기능 + ToolRegistry
+도메인 서비스         services/             RAG · 로컬 문서 · 검증 · 능동형 제안 · 화면 캡처
+인프라(Infra)        llm/  storage/  db/    LLM 클라이언트 / 벡터DB / SQLite
+공유(Shared)         core/                 프롬프트 · 공용 데이터 모델
+```
 
 `web_search_tool.py` uses DuckDuckGo HTML search with the installed `ddgs`
 package as a fallback. It does not require an API key, Docker, public instance
@@ -371,6 +204,21 @@ Example:
 ```powershell
 python main.py "research topic" --output-dir ./output --phase all
 ```
+term_grounding → query_plan(초기) → scout 수집 → 요약
+   → gap 분석 → query_plan(재계획) → [수집 → 요약 → 재계획] 반복
+   → final_report → ChromaDB 색인(RAG)
+```
+
+각 단계는 `tools/`의 tool을 `ToolRegistry`로 호출하고, 진행 이벤트를 콜백으로 흘려보내 프론트엔드가 실시간으로 렌더링합니다.
+
+### 로컬 문서 색인 파이프라인
+
+```
+폴더 등록 → 스캔(FileScanner) → 파싱(PDF/DOCX/XLSX/CSV/MD/TXT)
+   → 청킹 → 임베딩 → ChromaDB 색인 → RAG·초안·검증에서 검색
+```
+
+파일 내용의 해시를 manifest로 관리하여, 다시 색인할 때 **변경된 파일만** 재처리합니다.
 
 `site:` constraints are preserved in the query string. Support depends on how
 DuckDuckGo handles the submitted search syntax.
@@ -396,11 +244,37 @@ fetched by Crawl4AI and can be persisted directly as clean Markdown.
 
 Storage layout — document text artifacts are always Markdown:
 
-```text
-clean_md/<doc_id>.md            # Crawl4AI clean Markdown — RAG source + summary input
-corpus/raw_html/<doc_id>.html   # original HTML archive (provenance only)
-summary/doc_<n>.md              # per-document summary (UX descriptor)
-summary/batch_<n>.md            # batch summary (gap analysis / final-report input)
+```
+veritas/
+├─ main.py                  # CLI 진입점
+├─ launcher.py              # 통합 런처 (모델 선택·다운로드 → 서버 기동 → UI 실행)
+├─ agent/                   # ChatAgent: 멀티턴 채팅 루프 · 스키마 기반 tool 호출
+├─ workflows/               # AutoSurveyWorkflow: 조사 파이프라인
+├─ tools/                   # 단위 기능 + ToolRegistry (web_search, fetch_webpage,
+│                           #   term_grounding, query_plan, document_summarize,
+│                           #   final_report, rag, autosurvey, screen_context …)
+├─ services/                # 도메인 서비스
+│  ├─ rag_service.py        #   RAG 색인/검색/근거 기반 답변
+│  ├─ local_corpus/         #   로컬 폴더 스캔 · 파싱 · 증분 색인
+│  ├─ knowledge/            #   청킹 · 색인 · 검색 · 초안용 지식팩 빌더
+│  ├─ run_store_tool_funcs/ #   워크스페이스 산출물 저장
+│  ├─ fetch_webpage_tool_funcs/  # Crawl4AI 수집
+│  ├─ screen_tool_funcs/    #   화면 OCR/UIA 캡처
+│  ├─ proactive/            #   룰 기반 능동형 제안 파이프라인
+│  └─ verification/         #   정합성 검증 (sections · reliability · consensus · crosscheck)
+├─ llm/                     # llama-server 클라이언트 · 모델 카탈로그/다운로드
+│                           #   + OpenAI API 어댑터 (AutoSurvey 전용)
+├─ storage/                 # ChromaDB 벡터 스토어 래퍼
+├─ db/                      # 로컬 SQLite (워크스페이스·문서·활동로그·app_state)
+├─ core/                    # 프롬프트(core/prompts/) · 공용 데이터 모델
+├─ api/                     # FastAPI 앱
+│  ├─ api_routes/           #   기능별 라우터 (research, verify, draft, feedback,
+│  │                        #     local_corpus, document_assist, write, workspaces …)
+│  └─ services/             #   라우터 뒤 로직 (agent_runtime 싱글톤 등)
+├─ frontend/                # PySide6 데스크톱 앱
+│  ├─ controllers/          #   HTTP 클라이언트 · JobManager · ChatBus
+│  └─ ui/pages/, ui/windows/#   화면별 페이지 · 플로팅 보조창/에디터
+└─ runs/<workspace>/        # 워크스페이스별 산출물 (corpus·summary·local·knowledge·final.md …)
 ```
 
 Fetched text is sanitized before writing, and file reads use UTF-8 with replacement
@@ -450,18 +324,12 @@ autosurvey
 
 These tools are not directly exposed in chat:
 
-```text
-web_search
-fetch_webpage
-term_grounding
-query_plan
-document_summarize
-final_report
-```
+1. **첫 실행 시** 초기 설정 화면을 띄워 Qwen3.5 GGUF 모델을 선택받고, 없는 모델은 Hugging Face에서 진행률과 함께 다운로드합니다.
+2. **`llama-server` 2개**를 기동 — 채팅(`8080`) · 임베딩(`8081`).
+3. **FastAPI 서버**(`8000`)를 기동.
+4. **PySide6 데스크톱 UI**를 띄웁니다.
 
-The chat loop does not call `web_search` directly. Fresh research goes through
-the `autosurvey` adapter, and already-indexed local evidence goes through
-`rag_search`.
+런처가 종료되면(정상 종료·창 닫기·강제 종료 포함) Windows Job Object가 모든 자식 프로세스를 함께 정리하므로, 포트를 잡고 남는 좀비 `llama-server`가 생기지 않습니다.
 
 Explicit slash commands bypass LLM tool selection:
 
@@ -482,10 +350,53 @@ the LLM deciding whether a tool should be called.
 
 Returns the current local date/time or a requested timezone date/time.
 
-### `rag_search`
+## 📂 로컬 문서 연결 (Local Corpus)
 
-Searches the indexed local corpus. It is a thin retrieval wrapper around
-`RAGService`; strict RAG mode uses `RAGService.answer()` directly.
+내 PC의 문서를 워크스페이스 지식베이스에 연결하는 기능입니다.
+
+1. **설정 → 로컬 접근 폴더 설정**에서 접근을 허용할 폴더를 추가하고 저장합니다.
+2. 폴더 안의 지원 문서가 자동으로 스캔·파싱·색인됩니다.
+   - 지원 형식: `.md` `.txt` `.pdf` `.docx` `.xlsx` `.csv` (파일당 최대 50MB, 폴더당 최대 300개)
+   - 표 형식 파일(CSV/XLSX)은 열 통계·샘플을 요약한 프로필로 변환되어 색인됩니다.
+3. 이후 **RAG 채팅 · 초안 작성 · 정합성 검증**에서 웹 자료와 함께 로컬 문서가 근거로 사용됩니다.
+4. 표 데이터 질의(`table_query`) — 채팅에서 로컬 CSV/XLSX의 **수치·집계·정렬 질문**(예: "3월 매출 합계")을 하면, 요약 프로필이 아닌 **원본 파일 전체를 직접 읽어** 행 수 제한 없이 정확한 값을 계산합니다.
+5. **Cross-check (내부↔외부 교차 검증)** — 검증 페이지에서 "검증 시작"을 누르면 내부 문서의 주장과 웹 조사 결과를 비교해, 같은 주제를 다루면서 **수치가 다른 항목**을 찾아냅니다. 결과는 검증 페이지의 "Cross-check 결과" 카드에 불일치 건별로 표시됩니다 (예: "내부 결산: 영업이익 15.8조원 ↔ 외부 발표: 16.4조원").
+
+**프라이버시 보장** — 로컬 문서에서 추출된 내용은 `local_private` 라벨로 관리되며, OpenAI 가속이 켜져 있어도 **외부 API로 전송되지 않습니다**. 로컬 문서가 근거에 포함되는 작업은 항상 로컬 LLM으로만 수행됩니다.
+
+---
+
+## ⚡ OpenAI 가속 (선택)
+
+자료조사(AutoSurvey)의 속도를 높이고 싶을 때, 조사 파이프라인에 한해 OpenAI API를 사용할 수 있습니다.
+
+- **설정 → 고급 설정 → OpenAI API**에서 API key를 등록하면 활성화되고, 삭제하면 로컬 LLM으로 돌아갑니다.
+- 기본 모델은 `gpt-5-mini`이며, 환경 변수로 변경할 수 있습니다.
+- OpenAI가 사용되는 범위는 **조사 단계(주제어 추출·검색 계획·문서 요약·최종 보고서)뿐**입니다. 채팅·RAG·임베딩·검증·로컬 문서 처리는 항상 로컬에서 수행됩니다.
+- OpenAI 사용 시 문서별 정제(cleanup) LLM 호출이 **사이클당 1회의 배치 메타데이터 호출로 통합**되어, 같은 조사 기준 LLM 호출 수가 약 절반으로 줄어듭니다. (로컬 LLM 사용 시에는 기존 문서별 정제 경로가 그대로 유지됩니다.)
+
+| 환경 변수 | 기본값 | 설명 |
+|---|---|---|
+| `VERITAS_AUTOSURVEY_LLM_PROVIDER` | `local` | `openai` 로 설정 시 AutoSurvey에 OpenAI 사용 |
+| `OPENAI_API_KEY` | — | OpenAI 인증 키 (provider가 `openai`일 때 필수) |
+| `VERITAS_AUTOSURVEY_OPENAI_MODEL` | `gpt-5-mini` | 사용할 OpenAI 모델 |
+| `VERITAS_AUTOSURVEY_OPENAI_SERVICE_TIER` | (자동) | `priority` 설정 시 응답 지연 감소 (추가 비용 발생) |
+| `VERITAS_AUTOSURVEY_CLEANUP_MODE` | `auto` | 문서 정제 경로: `auto`(LLM 종류로 자동 결정) / `per_doc`(문서별 정제) / `batch`(사이클당 배치 처리) |
+
+---
+
+## 💾 워크스페이스 & 데이터 위치
+
+하나의 조사 주제 = `runs/` 아래 폴더 하나(= 워크스페이스)입니다.
+
+| 저장소 | 위치 | 내용 |
+|---|---|---|
+| 워크스페이스 산출물 | `runs/<workspace>/` | 수집 원문, 문서·배치 요약, 검증 결과, `final.md`, 초안 |
+| 로컬 문서 색인 | `runs/<workspace>/local/`, `knowledge/` | 로컬 파일 manifest, 추출 텍스트, 표 프로필, 출처 목록 |
+| 벡터 인덱스 | `runs/<workspace>/chromadb/` | RAG용 임베딩 (웹 + 로컬 문서) |
+| 앱 메타데이터 | `%LOCALAPPDATA%/VERITAS/veritas.db` | 워크스페이스·문서·활동 로그·현재 상태 |
+| 모델 파일 | `%LOCALAPPDATA%/VERITAS/models/` | GGUF LLM·임베딩 모델 |
+| 로그 | `%LOCALAPPDATA%/VERITAS/logs/` | 자식 프로세스 로그 |
 
 ### `autosurvey`
 
@@ -521,7 +432,16 @@ recent history is context and should not override the current user message.
 
 ## RAG Indexing
 
-Before `--phase rag` or `--phase chat`, `main.py` calls `ensure_rag_index()`.
+| 변수 | 기본값 | 설명 |
+|---|---|---|
+| `VERITAS_LLM_HOST` / `VERITAS_LLM_PORT` | `127.0.0.1` / `8080` | 채팅 LLM 서버 |
+| `VERITAS_EMBED_HOST` / `VERITAS_EMBED_PORT` | LLM과 동일 / `8081` | 임베딩 서버 |
+| `VERITAS_API_BASE_URL` | `http://127.0.0.1:8000` | 프론트엔드가 연결할 API 주소 |
+| `VERITAS_OUTPUT_DIR` | `runs` | 산출물·인덱스 저장 루트 |
+| `VERITAS_LLM_PARALLEL` | `1` | 배치 작업 동시 LLM 요청 수 (llama-server `-np`와 일치시킬 것) |
+| `VERITAS_MAX_DOCS` | `15` | AutoSurvey 1회 최대 수집 문서 수 |
+| `VERITAS_ENABLE_SCREEN_CONTEXT` | `1` | 화면 모니터링 기능 on/off |
+| `VERITAS_AUTOSURVEY_LLM_PROVIDER` | `local` | AutoSurvey LLM 백엔드 (`local` / `openai`) |
 
 - If `--markdown-root` is omitted, `--output-dir` is used.
 - If AutoSurvey `clean_md/` documents exist and the markdown root is
@@ -577,15 +497,10 @@ To add a new tool:
 6. Describe usage conditions in the tool schema and prompts.
 ```
 
-Avoid adding:
+- 사용자 메시지의 키워드/정규식으로 tool을 분기하지 않습니다. 어떤 tool을 쓸지는 LLM이 프롬프트와 스키마를 보고 결정합니다.
+- 코드는 리소스 상한, 허용 tool 경계, 영속화, 결정론적 워크플로 단계를 담당합니다.
+- 모든 프롬프트는 `core/prompts/`에 중앙화되어 있습니다(코드에 인라인 금지).
+- 정합성 검증 레이어는 외부 키워드 사전·도메인 가정을 코드에 박지 않고, 신호를 산출물 텍스트와 알고리즘에서 도출합니다.
+- 로컬 문서(`local_private`)는 어떤 경우에도 외부 API로 전송하지 않습니다 — 코드 레벨에서 차단됩니다.
 
-```text
-- regex or keyword routers in chat_agent.py
-- per-tool if/else routing based on words in the user message
-- term extraction fallback logic in term_grounding_tool.py
-- search-query construction inside term_grounding_tool.py
-```
-
-Use prompts and schema descriptions for LLM intent decisions. Use code for
-resource caps, allowed tool boundaries, persistence, and deterministic workflow
-steps.
+---

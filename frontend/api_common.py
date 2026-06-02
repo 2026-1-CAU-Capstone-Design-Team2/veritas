@@ -51,6 +51,11 @@ STATE: dict[str, object] = {
             "sampleCount": 3,
             "planCount": 5,
         },
+        "autosurveyOpenAI": {
+            "provider": "local",
+            "apiKeySet": False,
+            "apiKeyPreview": "",
+        },
         "llmParallel": 1,
     },
 }

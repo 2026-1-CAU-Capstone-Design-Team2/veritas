@@ -1,0 +1,81 @@
+{
+  "type": "function",
+  "function": {
+    "name": "table_query",
+    "description": "Query the FULL raw data of local .csv/.xlsx files the user registered as local access folders. Use this when the user asks for specific values, totals, averages, counts, min/max, filtering, or sorting over their local spreadsheet/CSV data (e.g. \"3월 매출 합계\", \"가장 비싼 항목\", \"row count\"). This reads the original file directly with no row limit, so prefer it over rag_search for numeric or per-row questions about local tables. Do not use it for prose documents, web research, or general knowledge questions.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": ["list_tables", "describe", "query"],
+          "description": "list_tables: list available local table files with their columns. describe: show one table's columns, inferred types, row count and sample rows. query: run a filter/aggregate query and return matching rows or aggregated values."
+        },
+        "file_name": {
+          "type": "string",
+          "description": "Target table file name, e.g. 'sales_2025.xlsx' or 'metrics.csv'. Required for describe and query. Use list_tables first when unsure which files exist."
+        },
+        "sheet_name": {
+          "type": "string",
+          "description": "Worksheet name for .xlsx files. Defaults to the first sheet."
+        },
+        "columns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Columns to return for a row query. Default: all columns."
+        },
+        "where": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "column": { "type": "string" },
+              "op": {
+                "type": "string",
+                "enum": ["==", "!=", ">", "<", ">=", "<=", "contains"]
+              },
+              "value": { "type": "string" }
+            },
+            "required": ["column", "op", "value"]
+          },
+          "description": "Row filter conditions, combined with AND. Numeric comparison is used when both sides are numbers; otherwise string comparison."
+        },
+        "group_by": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Columns to group by before aggregation."
+        },
+        "aggregate": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "column": { "type": "string" },
+              "func": {
+                "type": "string",
+                "enum": ["sum", "mean", "min", "max", "count"]
+              }
+            },
+            "required": ["column", "func"]
+          },
+          "description": "Aggregations computed over matching rows (per group when group_by is set). Use column '*' with func 'count' to count rows."
+        },
+        "sort_by": {
+          "type": "string",
+          "description": "Column (or aggregate label like 'sum(매출)') to sort result rows by."
+        },
+        "descending": {
+          "type": "boolean",
+          "default": false,
+          "description": "Sort in descending order."
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50,
+          "description": "Maximum number of result rows to return (1-200)."
+        }
+      },
+      "required": ["operation"]
+    }
+  }
+}

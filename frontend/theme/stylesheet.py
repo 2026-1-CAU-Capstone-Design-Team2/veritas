@@ -762,6 +762,28 @@ _MAIN_TMPL = """
 		color: %(text.primary)s;
 	}
 
+	/* CollapsibleCard header (components/cards.py) — chevron glyph + status badge
+	   that stays visible while the card body is collapsed. */
+	QLabel#CollapsibleChevron {
+		font-size: 11px;
+		color: %(text.secondary)s;
+	}
+
+	QFrame#CollapsibleCardHeader:hover QLabel#CollapsibleChevron,
+	QFrame#CollapsibleCardHeader:hover QLabel#CardTitle {
+		color: %(accent)s;
+	}
+
+	QLabel#CollapsibleStatus {
+		font-size: 12px;
+		font-weight: 700;
+		color: %(success.strong)s;
+	}
+
+	QLabel#CollapsibleStatus[tone="warning"] { color: %(warning.fg2)s; }
+	QLabel#CollapsibleStatus[tone="danger"] { color: %(danger.fg)s; }
+	QLabel#CollapsibleStatus[tone="neutral"] { color: %(text.secondary)s; }
+
 	QLabel#CardPrimary {
 		font-size: 13px;
 		font-weight: 700;

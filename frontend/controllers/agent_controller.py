@@ -154,6 +154,37 @@ class AgentController:
 			{"sampleCount": int(sample_count), "planCount": int(plan_count)},
 		)
 
+	def update_local_access(
+		self,
+		folder_paths: list[str],
+		workspace_id: str,
+	) -> dict[str, Any]:
+		cleaned = [str(path).strip() for path in folder_paths if str(path).strip()]
+		response = api_client.put(
+			"/api/v1/settings/local-access",
+			{"folderPaths": cleaned},
+		)
+		response["localCorpus"] = api_client.post(
+			"/api/v1/local-corpus/index",
+			{
+				"workspaceId": workspace_id,
+				"roots": cleaned,
+				"clearLocalFirst": True,
+			},
+		)
+		return response
+
+	def update_autosurvey_openai_api_key(
+		self,
+		api_key: str = "",
+		*,
+		clear: bool = False,
+	) -> dict[str, Any]:
+		return api_client.put(
+			"/api/v1/settings/autosurvey-openai",
+			{"apiKey": str(api_key or ""), "clear": bool(clear)},
+		)
+
 	def update_llm_parallel(self, value: int) -> dict[str, Any]:
 		return api_client.put(
 			"/api/v1/settings/llm-parallel",

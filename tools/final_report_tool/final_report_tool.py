@@ -39,7 +39,11 @@ class FinalReportTool(BaseTool):
                 indent=2,
             )
 
-            final_markdown = self._llm.ask(FINAL_PROMPT, prompt, reasoning=True)
+            # The final report is the survey's visible synthesis artifact —
+            # keep API reasoning models at their default (medium) effort.
+            final_markdown = self._llm.ask(
+                FINAL_PROMPT, prompt, reasoning=True, reasoning_effort="medium"
+            )
             # Local llama-server models double-escape backslashes inside math
             # blocks (``\\\\mathcal{L}`` instead of ``\\mathcal{L}``), which
             # the markdown renderer then parses as a forced newline followed

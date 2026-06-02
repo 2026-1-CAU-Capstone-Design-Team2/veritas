@@ -73,7 +73,13 @@ def draft_regenerate(draftId: str, payload: DraftRegenerateRequest) -> dict[str,
 
 @router.post("/api/v1/chat/messages")
 def chat_send(payload: ChatMessageRequest) -> dict[str, str]:
-    return draft_chat_service.send_chat_message(payload.workspaceId, payload.message, payload.mode)
+    return draft_chat_service.send_chat_message(
+        payload.workspaceId,
+        payload.message,
+        payload.mode,
+        source_scope_filter=payload.sourceScopeFilter,
+        include_private_local=payload.includePrivateLocal,
+    )
 
 
 @router.post("/api/v1/chat/messages/stream")
@@ -85,6 +91,8 @@ async def chat_send_stream(payload: ChatMessageRequest) -> StreamingResponse:
             payload.mode,
             doc_text=payload.docText,
             source=payload.source,
+            source_scope_filter=payload.sourceScopeFilter,
+            include_private_local=payload.includePrivateLocal,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

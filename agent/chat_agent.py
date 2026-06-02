@@ -111,6 +111,7 @@ class ChatAgent:
     DEFAULT_OPTIONAL_TOOL_NAMES = (
         "current_time",
         "rag_search",
+        "table_query",
         "autosurvey",
         "screen_context",
     )
@@ -181,7 +182,15 @@ class ChatAgent:
         # on the same paragraph re-issue the same query, so cache on the query tail.
         self._screen_ctx_cache: dict[str, Any] = {"key": "", "context": None}
 
-    def ask_rag(self, question: str, *, stream: bool = False, doc_context: str = "") -> str:
+    def ask_rag(
+        self,
+        question: str,
+        *,
+        stream: bool = False,
+        doc_context: str = "",
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
+    ) -> str:
         """Strict document-grounded Q&A mode.
 
         Backs both the CLI ``--phase rag`` session and the frontend "RAG" chat
@@ -191,9 +200,16 @@ class ChatAgent:
         instead of answering from general knowledge.
         """
         with self._conversation_lock:
-            answer = self.rag_service.answer(
-                question, stream=stream, use_history=True, doc_context=doc_context
-            )
+            kwargs = {
+                "stream": stream,
+                "use_history": True,
+                "doc_context": doc_context,
+            }
+            if source_scope_filter != "all" or not include_private_local:
+                kwargs["source_scope_filter"] = source_scope_filter
+                kwargs["include_private_local"] = include_private_local
+            answer = self.rag_service.answer(question, **kwargs)
+            self._append_history(question, answer)
             return answer
 
     def ask_auto(self, question: str, *, stream: bool = False) -> str:
@@ -310,7 +326,14 @@ class ChatAgent:
                 doc_context=doc_context,
             )
 
-    def ask_rag_iter(self, question: str, doc_context: str = "") -> Iterator[str]:
+    def ask_rag_iter(
+        self,
+        question: str,
+        doc_context: str = "",
+        *,
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
+    ) -> Iterator[str]:
         """Streaming strict document-grounded Q&A — same grounding as ask_rag.
 
         The frontend "RAG" chat mode streams through here, so off-corpus
@@ -319,15 +342,27 @@ class ChatAgent:
         """
         with self._conversation_lock:
             try:
-                for chunk in self.rag_service.iter_answer(
-                    question, use_history=True, doc_context=doc_context
-                ):
+                kwargs = {"use_history": True, "doc_context": doc_context}
+                if source_scope_filter != "all" or not include_private_local:
+                    kwargs["source_scope_filter"] = source_scope_filter
+                    kwargs["include_private_local"] = include_private_local
+                for chunk in self.rag_service.iter_answer(question, **kwargs):
+                    collected.append(chunk)
                     yield chunk
             except AttributeError:
                 # Defensive: older rag_service without iter_answer — one-shot.
-                yield self.rag_service.answer(
-                    question, stream=False, use_history=True, doc_context=doc_context
-                )
+                kwargs = {
+                    "stream": False,
+                    "use_history": True,
+                    "doc_context": doc_context,
+                }
+                if source_scope_filter != "all" or not include_private_local:
+                    kwargs["source_scope_filter"] = source_scope_filter
+                    kwargs["include_private_local"] = include_private_local
+                answer = self.rag_service.answer(question, **kwargs)
+                collected.append(answer)
+                yield answer
+            self._append_history(question, "".join(collected))
 
     # -- editor (standalone writer) surfaces ---------------------------------
     # Power the editor window's ghost-writing / quick actions / chat. They reuse

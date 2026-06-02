@@ -7,3 +7,5 @@ __pycache__/
 .claude/
 services/screen_tool_funcs/test/outputs/
 test/
+# Generated synthetic test data (tests/fixtures/generate_scenario_data.py)
+/test_data/

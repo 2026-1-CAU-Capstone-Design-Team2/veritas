@@ -23,6 +23,7 @@ from tools.verify_flow_planner_tool import VerifyFlowPlannerTool
 
 from .artifact_loader import ArtifactLoader, key_points_from_docs
 from .consensus.consensus_pipeline import run_consensus_pipeline
+from .crosscheck import run_crosscheck_pipeline
 from .indexing.bm25_index import BM25Index
 from .indexing.dense_index import DenseIndex
 from core.models import ParsedDocRecord
@@ -50,7 +51,7 @@ _FLOW_PLANNER_SCHEMA_PATH = (
 # Task names the service dispatches when ``tasks`` is left at the default.
 # The order here is the order pipelines execute. To run a subset during
 # tuning, pass an explicit tuple to :meth:`VerificationService.run`.
-ALL_TASKS: tuple[str, ...] = ("sections", "reliability", "consensus")
+ALL_TASKS: tuple[str, ...] = ("sections", "reliability", "consensus", "crosscheck")
 DEFAULT_TASKS: tuple[str, ...] = ALL_TASKS
 
 # Progress callback: same shape as ``workflows.autosurvey_workflow``'s callback
@@ -132,6 +133,14 @@ class VerificationService:
     @cached_property
     def key_points(self) -> list[KeyPointRecord]:
         return key_points_from_docs(self.docs)
+
+    @cached_property
+    def local_sources(self):
+        return self._loader.load_knowledge_sources(self._workspace)
+
+    @cached_property
+    def local_documents(self) -> dict[str, str]:
+        return self._loader.load_local_documents(self._workspace)
 
     @cached_property
     def kp_bm25(self) -> BM25Index:
@@ -259,6 +268,36 @@ class VerificationService:
                 detail={"clusters": cluster_count, "conflicts": conflict_count},
             )
             completed.append("consensus")
+
+        if "crosscheck" in requested:
+            cb(
+                "crosscheck",
+                "Comparing external research with local private corpus...",
+                detail={
+                    "externalDocuments": len(self.docs),
+                    "localSources": len(self.local_sources),
+                },
+            )
+            artifacts.crosscheck = run_crosscheck_pipeline(
+                external_docs=self.docs,
+                local_sources=self.local_sources,
+                local_documents=self.local_documents,
+                # Reuse the service's Kiwi tokenizer so Korean particles don't
+                # break token overlap ("영업이익은" vs "영업이익" must match —
+                # without this, differently-phrased claims about the same fact
+                # are never compared and real mismatches go undetected).
+                tokenizer=self._tokenizer,
+            )
+            cb(
+                "crosscheck",
+                "Cross-check complete",
+                detail={
+                    "claims": len(artifacts.crosscheck.claims),
+                    "relations": len(artifacts.crosscheck.relations),
+                    "flags": len(artifacts.crosscheck.flags),
+                },
+            )
+            completed.append("crosscheck")
 
         cb("persisting", "검증 결과 저장 중...")
         self._persistence.persist(

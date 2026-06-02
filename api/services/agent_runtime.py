@@ -11,6 +11,7 @@ from typing import Any, Iterator
 from fastapi import HTTPException
 
 from agent import ChatAgent
+from llm.autosurvey_llm_factory import build_autosurvey_llm
 from llm.llama_server_llm import LLMClient
 from llm.llama_supervisor import LlamaServer
 from llm.memory_aware_llm import MemoryAwareLLMClient
@@ -381,7 +382,13 @@ class AgentRuntime:
         return self.chat_agent.ask_auto_iter(message)
 
     def answer_chat_selection_iter(
-        self, message: str, mode: str, doc_context: str = ""
+        self,
+        message: str,
+        mode: str,
+        doc_context: str = "",
+        *,
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
     ) -> Iterator[str]:
         normalized_mode = str(mode or "research").strip().lower()
         if normalized_mode in {"research", "autosurvey"}:
@@ -394,7 +401,12 @@ class AgentRuntime:
             # path: when the active workspace's index has nothing relevant to the
             # question (e.g. it is about another workspace's topic), the model
             # says so instead of answering from general knowledge.
-            return self.chat_agent.ask_rag_iter(message, doc_context=doc_context)
+            return self.chat_agent.ask_rag_iter(
+                message,
+                doc_context=doc_context,
+                source_scope_filter=source_scope_filter,
+                include_private_local=include_private_local,
+            )
         return self.chat_agent.ask_auto_iter(message, doc_context=doc_context)
 
     # -- proactive bandit -----------------------------------------------------
@@ -512,7 +524,14 @@ class AgentRuntime:
             return self.chat_agent.ask_rag(message, stream=False)
         return self.chat_agent.ask_auto(message, stream=False)
 
-    def answer_chat_selection(self, message: str, mode: str) -> str:
+    def answer_chat_selection(
+        self,
+        message: str,
+        mode: str,
+        *,
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
+    ) -> str:
         """Answer a frontend chat turn where the mode selector is authoritative.
 
         The chat UI's "자료조사" and "RAG" choices are equivalent to entering
@@ -526,7 +545,12 @@ class AgentRuntime:
             self._ensure_rag_index(require_documents=False)
             # Strict grounded RAG (see answer_chat_selection_iter) — refuses
             # off-corpus questions rather than answering from general knowledge.
-            return self.chat_agent.ask_rag(message, stream=False)
+            return self.chat_agent.ask_rag(
+                message,
+                stream=False,
+                source_scope_filter=source_scope_filter,
+                include_private_local=include_private_local,
+            )
         return self.chat_agent.ask_auto(message, stream=False)
 
     def run_autosurvey(
@@ -549,8 +573,12 @@ class AgentRuntime:
             workspaceId=self.workspace_id,
             instruction=instruction,
         )
+        autosurvey_llm = build_autosurvey_llm(self.llm)
         self._research_progress.emit("term_grounding", "주제어 추출 중...")
-        workspace_name, grounding = self._grounding_workspace_from_request(request)
+        workspace_name, grounding = self._grounding_workspace_from_request(
+            request,
+            llm=autosurvey_llm,
+        )
         workspace_dir = self._reserve_workspace_dir(workspace_name)
         # Make the new workspace visible to the rest of the system *immediately*.
         # The frontend's Research page, sidebar, and chat panels can switch to
@@ -575,6 +603,8 @@ class AgentRuntime:
         registry, run_store_service, rag_service = build_registry(
             llm=self.llm,
             run_root=workspace_dir,
+            autosurvey_llm=autosurvey_llm,
+            embedding_llm=self.llm,
             batch_size=autosurvey_config.collect_batch_size,
             max_context=int(os.getenv("VERITAS_MAX_CONTEXT", "16384")),
             enable_screen_context=False,
@@ -659,9 +689,15 @@ class AgentRuntime:
             "workflow_result": self._compact_workflow_result(result),
         }
 
-    def _grounding_workspace_from_request(self, request: str) -> tuple[str, dict[str, Any] | None]:
+    def _grounding_workspace_from_request(
+        self,
+        request: str,
+        *,
+        llm=None,
+    ) -> tuple[str, dict[str, Any] | None]:
         return workspace_paths.extract_workspace_name_from_request(
-            request, llm=self.llm
+            request,
+            llm=llm or self.llm,
         )
 
     def _reserve_workspace_dir(self, workspace_name: str) -> Path:
@@ -742,7 +778,7 @@ class AgentRuntime:
         workspace_paths.cleanup_empty_api_dir(self.output_root)
 
     def _ensure_rag_index(self, *, require_documents: bool) -> None:
-        if self.rag_service.get_document_count() > 0:
+        if self.rag_service.get_document_count(source_scope_filter="external") > 0:
             return
 
         clean_md_dir = self.run_store_service.clean_md_dir

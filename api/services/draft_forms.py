@@ -107,6 +107,17 @@ DEFAULT_TONE = "중립"
 LENGTHS = ["짧게", "보통", "길게"]
 DEFAULT_LENGTH = "보통"
 
+# Hard output budget (tokens) per length setting. Without this cap the
+# llama-server request runs with n_predict = -1 (unbounded): a small local
+# model that fails to emit EOS keeps generating until the context window
+# (tens of thousands of tokens) fills up — which is how a draft request can
+# run for 10+ minutes and time out on both the backend and the frontend.
+LENGTH_MAX_TOKENS = {
+    "짧게": 1_200,
+    "보통": 2_500,
+    "길게": 4_000,
+}
+
 
 # ------------------------------------------------------------------- lookups
 
@@ -128,6 +139,11 @@ def resolve_tone(tone: str | None) -> dict[str, Any]:
 def resolve_length(length: str | None) -> str:
     label = str(length or "").strip()
     return label if label in LENGTHS else DEFAULT_LENGTH
+
+
+def resolve_length_max_tokens(length: str | None) -> int:
+    """Output token budget for the given length setting (falls back to 보통)."""
+    return LENGTH_MAX_TOKENS[resolve_length(length)]
 
 
 def find_category(category_key: str | None) -> dict[str, Any] | None:
