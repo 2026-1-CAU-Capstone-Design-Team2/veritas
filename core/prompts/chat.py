@@ -45,11 +45,17 @@ Knowledge scope (read this first):
 - Before answering, check whether the documents actually address the user's question. If the documents are about a DIFFERENT topic than the question (i.e. they do not contain information that answers it), then the workspace has no material on this topic.
 - In that case you MUST clearly say that the indexed materials for this workspace do not contain information on that topic, and you MUST NOT answer from your own general knowledge. Do not explain the off-topic concept yourself, do not guess, and do not pad with background. A short "이 워크스페이스의 조사 자료에는 해당 내용이 없습니다." (in the user's language) is the correct answer.
 
+Meta-conversation exception (check this BEFORE applying the off-topic refusal):
+- Questions that ask ABOUT this conversation itself are NOT off-corpus refusals. Examples: "summarize what we discussed so far", "what did I ask earlier", "여태까지 나랑 나눈 대화를 요약해볼래", "이전에 내가 뭘 물어봤지", "방금 그건 무슨 의미였어".
+- For such meta-conversation questions, the answer source is (a) the chat messages that precede this turn in the conversation and (b) any memory blocks present in this system instruction: "### Working Context ###", "### Recent Conversation Summary ###", "### Retrieved Recall Context ###". For these questions the "answer only from documents" rule does NOT apply, and the off-topic refusal MUST NOT be used.
+- Do NOT say "the workspace has no material" for a conversation-history question. If no prior turns exist yet, say so plainly (e.g. "아직 나눈 대화가 없습니다") instead of refusing as off-corpus.
+- This exception applies ONLY to genuine conversational meta-questions about prior turns of THIS conversation. Questions about the workspace's research topic still follow the strict document-grounding rules above.
+
 Rules:
-- Use ONLY information from the provided documents.
+- For content questions about the workspace topic, use ONLY information from the provided documents.
 - Cite document IDs when referencing specific information using this format: [Document parent_doc_id].
 - Treat keyword lists, search-query metadata, and reliability notes as weak retrieval metadata, not factual evidence.
-- If the documents do not contain substantive relevant information, say so clearly.
+- If the documents do not contain substantive relevant information AND the question is not a meta-conversation question, say so clearly.
 - Never fill missing or off-topic document evidence with general model knowledge.
 - Be concise but comprehensive.
 - Answer in the primary language of the user's question.
@@ -83,22 +89,17 @@ RAG_USER_PROMPT_TEMPLATE = """Based on the following research documents, answer 
 DOCUMENTS:
 {context}
 
-RECENT CONVERSATION:
-{history}
-
 USER QUESTION: {question}
 
+Recent conversation has already been injected as separate chat messages preceding this one — use it as context. Do not expect a RECENT CONVERSATION block in this message.
 Provide a clear, well-structured answer based on the documents above.
 Language rule: answer in the primary language of USER QUESTION. If USER QUESTION is Korean, answer in Korean even when DOCUMENTS contain English titles, metadata, or technical terms."""
 
 RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE = """No relevant documents found.
 
-RECENT CONVERSATION:
-{history}
-
 USER QUESTION: {question}
 
-Please indicate that you don't have enough information.
+Recent conversation has already been injected as separate chat messages preceding this one. If the question is about prior turns, answer from those messages; otherwise indicate that you don't have enough information.
 Language rule: answer in the primary language of USER QUESTION. If USER QUESTION is Korean, answer in Korean."""
 
 TOOL_CHAT_SYSTEM_PROMPT = """{base_system_prompt}
@@ -155,10 +156,7 @@ CURRENT USER MESSAGE:
 
 Decide whether one exposed tool is needed for the CURRENT USER MESSAGE. If no tool is needed, do not call a tool."""
 
-TOOL_CHAT_FINAL_PROMPT_TEMPLATE = """RECENT CONVERSATION, FOR CONTEXT ONLY:
-{history}
-
-CURRENT USER MESSAGE, THE ONLY MESSAGE YOU MUST ANSWER NOW:
+TOOL_CHAT_FINAL_PROMPT_TEMPLATE = """CURRENT USER MESSAGE, THE ONLY MESSAGE YOU MUST ANSWER NOW:
 {question}
 
 CURRENT TURN TOOL RESULTS:
@@ -232,10 +230,7 @@ SCREEN_INTERVENTION_SYSTEM_PROMPT = SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE.f
     document_type=SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE
 )
 
-SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE = """RECENT CHAT HISTORY:
-{history}
-
-ACTIVE WINDOW:
+SCREEN_INTERVENTION_USER_PROMPT_TEMPLATE = """ACTIVE WINDOW:
 {app_context}
 
 SCREEN WRITING CONTEXT:

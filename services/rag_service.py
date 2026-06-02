@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
 from core.knowledge_models import PrivacyLabel, SourceScope
+from core.memory.request import CallConstraints, CallRequest
 from core.prompts import (
     QUERY_REWRITE_PROMPT,
     QUERY_REWRITE_SYSTEM_PROMPT,
@@ -45,7 +46,6 @@ class RAGService:
         self.max_embed_chars = max_embed_chars
         self.chunk_overlap_chars = chunk_overlap_chars
         self.max_history_turns = max_history_turns
-        self.chat_history: list[tuple[str, str]] = []
 
     def clear_index(self) -> None:
         self.vector_store.clear()
@@ -71,16 +71,26 @@ class RAGService:
             except Exception:
                 pass
 
-    def _format_recent_history(self) -> str:
-        if not self.chat_history:
-            return "(No previous conversation)"
+    def _supports_memory_calls(self) -> bool:
+        """True when the LLM client exposes the memory-engaged call API."""
+        return callable(getattr(self.llm, "call", None)) and callable(
+            getattr(self.llm, "iter_call", None)
+        )
 
-        recent = self.chat_history[-self.max_history_turns :]
-        parts: list[str] = []
-        for i, (user_q, assistant_a) in enumerate(recent, start=1):
-            parts.append(f"Turn {i} User: {user_q}")
-            parts.append(f"Turn {i} Assistant: {assistant_a}")
-        return "\n".join(parts)
+    def _memory_runtime(self):
+        """Return the bound MemoryRuntime, or None when memory is unavailable."""
+        return getattr(self.llm, "memory_runtime", None)
+
+    def _recent_history_text(self) -> str:
+        """Flat recent-turn block from FIFO memory, used by query rewriting and
+        the empty-context grounded prompt. Thin wrapper over
+        :meth:`MemoryRuntime.recent_history_text` so this surface and ChatAgent
+        share a single definition of "recent history".
+        """
+        runtime = self._memory_runtime()
+        if runtime is None:
+            return "(No previous conversation)"
+        return runtime.recent_history_text(turns=self.max_history_turns)
 
     def _normalize_for_embedding(self, text: str) -> str:
         text = text.replace("\r\n", "\n")
@@ -327,11 +337,14 @@ class RAGService:
         return any(part.lower() in blocked or part == "__pycache__" for part in rel_parts)
 
     def _rewrite_query_with_context(self, question: str) -> str:
-        if not self.chat_history:
+        history = self._recent_history_text()
+        # No prior turns recorded yet -> nothing to resolve, search the raw question.
+        if history == "(No previous conversation)":
             return question
 
-        history = self._format_recent_history()
         rewrite_prompt = QUERY_REWRITE_PROMPT.format(history=history, question=question)
+        # Query rewriting is an internal, transient call: it must not be recorded
+        # as a conversation turn and needs no memory injection of its own.
         rewritten = self.llm.ask(
             QUERY_REWRITE_SYSTEM_PROMPT,
             rewrite_prompt,
@@ -547,16 +560,38 @@ class RAGService:
         )
         if not context.strip():
             return (
-                RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE.format(
-                    history=history, question=question
-                )
+                RAG_EMPTY_CONTEXT_PROMPT_TEMPLATE.format(question=question)
                 + draft_block
             )
         return (
             RAG_USER_PROMPT_TEMPLATE.format(
-                context=context, history=history, question=question
+                context=context, question=question
             )
             + draft_block
+        )
+
+    def _rag_call_request(self, *, user_prompt: str, question: str) -> CallRequest:
+        """Build the memory-engaged request for a grounded RAG answer.
+
+        - profile="rag": the ProfilePolicyDispatcher allows a small recall pull
+          (recall_limit=2), so working/recall ride along as secondary context
+          while documents stay the primary evidence.
+        - grounded=False so working context is allowed; the RAG_SYSTEM_PROMPT in
+          task_instruction keeps "answer only from the documents" in force.
+        - record_content=question so the FIFO/recall turn stores the clean user
+          question, not the full doc-stuffed prompt.
+        - enable_memory_tools=False keeps iter_call on the streaming path.
+        """
+        return CallRequest(
+            task_instruction=RAG_SYSTEM_PROMPT,
+            user_content=user_prompt,
+            record_content=question,
+            constraints=CallConstraints(),
+            use_history=True,
+            profile="rag",
+            stream_label="rag",
+            method_hint="rag",
+            enable_memory_tools=False,
         )
 
     def answer(
@@ -576,6 +611,10 @@ class RAGService:
             source_scope_filter=source_scope_filter,
             include_private_local=include_private_local,
         )
+        if self._supports_memory_calls():
+            return self.llm.call(
+                self._rag_call_request(user_prompt=user_prompt, question=question)
+            )
         return self.llm.ask(
             RAG_SYSTEM_PROMPT,
             user_prompt,
@@ -608,6 +647,11 @@ class RAGService:
             source_scope_filter=source_scope_filter,
             include_private_local=include_private_local,
         )
+        if self._supports_memory_calls():
+            yield from self.llm.iter_call(
+                self._rag_call_request(user_prompt=user_prompt, question=question)
+            )
+            return
         yield from self.llm.iter_ask(
             RAG_SYSTEM_PROMPT,
             user_prompt,

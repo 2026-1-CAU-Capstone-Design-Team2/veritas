@@ -77,6 +77,26 @@ class RagServiceGroundingTests(unittest.TestCase):
             "RAG_SYSTEM_PROMPT should tell the model to refuse off-topic questions",
         )
 
+    def test_system_prompt_carves_out_meta_conversation_questions(self) -> None:
+        # Without this carve-out, asking "여태까지 나랑 나눈 대화를 요약해볼래?"
+        # in RAG mode gets the off-corpus refusal because the strict grounding
+        # contract treats anything not in the documents as "no material".
+        lowered = RAG_SYSTEM_PROMPT.lower()
+        self.assertIn("meta-conversation", lowered)
+        # Points the model at the actual sources for meta-questions: the chat
+        # messages preceding this turn AND the memory blocks in the system
+        # instruction (working context / FIFO summary / recall).
+        self.assertIn("chat messages", lowered)
+        self.assertIn("working context", lowered)
+        self.assertIn("recent conversation summary", lowered)
+        self.assertIn("retrieved recall context", lowered)
+        # The off-topic refusal must be explicitly suppressed for these.
+        self.assertTrue(
+            "off-topic refusal must not" in lowered
+            or "does not apply" in lowered,
+            "RAG_SYSTEM_PROMPT should suppress off-corpus refusal for meta-questions",
+        )
+
     def test_empty_retrieval_uses_refusal_prompt(self) -> None:
         rag = self._service()
         rag.retrieve = lambda q, use_history=True: []  # nothing relevant in workspace
@@ -117,7 +137,6 @@ class RecordingRag:
     def __init__(self) -> None:
         self.iter_called = 0
         self.answer_called = 0
-        self.chat_history: list[tuple[str, str]] = []
 
     def iter_answer(self, question, *, use_history=True, doc_context=""):
         self.iter_called += 1
@@ -166,11 +185,14 @@ class ChatAgentRagRoutingTests(unittest.TestCase):
         self.assertEqual(rag.iter_called, 1)
         self.assertEqual(registry.calls, [])  # permissive path not taken
 
-    def test_ask_rag_appends_single_history_turn(self) -> None:
+    def test_ask_rag_invokes_rag_service_once(self) -> None:
+        # The agent no longer keeps a parallel chat_history list — turn
+        # recording is owned by the memory runtime via RAGService.iter_answer /
+        # .answer (which go through MemoryAwareLLMClient.call/iter_call). This
+        # test just guards the single-invocation contract on the strict path.
         agent, rag, _ = self._agent()
         agent.ask_rag("질문")
         self.assertEqual(rag.answer_called, 1)
-        self.assertEqual(len(agent.chat_history), 1)
 
 
 if __name__ == "__main__":
