@@ -14,6 +14,9 @@ from core.memory.policy import ProfilePolicyDispatcher
 from core.memory.request import CallConstraints, CallRequest
 from services.memory_tools_funcs.context_builder import build_messages
 from services.memory_tools_funcs.debug import mem_debug, mem_debug_enabled
+from services.memory_tools_funcs.external_context.embedding_recall_store import (
+    EmbeddingRecallStore,
+)
 from services.memory_tools_funcs.external_context.recall_storage import RecallStorage
 from services.memory_tools_funcs.main_context.heuristic_memory import extract_explicit_facts
 from services.memory_tools_funcs.main_context.queue_manage import QueueManager, utc_now_iso
@@ -54,7 +57,10 @@ class MemoryRuntime:
 
         self.token_counter = TokenCounter(raw_llm)
         self.store = MemoryStore(self.workspace_root, reuse_connection=True)
-        self.recall = RecallStorage(self.store, self.token_counter)
+        self.embedding_recall = EmbeddingRecallStore(self.workspace_root, raw_llm)
+        self.recall = RecallStorage(
+            self.store, self.token_counter, embedding_store=self.embedding_recall
+        )
         self.working = WorkingContextManager(self.store, self.token_counter)
         self.queue = QueueManager(self.store, self.token_counter, self.recall)
         self.summarizer = MemorySummarizer(raw_llm)
@@ -64,18 +70,62 @@ class MemoryRuntime:
         self._flush_lock = threading.Lock()
         self._flush_in_progress = False
 
+        self._launch_embedding_backfill()
+
     def configure_workspace(self, workspace_root: Path) -> None:
         """workspace 전환 시 storage 핸들을 새 디렉토리로 교체한다."""
         self.store.close()
+        if getattr(self, "embedding_recall", None) is not None:
+            self.embedding_recall.close()
         self.workspace_root = Path(workspace_root)
         self.store = MemoryStore(self.workspace_root, reuse_connection=True)
-        self.recall = RecallStorage(self.store, self.token_counter)
+        self.embedding_recall = EmbeddingRecallStore(self.workspace_root, self.raw_llm)
+        self.recall = RecallStorage(
+            self.store, self.token_counter, embedding_store=self.embedding_recall
+        )
         self.working = WorkingContextManager(self.store, self.token_counter)
         self.queue = QueueManager(self.store, self.token_counter, self.recall)
+        self._launch_embedding_backfill()
 
     def close(self) -> None:
         """Release runtime-owned storage resources."""
         self.store.close()
+        if getattr(self, "embedding_recall", None) is not None:
+            self.embedding_recall.close()
+
+    # Upper bound on rows pulled into a one-shot dense backfill for a
+    # workspace whose recall predates the embedding index. Recall keeps every
+    # turn, so this caps embed cost to the most recent slice.
+    EMBED_BACKFILL_LIMIT = 2000
+
+    def _launch_embedding_backfill(self) -> None:
+        """Background one-shot: index pre-existing recall turns into the dense
+        store so a workspace opened before embedding recall existed still gets
+        semantic search, without blocking the first chat turn. Captures the
+        current recall/embedding handles so a workspace swap mid-backfill does
+        not retarget the worker."""
+        recall = self.recall
+        embedding_recall = self.embedding_recall
+        t = threading.Thread(
+            target=self._embedding_backfill_worker,
+            args=(recall, embedding_recall),
+            name="memory-embed-backfill",
+            daemon=True,
+        )
+        t.start()
+
+    def _embedding_backfill_worker(self, recall, embedding_recall) -> None:
+        try:
+            if embedding_recall.count() > 0:
+                return
+            rows = recall.tail(limit=self.EMBED_BACKFILL_LIMIT)
+            if not rows:
+                return
+            indexed = embedding_recall.backfill(rows)
+            if indexed:
+                mem_debug("embed", f"backfilled {indexed} recall turns into dense index")
+        except Exception as e:
+            print(f"[memory][embed_backfill][warn] {type(e).__name__}: {e}")
 
     def update_n_ctx(self, max_context_tokens: int) -> None:
         """모델 스왑 후 n_ctx를 갱신한다."""
@@ -183,12 +233,20 @@ class MemoryRuntime:
     def prepare(self, req: CallRequest) -> PreparedCall:
         """CallRequest를 받아 messages[]를 만들고 USER turn을 기록한다."""
         invocation_id = str(uuid.uuid4())
+        
+        """
+        MemoryBudget으로 만들어지면, 속성 결정됨
+            - usable_prompt_tokens : 응답 reserve를 뺀 입력 가능 token 수
+            - warning_tokens : memory pressure 경고 임계값.
+            - flush_tokens : FIFO evict + summarize 임계값.
+        """
         budget = MemoryBudget(
             max_context_tokens=self.max_context_tokens,
             system_tokens=self.token_counter.count(req.task_instruction),
             current_request_tokens=self.token_counter.count(req.user_content),
         )
 
+        # debug용 로그
         if mem_debug_enabled():
             c = req.constraints
             mem_debug(
@@ -205,17 +263,25 @@ class MemoryRuntime:
                 f"flush={self.queue.is_flush_pressure(budget)}]",
             )
 
+        # no_record 제약이 없으면 invocations.jsonl 한 줄 기록 
+        # (메모리 디버깅과 호출 패턴 분석용, 실제 LLM 프롬프트에는 영향 없음).
         if not req.constraints.no_record:
             self._log_invocation(invocation_id, req, budget)
 
-        # flush_pressure 감지 시 즉시 flush 안 함. 이번 호출은 옛 summary로 진행하고,
+        # 플래그만 마킹하고, flush_pressure 감지 시 즉시 flush 안 함. 
+        # 이번 호출은 옛 summary로 진행하고,
         # commit() 끝난 뒤 background thread로 처리 (1세대 stale 감수).
         flush_pending = (
             self._should_record(req.constraints)
             and self.queue.is_flush_pressure(budget)
         )
-
-        # USER turn 기록은 build_messages 뒤로 — history에 user_content가 중복 들어가는 것 방지.
+        """
+        =================================중요=================================
+         - build_messages()는 MemoryBudget을 받아서, 시스템 프롬프트 + FIFO
+            prompts 생성
+            # USER turn 기록은 build_messages 뒤로 
+            # — history에 user_content가 중복 들어가는 것 방지.
+        """
         messages = build_messages(
             req=req,
             budget=budget,
@@ -235,6 +301,10 @@ class MemoryRuntime:
                 f"system_tokens={self.token_counter.count(messages[0]['content']) if messages else 0}",
             )
 
+
+        # should append -> append_event 수행, 
+        #   FIFO와 Recall에 USER turn 기록. 
+        #   heuristic fact 추출해서 working에도 추가.
         if self._should_record(req.constraints):
             record_content = req.record_content or req.user_content
             self.queue.append_event(
@@ -248,6 +318,9 @@ class MemoryRuntime:
                 f"id={invocation_id[:8]} recorded USER turn "
                 f"({self.token_counter.count(record_content)} tokens)",
             )
+          
+        #  Heuristic explicit fact 추출해서 working context에 추가 (옵션이 켜져 있고, 기록 제약이 없을 때).
+        #  append_fact() -> working 테이블에 저장. 
             for fact in extract_explicit_facts(record_content):
                 self.working.append_fact(
                     fact,
@@ -279,6 +352,14 @@ class MemoryRuntime:
             },
         )
 
+
+
+#########################################################################################
+#########################################################################################
+    """
+        ASSISTANT 저장 + flush 트리거 
+        append_event() 가 USER turn 저장과 똑같은 경로로 FIFO + Recall 에 동시 INSERT
+    """
     def commit(self, prepared: PreparedCall, assistant_text: str) -> None:
         """LLM 응답을 ASSISTANT turn으로 기록하고, flush가 마킹돼 있으면 bg launch."""
         inv = prepared.invocation_id[:8]
@@ -363,6 +444,9 @@ class MemoryRuntime:
         finally:
             with self._flush_lock:
                 self._flush_in_progress = False
+
+############################################################################################
+############################################################################################
 
     def _flush_fifo(self, *, profile: str = "chat") -> None:
         """FIFO 오래된 prefix를 evict하고 summary로 압축한다."""

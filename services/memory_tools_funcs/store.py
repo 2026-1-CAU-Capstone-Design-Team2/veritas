@@ -175,6 +175,12 @@ class MemoryStore:
             )
             conn.commit()
 
+    """
+        가장 최신의 summary 하나만 SQLite에 저장하는 구조.
+        - append_summary()는 새로운 summary로 기존 summary를 덮어 쓴다. 
+        - id는 매번 새로 생성하거나, 고유한 summary_id가 주어지면 그걸 사용
+        
+    """
     def load_latest_summary(self) -> str:
         """Return the latest summary from SQLite."""
         if not self.db_path.exists() and not self.summaries_path.exists():
@@ -401,6 +407,10 @@ class MemoryStore:
     @staticmethod
     def format_working_records(records: list[dict[str, Any]]) -> str:
         """Format working-context records for system prompt injection."""
+        """
+            record를 {text} 으로 join
+            binary search로 substring 자른다.    
+        """
         lines: list[str] = []
         for row in records:
             text = str(row.get("text") or "").strip()

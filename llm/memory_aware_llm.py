@@ -24,10 +24,18 @@ class MemoryAwareLLMClient:
 
     # ── memory-engaged API ──────────────────────────────────────────
 
+    """
+    메모리 진입점
+    - memory_runtime.prepare(req) — 메모리에서 prompt 를 만들고 USER turn 을 기록
+    - self.raw.chat(prepared.messages, ...) — 실제 LLM 호출
+    - memory_runtime.commit(prepared, text) — LLM 응답을 메모리에 기록(ASSISTANT turn 기록 + 필요시 백그라운드 flush)
+    """
     def call(self, req: CallRequest) -> str:
         """prepare → raw.chat → commit."""
         prepared = self.memory_runtime.prepare(req)
         tools, tool_runner = self._memory_tools(req)
+        
+        # llm 호출
         text = self.raw.chat(
             prepared.messages,
             reasoning=False,
