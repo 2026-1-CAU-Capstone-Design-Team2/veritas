@@ -79,7 +79,9 @@ User message
   → optional tool-call decision
   → allowed tool execution
   → final answer generation from current message + current tool result
-  → append (user, assistant) to chat_history exactly once
+  → MemoryRuntime records the (user, assistant) turn into workspace
+    memory.sqlite3 (FIFO + recall) via prepare/commit inside the wrapped LLM
+    call — the agent keeps no parallel turn log
 ```
 
 이 구조는 tool이 추가되어도 변하지 않아야 합니다. 새 tool은 schema와 registry에 추가하고 allowlist에 포함시키면 됩니다.

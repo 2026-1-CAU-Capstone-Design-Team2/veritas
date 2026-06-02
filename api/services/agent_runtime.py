@@ -13,6 +13,8 @@ from fastapi import HTTPException
 from agent import ChatAgent
 from llm.llama_server_llm import LLMClient
 from llm.llama_supervisor import LlamaServer
+from llm.memory_aware_llm import MemoryAwareLLMClient
+from services.memory_tools_funcs import MemoryRuntime
 from services.proactive.generator import ProactiveGenerator
 from services.proactive.orchestrator import ProactiveOrchestrator
 from services.proactive.screen_bridge import (
@@ -70,12 +72,24 @@ class AgentRuntime:
         # see shutdown_runtime / the API shutdown hook for the uvicorn path).
         atexit.register(self.shutdown)
 
-        self.llm = LLMClient(
+        self.raw_llm = LLMClient(
             host=llm_host,
             port=llm_port,
             embed_host=os.getenv("VERITAS_EMBED_HOST") or None,
             embed_port=embed_port,
             trace_latency=os.getenv("VERITAS_TRACE_LATENCY", "1") != "0",
+        )
+        # MemoryRuntime은 workspace 결정 전이라 placeholder로 만들고,
+        # _configure_workspace_runtime에서 configure_workspace로 갈아 끼운다.
+        self.memory_runtime = MemoryRuntime(
+            raw_llm=self.raw_llm,
+            workspace_root=self.output_root / "api",
+            max_context_tokens=int(getattr(self.raw_llm, "n_ctx", 8192) or 8192),
+        )
+        # self.llm은 wrapper. callers는 동일한 surface(.ask/.iter_ask/.call/...)를 본다.
+        self.llm = MemoryAwareLLMClient(
+            raw_llm=self.raw_llm,
+            memory_runtime=self.memory_runtime,
         )
         self._workspace_lock = threading.RLock()
         # ScreenMonitor owns the intervention event ring buffer + lifecycle
@@ -125,6 +139,16 @@ class AgentRuntime:
 
         output_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir = output_dir
+        # workspace 전환마다 memory storage 핸들을 새 디렉토리로 교체.
+        if hasattr(self, "memory_runtime"):
+            self.memory_runtime.configure_workspace(output_dir)
+            # One-shot lift of the legacy chat_history.json log into the
+            # workspace's memory.sqlite3, so the new read-side projection sees
+            # pre-memory conversations. The helper is idempotent — it bails
+            # when recall already has rows OR no legacy file exists — and on a
+            # successful import the JSON file is renamed out of the way so the
+            # migration never repeats.
+            self._migrate_legacy_chat_history(output_dir)
         self.registry, self.run_store_service, self.rag_service = build_registry(
             llm=self.llm,
             run_root=self.output_dir,
@@ -147,9 +171,12 @@ class AgentRuntime:
             screen_debug=os.getenv("VERITAS_SCREEN_DEBUG", "0") == "1",
             screen_workspace_id=self.workspace_id,
         )
-        self.chat_agent.chat_history = self._load_workspace_chat_history()
-        if self.rag_service is not None:
-            self.rag_service.chat_history = list(self.chat_agent.chat_history)
+        # Conversation history lives in the workspace memory.sqlite3 (FIFO +
+        # recall) which the MemoryRuntime opened above; the agent keeps no
+        # parallel in-memory turn log, and ``draft_chat_service.get_chat_history``
+        # projects the recall tier into the UI shape on demand. The legacy
+        # per-workspace chat_history.json file is migrated above and then
+        # archived — it is no longer a live writer.
         # Rebind the screen-monitor's view of the workspace — same controller
         # instance, fresh chat_agent / registry every workspace switch. Avoids
         # the stale-reference race the pre-extraction code didn't even
@@ -268,6 +295,21 @@ class AgentRuntime:
                 server.stop()
             except Exception:
                 pass
+        # Close the reused memory.sqlite3 connection so WAL/SHM sidecar files are
+        # checkpointed and removed instead of relying on __del__ GC at exit.
+        memory_runtime = getattr(self, "memory_runtime", None)
+        if memory_runtime is not None:
+            try:
+                memory_runtime.close()
+            except Exception:
+                pass
+        # Flush + close the optional memory trace file (--mem-debug-file).
+        try:
+            from services.memory_tools_funcs.debug import close_debug_file
+
+            close_debug_file()
+        except Exception:
+            pass
 
     def set_llm_parallel(self, value: int) -> int:
         """Apply the parallel-decoding concurrency to the shared LLM client.
@@ -408,36 +450,61 @@ class AgentRuntime:
             action, text, max_tokens=max_tokens, use_workspace=use_workspace
         )
 
-    def persist_chat_turn(self, message: str, assistant_text: str) -> None:
-        """Persist a (user, assistant) turn into the workspace chat_history.json
-        file so any chat panel (write/document-assist) can render the same log.
-        """
-        try:
-            path = self.output_dir / "chat_history.json"
-            payload: list[dict[str, Any]] = []
-            if path.exists():
-                try:
-                    raw = json.loads(path.read_text(encoding="utf-8"))
-                    items = raw.get("items", raw) if isinstance(raw, dict) else raw
-                    if isinstance(items, list):
-                        payload = [item for item in items if isinstance(item, dict)]
-                except Exception:
-                    payload = []
-            payload.append({"role": "user", "text": message})
-            payload.append({"role": "assistant", "text": assistant_text})
-            from ..api_common import utc_now_iso
+    def _migrate_legacy_chat_history(self, output_dir: Path) -> None:
+        """One-shot lift of ``<workspace>/chat_history.json`` into memory.sqlite3.
 
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(
-                    {"items": payload, "updatedAt": utc_now_iso()},
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+        The legacy JSON log existed because each chat turn was written to two
+        parallel stores — the workspace JSON file (for UI rendering) and the
+        memory FIFO/Recall. Now the recall tier is the single source of truth
+        and ``draft_chat_service`` reads through ``history_as_chat_items``, so
+        pre-memory workspaces would lose their visible history without this
+        bootstrap.
+
+        Guarded against repeating itself: bails when the recall tier already
+        has rows (so live conversations aren't double-imported on subsequent
+        workspace switches), and on a successful import renames the JSON to
+        ``chat_history.legacy.json`` so the next configure call sees nothing
+        to migrate. Failures are logged but never raised — chat history is
+        best-effort and the runtime must boot regardless.
+        """
+        legacy_path = output_dir / "chat_history.json"
+        if not legacy_path.exists():
+            return
+        try:
+            if self.memory_runtime.recall.tail(limit=1):
+                # The workspace already has live recall rows — either the
+                # migration already ran or new chat happened. Either way, do
+                # not re-import the JSON over the top of fresh memory.
+                return
+            payload = json.loads(legacy_path.read_text(encoding="utf-8"))
         except Exception as e:
-            print(f"[chat][persist][warn] failed to save chat history: {e}")
+            print(f"[chat][migrate][warn] could not read {legacy_path.name}: {e}")
+            return
+
+        items = payload.get("items", payload) if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            return
+
+        try:
+            imported = self.memory_runtime.import_legacy_chat_items(items)
+        except Exception as e:
+            print(f"[chat][migrate][warn] import failed: {e}")
+            return
+
+        if imported <= 0:
+            return
+
+        try:
+            legacy_path.rename(output_dir / "chat_history.legacy.json")
+        except Exception as e:
+            # Renaming is the idempotency guard; if it fails the next configure
+            # call would see the JSON again, but the recall-non-empty guard
+            # above still prevents re-import.
+            print(f"[chat][migrate][warn] could not archive legacy file: {e}")
+        print(
+            f"[chat][migrate] imported {imported} legacy turn(s) "
+            f"from {legacy_path.name} into memory.sqlite3"
+        )
 
     def answer_chat(self, message: str, mode: str) -> str:
         if mode == "rag":
@@ -461,31 +528,6 @@ class AgentRuntime:
             # off-corpus questions rather than answering from general knowledge.
             return self.chat_agent.ask_rag(message, stream=False)
         return self.chat_agent.ask_auto(message, stream=False)
-
-    def _load_workspace_chat_history(self) -> list[tuple[str, str]]:
-        path = self.output_dir / "chat_history.json"
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-
-        items = payload.get("items", payload) if isinstance(payload, dict) else payload
-        if not isinstance(items, list):
-            return []
-
-        turns: list[tuple[str, str]] = []
-        pending_user: str | None = None
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            role = str(item.get("role") or "").lower()
-            text = str(item.get("text") or item.get("content") or "")
-            if role == "user":
-                pending_user = text
-            elif role == "assistant" and pending_user is not None:
-                turns.append((pending_user, text))
-                pending_user = None
-        return turns
 
     def run_autosurvey(
         self,

@@ -227,6 +227,43 @@ class LLMClient:
                 return n_ctx
         return default
 
+    def tokenize_count(self, text: str, *, timeout_sec: float = 0.5) -> int | None:
+        """Return llama-server's token count for text, or None if unavailable."""
+        text = str(text or "")
+        if not text:
+            return 0
+
+        payload = {"content": text, "add_special": False}
+        urls = (
+            f"http://{self._chat_host}:{self._chat_port}/tokenize",
+            f"http://{self._chat_host}:{self._chat_port}/v1/tokenize",
+        )
+        for url in urls:
+            try:
+                response = httpx.post(url, json=payload, timeout=timeout_sec)
+                if response.status_code >= 400:
+                    continue
+                token_count = self._parse_tokenize_response(response.json())
+                if token_count is not None:
+                    return token_count
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _parse_tokenize_response(payload: Any) -> int | None:
+        if isinstance(payload, dict):
+            for key in ("tokens", "input_ids"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return len(value)
+            value = payload.get("count")
+            if isinstance(value, int):
+                return max(0, value)
+        if isinstance(payload, list):
+            return len(payload)
+        return None
+
     def ask(
         self,
         system_prompt: str,
@@ -588,6 +625,338 @@ class LLMClient:
             text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
         return {"content": text.strip(), "tool_outputs": tool_outputs}
+
+    # ──────────────────────────────────────────────────────────────────────
+    # messages-direct API (Gateway가 messages[]를 직접 전달할 때 사용)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        reasoning: bool = False,
+        *,
+        stream: bool = False,
+        stream_label: str = "",
+        sampling_params: dict[str, Any] | None = None,
+        extra_sampling_params: dict[str, Any] | None = None,
+        force_json: bool = False,
+        response_format: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_runner: Callable[[str, dict[str, Any]], Any] | None = None,
+        max_tool_rounds: int = 4,
+        timeout_sec: float | None = None,
+    ) -> str:
+        """messages[] 기반 chat completion."""
+        think_tag = "/think" if reasoning else "/no_think"
+        start = time.perf_counter()
+
+        sampled_params = {**self.SAMPLING_PARAMS, **(sampling_params or {})}
+        sampled_extra = {**self.EXTRA_SAMPLING_PARAMS, **(extra_sampling_params or {})}
+
+        prepared = self._prepend_think_tag(messages, think_tag)
+
+        extra_body = {
+            **sampled_extra,
+            "enable_thinking": reasoning,
+            "enable_reasoning": reasoning,
+            "chat_template_kwargs": {
+                "enable_thinking": reasoning,
+                "enable_reasoning": reasoning,
+            },
+        }
+
+        if stream and tools:
+            print("[llm][tools] stream=True is not supported with tool calls; falling back to non-stream mode")
+            stream = False
+
+        if stream:
+            stream_kwargs = {
+                "model": self.model,
+                "messages": prepared,
+                "stream": True,
+                **sampled_params,
+                "extra_body": extra_body,
+            }
+            if timeout_sec is not None:
+                stream_kwargs["timeout"] = self._request_timeout(timeout_sec)
+            chunks = self.client.chat.completions.create(**stream_kwargs)
+            text = self._consume_stream(chunks, stream_label=stream_label, filter_think=not reasoning)
+        else:
+            text = self._chat_with_optional_tools(
+                messages=prepared,
+                sampled_params=sampled_params,
+                extra_body=extra_body,
+                response_format=response_format,
+                tools=tools,
+                tool_runner=tool_runner,
+                max_tool_rounds=max_tool_rounds,
+                timeout_sec=timeout_sec,
+            )
+
+        if self.trace_latency:
+            elapsed = time.perf_counter() - start
+            tag = f" [{stream_label}]" if stream_label else ""
+            mode = "think" if reasoning else "no_think"
+            print(f"[llm:chat]{tag} mode={mode} elapsed={elapsed:.2f}s")
+
+        if not reasoning:
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        # force_json 시 strict 규칙은 caller가 messages[0]에 이미 포함 — 추가 처리 없음.
+        del force_json
+        return text.strip()
+
+    def iter_chat(
+        self,
+        messages: list[dict[str, Any]],
+        reasoning: bool = False,
+        *,
+        stream_label: str = "",
+        sampling_params: dict[str, Any] | None = None,
+        extra_sampling_params: dict[str, Any] | None = None,
+        timeout_sec: float | None = None,
+    ) -> Iterator[str]:
+        """messages[] 기반 streaming chat completion."""
+        think_tag = "/think" if reasoning else "/no_think"
+        sampled_params = {**self.SAMPLING_PARAMS, **(sampling_params or {})}
+        sampled_extra = {**self.EXTRA_SAMPLING_PARAMS, **(extra_sampling_params or {})}
+        extra_body = {
+            **sampled_extra,
+            "enable_thinking": reasoning,
+            "enable_reasoning": reasoning,
+            "chat_template_kwargs": {
+                "enable_thinking": reasoning,
+                "enable_reasoning": reasoning,
+            },
+        }
+        prepared = self._prepend_think_tag(messages, think_tag)
+        stream_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": prepared,
+            "stream": True,
+            **sampled_params,
+            "extra_body": extra_body,
+        }
+        if timeout_sec is not None:
+            stream_kwargs["timeout"] = self._request_timeout(timeout_sec)
+
+        start = time.perf_counter()
+        prefix = f"[{stream_label}] " if stream_label else ""
+        print(f"[stream-iter-chat] {prefix}start")
+
+        chunks = self.client.chat.completions.create(**stream_kwargs)
+        filter_think = not reasoning
+        buffer = ""
+        in_think = False
+        total = 0
+
+        for chunk in chunks:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            content = getattr(delta, "content", None) or ""
+            if not content:
+                continue
+            if not filter_think:
+                total += len(content)
+                yield content
+                continue
+            buffer += content
+            while True:
+                if in_think:
+                    end_idx = buffer.find("</think>")
+                    if end_idx != -1:
+                        buffer = buffer[end_idx + 8 :]
+                        in_think = False
+                        continue
+                    break
+                start_idx = buffer.find("<think>")
+                if start_idx != -1:
+                    visible = buffer[:start_idx]
+                    if visible:
+                        total += len(visible)
+                        yield visible
+                    buffer = buffer[start_idx + 7 :]
+                    in_think = True
+                    continue
+                safe_end = max(0, len(buffer) - 7)
+                visible = buffer[:safe_end]
+                if visible:
+                    total += len(visible)
+                    yield visible
+                buffer = buffer[safe_end:]
+                break
+
+        if filter_think and buffer and not in_think:
+            total += len(buffer)
+            yield buffer
+        elif filter_think and in_think and total == 0:
+            leftover = buffer.strip()
+            if leftover:
+                total += len(leftover)
+                yield leftover
+
+        if self.trace_latency:
+            elapsed = time.perf_counter() - start
+            print(f"[stream-iter-chat] {prefix}end chars={total} elapsed={elapsed:.2f}s")
+
+    def chat_json(
+        self,
+        messages: list[dict[str, Any]],
+        reasoning: bool = False,
+        max_retries: int = 2,
+        *,
+        stream: bool = False,
+        stream_label: str = "",
+        tools: list[dict[str, Any]] | None = None,
+        tool_runner: Callable[[str, dict[str, Any]], Any] | None = None,
+        max_tool_rounds: int = 4,
+        timeout_sec: float | None = None,
+    ) -> dict[str, Any]:
+        """messages[] 기반 chat completion + JSON 파싱."""
+        last_error: Exception | None = None
+        prefer_response_format = True
+        for attempt in range(max_retries + 1):
+            attempt_no = attempt + 1
+            stage = "first-attempt" if attempt == 0 else "retry"
+            tag = f" [{stream_label}]" if stream_label else ""
+            print(f"[llm:chat:json]{tag} {stage}={attempt_no}/{max_retries + 1}")
+
+            try:
+                text = self.chat(
+                    messages,
+                    reasoning=reasoning,
+                    stream=stream,
+                    stream_label=stream_label,
+                    sampling_params=self.JSON_SAMPLING_PARAMS,
+                    extra_sampling_params=self.JSON_EXTRA_SAMPLING_PARAMS,
+                    force_json=True,
+                    response_format=(
+                        {"type": "json_object"}
+                        if (prefer_response_format and not reasoning and not stream and not tools)
+                        else None
+                    ),
+                    tools=tools,
+                    tool_runner=tool_runner,
+                    max_tool_rounds=max_tool_rounds,
+                    timeout_sec=timeout_sec,
+                )
+            except Exception as e:
+                last_error = e
+                print(f"[llm:chat:json]{tag} request-failed attempt={attempt_no}/{max_retries + 1} error={e}")
+                if prefer_response_format and not stream:
+                    prefer_response_format = False
+                    print(f"[llm:chat:json]{tag} response_format-fallback reason={e}")
+                    if attempt < max_retries:
+                        continue
+                if attempt < max_retries:
+                    continue
+                break
+
+            try:
+                return self._extract_json(text)
+            except json.JSONDecodeError as e:
+                last_error = e
+                print(f"[llm:chat:json]{tag} parse-failed attempt={attempt_no}/{max_retries + 1} error={e}")
+                if attempt < max_retries:
+                    continue
+
+        if isinstance(last_error, Exception):
+            raise last_error
+        raise json.JSONDecodeError("Failed to parse JSON", "", 0)
+
+    def _prepend_think_tag(
+        self,
+        messages: list[dict[str, Any]],
+        think_tag: str,
+    ) -> list[dict[str, Any]]:
+        """마지막 user message에 think_tag를 prepend한 사본을 반환한다."""
+        if not messages:
+            return []
+        result: list[dict[str, Any]] = [dict(m) for m in messages]
+        for i in range(len(result) - 1, -1, -1):
+            if result[i].get("role") == "user":
+                content = str(result[i].get("content") or "")
+                result[i]["content"] = f"{think_tag}\n{content}"
+                break
+        return result
+
+    def _chat_with_optional_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        sampled_params: dict[str, Any],
+        extra_body: dict[str, Any],
+        response_format: dict[str, Any] | None,
+        tools: list[dict[str, Any]] | None,
+        tool_runner: Callable[[str, dict[str, Any]], Any] | None,
+        max_tool_rounds: int,
+        timeout_sec: float | None = None,
+    ) -> str:
+        """_ask_with_optional_tools의 messages-direct version."""
+        messages = [dict(m) for m in messages]
+        tool_schemas = list(tools or [])
+        tools_enabled = bool(tool_schemas)
+        tool_round_budget = max(1, int(max_tool_rounds))
+        tool_rounds_used = 0
+        last_tool_outputs: list[str] = []
+
+        while True:
+            request_kwargs = self._build_request_kwargs(
+                messages=messages,
+                sampled_params=sampled_params,
+                extra_body=extra_body,
+                response_format=response_format,
+                tools=(tool_schemas if tools_enabled else None),
+                timeout_sec=timeout_sec,
+            )
+            try:
+                label = "with-tools" if tools_enabled else "plain"
+                print(
+                    "[llm:chat][request] "
+                    f"mode={label} timeout={timeout_sec} "
+                    f"tools={len(tool_schemas) if tools_enabled else 0} "
+                    f"messages={len(messages)}"
+                )
+                response = self.client.chat.completions.create(**request_kwargs)
+                print("[llm:chat][response] received")
+            except Exception as e:
+                if tools_enabled:
+                    print(f"[llm:chat][tools] disabled after API error: {e}")
+                    tools_enabled = False
+                    continue
+                raise
+
+            message = response.choices[0].message
+            text = self._coerce_message_content(getattr(message, "content", ""))
+            tool_calls = list(getattr(message, "tool_calls", []) or [])
+
+            if not tools_enabled or not tool_calls:
+                if not text.strip() and tool_rounds_used and last_tool_outputs:
+                    fallback_text = self._fallback_text_from_tool_outputs(last_tool_outputs)
+                    if fallback_text:
+                        return fallback_text
+                return text
+
+            if tool_runner is None:
+                raise RuntimeError("Model returned tool calls but no `tool_runner` was provided.")
+
+            messages.append({
+                "role": "assistant",
+                "content": text or "",
+                "tool_calls": [self._tool_call_to_message(tc) for tc in tool_calls],
+            })
+            for tool_call in tool_calls:
+                tool_message = self._execute_tool_call(tool_call, tool_runner)
+                messages.append(tool_message)
+                last_tool_outputs.append(str(tool_message.get("content") or ""))
+
+            tool_rounds_used += 1
+            if tool_rounds_used >= tool_round_budget:
+                messages.append({
+                    "role": "user",
+                    "content": "Tool-call budget reached. Provide the best final answer now without additional tool calls.",
+                })
+                tools_enabled = False
 
     def _ask_with_optional_tools(
         self,

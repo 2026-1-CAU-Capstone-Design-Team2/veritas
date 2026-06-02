@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-from pathlib import Path
 from typing import Any, Iterator
 
 from fastapi import HTTPException
@@ -56,19 +54,19 @@ def regenerate_draft(draft_id: str, prompt: str) -> dict[str, Any]:
 
 
 def send_chat_message(workspace_id: str, message: str, mode: str = "research") -> dict[str, str]:
+    # The conversation turn is recorded by the memory runtime inside
+    # MemoryAwareLLMClient.call (prepare/commit), so this surface no longer
+    # maintains its own history list or writes a parallel chat_history.json.
+    # UI rendering goes through get_chat_history, which projects the recall
+    # tier on demand.
     message_text = message.strip()
     if not message_text:
         raise HTTPException(status_code=422, detail="message must not be empty")
 
     message_id = new_id("msg")
-    session_id = f"session_{workspace_id}"
-    history = _get_workspace_chat_history(workspace_id, session_id)
-    history.append({"role": "user", "text": message})
     runtime = get_runtime()
     runtime.set_workspace(workspace_id)
     assistant_text = runtime.answer_chat_selection(message_text, mode)
-    history.append({"role": "assistant", "text": assistant_text})
-    _save_workspace_chat_history(workspace_id, history)
     return {"messageId": message_id, "assistant": assistant_text, "mode": mode}
 
 
@@ -96,11 +94,13 @@ def send_chat_message_stream(
         yield _sse("error", {"error": "message must not be empty"})
         return
 
+    # Turn recording happens inside MemoryAwareLLMClient.iter_call via the
+    # memory runtime; this surface only forwards SSE chunks to the UI. The
+    # legacy chat_history.json write was removed when the recall tier became
+    # the single source of truth — see ``get_chat_history`` below for the
+    # read-side projection that replaces it.
     doc_context = (doc_text or "")[:4000].strip()
     message_id = new_id("msg")
-    session_id = f"session_{workspace_id}"
-    history = _get_workspace_chat_history(workspace_id, session_id)
-    history.append({"role": "user", "text": message, "source": source})
 
     runtime = get_runtime()
     runtime.set_workspace(workspace_id)
@@ -125,8 +125,6 @@ def send_chat_message_stream(
         yield _sse("error", {"error": str(e)})
 
     assistant_text = "".join(collected)
-    history.append({"role": "assistant", "text": assistant_text, "source": source})
-    _save_workspace_chat_history(workspace_id, history)
     yield _sse(
         "done",
         {
@@ -143,37 +141,27 @@ def _sse(event: str, payload: dict[str, Any]) -> bytes:
 
 
 def get_chat_history(session_id: str) -> dict[str, Any]:
+    """Read-side projection of the workspace conversation log.
+
+    Pulls the user/assistant turn list from the active workspace's
+    memory.sqlite3 recall tier — the single source of truth since the
+    legacy parallel ``chat_history.json`` write was removed. Pre-memory
+    JSON logs are lifted in by ``AgentRuntime._migrate_legacy_chat_history``
+    when a workspace is first opened, so older conversations are still
+    visible after the storage cut-over.
+
+    Side effect: switches the runtime to the requested workspace, so the
+    history pulled matches what subsequent ``send_chat_message_stream``
+    calls would write. Frontends typically open the chat panel right after
+    selecting a workspace, so this matches the user's intent.
+    """
     workspace_id = session_id.removeprefix("session_")
-    items = _get_workspace_chat_history(workspace_id, session_id)
-    return {"items": items, "nextCursor": None}
-
-
-def _get_workspace_chat_history(workspace_id: str, session_id: str) -> list[dict[str, Any]]:
-    history = repo.get_or_create_chat_history(session_id)
-    if history:
-        return history
-
-    path = _chat_history_path(workspace_id)
+    runtime = get_runtime()
+    if workspace_id and workspace_id != "default":
+        runtime.set_workspace(workspace_id)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        items = payload.get("items", payload) if isinstance(payload, dict) else payload
-    except Exception:
+        items = runtime.memory_runtime.history_as_chat_items()
+    except Exception as e:
+        print(f"[chat][history][warn] memory projection failed: {e}")
         items = []
-    if isinstance(items, list):
-        history.extend([item for item in items if isinstance(item, dict)])
-    return history
-
-
-def _save_workspace_chat_history(workspace_id: str, history: list[dict[str, Any]]) -> None:
-    path = _chat_history_path(workspace_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"items": history, "updatedAt": utc_now_iso()}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-def _chat_history_path(workspace_id: str) -> Path:
-    root = Path(os.getenv("VERITAS_OUTPUT_DIR", "runs")).expanduser().resolve()
-    workspace_dir = root / workspace_id if workspace_id != "default" else root / "api"
-    return workspace_dir / "chat_history.json"
+    return {"items": items, "nextCursor": None}
