@@ -36,6 +36,8 @@ from fastapi import HTTPException
 
 from core.latex_cleanup import clean_latex_in_markdown
 from core.prompts import (
+    DRAFT_CROSSCHECK_GUIDELINE,
+    DRAFT_CROSSCHECK_NOTES_TITLE,
     DRAFT_KNOWLEDGE_BLOCK_TEMPLATE,
     DRAFT_LENGTH_GUIDE,
     DRAFT_NO_KNOWLEDGE_NOTICE,
@@ -60,6 +62,13 @@ _SETTINGS_RE = re.compile(r"^draft_(\d+)_settings\.json$")
 # can never claim the same number. The slow LLM generation runs *outside* the
 # lock; only the (allocate number → write reservation) step is guarded.
 _draft_lock = threading.Lock()
+
+# Ceiling for the draft LLM call. Deliberately BELOW the frontend's 600s HTTP
+# default (frontend/api_common._DEFAULT_TIMEOUT): when generation overruns, the
+# backend fails first with a clear error and the llama-server request is
+# aborted (freeing its slot for chat / screen / proactive), instead of the
+# frontend timing out against a backend that silently keeps generating.
+_DRAFT_LLM_TIMEOUT_SEC = 540.0
 
 
 # ------------------------------------------------------------------- public API
@@ -111,7 +120,9 @@ def regenerate_builtin_draft(workspace_id: str, draft_number: int) -> dict[str, 
     record["sampling"] = {
         "samplingParams": profile["samplingParams"],
         "extraSamplingParams": profile["extraSamplingParams"],
-        "reasoning": bool((record.get("sampling") or {}).get("reasoning", True)),
+        # Informational only — generation always runs with reasoning=False
+        # (see _render_and_persist). Old records that stored True are ignored.
+        "reasoning": False,
     }
     record.setdefault("createdAt", utc_now_iso())
     record["draftNumber"] = number
@@ -174,13 +185,28 @@ def _render_and_persist(workspace_id: str, number: int, record: dict[str, Any]) 
     user_prompt = _compose_user_prompt(record, knowledge)
     sampling = record.get("sampling") or {}
 
+    # Hard output budget per the user's length setting. Without it the
+    # llama-server request runs unbounded (n_predict = -1) and a small local
+    # model can generate for tens of minutes before hitting the context limit.
+    sampling_params = dict(sampling.get("samplingParams") or {})
+    sampling_params.setdefault(
+        "max_tokens", draft_forms.resolve_length_max_tokens(record.get("length"))
+    )
+
     content = runtime.llm.ask(
         DRAFT_SYSTEM_PROMPT,
         user_prompt,
-        reasoning=bool(sampling.get("reasoning", True)),
-        sampling_params=sampling.get("samplingParams"),
+        # Thinking mode is intentionally OFF for drafts: the outline / tone /
+        # knowledge scaffolding already does the planning, and on small local
+        # models the <think> block both burns minutes of generation time and
+        # eats the max_tokens budget before the actual document starts (the
+        # historical reasoning=True default is why drafts could run past the
+        # 10-minute timeouts without producing a properly formatted document).
+        reasoning=False,
+        sampling_params=sampling_params,
         extra_sampling_params=sampling.get("extraSamplingParams"),
         stream_label="draft",
+        timeout_sec=_DRAFT_LLM_TIMEOUT_SEC,
     )
     content = clean_latex_in_markdown(content).strip()
 
@@ -235,6 +261,15 @@ def _compose_user_prompt(record: dict[str, Any], knowledge: str) -> str:
         else DRAFT_NO_KNOWLEDGE_NOTICE
     )
 
+    # Cross-check guideline is only injected when the knowledge base actually
+    # carries a cross-check notes section — prompting a model about a section
+    # that does not exist invites hallucinated "검증 결과" sentences.
+    crosscheck_guideline = (
+        f"{DRAFT_CROSSCHECK_GUIDELINE}\n"
+        if DRAFT_CROSSCHECK_NOTES_TITLE in knowledge
+        else ""
+    )
+
     # Uploaded-form path: follow the extracted Markdown template (headings /
     # tables) rather than the outline alone.
     form_markdown = str(record.get("formMarkdown") or "").strip()
@@ -248,6 +283,7 @@ def _compose_user_prompt(record: dict[str, Any], knowledge: str) -> str:
             outline=outline_text,
             knowledge_block=knowledge_block,
             template_block=DRAFT_TEMPLATE_BLOCK_TEMPLATE.format(template=form_markdown),
+            crosscheck_guideline=crosscheck_guideline,
         )
 
     return DRAFT_USER_PROMPT_TEMPLATE.format(
@@ -258,6 +294,7 @@ def _compose_user_prompt(record: dict[str, Any], knowledge: str) -> str:
         keypoints_block=keypoints_block,
         outline=outline_text,
         knowledge_block=knowledge_block,
+        crosscheck_guideline=crosscheck_guideline,
     )
 
 
@@ -616,7 +653,9 @@ def _build_settings_record(
         "sampling": {
             "samplingParams": profile["samplingParams"],
             "extraSamplingParams": profile["extraSamplingParams"],
-            "reasoning": True,
+            # Informational only — _render_and_persist forces reasoning=False
+            # for every draft generation (see the comment there).
+            "reasoning": False,
         },
         "model": model_id,
         "createdAt": created_at,

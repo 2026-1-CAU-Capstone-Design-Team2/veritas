@@ -282,6 +282,11 @@ class VerificationService:
                 external_docs=self.docs,
                 local_sources=self.local_sources,
                 local_documents=self.local_documents,
+                # Reuse the service's Kiwi tokenizer so Korean particles don't
+                # break token overlap ("영업이익은" vs "영업이익" must match —
+                # without this, differently-phrased claims about the same fact
+                # are never compared and real mismatches go undetected).
+                tokenizer=self._tokenizer,
             )
             cb(
                 "crosscheck",

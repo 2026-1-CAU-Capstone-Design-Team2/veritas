@@ -243,8 +243,16 @@ class LLMClient:
         tool_runner: Callable[[str, dict[str, Any]], Any] | None = None,
         max_tool_rounds: int = 4,
         timeout_sec: float | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
-        """Generate a chat completion response."""
+        """Generate a chat completion response.
+
+        ``reasoning_effort`` is accepted for interface compatibility with
+        :class:`llm.openai_chat_llm.OpenAIChatLLMClient` (AutoSurvey tools pass
+        it unconditionally) and ignored — local llama-server models have no
+        effort dial; reasoning on/off is the ``reasoning`` flag (/think tag).
+        """
+        del reasoning_effort
         think_tag = "/think" if reasoning else "/no_think"
         start = time.perf_counter()
 
@@ -444,8 +452,14 @@ class LLMClient:
         tool_runner: Callable[[str, dict[str, Any]], Any] | None = None,
         max_tool_rounds: int = 4,
         timeout_sec: float | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
-        """Generate a chat completion and parse as JSON."""
+        """Generate a chat completion and parse as JSON.
+
+        ``reasoning_effort`` is accepted for interface compatibility with the
+        OpenAI adapter and ignored (see :meth:`ask`).
+        """
+        del reasoning_effort
         last_error: Exception | None = None
         prefer_response_format = True
         for attempt in range(max_retries + 1):

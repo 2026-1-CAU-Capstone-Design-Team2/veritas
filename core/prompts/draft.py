@@ -70,6 +70,26 @@ DRAFT_KNOWLEDGE_BLOCK_TEMPLATE = (
     "{knowledge}"
 )
 
+# Heading + usage instruction rendered above the cross-check notes block inside
+# the knowledge base (services.knowledge.KnowledgePackBuilder). The writing
+# guides below refer to the same heading, so keep them in sync.
+DRAFT_CROSSCHECK_NOTES_TITLE = "내부·외부 자료 교차 검증 결과"
+
+DRAFT_CROSSCHECK_NOTES_HEADER = (
+    f"## {DRAFT_CROSSCHECK_NOTES_TITLE}\n\n"
+    "아래 각 항목은 같은 주제에 대해 외부 조사 자료와 내부 문서가 서로 다른 수치나 내용을 "
+    "제시한 사례입니다. 본문에서 해당 주제를 다룰 때는 어느 한쪽 수치만 쓰지 말고, 두 출처의 "
+    "수치를 함께 제시한 뒤 차이가 나는 기준이나 이유를 자연스러운 문장으로 설명하세요. "
+    "(예: \"공시 기준 16.4조원(내부 관리회계 기준 15.8조원)으로, 차이는 본사 공통비 배부 기준에 기인합니다.\")"
+)
+
+# Writing guideline appended to both user prompts; only meaningful when the
+# knowledge block carries a cross-check section produced with the header above.
+DRAFT_CROSSCHECK_GUIDELINE = (
+    f"- [지식베이스]에 '{DRAFT_CROSSCHECK_NOTES_TITLE}' 섹션이 있으면, 각 항목을 관련 목차 본문에 반영하세요. "
+    "외부 자료와 내부 자료의 수치를 함께 제시하고, 어떤 기준의 차이인지 한 문장으로 설명합니다."
+)
+
 DRAFT_NO_KNOWLEDGE_NOTICE = (
     "[지식베이스]\n"
     "이 워크스페이스에는 아직 조사로 수집된 지식베이스가 없습니다. 제공된 문서 유형·목차·핵심 내용만으로 "
@@ -95,7 +115,7 @@ DRAFT_USER_PROMPT_TEMPLATE = """{knowledge_block}
 
 [작성 지침]
 - 각 목차 항목을 `## 항목명` 제목으로 두고, 그 아래에 [지식베이스]의 구체적 사실·수치·내용을 반영한 본문을 작성하세요.
-- 양식 설명이나 빈 골격이 아니라, 조사된 실제 내용으로 채워진 완성 문서를 작성하세요.
+{crosscheck_guideline}- 양식 설명이나 빈 골격이 아니라, 조사된 실제 내용으로 채워진 완성 문서를 작성하세요.
 - 문서 맨 위에 `# 제목` 한 줄을 작성하세요."""
 
 
@@ -128,7 +148,7 @@ DRAFT_USER_PROMPT_TEMPLATE_TEMPLATED = """{knowledge_block}
 [작성 지침]
 - [목차]의 각 항목을 그 순서대로 작성하고, 각 항목에 [양식 템플릿]의 해당 제목 계층·글머리표·표 구조를 반영하세요.
 - 각 부분을 [지식베이스]의 구체적 사실·수치·내용으로 채워 완성하세요. 표는 칸 구조를 유지한 채 채우되, 근거가 없는 칸은 비워 둡니다.
-- 양식 설명이나 빈 골격이 아니라, 조사된 실제 내용으로 채워진 완성 문서를 작성하세요.
+{crosscheck_guideline}- 양식 설명이나 빈 골격이 아니라, 조사된 실제 내용으로 채워진 완성 문서를 작성하세요.
 - 문서 맨 위에 `# 제목` 한 줄을 작성하세요."""
 
 
@@ -138,6 +158,9 @@ __all__ = [
     "DRAFT_LENGTH_GUIDE",
     "DRAFT_KNOWLEDGE_BLOCK_TEMPLATE",
     "DRAFT_NO_KNOWLEDGE_NOTICE",
+    "DRAFT_CROSSCHECK_NOTES_TITLE",
+    "DRAFT_CROSSCHECK_NOTES_HEADER",
+    "DRAFT_CROSSCHECK_GUIDELINE",
     "DRAFT_USER_PROMPT_TEMPLATE",
     "DRAFT_TEMPLATE_BLOCK_TEMPLATE",
     "DRAFT_USER_PROMPT_TEMPLATE_TEMPLATED",

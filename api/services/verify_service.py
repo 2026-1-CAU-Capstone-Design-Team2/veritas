@@ -228,10 +228,13 @@ def get_summary(workspace_id: str | None) -> dict[str, Any]:
         "sentenceCount": (
             artifacts.sections.sentence_count if artifacts.sections else 0
         ),
-        # Drill-down payloads — kept inline so the issues dialog and the
-        # sections panel render without a second round-trip.
+        # Drill-down payloads — kept inline so the issues dialog, the sections
+        # panel, and the cross-check panel render without a second round-trip.
         "sectionsOverview": verify_view.sections_overview(artifacts),
         "issues": verify_view.issues_overview(artifacts, titles),
+        # Internal (local corpus) vs external (web research) comparison —
+        # resolved claim pairs the Cross-check panel renders directly.
+        "crosscheck": verify_view.crosscheck_overview(artifacts),
     }
 
 

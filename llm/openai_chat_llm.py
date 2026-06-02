@@ -10,8 +10,10 @@ import httpx
 from openai import OpenAI
 
 
-DEFAULT_AUTOSURVEY_OPENAI_MODEL = "gpt-5-mini"
+DEFAULT_AUTOSURVEY_OPENAI_MODEL = "gpt-5-nano"
 _SERVICE_TIERS = {"default", "flex", "priority"}
+# Valid OpenAI reasoning-effort levels (gpt-5 family reasoning models).
+_REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
 
 
 class OpenAIChatLLMClient:
@@ -106,7 +108,13 @@ class OpenAIChatLLMClient:
         tool_runner: Callable[[str, dict[str, Any]], Any] | None = None,
         max_tool_rounds: int = 4,
         timeout_sec: float | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
+        """``reasoning_effort`` ("minimal"/"low"/"medium"/"high") caps how many
+        reasoning tokens a gpt-5-family model spends before answering. Lower
+        effort = faster + cheaper; use "low" for extraction-style calls and
+        leave the model default (medium) for synthesis-style calls. Ignored
+        for non-reasoning models."""
         del extra_sampling_params
         start = time.perf_counter()
 
@@ -136,6 +144,7 @@ class OpenAIChatLLMClient:
                 response_format=None,
                 tools=None,
                 timeout_sec=timeout_sec,
+                reasoning_effort=reasoning_effort,
             )
             request_kwargs["stream"] = True
             chunks = self._create_completion(request_kwargs)
@@ -150,6 +159,7 @@ class OpenAIChatLLMClient:
                 tool_runner=tool_runner,
                 max_tool_rounds=max_tool_rounds,
                 timeout_sec=timeout_sec,
+                reasoning_effort=reasoning_effort,
             )
 
         if self.trace_latency:
@@ -175,6 +185,7 @@ class OpenAIChatLLMClient:
         tool_runner: Callable[[str, dict[str, Any]], Any] | None = None,
         max_tool_rounds: int = 4,
         timeout_sec: float | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         last_error: Exception | None = None
         prefer_response_format = True
@@ -202,6 +213,7 @@ class OpenAIChatLLMClient:
                     tool_runner=tool_runner,
                     max_tool_rounds=max_tool_rounds,
                     timeout_sec=timeout_sec,
+                    reasoning_effort=reasoning_effort,
                 )
             except Exception as exc:  # noqa: BLE001 - retries preserve current behavior
                 last_error = exc
@@ -259,6 +271,7 @@ class OpenAIChatLLMClient:
         tool_runner: Callable[[str, dict[str, Any]], Any] | None,
         max_tool_rounds: int,
         timeout_sec: float | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_text},
@@ -277,6 +290,7 @@ class OpenAIChatLLMClient:
                 response_format=response_format,
                 tools=(tool_schemas if tools_enabled else None),
                 timeout_sec=timeout_sec,
+                reasoning_effort=reasoning_effort,
             )
 
             try:
@@ -346,6 +360,7 @@ class OpenAIChatLLMClient:
         response_format: dict[str, Any] | None,
         tools: list[dict[str, Any]] | None,
         timeout_sec: float | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         request_kwargs: dict[str, Any] = {
             "model": self.model,
@@ -359,6 +374,9 @@ class OpenAIChatLLMClient:
             request_kwargs["tool_choice"] = "auto"
         if self.service_tier:
             request_kwargs["service_tier"] = self.service_tier
+        effort = self._normalize_reasoning_effort(reasoning_effort)
+        if effort and self._supports_reasoning_effort():
+            request_kwargs["reasoning_effort"] = effort
         if timeout_sec is not None:
             request_kwargs["timeout"] = self._request_timeout(timeout_sec)
         return request_kwargs
@@ -373,10 +391,43 @@ class OpenAIChatLLMClient:
             )
         return tier
 
+    def _normalize_reasoning_effort(self, reasoning_effort: str | None) -> str | None:
+        """Validate a per-call reasoning effort. Invalid values are dropped with
+        a warning (the model then uses its own default) — a typo must degrade
+        to default behavior, never crash a survey mid-run."""
+        effort = str(reasoning_effort or "").strip().lower()
+        if not effort:
+            return None
+        if effort not in _REASONING_EFFORTS:
+            print(
+                "[openai][reasoning-effort] "
+                f"invalid effort={effort!r}; expected one of {sorted(_REASONING_EFFORTS)}. "
+                "Using the model default."
+            )
+            return None
+        return effort
+
+    def _supports_reasoning_effort(self) -> bool:
+        """gpt-5 family models are reasoning models and accept reasoning_effort.
+        Older chat models (gpt-4o family) reject the parameter, so it is never
+        sent for them."""
+        return self._uses_fixed_sampling_defaults()
+
     def _create_completion(self, request_kwargs: dict[str, Any]) -> Any:
         try:
             return self.client.chat.completions.create(**request_kwargs)
         except Exception as exc:
+            # Optional request fields are dropped (one at a time) when the API
+            # rejects them, so a model/tier mismatch degrades instead of failing
+            # the survey. reasoning_effort falls back first, then service_tier.
+            if "reasoning_effort" in request_kwargs and self._is_reasoning_effort_error(exc):
+                fallback_kwargs = dict(request_kwargs)
+                effort = fallback_kwargs.pop("reasoning_effort", "")
+                print(
+                    "[openai][reasoning-effort] "
+                    f"effort={effort} rejected; retrying without it"
+                )
+                return self._create_completion(fallback_kwargs)
             if "service_tier" not in request_kwargs or not self._is_service_tier_error(exc):
                 raise
             fallback_kwargs = dict(request_kwargs)
@@ -390,6 +441,10 @@ class OpenAIChatLLMClient:
     def _is_service_tier_error(self, exc: Exception) -> bool:
         text = str(exc).lower()
         return "service_tier" in text or "service tier" in text
+
+    def _is_reasoning_effort_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "reasoning_effort" in text or "reasoning effort" in text
 
     def _clean_sampling_params(self, params: dict[str, Any]) -> dict[str, Any]:
         if self._uses_fixed_sampling_defaults():

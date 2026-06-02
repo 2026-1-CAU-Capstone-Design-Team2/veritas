@@ -107,6 +107,7 @@ class ChatAgent:
     DEFAULT_OPTIONAL_TOOL_NAMES = (
         "current_time",
         "rag_search",
+        "table_query",
         "autosurvey",
         "screen_context",
     )

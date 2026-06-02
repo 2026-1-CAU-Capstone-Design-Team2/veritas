@@ -525,6 +525,90 @@ def issues_overview(
     return rows
 
 
+def crosscheck_overview(artifacts: VerificationArtifacts) -> dict[str, Any]:
+    """Resolved cross-check payload for the verify page's Cross-check panel.
+
+    The stored flags reference claim ids only; this resolves each flag into a
+    displayable pair — the external (web) claim and the internal (local
+    corpus) claim, with their source labels — so the frontend renders the
+    "내부 주장 vs 외부 주장" rows without re-joining claims itself.
+
+    ``available`` is False when the crosscheck task never ran (no artifact);
+    ``localSourceCount == 0`` with ``available: True`` means it ran but the
+    workspace has no registered local documents — the panel distinguishes the
+    two so the user knows whether to register a local folder or to re-verify.
+    """
+    crosscheck = getattr(artifacts, "crosscheck", None)
+    if crosscheck is None:
+        return {
+            "available": False,
+            "localSourceCount": 0,
+            "externalDocCount": 0,
+            "claimCount": 0,
+            "supportCount": 0,
+            "partialSupportCount": 0,
+            "flagCount": 0,
+            "flags": [],
+        }
+
+    claims_by_id = {claim.claim_id: claim for claim in crosscheck.claims}
+    local_source_ids = {
+        claim.source_id for claim in crosscheck.claims if claim.source_scope.value == "local"
+    }
+    external_source_ids = {
+        claim.source_id for claim in crosscheck.claims if claim.source_scope.value == "external"
+    }
+
+    def _claim_side(claim_id: str) -> dict[str, Any]:
+        claim = claims_by_id.get(str(claim_id or ""))
+        if claim is None:
+            return {"text": "", "title": "", "label": ""}
+        metadata = claim.metadata or {}
+        title = str(metadata.get("title") or "").strip()
+        if claim.source_scope.value == "local":
+            label = str(metadata.get("display_path") or title or claim.source_id)
+        else:
+            label = str(metadata.get("domain") or title or f"doc_{claim.source_id}")
+        return {
+            "text": claim.text,
+            "title": title,
+            "label": label,
+            "sourceId": claim.source_id,
+        }
+
+    flags: list[dict[str, Any]] = []
+    for flag in crosscheck.flags:
+        if not isinstance(flag, dict):
+            continue
+        flags.append(
+            {
+                "relation": str(flag.get("relation") or ""),
+                "severity": str(flag.get("severity") or ""),
+                "message": str(flag.get("message") or ""),
+                # claim_a is always the external claim, claim_b the local one
+                # (see crosscheck/pipeline.py::_compare_claims).
+                "external": _claim_side(flag.get("claimA")),
+                "local": _claim_side(flag.get("claimB")),
+            }
+        )
+
+    support_count = sum(1 for r in crosscheck.relations if r.relation == "supports")
+    partial_count = sum(
+        1 for r in crosscheck.relations if r.relation == "partially_supports"
+    )
+
+    return {
+        "available": True,
+        "localSourceCount": len(local_source_ids),
+        "externalDocCount": len(external_source_ids),
+        "claimCount": len(crosscheck.claims),
+        "supportCount": support_count,
+        "partialSupportCount": partial_count,
+        "flagCount": len(flags),
+        "flags": flags,
+    }
+
+
 __all__ = [
     "build_doc_items",
     "level_label",
@@ -532,4 +616,5 @@ __all__ = [
     "concept_participation_for",
     "sections_overview",
     "issues_overview",
+    "crosscheck_overview",
 ]
