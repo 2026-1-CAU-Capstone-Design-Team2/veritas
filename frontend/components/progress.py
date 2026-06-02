@@ -21,15 +21,17 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
+from ..theme import theme
 
-# Per-state palette: fill gradient (start, end) + status chip (bg, fg, border).
-_STATE_COLORS = {
-	"running": ("#6366F1", "#3B82F6", "#E0E7FF", "#3730A3", "#C7D2FE"),
-	"completed": ("#34D399", "#10B981", "#DCFCE7", "#15803D", "#86EFAC"),
-	"partial": ("#FBBF24", "#F59E0B", "#FEF3C7", "#B45309", "#FCD34D"),
-	"failed": ("#F87171", "#EF4444", "#FEE2E2", "#B91C1C", "#FCA5A5"),
+
+# Per-state theme tokens: fill gradient (start, end) + status chip (bg, fg, border).
+# Resolved against the active palette so the bar adapts to light/dark.
+_STATE_TOKENS = {
+	"running": ("progress.running.start", "progress.running.end", "accent.subtle.bg.hover", "accent.text", "accent.subtle.border"),
+	"completed": ("progress.completed.start", "progress.completed.end", "success.bg", "success.fg", "success.border"),
+	"partial": ("progress.partial.start", "progress.partial.end", "badge.warning.bg", "warning.fg2", "badge.warning.border"),
+	"failed": ("progress.failed.start", "progress.failed.end", "danger.bg2", "danger.fg", "danger.border2"),
 }
-_TRACK_BG = "#E8EDF4"
 
 
 def _format_duration(seconds: float, *, precise: bool = False) -> str:
@@ -73,6 +75,11 @@ class _ProgressTrack(QWidget):
 		self._shimmer_anim.setStartValue(0.0)
 		self._shimmer_anim.setEndValue(1.0)
 		self._shimmer_anim.setLoopCount(-1)
+
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		self.update()
 
 	def get_ratio(self) -> float:
 		return self._ratio
@@ -126,14 +133,14 @@ class _ProgressTrack(QWidget):
 
 		track_path = QPainterPath()
 		track_path.addRoundedRect(rect, radius, radius)
-		painter.fillPath(track_path, QColor(_TRACK_BG))
+		painter.fillPath(track_path, QColor(theme.color("progress.track")))
 
 		if self._ratio <= 0.0:
 			return
 
-		fill_start, fill_end, *_chip = _STATE_COLORS.get(
-			self._state, _STATE_COLORS["running"]
-		)
+		tokens = _STATE_TOKENS.get(self._state, _STATE_TOKENS["running"])
+		fill_start = theme.color(tokens[0])
+		fill_end = theme.color(tokens[1])
 		# Keep at least a pill-width sliver visible so tiny percentages still read.
 		fill_width = max(rect.height(), rect.width() * self._ratio)
 		fill_rect = QRectF(rect.x(), rect.y(), fill_width, rect.height())
@@ -188,11 +195,10 @@ class ResearchProgressBar(QFrame):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("ResearchProgressBar")
-		self.setStyleSheet(
-			"QFrame#ResearchProgressBar { background-color: #F8FAFC; "
-			"border: 1px solid #E2E8F0; border-radius: 12px; }"
-		)
 		self._state = "idle"
+		# Last caption (text + colour token) so it can be re-tinted on a theme toggle.
+		self._caption_text = ""
+		self._caption_token = "text.secondary"
 		self._error_message = ""
 		# Wall-clock start of the current live run; set by start() and consumed
 		# by the terminal-state handlers to compute the total elapsed time.
@@ -214,9 +220,6 @@ class ResearchProgressBar(QFrame):
 		header.addWidget(self._chip, 0, Qt.AlignLeft)
 		header.addStretch(1)
 		self._percent = QLabel("0%")
-		self._percent.setStyleSheet(
-			"color: #0F172A; font-size: 16px; font-weight: 800;"
-		)
 		header.addWidget(self._percent, 0, Qt.AlignRight)
 		layout.addLayout(header)
 
@@ -230,21 +233,36 @@ class ResearchProgressBar(QFrame):
 		self._caption = QLabel("")
 		self._caption.setWordWrap(False)
 		self._caption.setTextFormat(Qt.PlainText)
-		self._caption.setStyleSheet(
-			"color: #64748B; font-size: 12px; font-weight: 600;"
-		)
 		footer.addWidget(self._caption, 1)
 		# Total elapsed time, parked at the bottom-right corner and filled in
 		# once the run reaches a terminal state (completed / partial / failed).
 		self._elapsed = QLabel("")
 		self._elapsed.setTextFormat(Qt.PlainText)
-		self._elapsed.setStyleSheet(
-			"color: #94A3B8; font-size: 11px; font-weight: 700;"
-		)
 		footer.addWidget(self._elapsed, 0, Qt.AlignRight | Qt.AlignVCenter)
 		layout.addLayout(footer)
 
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
 		self.set_idle()
+
+	def _apply_theme(self, *args) -> None:
+		"""(Re)apply every palette-derived style — frame, percent, elapsed,
+		caption and chip — so the bar follows a light/dark toggle."""
+		self.setStyleSheet(
+			f"QFrame#ResearchProgressBar {{ background-color: {theme.color('surface.muted')}; "
+			f"border: 1px solid {theme.color('border')}; border-radius: 12px; }}"
+		)
+		self._percent.setStyleSheet(
+			f"color: {theme.color('text.primary')}; font-size: 16px; font-weight: 800;"
+		)
+		self._elapsed.setStyleSheet(
+			f"color: {theme.color('text.muted')}; font-size: 11px; font-weight: 700;"
+		)
+		self._caption.setStyleSheet(
+			f"color: {theme.color(self._caption_token)}; font-size: 12px; font-weight: 600;"
+		)
+		if self._state in _STATE_TOKENS:
+			self._apply_chip(self._state)
 
 	# -- state transitions ------------------------------------------------
 
@@ -269,7 +287,7 @@ class ResearchProgressBar(QFrame):
 		self._track.set_state("running")
 		self._track.set_ratio_immediate(0.0)
 		self._apply_chip("running")
-		self._apply_caption(caption, "#64748B")
+		self._apply_caption(caption, "text.secondary")
 
 	def set_progress(self, percent: float, caption: str | None = None) -> None:
 		"""Ease the bar toward ``percent`` (0..100) while running."""
@@ -280,11 +298,11 @@ class ResearchProgressBar(QFrame):
 			self._apply_chip("running")
 		self._track.animate_to(max(0.0, min(100.0, float(percent))) / 100.0)
 		if caption:
-			self._apply_caption(caption, "#64748B")
+			self._apply_caption(caption, "text.secondary")
 
 	def set_caption(self, caption: str) -> None:
-		color = "#B91C1C" if self._state == "failed" else "#64748B"
-		self._apply_caption(caption, color)
+		color_token = "danger.fg" if self._state == "failed" else "text.secondary"
+		self._apply_caption(caption, color_token)
 
 	def mark_completed(self, animate: bool = True, elapsed_seconds: float | None = None) -> None:
 		self._state = "completed"
@@ -297,7 +315,7 @@ class ResearchProgressBar(QFrame):
 		else:
 			self._track.set_ratio_immediate(1.0)
 		self._apply_chip("completed")
-		self._apply_caption("조사가 완료되었습니다.", "#15803D")
+		self._apply_caption("조사가 완료되었습니다.", "success.fg")
 		self._finish_timing(elapsed_seconds)
 
 	def mark_partial(self, animate: bool = True, elapsed_seconds: float | None = None) -> None:
@@ -318,7 +336,7 @@ class ResearchProgressBar(QFrame):
 		self._apply_chip("partial")
 		self._apply_caption(
 			"일부 문서 요약에 실패했습니다. 클릭하면 실패한 문서를 확인할 수 있습니다.",
-			"#B45309",
+			"warning.fg2",
 		)
 		self._finish_timing(elapsed_seconds)
 
@@ -329,7 +347,7 @@ class ResearchProgressBar(QFrame):
 		self.setVisible(True)
 		self._track.set_state("failed")
 		self._apply_chip("failed")
-		self._apply_caption("클릭하면 오류 메시지를 확인할 수 있습니다.", "#B91C1C")
+		self._apply_caption("클릭하면 오류 메시지를 확인할 수 있습니다.", "danger.fg")
 		self._finish_timing(elapsed_seconds)
 
 	def restore_running(self, percent: float, caption: str = "") -> None:
@@ -345,7 +363,7 @@ class ResearchProgressBar(QFrame):
 		self._track.set_state("running")
 		self._track.set_ratio_immediate(max(0.0, min(100.0, float(percent))) / 100.0)
 		self._apply_chip("running")
-		self._apply_caption(caption or "조사가 진행 중입니다.", "#64748B")
+		self._apply_caption(caption or "조사가 진행 중입니다.", "text.secondary")
 
 	# -- internals --------------------------------------------------------
 
@@ -387,7 +405,10 @@ class ResearchProgressBar(QFrame):
 			self._elapsed.setText(f"총 소요 시간 {_format_duration(elapsed, precise=True)}")
 
 	def _apply_chip(self, state: str) -> None:
-		_s, _e, bg, fg, border = _STATE_COLORS.get(state, _STATE_COLORS["running"])
+		tokens = _STATE_TOKENS.get(state, _STATE_TOKENS["running"])
+		bg = theme.color(tokens[2])
+		fg = theme.color(tokens[3])
+		border = theme.color(tokens[4])
 		self._chip.setText(f"● {self._STATE_LABEL.get(state, '')}")
 		self._chip.setStyleSheet(
 			f"QLabel#ResearchProgressChip {{ background-color: {bg}; color: {fg}; "
@@ -395,14 +416,16 @@ class ResearchProgressBar(QFrame):
 			f"font-size: 12px; font-weight: 800; }}"
 		)
 
-	def _apply_caption(self, text: str, color: str) -> None:
+	def _apply_caption(self, text: str, color_token: str) -> None:
 		clean = " ".join(str(text or "").split())
 		if len(clean) > 200:
 			clean = clean[:197] + "..."
+		self._caption_text = clean
+		self._caption_token = color_token
 		self._caption.setText(clean)
 		self._caption.setToolTip(clean)
 		self._caption.setStyleSheet(
-			f"color: {color}; font-size: 12px; font-weight: 600;"
+			f"color: {theme.color(color_token)}; font-size: 12px; font-weight: 600;"
 		)
 
 	def mousePressEvent(self, event) -> None:  # type: ignore[override]

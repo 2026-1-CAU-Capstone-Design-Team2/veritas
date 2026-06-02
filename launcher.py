@@ -12,17 +12,32 @@ import urllib.request
 
 from core.stdio_utf8 import force_utf8_stdio
 from db.db import get_app_data_dir
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import (
+    QByteArray,
+    QObject,
+    QPoint,
+    QRectF,
+    QSize,
+    Qt,
+    QThread,
+    Signal,
+)
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QFrame,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QVBoxLayout,
+    QWidget,
 )
 
 from llm.model_catalog import (
@@ -106,6 +121,30 @@ def configure_screen_debug_from_argv() -> None:
         sys.argv.remove("--screen-debug")
 
 
+_PROACTIVE_DEBUG: bool = False
+
+
+def proactive_debug_enabled() -> bool:
+    return _PROACTIVE_DEBUG
+
+
+def configure_proactive_debug_from_argv() -> None:
+    """``--proactive-debug``: stream ONLY the proactive bandit's ``[proactive]``
+    lines (decision / feedback / update / noop_out) to the console — every
+    other API tag still writes to the log file but is suppressed from stdout.
+
+    Same shape as :func:`configure_screen_debug_from_argv`: forces console
+    streaming on (the relay needs the pipe to filter) and sets
+    ``VERITAS_PROACTIVE_LOG=1`` so the API child emits the proactive lines."""
+    global _PROACTIVE_DEBUG, _CONSOLE_LOGS
+    if "--proactive-debug" in sys.argv:
+        _PROACTIVE_DEBUG = True
+        _CONSOLE_LOGS = True
+        os.environ["VERITAS_PROACTIVE_LOG"] = "1"
+    while "--proactive-debug" in sys.argv:
+        sys.argv.remove("--proactive-debug")
+
+
 class DownloadWorker(QObject):
     # Qt int signals are 32-bit on Windows. GGUF downloads commonly exceed
     # 2GB, so pass Python ints as objects to avoid progress overflow.
@@ -149,25 +188,219 @@ class DownloadWorker(QObject):
         self.finished.emit()
 
 
+# ---------------------------------------------------------------------------
+# Setup-dialog presentation (front-end only).
+#
+# Reproduces launcher_ref.html: a frameless, rounded "card" dialog with a dark
+# gradient header, a rich model selector, info rows, a status/progress box and a
+# footer. Only the *look* changed here — the model list, disk checks and the
+# download flow further down behave exactly as before.
+# ---------------------------------------------------------------------------
+
+_ICON_RENDER_SCALE = 3  # render oversized then downscale for crisp edges
+
+
+def _svg_pixmap(markup: str, size: int) -> QPixmap:
+    renderer = QSvgRenderer(QByteArray(markup.encode("utf-8")))
+    scaled = size * _ICON_RENDER_SCALE
+    pixmap = QPixmap(scaled, scaled)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    renderer.render(painter, QRectF(0, 0, scaled, scaled))
+    painter.end()
+    pixmap.setDevicePixelRatio(_ICON_RENDER_SCALE)
+    return pixmap
+
+
+def _line_icon(body: str, color: str, *, width: float = 1.8) -> str:
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+        f'stroke="{color}" stroke-width="{width}" stroke-linecap="round" '
+        f'stroke-linejoin="round">{body}</svg>'
+    )
+
+
+def _short_path(path: Path) -> str:
+    """``C:\\Users\\me\\AppData\\Roaming\\VERITAS\\models`` -> ``C:\\…\\VERITAS\\models``."""
+    parts = path.parts
+    if len(parts) <= 4:
+        return str(path)
+    return f"{parts[0]}…{os.sep}{parts[-2]}{os.sep}{parts[-1]}"
+
+
+_ICON_MODEL = (
+    '<rect x="4" y="4" width="16" height="16" rx="3"></rect>'
+    '<path d="M9 9h6v6H9z"></path>'
+    '<path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"></path>'
+)
+_ICON_ATOM = (
+    '<circle cx="12" cy="12" r="3"></circle>'
+    '<path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1'
+    'M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"></path>'
+)
+_ICON_DB = (
+    '<ellipse cx="12" cy="6" rx="8" ry="3"></ellipse>'
+    '<path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6'
+    'M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"></path>'
+)
+_ICON_LOCK = (
+    '<rect x="4" y="10" width="16" height="10" rx="2"></rect>'
+    '<path d="M8 10V7a4 4 0 0 1 8 0v3"></path>'
+)
+_ICON_DOWNLOAD = '<path d="M12 3v12M7 10l5 5 5-5M5 21h14"></path>'
+_ICON_CARET = '<path d="M6 9l6 6 6-6"></path>'
+_ICON_LOGO_V = '<path d="M4 4l8 16L20 4"></path>'
+
+
+_DIALOG_QSS = """
+* { font-family: "Pretendard Variable", "Pretendard", "Malgun Gothic",
+    "Segoe UI", sans-serif; }
+
+#dialog { background: #FFFFFF; border: 1px solid #D7DCE5; border-radius: 18px; }
+
+#dhead {
+    border-top-left-radius: 17px; border-top-right-radius: 17px;
+    background: qlineargradient(x1:0, y1:0, x2:0.35, y2:1,
+        stop:0 #1B2A49, stop:0.55 #121A2E, stop:1 #0B1120);
+}
+#logo {
+    border-radius: 13px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2E5BFF, stop:1 #5B83FF);
+}
+#headTitle { color: #FFFFFF; font-size: 19px; font-weight: 800; }
+#headSub { color: #9FB0CC; font-size: 13px; }
+#closeBtn {
+    color: #9FB0CC; font-size: 14px; font-weight: 700;
+    background: rgba(255, 255, 255, 0.06); border: none; border-radius: 9px;
+}
+#closeBtn:hover { background: rgba(255, 255, 255, 0.16); color: #FFFFFF; }
+
+#dbody { background: #FFFFFF; }
+#lead { color: #475569; font-size: 14px; }
+#fieldLabel { color: #8A94A6; font-size: 12px; font-weight: 700; }
+
+#combo { background: #FBFCFE; border: 1px solid #D7DCE5; border-radius: 12px; }
+#combo:hover { border: 1px solid #B9C5DE; }
+#micon { background: #EEF3FF; border-radius: 9px; }
+#comboName { color: #0E1726; font-size: 15px; font-weight: 700; }
+#comboMeta { color: #8A94A6; font-size: 13px; }
+
+#row { background: #FFFFFF; border: 1px solid #E6E9EF; border-radius: 12px; }
+#riBlue { background: #EEF3FF; border-radius: 9px; }
+#riSlate { background: #EEF1F6; border-radius: 9px; }
+#rowLabel { color: #0E1726; font-size: 14px; font-weight: 600; }
+#rowSub { color: #8A94A6; font-size: 12px; }
+#rowValue { color: #475569; font-size: 14px; font-weight: 700; }
+
+#statusbox { background: #FBFCFE; border: 1px solid #E6E9EF; border-radius: 12px; }
+#statusText { color: #475569; font-size: 14px; font-weight: 600; }
+#pleft, #pright { color: #8A94A6; font-size: 12px; }
+
+QProgressBar#pbar {
+    background: #E9EDF4; border: none; border-radius: 5px;
+    min-height: 8px; max-height: 8px;
+}
+QProgressBar#pbar::chunk {
+    border-radius: 5px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2E5BFF, stop:1 #5B83FF);
+}
+
+#dfoot {
+    border-top: 1px solid #E6E9EF;
+    border-bottom-left-radius: 17px; border-bottom-right-radius: 17px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #FFFFFF, stop:1 #FBFCFE);
+}
+#hintText { color: #8A94A6; font-size: 12px; }
+
+#cancelBtn {
+    background: #FFFFFF; color: #475569; border: 1px solid #D7DCE5;
+    border-radius: 11px; font-size: 14px; font-weight: 700; padding: 11px 20px;
+}
+#cancelBtn:hover { background: #F4F6FA; color: #0E1726; border: 1px solid #C7CFDC; }
+
+#installBtn {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3463FF, stop:1 #2E5BFF);
+    color: #FFFFFF; border: none; border-radius: 11px;
+    font-size: 14px; font-weight: 700; padding: 11px 20px;
+}
+#installBtn:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3E6CFF, stop:1 #3463FF);
+}
+#installBtn:disabled { background: #A9BEFF; color: #EAF0FF; }
+
+QMenu#modelMenu {
+    background: #FFFFFF; border: 1px solid #D7DCE5; border-radius: 10px; padding: 6px;
+}
+QMenu#modelMenu::item {
+    padding: 9px 14px; border-radius: 7px; color: #0E1726; font-size: 13px;
+}
+QMenu#modelMenu::item:selected { background: #EEF3FF; color: #1E40C8; }
+"""
+
+
+class _DragHeader(QFrame):
+    """Header strip that drags the frameless dialog (mirrors the app windows)."""
+
+    def __init__(self, window: QWidget, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._window = window
+        self._drag_start: QPoint | None = None
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self._drag_start = (
+                event.globalPosition().toPoint()
+                - self._window.frameGeometry().topLeft()
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._drag_start is not None and event.buttons() & Qt.LeftButton:
+            self._window.move(event.globalPosition().toPoint() - self._drag_start)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        self._drag_start = None
+        super().mouseReleaseEvent(event)
+
+
+class _ClickableFrame(QFrame):
+    """Framed row that opens the model menu when clicked."""
+
+    clicked = Signal()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class ModelSetupDialog(QDialog):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("VERITAS Model Setup")
-        self.setMinimumWidth(520)
+        # Frameless, translucent rounded card — the same chrome convention the
+        # app's main / editor / assist windows use.
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setStyleSheet(_DIALOG_QSS)
+
         self._settings = load_settings()
         self._selected_embedding_id = DEFAULT_EMBEDDING_MODEL_ID
         selected_llm = selected_model_from_settings(self._settings)
         selected_embedding = selected_embedding_from_settings(self._settings)
         self._selected_embedding_id = selected_embedding.id
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-
-        title = QLabel("Select the local GGUF model VERITAS should load.")
-        title.setWordWrap(True)
-        layout.addWidget(title)
-
-        self.model_combo = QComboBox()
+        # Hidden data model behind the styled selector: keeps selected_llm_id()
+        # and the currentIndexChanged -> refresh wiring identical to before.
+        self.model_combo = QComboBox(self)
         for spec in llm_models():
             installed = "installed" if find_model_file(spec) else "not installed"
             self.model_combo.addItem(
@@ -176,42 +409,367 @@ class ModelSetupDialog(QDialog):
             )
         index = max(0, self.model_combo.findData(selected_llm.id))
         self.model_combo.setCurrentIndex(index)
-        self.model_combo.currentIndexChanged.connect(self._refresh_status)
-        layout.addWidget(self.model_combo)
+        self.model_combo.hide()
 
-        embedding_label = QLabel(
-            f"Embedding: {selected_embedding.short_name} "
-            f"({bytes_label(selected_embedding.size_bytes)})"
-        )
-        embedding_label.setWordWrap(True)
-        layout.addWidget(embedding_label)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(48, 34, 48, 64)
+        outer.setSpacing(0)
 
-        self.disk_label = QLabel()
-        self.disk_label.setWordWrap(True)
-        layout.addWidget(self.disk_label)
+        card = QFrame()
+        card.setObjectName("dialog")
+        card.setFixedWidth(560)
+        shadow = QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(44)
+        shadow.setXOffset(0)
+        shadow.setYOffset(18)
+        shadow.setColor(QColor(12, 18, 32, 80))
+        card.setGraphicsEffect(shadow)
+        outer.addWidget(card)
 
-        self.status_label = QLabel()
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(0, 0, 0, 0)
+        card_layout.setSpacing(0)
+        card_layout.addWidget(self._build_header())
+        card_layout.addWidget(self._build_body(selected_embedding))
+        card_layout.addWidget(self._build_footer())
 
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        layout.addWidget(self.progress)
-
-        actions = QHBoxLayout()
-        actions.addStretch(1)
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.clicked.connect(self.reject)
-        self.install_button = QPushButton("Install / Continue")
-        self.install_button.clicked.connect(self._install_or_accept)
-        actions.addWidget(self.cancel_button)
-        actions.addWidget(self.install_button)
-        layout.addLayout(actions)
+        # Re-wire the original refresh trigger now that the widgets exist.
+        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
 
         self._thread: QThread | None = None
         self._worker: DownloadWorker | None = None
+        self._sync_combo_display()
         self._refresh_status()
+
+    # ----- construction helpers (presentation only) -----------------------
+    def _build_header(self) -> QWidget:
+        header = _DragHeader(self)
+        header.setObjectName("dhead")
+        lay = QHBoxLayout(header)
+        lay.setContentsMargins(28, 22, 22, 22)
+        lay.setSpacing(15)
+
+        logo = QFrame()
+        logo.setObjectName("logo")
+        logo.setFixedSize(46, 46)
+        logo_lay = QVBoxLayout(logo)
+        logo_lay.setContentsMargins(0, 0, 0, 0)
+        logo_icon = QLabel()
+        logo_icon.setAlignment(Qt.AlignCenter)
+        logo_icon.setPixmap(_svg_pixmap(_line_icon(_ICON_LOGO_V, "#FFFFFF", width=2.8), 25))
+        logo_lay.addWidget(logo_icon)
+        lay.addWidget(logo, 0, Qt.AlignVCenter)
+
+        txt_w = QWidget()
+        txt = QVBoxLayout(txt_w)
+        txt.setContentsMargins(0, 0, 0, 0)
+        txt.setSpacing(3)
+        txt.addStretch(1)
+        title = QLabel("모델 설정")
+        title.setObjectName("headTitle")
+        subtitle = QLabel("VERITAS · 로컬 AI 모델 준비")
+        subtitle.setObjectName("headSub")
+        txt.addWidget(title)
+        txt.addWidget(subtitle)
+        txt.addStretch(1)
+        lay.addWidget(txt_w)
+
+        lay.addStretch(1)
+
+        close_btn = QPushButton("✕")
+        close_btn.setObjectName("closeBtn")
+        close_btn.setFixedSize(30, 30)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.clicked.connect(self.reject)
+        lay.addWidget(close_btn, 0, Qt.AlignVCenter)
+        return header
+
+    def _build_body(self, embedding_spec) -> QWidget:
+        body = QFrame()
+        body.setObjectName("dbody")
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(28, 24, 28, 12)
+        lay.setSpacing(0)
+
+        lead = QLabel(
+            "VERITAS가 로드할 "
+            '<span style="color:#0E1726; font-weight:700;">로컬 LLM 모델</span>'
+            "을 선택하세요."
+        )
+        lead.setObjectName("lead")
+        lead.setTextFormat(Qt.RichText)
+        lead.setWordWrap(True)
+        lay.addWidget(lead)
+        lay.addSpacing(20)
+
+        field = QLabel("AI 모델")
+        field.setObjectName("fieldLabel")
+        lay.addWidget(field)
+        lay.addSpacing(8)
+
+        lay.addWidget(self._build_combo())
+        lay.addSpacing(18)
+
+        lay.addWidget(self._build_rows(embedding_spec))
+        lay.addSpacing(20)
+
+        lay.addWidget(self._build_statusbox())
+        return body
+
+    def _build_combo(self) -> QWidget:
+        combo = _ClickableFrame()
+        combo.setObjectName("combo")
+        combo.setCursor(Qt.PointingHandCursor)
+        combo.clicked.connect(self._open_model_menu)
+        self._combo_frame = combo
+        lay = QHBoxLayout(combo)
+        lay.setContentsMargins(15, 13, 15, 13)
+        lay.setSpacing(12)
+
+        icon = QFrame()
+        icon.setObjectName("micon")
+        icon.setFixedSize(34, 34)
+        icon_lay = QVBoxLayout(icon)
+        icon_lay.setContentsMargins(0, 0, 0, 0)
+        icon_lbl = QLabel()
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setPixmap(_svg_pixmap(_line_icon(_ICON_MODEL, "#2E5BFF"), 18))
+        icon_lay.addWidget(icon_lbl)
+        lay.addWidget(icon, 0, Qt.AlignVCenter)
+
+        info_w = QWidget()
+        info = QVBoxLayout(info_w)
+        info.setContentsMargins(0, 0, 0, 0)
+        info.setSpacing(2)
+        info.addStretch(1)
+        self._combo_name = QLabel("—")
+        self._combo_name.setObjectName("comboName")
+        self._combo_meta = QLabel("—")
+        self._combo_meta.setObjectName("comboMeta")
+        info.addWidget(self._combo_name)
+        info.addWidget(self._combo_meta)
+        info.addStretch(1)
+        lay.addWidget(info_w, 1)
+
+        self._combo_badge = QLabel("미설치")
+        self._combo_badge.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self._combo_badge, 0, Qt.AlignVCenter)
+
+        caret = QLabel()
+        caret.setAlignment(Qt.AlignCenter)
+        caret.setPixmap(_svg_pixmap(_line_icon(_ICON_CARET, "#8A94A6", width=2), 18))
+        lay.addWidget(caret, 0, Qt.AlignVCenter)
+        return combo
+
+    def _build_rows(self, embedding_spec) -> QWidget:
+        rows = QWidget()
+        lay = QVBoxLayout(rows)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+
+        embed_value = (
+            f"{embedding_spec.short_name} · {bytes_label(embedding_spec.size_bytes)}"
+        )
+        embed_row, _, _ = self._make_row(
+            "riBlue", _ICON_ATOM, "#2E5BFF",
+            "임베딩 모델", "검색·검증에 사용 · 자동 포함", embed_value,
+        )
+        lay.addWidget(embed_row)
+
+        storage_row, _, self._storage_value = self._make_row(
+            "riSlate", _ICON_DB, "#5A6678",
+            "저장 공간", _short_path(model_root()), "—",
+        )
+        storage_row.setToolTip(str(model_root()))
+        lay.addWidget(storage_row)
+        return rows
+
+    def _make_row(self, icon_obj, icon_body, icon_color, label, sub, value):
+        row = QFrame()
+        row.setObjectName("row")
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(15, 13, 15, 13)
+        lay.setSpacing(13)
+
+        icon = QFrame()
+        icon.setObjectName(icon_obj)
+        icon.setFixedSize(34, 34)
+        icon_lay = QVBoxLayout(icon)
+        icon_lay.setContentsMargins(0, 0, 0, 0)
+        icon_lbl = QLabel()
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setPixmap(_svg_pixmap(_line_icon(icon_body, icon_color), 18))
+        icon_lay.addWidget(icon_lbl)
+        lay.addWidget(icon, 0, Qt.AlignVCenter)
+
+        text_w = QWidget()
+        text = QVBoxLayout(text_w)
+        text.setContentsMargins(0, 0, 0, 0)
+        text.setSpacing(2)
+        text.addStretch(1)
+        label_lbl = QLabel(label)
+        label_lbl.setObjectName("rowLabel")
+        sub_lbl = QLabel(sub)
+        sub_lbl.setObjectName("rowSub")
+        text.addWidget(label_lbl)
+        text.addWidget(sub_lbl)
+        text.addStretch(1)
+        lay.addWidget(text_w, 1)
+
+        value_lbl = QLabel(value)
+        value_lbl.setObjectName("rowValue")
+        value_lbl.setTextFormat(Qt.RichText)
+        value_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        lay.addWidget(value_lbl, 0, Qt.AlignVCenter)
+        return row, sub_lbl, value_lbl
+
+    def _build_statusbox(self) -> QWidget:
+        box = QFrame()
+        box.setObjectName("statusbox")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(16, 15, 16, 15)
+        lay.setSpacing(0)
+
+        line = QHBoxLayout()
+        line.setContentsMargins(0, 0, 0, 0)
+        line.setSpacing(9)
+        self._status_dot = QFrame()
+        self._status_dot.setFixedSize(8, 8)
+        self._set_dot("ready")
+        line.addWidget(self._status_dot, 0, Qt.AlignVCenter)
+        self.status_label = QLabel("…")
+        self.status_label.setObjectName("statusText")
+        self.status_label.setWordWrap(True)
+        line.addWidget(self.status_label, 1)
+        lay.addLayout(line)
+
+        self._progress_area = QWidget()
+        area = QVBoxLayout(self._progress_area)
+        area.setContentsMargins(0, 12, 0, 0)
+        area.setSpacing(9)
+        self.progress = QProgressBar()
+        self.progress.setObjectName("pbar")
+        self.progress.setTextVisible(False)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        area.addWidget(self.progress)
+        meta = QHBoxLayout()
+        meta.setContentsMargins(0, 0, 0, 0)
+        meta.setSpacing(0)
+        self._pleft = QLabel("")
+        self._pleft.setObjectName("pleft")
+        self._pright = QLabel("")
+        self._pright.setObjectName("pright")
+        meta.addWidget(self._pleft)
+        meta.addStretch(1)
+        meta.addWidget(self._pright)
+        area.addLayout(meta)
+        lay.addWidget(self._progress_area)
+        self._progress_area.setVisible(False)
+        return box
+
+    def _build_footer(self) -> QWidget:
+        foot = QFrame()
+        foot.setObjectName("dfoot")
+        lay = QHBoxLayout(foot)
+        lay.setContentsMargins(28, 18, 28, 24)
+        lay.setSpacing(10)
+
+        hint = QWidget()
+        hint_lay = QHBoxLayout(hint)
+        hint_lay.setContentsMargins(0, 0, 0, 0)
+        hint_lay.setSpacing(6)
+        hint_icon = QLabel()
+        hint_icon.setAlignment(Qt.AlignCenter)
+        hint_icon.setPixmap(_svg_pixmap(_line_icon(_ICON_LOCK, "#8A94A6"), 14))
+        hint_text = QLabel("오프라인 · 데이터는 기기에만 저장")
+        hint_text.setObjectName("hintText")
+        hint_lay.addWidget(hint_icon)
+        hint_lay.addWidget(hint_text)
+        lay.addWidget(hint, 0, Qt.AlignVCenter)
+
+        lay.addStretch(1)
+
+        self.cancel_button = QPushButton("취소")
+        self.cancel_button.setObjectName("cancelBtn")
+        self.cancel_button.setCursor(Qt.PointingHandCursor)
+        self.cancel_button.clicked.connect(self.reject)
+        lay.addWidget(self.cancel_button)
+
+        self.install_button = QPushButton("설치하고 계속")
+        self.install_button.setObjectName("installBtn")
+        self.install_button.setCursor(Qt.PointingHandCursor)
+        self.install_button.setIcon(
+            QIcon(_svg_pixmap(_line_icon(_ICON_DOWNLOAD, "#FFFFFF", width=2), 16))
+        )
+        self.install_button.setIconSize(QSize(16, 16))
+        self.install_button.clicked.connect(self._install_or_accept)
+        lay.addWidget(self.install_button)
+        return foot
+
+    # ----- small UI-state helpers -----------------------------------------
+    def _set_dot(self, state: str) -> None:
+        color = "#2E5BFF" if state == "busy" else "#16A36A"
+        self._status_dot.setStyleSheet(f"background: {color}; border-radius: 4px;")
+
+    def _set_downloading(self, on: bool) -> None:
+        self._progress_area.setVisible(on)
+        self._set_dot("busy" if on else "ready")
+        self.install_button.setText("설치 중…" if on else "설치하고 계속")
+
+    def _set_combo_badge(self, installed: bool) -> None:
+        if installed:
+            self._combo_badge.setText("설치됨")
+            self._combo_badge.setStyleSheet(
+                "background: #E7F6EF; color: #16A36A; border-radius: 9px;"
+                " padding: 3px 9px; font-size: 11px; font-weight: 700;"
+            )
+        else:
+            self._combo_badge.setText("미설치")
+            self._combo_badge.setStyleSheet(
+                "background: #FFF1E8; color: #C2682B; border-radius: 9px;"
+                " padding: 3px 9px; font-size: 11px; font-weight: 700;"
+            )
+
+    def _sync_combo_display(self) -> None:
+        spec = get_model(self.selected_llm_id(), kind="llm")
+        self._combo_name.setText(spec.name)
+        self._combo_meta.setText(
+            f"{spec.quantization} · {bytes_label(spec.size_bytes)}"
+        )
+        self._set_combo_badge(find_model_file(spec) is not None)
+
+    def _on_model_changed(self) -> None:
+        self._sync_combo_display()
+        self._refresh_status()
+
+    def _open_model_menu(self) -> None:
+        menu = QMenu(self)
+        menu.setObjectName("modelMenu")
+        menu.setMinimumWidth(self._combo_frame.width())
+        current = self.model_combo.currentIndex()
+        for i in range(self.model_combo.count()):
+            spec = get_model(str(self.model_combo.itemData(i)), kind="llm")
+            tag = "설치됨" if find_model_file(spec) else "미설치"
+            action = menu.addAction(
+                f"{spec.name}    ·    {spec.quantization} · "
+                f"{bytes_label(spec.size_bytes)}    ·    {tag}"
+            )
+            action.setData(i)
+            action.setCheckable(True)
+            action.setChecked(i == current)
+        pos = self._combo_frame.mapToGlobal(QPoint(0, self._combo_frame.height() + 6))
+        chosen = menu.exec(pos)
+        if chosen is not None and chosen.data() is not None:
+            self.model_combo.setCurrentIndex(int(chosen.data()))
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            geometry = self.frameGeometry()
+            geometry.moveCenter(screen.availableGeometry().center())
+            self.move(geometry.topLeft())
 
     def selected_llm_id(self) -> str:
         return str(self.model_combo.currentData())
@@ -228,15 +786,16 @@ class ModelSetupDialog(QDialog):
         free = available_bytes(model_root())
         missing = self._required_specs()
         required = int(sum(spec.size_bytes for spec in missing) * 1.15)
-        self.disk_label.setText(
-            f"Model path: {model_root()} | Free: {bytes_label(free)} | "
-            f"Required: {bytes_label(required)}"
+        self._storage_value.setText(
+            f'<span style="color:#16A36A;">여유 {bytes_label(free)}</span>'
+            f" · 필요 {bytes_label(required)}"
         )
         if missing:
             names = ", ".join(spec.short_name for spec in missing)
-            self.status_label.setText(f"Missing model files: {names}")
+            self.status_label.setText(f"설치 필요: {names}")
         else:
-            self.status_label.setText("All required model files are installed.")
+            self.status_label.setText("필요한 모델 파일이 모두 설치되어 있어요.")
+        self._set_dot("ready")
 
     def _install_or_accept(self) -> None:
         missing = self._required_specs()
@@ -262,6 +821,11 @@ class ModelSetupDialog(QDialog):
         self.install_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
         self.progress.setValue(0)
+        self._set_downloading(True)
+        self.status_label.setText("모델을 다운로드하는 중입니다…")
+        active = get_model(self.selected_llm_id(), kind="llm")
+        self._pleft.setText(f"{active.short_name} 다운로드 중…")
+        self._pright.setText("")
         self._thread = QThread(self)
         self._worker = DownloadWorker(self.selected_llm_id(), self._selected_embedding_id)
         self._worker.moveToThread(self._thread)
@@ -277,17 +841,17 @@ class ModelSetupDialog(QDialog):
     def _on_progress(self, done: int, total: int) -> None:
         if total <= 0:
             self.progress.setRange(0, 0)
+            self._pright.setText("")
             return
         self.progress.setRange(0, 100)
         self.progress.setValue(min(100, int(done * 100 / total)))
-        self.status_label.setText(
-            f"Downloading... {bytes_label(done)} / {bytes_label(total)}"
-        )
+        self._pright.setText(f"{bytes_label(done)} / {bytes_label(total)}")
 
     def _on_failed(self, message: str) -> None:
         self.progress.setRange(0, 100)
         self.install_button.setEnabled(True)
         self.cancel_button.setEnabled(True)
+        self._set_downloading(False)
         QMessageBox.critical(self, "Model download failed", message)
         self._refresh_status()
 
@@ -451,13 +1015,21 @@ def _start_output_stream(process: subprocess.Popen, name: str, path: Path) -> No
             return
         # --screen-debug: the full child output still goes to the log file, but
         # the console shows only the screen pipeline's [screen_debug] lines.
+        # --proactive-debug: same idea for [proactive][*] lines. These two
+        # filters are mutually exclusive; if both are given we keep both.
         screen_only = screen_debug_enabled()
+        proactive_only = proactive_debug_enabled()
+        focused = screen_only or proactive_only
         with path.open("a", encoding="utf-8", errors="replace") as log:
             for line in stream:
                 log.write(line)
                 log.flush()
-                if screen_only:
-                    if "[screen_debug]" in line:
+                if focused:
+                    keep = (
+                        (screen_only and "[screen_debug]" in line)
+                        or (proactive_only and "[proactive]" in line)
+                    )
+                    if keep:
                         print(line, end="", flush=True)
                     continue
                 prefix = "" if line.startswith(("[llm]", "[api]")) else f"[{name}] "
@@ -673,6 +1245,7 @@ def main() -> int:
     # mode (forcing streaming on) and flags the API child to emit the focused
     # screen trace that the relay then filters down to.
     configure_screen_debug_from_argv()
+    configure_proactive_debug_from_argv()
     # Guarantee no orphaned llama-server/API/UI even on a hard launcher kill.
     _install_kill_on_close_job()
     app = QApplication(sys.argv)

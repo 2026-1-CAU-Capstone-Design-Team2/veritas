@@ -43,6 +43,7 @@ from ...components.buttons import AppButton
 from ...components.cards import CardWidget
 from ...components.progress import ResearchProgressBar
 from ...controllers import AgentController, JobCategory, get_job_manager
+from ...theme import theme
 
 _FILTERS = ("전체", "높음", "중간", "낮음")
 # Verification has three task pipelines; reaching "검증 완료" maps to 100%.
@@ -161,21 +162,19 @@ class _SummaryStripe(QFrame):
 	# borrow the app's success/warning/danger tints so the distribution reads at
 	# a glance; 검토 자료 stays neutral white and 점검 필요 항목 takes the indigo
 	# brand accent because it is the actionable (clickable) tile.
+	# (bg, border, value_color, caption_color) as theme tokens, resolved live.
 	_TILE_STYLES = {
-		"total": ("#FFFFFF", "#E2E8F0", "#0F172A", "#64748B"),
-		"high": ("#ECFDF3", "#BBF7D0", "#15803D", "#15803D"),
-		"medium": ("#FFF7ED", "#FED7AA", "#B45309", "#B45309"),
-		"low": ("#FEF2F2", "#FECACA", "#B91C1C", "#B91C1C"),
-		"issues": ("#EEF2FF", "#C7D2FE", "#3730A3", "#4F46E5"),
+		"total": ("surface", "border", "text.primary", "text.secondary"),
+		"high": ("success.bg", "success.border", "success.fg", "success.fg"),
+		"medium": ("warning.bg", "warning.border", "warning.fg2", "warning.fg2"),
+		"low": ("danger.bg", "danger.border", "danger.fg", "danger.fg"),
+		"issues": ("accent.subtle.bg", "accent.subtle.border", "accent.text", "accent"),
 	}
 
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("VerifySummaryStripe")
-		self.setStyleSheet(
-			"QFrame#VerifySummaryStripe { background: transparent; border: none; }"
-			"QLabel#SummaryHint { color: #94A3B8; font-size: 11px; font-weight: 600; }"
-		)
+		self._tiles: list[dict[str, Any]] = []
 		outer = QVBoxLayout(self)
 		outer.setContentsMargins(0, 0, 0, 0)
 		outer.setSpacing(8)
@@ -203,6 +202,46 @@ class _SummaryStripe(QFrame):
 		outer.addWidget(self._hint, 0, Qt.AlignRight)
 
 		self._issue_count = 0
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		self.setStyleSheet(
+			"QFrame#VerifySummaryStripe { background: transparent; border: none; }"
+			f"QLabel#SummaryHint {{ color: {theme.color('text.muted')}; font-size: 11px;"
+			" font-weight: 600; }"
+		)
+		for tile in self._tiles:
+			self._style_tile(tile)
+
+	def _style_tile(self, tile: dict[str, Any]) -> None:
+		bg, border, value_color, caption_color = (
+			theme.color(token) for token in self._TILE_STYLES[tile["key"]]
+		)
+		if tile["clickable"]:
+			tile["frame"].setStyleSheet(
+				f"QFrame#SummaryTile {{ background-color: {bg}; border: 1px solid {border};"
+				f" border-radius: 12px; }}"
+				f"QFrame#SummaryTile:hover {{ border-color: {value_color}; }}"
+			)
+		else:
+			tile["frame"].setStyleSheet(
+				f"QFrame#SummaryTile {{ background-color: {bg}; border: 1px solid {border};"
+				f" border-radius: 12px; }}"
+			)
+		tile["caption"].setStyleSheet(
+			f"color: {caption_color}; font-size: 11px; font-weight: 800;"
+			" background: transparent; border: none;"
+		)
+		tile["value"].setStyleSheet(
+			f"color: {value_color}; font-size: 26px; font-weight: 800;"
+			" background: transparent; border: none;"
+		)
+		if tile["action"] is not None:
+			tile["action"].setStyleSheet(
+				f"color: {value_color}; font-size: 10px; font-weight: 700;"
+				" background: transparent; border: none;"
+			)
 
 	def _tile(
 		self,
@@ -212,53 +251,36 @@ class _SummaryStripe(QFrame):
 		clickable: bool = False,
 		action_hint: str = "",
 	) -> dict[str, Any]:
-		bg, border, value_color, caption_color = self._TILE_STYLES[key]
 		frame = QFrame()
 		frame.setObjectName("SummaryTile")
-		frame.setStyleSheet(
-			f"QFrame#SummaryTile {{ background-color: {bg}; border: 1px solid {border};"
-			f" border-radius: 12px; }}"
-			f"QFrame#SummaryTile:hover {{ border-color: {value_color}; }}"
-			if clickable
-			else f"QFrame#SummaryTile {{ background-color: {bg}; border: 1px solid {border};"
-			f" border-radius: 12px; }}"
-		)
 		layout = QVBoxLayout(frame)
 		layout.setContentsMargins(14, 12, 14, 12)
 		layout.setSpacing(3)
 
 		caption_label = QLabel(caption)
-		caption_label.setStyleSheet(
-			f"color: {caption_color}; font-size: 11px; font-weight: 800;"
-			" background: transparent; border: none;"
-		)
 		layout.addWidget(caption_label)
 
 		if clickable:
 			value_label: QLabel = _ClickableLabel("—")
 		else:
 			value_label = QLabel("—")
-		value_label.setStyleSheet(
-			f"color: {value_color}; font-size: 26px; font-weight: 800;"
-			" background: transparent; border: none;"
-		)
 		layout.addWidget(value_label)
 
 		action_label: QLabel | None = None
 		if clickable and action_hint:
 			action_label = QLabel(action_hint)
-			action_label.setStyleSheet(
-				f"color: {value_color}; font-size: 10px; font-weight: 700;"
-				" background: transparent; border: none;"
-			)
 			layout.addWidget(action_label)
 
-		return {
+		tile = {
 			"frame": frame,
 			"caption": caption_label,
 			"value": value_label,
 			"action": action_label,
+			"key": key,
+			"clickable": clickable,
 		}
+		self._tiles.append(tile)
+		return tile
 
 	def apply(self, summary: dict[str, Any] | None) -> None:
 		if not summary or not summary.get("available"):
@@ -318,37 +340,38 @@ class VerifyDetailDialog(QDialog):
 		self.resize(720, 640)
 		self.setStyleSheet(
 			"""
-			QDialog#VerifyDetailDialog { background-color: #F8FAFC; }
+			QDialog#VerifyDetailDialog { background-color: %(surface.muted)s; }
 			QFrame#VerifyDialogHeader {
-				background-color: #FFFFFF; border: 1px solid #E2E8F0;
+				background-color: %(surface)s; border: 1px solid %(border)s;
 				border-radius: 12px;
 			}
 			QFrame#DetailSection {
-				background-color: #FFFFFF; border: 1px solid #E5E7EB;
+				background-color: %(surface)s; border: 1px solid %(border.gray)s;
 				border-radius: 10px;
 			}
 			QLabel#DetailSectionTitle {
-				color: #0F172A; font-size: 13px; font-weight: 800;
+				color: %(text.primary)s; font-size: 13px; font-weight: 800;
 			}
-			QLabel#DetailRowTitle { color: #1F2937; font-size: 12px; font-weight: 700; }
-			QLabel#DetailRowMeta  { color: #64748B; font-size: 11px; font-weight: 600; }
-			QLabel#DetailScore    { color: #4F46E5; font-size: 12px; font-weight: 800; }
+			QLabel#DetailRowTitle { color: %(text.body)s; font-size: 12px; font-weight: 700; }
+			QLabel#DetailRowMeta  { color: %(text.secondary)s; font-size: 11px; font-weight: 600; }
+			QLabel#DetailScore    { color: %(accent)s; font-size: 12px; font-weight: 800; }
 			QLabel#IssueNumber {
-				background-color: #EEF2FF; border: 1px solid #C7D2FE;
-				border-radius: 12px; color: #3730A3; font-size: 11px;
+				background-color: %(accent.subtle.bg)s; border: 1px solid %(accent.subtle.border)s;
+				border-radius: 12px; color: %(accent.text)s; font-size: 11px;
 				font-weight: 800; padding: 3px 8px;
 			}
-			QLabel#SignalLabel { color: #1F2937; font-size: 12px; font-weight: 700; }
-			QLabel#SignalStrong { color: #15803D; font-size: 12px; font-weight: 800; }
-			QLabel#SignalMixed { color: #B45309; font-size: 12px; font-weight: 800; }
-			QLabel#SignalWeak { color: #B91C1C; font-size: 12px; font-weight: 800; }
+			QLabel#SignalLabel { color: %(text.body)s; font-size: 12px; font-weight: 700; }
+			QLabel#SignalStrong { color: %(success.fg)s; font-size: 12px; font-weight: 800; }
+			QLabel#SignalMixed { color: %(warning.fg2)s; font-size: 12px; font-weight: 800; }
+			QLabel#SignalWeak { color: %(danger.fg)s; font-size: 12px; font-weight: 800; }
 			QLabel#MentionKind {
-				background-color: #EEF2FF; color: #3730A3; border: 1px solid #C7D2FE;
+				background-color: %(accent.subtle.bg)s; color: %(accent.text)s; border: 1px solid %(accent.subtle.border)s;
 				border-radius: 10px; padding: 2px 8px; font-size: 10px; font-weight: 800;
 			}
-			QLabel#MentionBatch { color: #64748B; font-size: 10px; font-weight: 700; }
-			QLabel#MentionSnippet { color: #1F2937; font-size: 12px; font-weight: 500; }
+			QLabel#MentionBatch { color: %(text.secondary)s; font-size: 10px; font-weight: 700; }
+			QLabel#MentionSnippet { color: %(text.body)s; font-size: 12px; font-weight: 500; }
 			"""
+			% theme.palette()
 		)
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(18, 18, 18, 18)
@@ -605,10 +628,10 @@ class _MiniBar(QWidget):
 
 		painter = QPainter(self)
 		painter.setRenderHint(QPainter.Antialiasing, True)
-		painter.fillRect(self.rect(), QColor("#E2E8F0"))
+		painter.fillRect(self.rect(), QColor(theme.color("border")))
 		if self._ratio > 0.0:
 			fill_width = max(2, int(self.width() * self._ratio))
-			painter.fillRect(0, 0, fill_width, self.height(), QColor("#6366F1"))
+			painter.fillRect(0, 0, fill_width, self.height(), QColor(theme.color("accent.glyph")))
 
 
 def _normalize_score(value: float, hi: float) -> float:
@@ -622,21 +645,64 @@ def _normalize_score(value: float, hi: float) -> float:
 # ``corpus_weakness`` / ``intent_gap`` were retired with intent_coverage but
 # kept in the palette so a stale workspace's issues_overview still renders
 # the right colour instead of falling through to the neutral default.
+# (bg, fg, border, label) as theme tokens, resolved against the active palette.
 _ISSUE_PALETTE = {
-	"low_reliability": ("#FEE2E2", "#B91C1C", "#FCA5A5", "신뢰도 낮음"),
-	"underweighted_section": ("#FEF3C7", "#B45309", "#FDE68A", "근거 부족"),
-	"conflict": ("#FEE2E2", "#B91C1C", "#FCA5A5", "출처 충돌"),
-	"corpus_weakness": ("#FEE2E2", "#B91C1C", "#FCA5A5", "자료 품질 약함"),
-	"intent_gap": ("#E0E7FF", "#3730A3", "#C7D2FE", "의도 미커버"),
+	"low_reliability": ("danger.bg2", "danger.fg", "danger.border2", "신뢰도 낮음"),
+	"underweighted_section": ("badge.warning.bg", "warning.fg2", "badge.warning.border", "근거 부족"),
+	"conflict": ("danger.bg2", "danger.fg", "danger.border2", "출처 충돌"),
+	"corpus_weakness": ("danger.bg2", "danger.fg", "danger.border2", "자료 품질 약함"),
+	"intent_gap": ("accent.subtle.bg.hover", "accent.text", "accent.subtle.border", "의도 미커버"),
 }
 
-# Role chip palette for ordered flow sections (intro / body / conclusion).
-# Body sits in neutral indigo, intro/conclusion get the warm/cool accents.
+# Role chip palette for ordered flow sections (intro / body / conclusion), as
+# theme tokens. Body sits in neutral indigo, intro/conclusion get warm/cool tints.
 _ROLE_CHIP = {
-	"intro": ("도입", "#DBEAFE", "#1D4ED8", "#BFDBFE"),
-	"body": ("본문", "#EEF2FF", "#3730A3", "#C7D2FE"),
-	"conclusion": ("마무리", "#DCFCE7", "#15803D", "#86EFAC"),
+	"intro": ("도입", "badge.working.bg", "badge.working.fg", "badge.working.border"),
+	"body": ("본문", "accent.subtle.bg", "accent.text", "accent.subtle.border"),
+	"conclusion": ("마무리", "success.bg", "success.fg", "success.border"),
 }
+
+# Results-area chrome (count badge + filter chips), rendered from the palette.
+_COUNT_BADGE_QSS = (
+	"QLabel#ResultsCountBadge {"
+	"  background-color: %(accent.subtle.bg)s; color: %(accent.text)s;"
+	"  border: 1px solid %(accent.subtle.border)s; border-radius: 12px;"
+	"  padding: 4px 12px; font-size: 12px; font-weight: 800;"
+	"}"
+)
+_FILTER_CHIP_QSS = (
+	"QToolButton#VerifyFilterChip {"
+	"  background-color: %(surface.inset)s; color: %(text.slate600)s;"
+	"  border: 1px solid %(border)s; border-radius: 14px;"
+	"  padding: 5px 12px; font-size: 12px; font-weight: 700;"
+	"}"
+	"QToolButton#VerifyFilterChip:hover { border-color: %(border.strong)s; }"
+	"QToolButton#VerifyFilterChip:checked {"
+	"  background-color: %(accent)s; color: %(text.on_accent)s;"
+	"  border: 1px solid %(accent.hover)s;"
+	"}"
+)
+_SECTION_CARD_QSS = (
+	"QFrame#SectionCard { background-color: %(surface)s; border: 1px solid %(border)s; border-radius: 10px; }"
+	"QFrame#SectionCard:hover { border-color: %(accent.glyph)s; }"
+	"QLabel#SectionOrderChip {"
+	"  background-color: %(surface.inset)s; color: %(text.body)s;"
+	"  border: 1px solid %(border.strong)s; border-radius: 13px;"
+	"  font-size: 12px; font-weight: 800; padding: 3px 10px;"
+	"}"
+	"QLabel#SectionRoleChip { font-size: 11px; font-weight: 800; padding: 3px 10px; border-radius: 11px; }"
+	"QLabel#SectionTitle { color: %(text.primary)s; font-size: 14px; font-weight: 800; }"
+	"QLabel#SectionDescription { color: %(text.slate600)s; font-size: 12px; font-weight: 500; }"
+	"QLabel#SectionMeta { color: %(text.secondary)s; font-size: 11px; font-weight: 700; }"
+	"QLabel#SectionAlert { color: %(warning.fg2)s; font-size: 11px; font-weight: 800; }"
+)
+_EMPTY_STATE_QSS = (
+	"QFrame#VerifyEmptyState { background-color: %(surface.inset)s; "
+	"border: 1px dashed %(text.muted)s; border-radius: 12px; }"
+	"QLabel#VerifyEmptyTitle { color: %(text.primary)s; font-size: 16px; font-weight: 800; }"
+	"QLabel#VerifyEmptyBody  { color: %(text.slate600)s; font-size: 13px; font-weight: 500; }"
+	"QLabel#VerifyEmptyHint  { color: %(text.secondary)s; font-size: 12px; font-weight: 600; }"
+)
 
 
 class VerifyIssuesDialog(QDialog):
@@ -655,24 +721,25 @@ class VerifyIssuesDialog(QDialog):
 		self.resize(620, 540)
 		self.setStyleSheet(
 			"""
-			QDialog#VerifyIssuesDialog { background-color: #F8FAFC; }
+			QDialog#VerifyIssuesDialog { background-color: %(surface.muted)s; }
 			QFrame#IssuesHeader {
-				background-color: #FFFFFF; border: 1px solid #E2E8F0;
+				background-color: %(surface)s; border: 1px solid %(border)s;
 				border-radius: 12px;
 			}
 			QFrame#IssueCard {
-				background-color: #FFFFFF; border: 1px solid #E5E7EB;
+				background-color: %(surface)s; border: 1px solid %(border.gray)s;
 				border-radius: 10px;
 			}
 			QLabel#IssueKindChip {
 				font-size: 11px; font-weight: 800;
 				padding: 3px 10px; border-radius: 11px;
 			}
-			QLabel#IssueTitle   { color: #0F172A; font-size: 13px; font-weight: 800; }
-			QLabel#IssueDetail  { color: #1F2937; font-size: 12px; font-weight: 600; }
-			QLabel#IssueHint    { color: #64748B; font-size: 11px; font-weight: 600; }
-			QLabel#IssueMetric  { color: #94A3B8; font-size: 11px; font-weight: 700; }
+			QLabel#IssueTitle   { color: %(text.primary)s; font-size: 13px; font-weight: 800; }
+			QLabel#IssueDetail  { color: %(text.body)s; font-size: 12px; font-weight: 600; }
+			QLabel#IssueHint    { color: %(text.secondary)s; font-size: 11px; font-weight: 600; }
+			QLabel#IssueMetric  { color: %(text.muted)s; font-size: 11px; font-weight: 700; }
 			"""
+			% theme.palette()
 		)
 
 		layout = QVBoxLayout(self)
@@ -727,9 +794,10 @@ class VerifyIssuesDialog(QDialog):
 
 	def _issue_card(self, issue: dict[str, Any]) -> QFrame:
 		kind = str(issue.get("kind") or "")
-		bg, fg, border, kind_label = _ISSUE_PALETTE.get(
-			kind, ("#F1F5F9", "#475569", "#CBD5E1", "기타")
+		bg_t, fg_t, border_t, kind_label = _ISSUE_PALETTE.get(
+			kind, ("surface.inset", "text.slate600", "border.strong", "기타")
 		)
+		bg, fg, border = theme.color(bg_t), theme.color(fg_t), theme.color(border_t)
 
 		card = QFrame()
 		card.setObjectName("IssueCard")
@@ -793,6 +861,14 @@ class _SectionCard(QFrame):
 	# the writer knows the outline asks for more than the corpus has.
 	_UNDERWEIGHTED_MIN = 3
 
+	def _apply_theme(self, *args) -> None:
+		self.setStyleSheet(_SECTION_CARD_QSS % theme.palette())
+		bg, fg, border = (theme.color(token) for token in self._role_tokens)
+		self._role_chip.setStyleSheet(
+			f"QLabel#SectionRoleChip {{ background-color: {bg}; color: {fg};"
+			f" border: 1px solid {border}; }}"
+		)
+
 	def __init__(
 		self,
 		section: dict[str, Any],
@@ -801,20 +877,6 @@ class _SectionCard(QFrame):
 		super().__init__(parent)
 		self._section_id = int(section.get("sectionId") or 0)
 		self.setObjectName("SectionCard")
-		self.setStyleSheet(
-			"QFrame#SectionCard { background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px; }"
-			"QFrame#SectionCard:hover { border-color: #6366F1; }"
-			"QLabel#SectionOrderChip {"
-			"  background-color: #F1F5F9; color: #1F2937;"
-			"  border: 1px solid #CBD5E1; border-radius: 13px;"
-			"  font-size: 12px; font-weight: 800; padding: 3px 10px;"
-			"}"
-			"QLabel#SectionRoleChip { font-size: 11px; font-weight: 800; padding: 3px 10px; border-radius: 11px; }"
-			"QLabel#SectionTitle { color: #0F172A; font-size: 14px; font-weight: 800; }"
-			"QLabel#SectionDescription { color: #475569; font-size: 12px; font-weight: 500; }"
-			"QLabel#SectionMeta { color: #64748B; font-size: 11px; font-weight: 700; }"
-			"QLabel#SectionAlert { color: #B45309; font-size: 11px; font-weight: 800; }"
-		)
 		outer = QHBoxLayout(self)
 		outer.setContentsMargins(14, 12, 14, 12)
 		outer.setSpacing(12)
@@ -839,15 +901,15 @@ class _SectionCard(QFrame):
 		title.setWordWrap(True)
 		head.addWidget(title, 1)
 		role = str(section.get("role") or "body").lower()
-		role_label_text, bg, fg, border = _ROLE_CHIP.get(role, _ROLE_CHIP["body"])
+		role_label_text, bg_t, fg_t, border_t = _ROLE_CHIP.get(role, _ROLE_CHIP["body"])
+		self._role_tokens = (bg_t, fg_t, border_t)
 		role_chip = QLabel(role_label_text)
 		role_chip.setObjectName("SectionRoleChip")
-		role_chip.setStyleSheet(
-			f"QLabel#SectionRoleChip {{ background-color: {bg}; color: {fg};"
-			f" border: 1px solid {border}; }}"
-		)
+		self._role_chip = role_chip
 		head.addWidget(role_chip, 0, Qt.AlignTop)
 		body.addLayout(head)
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
 
 		desc_text = str(section.get("description") or "").strip()
 		if desc_text:
@@ -903,7 +965,9 @@ class _SectionsPanel(CardWidget):
 		# Tiny fallback notice — switches on when ``flow_source != 'llm'``.
 		self._fallback_notice = QLabel("")
 		self._fallback_notice.setObjectName("CardSecondary")
-		self._fallback_notice.setStyleSheet("color: #B45309; font-weight: 700;")
+		self._fallback_notice.setStyleSheet(
+			f"color: {theme.color('warning.fg2')}; font-weight: 700;"
+		)
 		self._fallback_notice.setWordWrap(True)
 		self._fallback_notice.setVisible(False)
 		self.layout.addWidget(self._fallback_notice)
@@ -966,23 +1030,24 @@ class VerifySectionDetailDialog(QDialog):
 		self.resize(720, 600)
 		self.setStyleSheet(
 			"""
-			QDialog#VerifySectionDialog { background-color: #F8FAFC; }
+			QDialog#VerifySectionDialog { background-color: %(surface.muted)s; }
 			QFrame#SectionDialogHeader {
-				background-color: #FFFFFF; border: 1px solid #E2E8F0;
+				background-color: %(surface)s; border: 1px solid %(border)s;
 				border-radius: 12px;
 			}
 			QFrame#SentenceRow {
-				background-color: #FFFFFF; border: 1px solid #E5E7EB;
+				background-color: %(surface)s; border: 1px solid %(border.gray)s;
 				border-radius: 10px;
 			}
-			QLabel#SectionDialogTitle { color: #0F172A; font-size: 15px; font-weight: 800; }
-			QLabel#SectionDialogDesc  { color: #475569; font-size: 12px; font-weight: 500; }
-			QLabel#SectionDialogMeta  { color: #64748B; font-size: 11px; font-weight: 600; }
-			QLabel#SentenceSource { color: #4F46E5; font-size: 11px; font-weight: 800; }
-			QLabel#SentenceLocator { color: #94A3B8; font-size: 10px; font-weight: 700; }
-			QLabel#SentenceBody { color: #1F2937; font-size: 13px; font-weight: 500; }
+			QLabel#SectionDialogTitle { color: %(text.primary)s; font-size: 15px; font-weight: 800; }
+			QLabel#SectionDialogDesc  { color: %(text.slate600)s; font-size: 12px; font-weight: 500; }
+			QLabel#SectionDialogMeta  { color: %(text.secondary)s; font-size: 11px; font-weight: 600; }
+			QLabel#SentenceSource { color: %(accent)s; font-size: 11px; font-weight: 800; }
+			QLabel#SentenceLocator { color: %(text.muted)s; font-size: 10px; font-weight: 700; }
+			QLabel#SentenceBody { color: %(text.body)s; font-size: 13px; font-weight: 500; }
 			QLabel#SectionDialogRoleChip { font-size: 11px; font-weight: 800; padding: 3px 10px; border-radius: 11px; }
 			"""
+			% theme.palette()
 		)
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(18, 18, 18, 18)
@@ -1046,7 +1111,8 @@ class VerifySectionDetailDialog(QDialog):
 		title.setWordWrap(True)
 		title_row.addWidget(title, 1)
 		role = str(section.get("role") or "body").lower()
-		role_label_text, bg, fg, border = _ROLE_CHIP.get(role, _ROLE_CHIP["body"])
+		role_label_text, bg_t, fg_t, border_t = _ROLE_CHIP.get(role, _ROLE_CHIP["body"])
+		bg, fg, border = theme.color(bg_t), theme.color(fg_t), theme.color(border_t)
 		role_chip = QLabel(role_label_text)
 		role_chip.setObjectName("SectionDialogRoleChip")
 		role_chip.setStyleSheet(
@@ -1122,16 +1188,14 @@ class _EmptyStateCard(CardWidget):
 	the run completes the card is dropped and the real results render.
 	"""
 
+	def _apply_theme(self, *args) -> None:
+		self.setStyleSheet(_EMPTY_STATE_QSS % theme.palette())
+
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(title=None, parent=parent)
 		self.setObjectName("VerifyEmptyState")
-		self.setStyleSheet(
-			"QFrame#VerifyEmptyState { background-color: #F1F5F9; "
-			"border: 1px dashed #94A3B8; border-radius: 12px; }"
-			"QLabel#VerifyEmptyTitle { color: #0F172A; font-size: 16px; font-weight: 800; }"
-			"QLabel#VerifyEmptyBody  { color: #475569; font-size: 13px; font-weight: 500; }"
-			"QLabel#VerifyEmptyHint  { color: #64748B; font-size: 12px; font-weight: 600; }"
-		)
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
 		title = QLabel("이 워크스페이스에는 아직 검증 결과가 없습니다.")
 		title.setObjectName("VerifyEmptyTitle")
 		title.setWordWrap(True)
@@ -1176,9 +1240,9 @@ def _summary_for_level(level: str) -> str:
 # Left-accent colour per reliability band — saturated versions of the badge
 # tones so a scanning reader spots the band from the card edge alone.
 _LEVEL_ACCENT = {
-	"높음": "#22C55E",
-	"중간": "#F59E0B",
-	"낮음": "#EF4444",
+	"높음": "verify.band.high",
+	"중간": "verify.band.medium",
+	"낮음": "verify.band.low",
 }
 
 
@@ -1196,20 +1260,21 @@ class _VerifyResultCard(QFrame):
 	def __init__(self, item: dict[str, Any], parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		level = str(item.get("level") or "")
-		accent = _LEVEL_ACCENT.get(level, "#94A3B8")
+		accent = theme.color(_LEVEL_ACCENT.get(level, "text.muted"))
+		p = theme.palette()
 		self.setObjectName("VerifyResultCard")
 		self.setStyleSheet(
-			f"QFrame#VerifyResultCard {{ background-color: #FFFFFF;"
-			f" border: 1px solid #E2E8F0; border-left: 5px solid {accent};"
+			f"QFrame#VerifyResultCard {{ background-color: {p['surface']};"
+			f" border: 1px solid {p['border']}; border-left: 5px solid {accent};"
 			f" border-radius: 12px; }}"
-			f"QFrame#VerifyResultCard:hover {{ border-color: #C7D2FE;"
+			f"QFrame#VerifyResultCard:hover {{ border-color: {p['accent.subtle.border']};"
 			f" border-left-color: {accent}; }}"
-			"QLabel#ResultTitle { color: #0F172A; font-size: 14px; font-weight: 800;"
-			" background: transparent; border: none; }"
-			"QLabel#ResultSubtitle { color: #64748B; font-size: 12px; font-weight: 600;"
-			" background: transparent; border: none; }"
-			"QLabel#ResultFooter { color: #475569; font-size: 12px; font-weight: 500;"
-			" background: transparent; border: none; }"
+			f"QLabel#ResultTitle {{ color: {p['text.primary']}; font-size: 14px; font-weight: 800;"
+			f" background: transparent; border: none; }}"
+			f"QLabel#ResultSubtitle {{ color: {p['text.secondary']}; font-size: 12px; font-weight: 600;"
+			f" background: transparent; border: none; }}"
+			f"QLabel#ResultFooter {{ color: {p['text.slate600']}; font-size: 12px; font-weight: 500;"
+			f" background: transparent; border: none; }}"
 		)
 
 		shadow = QGraphicsDropShadowEffect(self)
@@ -1246,7 +1311,7 @@ class _VerifyResultCard(QFrame):
 		footer_row.setSpacing(7)
 		dot = QLabel("●")
 		dot.setStyleSheet(
-			f"color: {accent if issues else '#94A3B8'}; font-size: 9px;"
+			f"color: {accent if issues else theme.color('text.muted')}; font-size: 9px;"
 			" background: transparent; border: none;"
 		)
 		footer_row.addWidget(dot, 0, Qt.AlignTop)
@@ -1373,13 +1438,7 @@ class VerifyPage(QWidget):
 
 		self._results_count_badge = QLabel("총 0개 자료")
 		self._results_count_badge.setObjectName("ResultsCountBadge")
-		self._results_count_badge.setStyleSheet(
-			"QLabel#ResultsCountBadge {"
-			"  background-color: #EEF2FF; color: #3730A3;"
-			"  border: 1px solid #C7D2FE; border-radius: 12px;"
-			"  padding: 4px 12px; font-size: 12px; font-weight: 800;"
-			"}"
-		)
+		self._results_count_badge.setStyleSheet(_COUNT_BADGE_QSS % theme.palette())
 		results_header.layout.addWidget(self._results_count_badge, 0, Qt.AlignLeft)
 
 		results_header_caption = QLabel(
@@ -1406,22 +1465,13 @@ class VerifyPage(QWidget):
 		filter_row.addStretch(1)
 		# Chip stylesheet — checked = brand color, unchecked = subdued. Applied
 		# on the filter row so chip count widgets inherit the same palette.
-		results_header.setStyleSheet(
-			"QToolButton#VerifyFilterChip {"
-			"  background-color: #F1F5F9; color: #475569;"
-			"  border: 1px solid #E2E8F0; border-radius: 14px;"
-			"  padding: 5px 12px; font-size: 12px; font-weight: 700;"
-			"}"
-			"QToolButton#VerifyFilterChip:hover { border-color: #CBD5E1; }"
-			"QToolButton#VerifyFilterChip:checked {"
-			"  background-color: #4F46E5; color: #FFFFFF;"
-			"  border: 1px solid #4338CA;"
-			"}"
-		)
+		results_header.setStyleSheet(_FILTER_CHIP_QSS % theme.palette())
 		self._filter_buttons[self._active_filter].setChecked(True)
 		results_header.layout.addLayout(filter_row)
 		root.addWidget(results_header)
 		self._results_header = results_header
+		# Re-tint results chrome + rebuild result cards on a light/dark toggle.
+		theme.themeChanged.connect(self._apply_theme)
 
 		self._content_layout = QVBoxLayout()
 		self._content_layout.setContentsMargins(0, 0, 0, 0)
@@ -1547,6 +1597,15 @@ class VerifyPage(QWidget):
 		self._sync_run_button()
 		self._stop_poller()
 
+	# -- theme ----------------------------------------------------------------
+
+	def _apply_theme(self, *args) -> None:
+		"""Re-tint the results chrome and rebuild the (cached) result cards so
+		the verify page follows a light/dark toggle."""
+		self._results_count_badge.setStyleSheet(_COUNT_BADGE_QSS % theme.palette())
+		self._results_header.setStyleSheet(_FILTER_CHIP_QSS % theme.palette())
+		self._render_results()
+
 	# -- data loading ---------------------------------------------------------
 
 	def _refresh_data(self) -> None:
@@ -1653,8 +1712,9 @@ class VerifyPage(QWidget):
 				empty_card = CardWidget(title=None)
 				empty_card.setObjectName("VerifyEmptyResults")
 				empty_card.setStyleSheet(
-					"QFrame#VerifyEmptyResults { background-color: #F1F5F9;"
-					" border: 1px dashed #94A3B8; border-radius: 12px; }"
+					"QFrame#VerifyEmptyResults { background-color: %(surface.inset)s;"
+					" border: 1px dashed %(text.muted)s; border-radius: 12px; }"
+					% theme.palette()
 				)
 				empty_title = QLabel("표시할 자료별 결과가 없습니다")
 				empty_title.setObjectName("CardTitle")

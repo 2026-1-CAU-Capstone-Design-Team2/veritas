@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 
 from ..api_common import STATE, load_bootstrap_state, switch_workspace
 from ..controllers import JobCategory, get_job_manager
+from ..theme import theme
 
 
 class NavButton(QPushButton):
@@ -47,6 +48,7 @@ class NavButton(QPushButton):
 		self.toggled.connect(self._on_toggled)
 
 		self._apply_style()
+		theme.themeChanged.connect(self._apply_style)
 
 	def _on_toggled(self, checked: bool) -> None:
 		self.setIcon(self._icon_active if checked else self._icon_default)
@@ -76,11 +78,11 @@ class NavButton(QPushButton):
 		self.style().unpolish(self)
 		self.style().polish(self)
 
-	def _apply_style(self) -> None:
-		# Static stylesheet — set once on construction and on compact toggle, not
-		# per animation frame. Hover state is driven by the `hovered` dynamic
-		# property; the checked rule is listed last so it wins for a checked
-		# button that is also hovered.
+	def _apply_style(self, *args) -> None:
+		# Static stylesheet — set once on construction, on compact toggle, and on
+		# theme change, not per animation frame. Hover state is driven by the
+		# `hovered` dynamic property; the checked rule is listed last so it wins
+		# for a checked button that is also hovered.
 		left_pad = 12 if not self._compact else 0
 		right_pad = 12 if not self._compact else 0
 		align = "left" if not self._compact else "center"
@@ -91,18 +93,18 @@ class NavButton(QPushButton):
 				border: 1px solid rgba(255, 255, 255, 0);
 				border-radius: 11px;
 				padding: 10px {right_pad}px 10px {left_pad}px;
-				color: #D6DBE5;
+				color: {theme.color('sidebar.nav.text')};
 				background-color: rgba(255, 255, 255, 0);
 				font-size: 13px;
 				font-weight: 600;
 			}}
 			QPushButton#NavButton[hovered="true"] {{
-				background-color: rgba(255, 255, 255, 18);
+				background-color: {theme.color('sidebar.nav.hover')};
 			}}
 			QPushButton#NavButton:checked {{
-				background-color: rgba(99, 102, 241, 48);
-				border: 1px solid rgba(165, 180, 252, 148);
-				color: #F8FAFC;
+				background-color: {theme.color('sidebar.nav.checked.bg')};
+				border: 1px solid {theme.color('sidebar.nav.checked.border')};
+				color: {theme.color('sidebar.nav.checked.text')};
 				font-weight: 700;
 			}}
 			"""
@@ -124,6 +126,10 @@ class CollapseButton(QPushButton):
 		self.setFixedSize(30, 30)
 		self.setCursor(Qt.PointingHandCursor)
 		self._points_right = False
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		self.update()
 
 	def set_points_right(self, points_right: bool) -> None:
 		self._points_right = points_right
@@ -135,7 +141,7 @@ class CollapseButton(QPushButton):
 		painter.setRenderHint(QPainter.Antialiasing, True)
 		center = self.rect().center()
 		cx, cy = center.x() + 0.5, center.y() + 0.5
-		pen = QPen(QColor("#FFFFFF"))
+		pen = QPen(QColor(theme.color("sidebar.chevron")))
 		pen.setWidthF(2.6)
 		pen.setCapStyle(Qt.RoundCap)
 		pen.setJoinStyle(Qt.RoundJoin)

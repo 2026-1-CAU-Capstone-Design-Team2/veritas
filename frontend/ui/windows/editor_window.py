@@ -71,9 +71,8 @@ from ...controllers import (
     get_job_manager,
 )
 from ..markdown_view import render_markdown_html
+from ...theme import build_editor_qss, theme
 from .document_assist_window import (
-    CHAT_QSS,
-    VERITAS_TITLEBAR_QSS,
     ChatInputBar,
     ChatPanel,
     TypingIndicator,
@@ -81,8 +80,6 @@ from .document_assist_window import (
     render_history_html,
 )
 
-
-GHOST_COLOR = "#9AA0A6"
 
 # Window-control glyphs. The previous plain-text symbols (－ ▢ ×) render as tofu
 # in the UI font; these are the standard Private-Use codepoints in Windows'
@@ -243,7 +240,10 @@ class MarkdownSourceEdit(QTextEdit):
 
     ghostAccepted = Signal()
     ghostDismissed = Signal()
-    ghostRetryRequested = Signal()
+    # Carries the ghost text the user was looking at when they hit "다시" so
+    # the backend can pass it to the LLM as a "do NOT repeat this" hint.
+    # See services/proactive/README.md §"Native reject ladder".
+    ghostRetryRequested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -302,7 +302,7 @@ class MarkdownSourceEdit(QTextEdit):
     @staticmethod
     def _ghost_format() -> QTextCharFormat:
         fmt = QTextCharFormat()
-        fmt.setForeground(QColor(GHOST_COLOR))
+        fmt.setForeground(QColor(theme.color("editor.ghost")))
         return fmt
 
     # -- ghost state ----------------------------------------------------------
@@ -405,8 +405,12 @@ class MarkdownSourceEdit(QTextEdit):
             self.ghostDismissed.emit()
 
     def _request_retry(self) -> None:
+        # Snapshot the ghost text BEFORE _reset_ghost wipes ``self._ghost_text``.
+        # The signal carries it to ``_on_ghost_retry`` which forwards it to the
+        # backend as the "previous rejected suggestion" the LLM must avoid.
+        prev_text = self._ghost_text or ""
         self._reset_ghost()
-        self.ghostRetryRequested.emit()
+        self.ghostRetryRequested.emit(prev_text)
 
     def accept_ghost(self) -> None:
         if not self._ghost_text:
@@ -760,6 +764,16 @@ class EditorWindow(QWidget):
         # Quick-action target: (start, end, is_insert) — where 본문에 대치 writes.
         self._assist_target: tuple[int, int, bool] | None = None
 
+        # Proactive bandit feedback wiring (see services/proactive/*).
+        # When the backend's /editor/suggest wrapper rolls intervene, the SSE
+        # start event carries ``decisionId`` — we cache it here so TAB / ESC /
+        # 다시 / inactivity can map onto /api/v1/proactive/feedback.
+        self._active_decision_id: str | None = None
+        self._active_decision_intervened: bool = False
+        self._proactive_timeout_timer = QTimer(self)
+        self._proactive_timeout_timer.setSingleShot(True)
+        self._proactive_timeout_timer.timeout.connect(self._on_proactive_timeout)
+
         # 문서 대화 shares the main chat's conversation through the app-wide
         # ChatBus + the persisted workspace chat history; mode mirrors the 채팅
         # page (rag/research). The open document is sent as additive context.
@@ -776,6 +790,7 @@ class EditorWindow(QWidget):
 
         self._build_ui()
         self._apply_stylesheet()
+        theme.themeChanged.connect(self._on_theme_changed)
         self._wire_timers()
         self._install_shortcuts()
         self._set_view_mode("split")
@@ -919,6 +934,10 @@ class EditorWindow(QWidget):
         layout.setContentsMargins(10, 5, 10, 5)
         layout.setSpacing(4)
 
+        # Painter-drawn toolbar icons carry a baked-in colour, so they are tracked
+        # and repainted in the new ink colour whenever the theme toggles.
+        self._tool_icon_buttons: list[tuple[QPushButton, str]] = []
+
         def add_sep() -> None:
             sep = QFrame()
             sep.setObjectName("EditorToolSep")
@@ -941,9 +960,10 @@ class EditorWindow(QWidget):
             button.setCursor(Qt.PointingHandCursor)
             button.setToolTip(tooltip)
             button.setFixedSize(30, 28)
-            button.setIcon(editor_tool_icon(icon_kind))
+            button.setIcon(editor_tool_icon(icon_kind, color=theme.color("editor.text.tertiary")))
             button.setIconSize(QSize(18, 18))
             button.clicked.connect(lambda checked=False, h=handler: h())
+            self._tool_icon_buttons.append((button, icon_kind))
             layout.addWidget(button)
 
         # Left-panel (문서 개요) show/hide toggle, mirroring its position.
@@ -1048,7 +1068,11 @@ class EditorWindow(QWidget):
         self.editor.textChanged.connect(self._on_text_changed)
         self.editor.ghostAccepted.connect(self._on_ghost_accepted)
         self.editor.ghostDismissed.connect(self._on_ghost_resolved)
-        self.editor.ghostRetryRequested.connect(self._fire_suggestion)
+        # Retry: send canonical `retry` to the proactive bandit BEFORE firing
+        # the next suggestion cycle, so the bandit's feedback log reflects the
+        # actual user intent (rather than recording an immediate timeout when
+        # the old ghost evaporates).
+        self.editor.ghostRetryRequested.connect(self._on_ghost_retry)
 
         self.preview = QTextBrowser()
         self.preview.setObjectName("EditorPreview")
@@ -1244,11 +1268,69 @@ class EditorWindow(QWidget):
             self._suggest_timer.start()
 
     def _on_ghost_resolved(self) -> None:
+        self._submit_proactive_feedback("esc")
         self._invalidate_suggestion()
 
     def _on_ghost_accepted(self) -> None:
+        self._submit_proactive_feedback("tab")
         self._invalidate_suggestion()
         self.assist_panel.add_history("고스트 제안 수락")
+
+    def _on_ghost_retry(self, prev_text: str = "") -> None:
+        """User hit the 다시 chip. Record retry feedback (with the previous
+        ghost text so the backend can pass it to the LLM as a "don't repeat
+        this" hint) then start a fresh suggestion cycle.
+        """
+        self._submit_proactive_feedback(
+            "retry",
+            metadata={"generated_text": prev_text} if prev_text else None,
+        )
+        self._fire_suggestion()
+
+    def _on_proactive_timeout(self) -> None:
+        """No TAB / ESC / 다시 within the spec horizon — submit ``timeout``.
+
+        The user can still keep typing past this point; the next observe()
+        will create a fresh decision. We only emit if there is still a
+        cached decisionId (the user hasn't already resolved it).
+        """
+        self._submit_proactive_feedback("timeout")
+
+    def _submit_proactive_feedback(
+        self,
+        raw_action: str,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        """Fire-and-forget proactive feedback for the cached decision.
+
+        ``metadata`` is forwarded to ``/api/v1/proactive/feedback``. The
+        ``retry`` and ``reject`` paths include ``generated_text`` so the
+        backend's per-anchor reject ladder can record the previous (rejected)
+        suggestion text — the LLM gets it back as a "don't repeat this"
+        instruction on the next observe at the same anchor.
+
+        Always clears the cached id afterwards so we never double-submit.
+        """
+        decision_id = self._active_decision_id
+        self._proactive_timeout_timer.stop()
+        if not decision_id:
+            return
+        self._active_decision_id = None
+        intervened = self._active_decision_intervened
+        self._active_decision_intervened = False
+        if not intervened and raw_action != "cancelled":
+            # The bandit chose no_op — there's no rendered suggestion the
+            # user could have accepted, so we don't pollute the feedback log
+            # with an "esc" the user never actually saw.
+            return
+        controller = AgentController()
+        get_job_manager().run_detached(
+            controller.submit_proactive_feedback,
+            decision_id,
+            raw_action,
+            metadata,
+            on_error=lambda err: print(f"[proactive_feedback][warn] {err}"),
+        )
 
     def _update_counts(self) -> None:
         text = self.editor.document_text()
@@ -1332,6 +1414,11 @@ class EditorWindow(QWidget):
         token = self._suggest_token
         self._suggest_anchor = pos
         self._suggest_prev_char = prefix[-1] if prefix else ""
+        # Clear any stale decisionId before the new cycle — the previous
+        # ghost has already been accepted / dismissed / retried by now.
+        self._active_decision_id = None
+        self._active_decision_intervened = False
+        self._proactive_timeout_timer.stop()
         partial: list[str] = []
         worker = EditorSuggestWorker(self._workspace_id, prefix, suffix, 64, self._use_workspace_rag, self)
 
@@ -1339,6 +1426,22 @@ class EditorWindow(QWidget):
             if token == self._suggest_token:
                 # Show the "작성 중" indicator at the caret until the first token.
                 self.editor.set_generating()
+
+        def on_proactive_started(info: dict) -> None:
+            # Cache the bandit decisionId so TAB/ESC/다시 can map to feedback.
+            # ``shouldIntervene=False`` is the no-op branch: the wrapper still
+            # carries a decisionId (for telemetry) but generation produces no
+            # text, so we don't arm the 20s timeout.
+            if token != self._suggest_token:
+                return
+            self._active_decision_id = str(info.get("decisionId") or "") or None
+            self._active_decision_intervened = bool(info.get("shouldIntervene"))
+            if self._active_decision_id and self._active_decision_intervened:
+                # Frontend-side timeout — matches spec §11.3 (20s for ghost,
+                # 30s for inline diff). Backend has its own sweeper as a
+                # fallback for cases where the window is closed mid-stream.
+                horizon_ms = 20_000 if (info.get("renderMode") or "") == "native_ghost" else 30_000
+                self._proactive_timeout_timer.start(horizon_ms)
 
         def on_delta(chunk: str) -> None:
             if token != self._suggest_token:
@@ -1365,6 +1468,7 @@ class EditorWindow(QWidget):
                 self.editor.clear_ghost()
 
         worker.started_stream.connect(on_start)
+        worker.proactive_started.connect(on_proactive_started)
         worker.delta.connect(on_delta)
         worker.completed.connect(on_completed)
         worker.failed.connect(on_failed)
@@ -1893,145 +1997,18 @@ class EditorWindow(QWidget):
     # ------------------------------------------------------------ stylesheet
 
     def _apply_stylesheet(self) -> None:
-        self.setStyleSheet(
-            """
-            QWidget {
-                font-family: 'Pretendard', 'Segoe UI Variable', 'Segoe UI', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
-                font-size: 13px;
-                color: #202124;
-            }
-            QFrame#EditorPanel { background-color: #ffffff; border: 1px solid #dadce0; border-radius: 12px; }
-            QFrame#EditorTitleBar {
-                background-color: #f8f9fa; border-top-left-radius: 12px; border-top-right-radius: 12px;
-                border-bottom: 1px solid #e8eaed;
-            }
-            QLabel#EditorDocTitle { font-size: 14px; font-weight: 700; color: #202124; }
-            QLabel#EditorSaveStatus { font-size: 11px; font-weight: 600; color: #5f6368; }
-            QPushButton#EditorWinButton, QPushButton#EditorCloseButton {
-                background-color: transparent; color: #5f6368; border: none; border-radius: 6px;
-                font-size: 14px; font-weight: 700;
-            }
-            QPushButton#EditorWinButton:hover { background-color: #e8eaed; color: #202124; }
-            QPushButton#EditorCloseButton:hover { background-color: #fce8e6; color: #d93025; }
-            QFrame#EditorMenuRow { background-color: #ffffff; border-bottom: 1px solid #f1f3f4; }
-            QToolButton#EditorMenuButton {
-                background-color: transparent; color: #3c4043; border: none; border-radius: 6px;
-                padding: 5px 9px; font-weight: 600;
-            }
-            QToolButton#EditorMenuButton:hover { background-color: #f1f3f4; }
-            QToolButton#EditorMenuButton::menu-indicator { image: none; width: 0; }
-            QToolButton#EditorExportButton {
-                background-color: #0b57d0; color: #ffffff; border: none; border-radius: 8px;
-                padding: 6px 14px; font-weight: 700;
-            }
-            QToolButton#EditorExportButton:hover { background-color: #1967d2; }
-            QToolButton#EditorExportButton::menu-indicator { image: none; width: 0; }
-            QFrame#EditorToolbar { background-color: #ffffff; border-bottom: 1px solid #e8eaed; }
-            QPushButton#EditorToolButton {
-                background-color: #ffffff; color: #3c4043; border: 1px solid #e8eaed; border-radius: 6px;
-                padding: 0px 9px; font-weight: 700; min-width: 22px;
-            }
-            QPushButton#EditorToolButton:hover { background-color: #f1f3f4; border-color: #dadce0; }
-            QPushButton#EditorIconButton {
-                background-color: #ffffff; border: 1px solid #e8eaed; border-radius: 6px; padding: 0px;
-            }
-            QPushButton#EditorIconButton:hover { background-color: #f1f3f4; border-color: #dadce0; }
-            QToolButton#EditorStyleButton {
-                background-color: #ffffff; color: #3c4043; border: 1px solid #e8eaed; border-radius: 6px;
-                padding: 3px 10px; font-weight: 600;
-            }
-            QToolButton#EditorStyleButton:hover { background-color: #f1f3f4; border-color: #dadce0; }
-            QToolButton#EditorStyleButton::menu-indicator { image: none; width: 0; }
-            QFrame#EditorToolSep { background-color: #e8eaed; }
-            QPushButton#ViewToggleButton {
-                background-color: #ffffff; color: #5f6368; border: 1px solid #dadce0; border-radius: 6px;
-                padding: 3px 12px; font-weight: 600;
-            }
-            QPushButton#ViewToggleButton:checked { background-color: #e8f0fe; color: #0b57d0; border-color: #0b57d0; }
-            QPushButton#PanelToggleButton {
-                background-color: #ffffff; color: #5f6368; border: 1px solid #dadce0; border-radius: 6px;
-                padding: 3px 10px; font-weight: 600;
-            }
-            QPushButton#PanelToggleButton:checked { background-color: #e8f0fe; color: #0b57d0; border-color: #0b57d0; }
-            QPushButton#PanelToggleButton:hover { background-color: #f1f3f4; }
-            QSplitter#EditorMainSplit::handle { background-color: #e8eaed; }
-            QSplitter#CenterSplit { background-color: #f6f7f9; }
-            QSplitter#CenterSplit::handle { background-color: #f6f7f9; }
-            QFrame#EditorCanvas { background-color: #f6f7f9; }
-            QFrame#EditorPage { background-color: #ffffff; border: 1px solid #e8eaed; border-radius: 4px; }
-            QTextEdit#EditorSource {
-                background-color: #ffffff; color: #202124; border: none; border-radius: 4px;
-                padding: 30px 40px; font-size: 15px;
-                selection-background-color: #d3e3fd; selection-color: #202124;
-            }
-            QTextBrowser#EditorPreview {
-                background-color: #ffffff; color: #202124; border: none; border-radius: 4px; padding: 24px 32px;
-            }
-            QFrame#OutlinePanel, QFrame#AssistPanel { background-color: #ffffff; }
-            QFrame#OutlinePanel { border-right: 1px solid #e8eaed; }
-            QFrame#AssistPanel { border-left: 1px solid #e8eaed; }
-            QLabel#PanelHeaderTitle { font-size: 13px; font-weight: 800; color: #202124; }
-            QLabel#PanelHint { font-size: 11px; color: #80868b; }
-            QLabel#PanelEmpty { font-size: 12px; color: #9aa0a6; padding: 18px; }
-            QPushButton#PanelHeaderClose {
-                background-color: transparent; color: #5f6368; border: none; border-radius: 6px; font-weight: 700;
-            }
-            QPushButton#PanelHeaderClose:hover { background-color: #e8eaed; color: #202124; }
-            QListWidget#OutlineList, QListWidget#HistoryList {
-                background-color: #ffffff; border: 1px solid #e8eaed; border-radius: 8px; padding: 4px;
-            }
-            QListWidget#OutlineList::item, QListWidget#HistoryList::item { padding: 6px 8px; border-radius: 6px; color: #3c4043; }
-            QListWidget#OutlineList::item:hover, QListWidget#HistoryList::item:hover { background-color: #f1f3f4; }
-            QListWidget#OutlineList::item:selected, QListWidget#HistoryList::item:selected { background-color: #e8f0fe; color: #0b57d0; }
-            QTabWidget#AssistTabs::pane { border: 1px solid #e8eaed; border-radius: 8px; top: -1px; }
-            QTabBar::tab {
-                background-color: #f1f3f4; color: #5f6368; padding: 6px 14px; border-top-left-radius: 8px;
-                border-top-right-radius: 8px; font-weight: 600; margin-right: 2px;
-            }
-            QTabBar::tab:selected { background-color: #ffffff; color: #0b57d0; border: 1px solid #e8eaed; border-bottom: none; }
-            QPushButton#QuickActionButton {
-                background-color: #ffffff; color: #3c4043; border: 1px solid #dadce0; border-radius: 8px;
-                padding: 9px 12px; font-weight: 600; text-align: left;
-            }
-            QPushButton#QuickActionButton:hover { background-color: #f8f9fa; border-color: #0b57d0; color: #0b57d0; }
-            QTextEdit#AssistResult {
-                background-color: #f8f9fa; color: #202124; border: 1px solid #e8eaed; border-radius: 8px; padding: 10px;
-            }
-            QTextEdit#AssistChatInput {
-                background-color: #f8f9fa; border: 1px solid #dadce0; border-radius: 10px; padding: 8px 10px; color: #202124;
-            }
-            QTextEdit#AssistChatInput:focus { background-color: #ffffff; border-color: #0b57d0; }
-            QPushButton#PrimaryButton {
-                background-color: #0b57d0; color: #ffffff; border: none; border-radius: 8px; padding: 8px 14px; font-weight: 700;
-            }
-            QPushButton#PrimaryButton:hover { background-color: #1967d2; }
-            QPushButton#GhostButton {
-                background-color: #ffffff; color: #3c4043; border: 1px solid #dadce0; border-radius: 8px; padding: 8px 12px; font-weight: 600;
-            }
-            QPushButton#GhostButton:hover { background-color: #f1f3f4; }
-            QFrame#GhostChip { background-color: #202124; border-radius: 8px; }
-            QPushButton#GhostChipButton {
-                background-color: transparent; color: #e8eaed; border: none; padding: 2px 6px; font-size: 11px; font-weight: 600;
-            }
-            QPushButton#GhostChipButton:hover { color: #ffffff; }
-            QFrame#GhostGenChip { background-color: #f1f3f4; border: 1px solid #e0e3e7; border-radius: 10px; }
-            QLabel#GhostGenLabel { color: #5f6368; font-size: 11px; font-weight: 600; background: transparent; }
-            QFrame#EditorStatusBar {
-                background-color: #f8f9fa; border-top: 1px solid #e8eaed;
-                border-bottom-left-radius: 12px; border-bottom-right-radius: 12px;
-            }
-            QLabel#EditorStatusItem { font-size: 11px; font-weight: 600; color: #5f6368; }
-            QMenu { background-color: #ffffff; border: 1px solid #dadce0; border-radius: 8px; padding: 6px; }
-            QMenu::item { color: #202124; padding: 7px 26px 7px 12px; border-radius: 6px; }
-            QMenu::item:selected { background-color: #e8f0fe; color: #0b57d0; }
-            QScrollBar:vertical { background: transparent; width: 9px; margin: 2px; }
-            QScrollBar::handle:vertical { background: #bdc1c6; border-radius: 4px; min-height: 28px; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-            """
-            + VERITAS_TITLEBAR_QSS
-            + CHAT_QSS
-        )
+        self.setStyleSheet(build_editor_qss(theme.palette()))
+
+    def _retint_tool_icons(self) -> None:
+        """Repaint the painter-drawn toolbar icons in the active ink colour."""
+        ink = theme.color("editor.text.tertiary")
+        for button, kind in getattr(self, "_tool_icon_buttons", []):
+            button.setIcon(editor_tool_icon(kind, color=ink))
+
+    def _on_theme_changed(self, _mode: str) -> None:
+        self._apply_stylesheet()
+        self._retint_tool_icons()
+
 
 
 if __name__ == "__main__":

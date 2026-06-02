@@ -15,6 +15,12 @@ from llm.llama_server_llm import LLMClient
 from llm.llama_supervisor import LlamaServer
 from llm.memory_aware_llm import MemoryAwareLLMClient
 from services.memory_tools_funcs import MemoryRuntime
+from services.proactive.generator import ProactiveGenerator
+from services.proactive.orchestrator import ProactiveOrchestrator
+from services.proactive.screen_bridge import (
+    observe_screen_intervention,
+    proactive_screen_enabled,
+)
 from tools.autosurvey_tool import AutoSurveyTool
 from tools.loader import build_registry, load_schema
 from workflows import AutoSurveyConfig, AutoSurveyWorkflow
@@ -120,6 +126,16 @@ class AgentRuntime:
                 previous_rag_service.close()
             except Exception as e:
                 print(f"[workspace][warn] failed to release previous RAG store: {e}")
+        # Stop the previous workspace's proactive bandit threads + flush state
+        # before we rebuild the agent and rag references that its generator
+        # closed over.
+        previous_proactive = getattr(self, "_proactive_orchestrator", None)
+        if previous_proactive is not None:
+            try:
+                previous_proactive.close()
+            except Exception as e:
+                print(f"[workspace][warn] failed to close previous proactive orchestrator: {e}")
+            self._proactive_orchestrator = None
 
         output_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir = output_dir
@@ -169,6 +185,12 @@ class AgentRuntime:
             chat_agent=self.chat_agent,
             registry=self.registry,
         )
+        # Build the per-workspace proactive orchestrator lazily — see
+        # ``get_proactive_orchestrator``. We do NOT eagerly construct it here
+        # because the boot-time workspace can be "default" (a placeholder) and
+        # we don't want to materialize a runs/api/proactive_policy/ folder if
+        # the user never opens the editor.
+        self._proactive_orchestrator: ProactiveOrchestrator | None = None
 
     def _ensure_llama_servers(self) -> None:
         """Adopt-or-spawn the LLM + embedding llama-servers (best effort).
@@ -260,6 +282,12 @@ class AgentRuntime:
 
     def shutdown(self) -> None:
         """Stop any llama-servers this process owns (best effort, idempotent)."""
+        proactive = getattr(self, "_proactive_orchestrator", None)
+        if proactive is not None:
+            try:
+                proactive.close()
+            except Exception:
+                pass
         for server in (getattr(self, "_llm_server", None), getattr(self, "_embed_server", None)):
             if server is None:
                 continue
@@ -368,6 +396,40 @@ class AgentRuntime:
             # says so instead of answering from general knowledge.
             return self.chat_agent.ask_rag_iter(message, doc_context=doc_context)
         return self.chat_agent.ask_auto_iter(message, doc_context=doc_context)
+
+    # -- proactive bandit -----------------------------------------------------
+    # One orchestrator per workspace; reused across native_editor and
+    # external_screen surfaces so the bandit learns from both.
+
+    def get_proactive_orchestrator(self) -> ProactiveOrchestrator:
+        """Return (and lazily build) the proactive orchestrator for the
+        current workspace. Reused on every observe / feedback call.
+
+        Post-pivot the orchestrator is purely deterministic — no rng to wire,
+        no bandit state to seed. The generator is constructed from the
+        AgentRuntime's existing ghostwrite / editor_assist facades so the
+        LLM call path stays unchanged.
+        """
+        with self._workspace_lock:
+            if self._proactive_orchestrator is not None:
+                return self._proactive_orchestrator
+            generator = ProactiveGenerator(
+                ghostwrite_iter=self.ghostwrite_iter,
+                editor_assist_iter=self.editor_assist_iter,
+                workspace_is_active=self._workspace_is_active,
+            )
+            self._proactive_orchestrator = ProactiveOrchestrator(
+                output_root=self.output_root,
+                workspace_id=self.workspace_id,
+                generator=generator,
+            )
+            return self._proactive_orchestrator
+
+    def _workspace_is_active(self, workspace_id: str) -> bool:
+        """Whether ``workspace_id`` matches the active runtime workspace —
+        the generator uses this as the RAG grounding gate, matching the
+        existing pattern in ``editor_service._workspace_is_active``."""
+        return str(workspace_id or "") == str(self.workspace_id or "")
 
     # -- editor (standalone writer) surfaces ----------------------------------
     # Thin facades over the ChatAgent so the editor window's three AI surfaces
@@ -901,12 +963,46 @@ class AgentRuntime:
     # the state.
 
     def start_screen_monitoring(self) -> dict[str, Any]:
-        """Start the screen poller; record assistant answers into the buffer."""
-        return self._screen_monitor.start(
-            on_answer=lambda answer, intervention, done=True: self._screen_monitor.record_assist_answer(
+        """Start the screen poller; record assistant answers into the buffer.
+
+        Wraps the on_answer callback to *also* drive a proactive observe on
+        the first chunk of each intervention (``done=False`` mid-stream OR
+        ``done=True`` final, whichever lands first). When proactive screen
+        mode is enabled (``VERITAS_PROACTIVE_SCREEN=1``, default on) we
+        rewrite the intervention's ``event_id`` to the ``pd_*`` decisionId so
+        the frontend card renders 복사 / 거절 / 다시 and the legacy feedback
+        endpoint forwards into the bandit canonical reward path.
+        """
+        seen_decisions: dict[str, str] = {}
+
+        def on_answer(answer, intervention, done=True):  # type: ignore[no-untyped-def]
+            if isinstance(intervention, dict) and proactive_screen_enabled():
+                event_id = str(intervention.get("event_id") or "")
+                decision_id = seen_decisions.get(event_id) if event_id else None
+                if decision_id is None:
+                    try:
+                        orch = self.get_proactive_orchestrator()
+                        decision_id = observe_screen_intervention(
+                            orchestrator=orch,
+                            intervention=intervention,
+                            workspace_id=self.workspace_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[proactive][screen_bridge][warn] {exc}")
+                        decision_id = None
+                    if decision_id and event_id:
+                        seen_decisions[event_id] = decision_id
+                if decision_id:
+                    # Swap eventId so feedback routes to /proactive/feedback.
+                    # Keep the original under ``legacyEventId`` for traceback.
+                    intervention = dict(intervention)
+                    intervention["legacy_event_id"] = event_id
+                    intervention["event_id"] = decision_id
+            self._screen_monitor.record_assist_answer(
                 answer, intervention, workspace_id=self.workspace_id, done=done
-            ),
-        )
+            )
+
+        return self._screen_monitor.start(on_answer=on_answer)
 
     def stop_screen_monitoring(self) -> dict[str, Any]:
         return self._screen_monitor.stop()

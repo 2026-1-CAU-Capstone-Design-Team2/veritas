@@ -30,6 +30,7 @@ from ...api_common import current_workspace_id
 from ...components.badges import Badge
 from ...components.buttons import AppButton
 from ...controllers import AgentController, JobCategory, get_job_manager
+from ...theme import theme
 from ..markdown_view import apply_markdown
 from .verify_page import VerifyDetailDialog, _tone_for_level
 
@@ -109,176 +110,218 @@ _TEXT_SUFFIXES = {".md", ".markdown", ".txt", ".rst", ".log"}
 
 # ----------------------------------------------------------------- 페이지 전용 QSS
 # 레퍼런스(aaa.html)의 레이아웃/컴포넌트는 차용하되, 색·폰트는 앱의 블루/슬레이트
-# 계열로 통일. guide_page._PAGE_QSS 와 동일하게 페이지 루트에만 적용해 다른 화면에
-# 영향이 없도록 격리한다. (전역 PrimaryButton/GhostButton 은 그대로 재사용)
-_DRAFT_QSS = """
+# 계열로 통일. guide_page 의 build_guide_qss / _PAGE_TMPL 과 동일하게 페이지 루트에만
+# 적용해 다른 화면에 영향이 없도록 격리한다. (전역 PrimaryButton/GhostButton 은 그대로 재사용)
+#
+# 색은 팔레트 토큰(%(token)s)으로 렌더링해 라이트/다크 토글 시 페이지가 즉시
+# 다시 칠해진다 (frontend/theme/stylesheet.py 참고). LIGHT 팔레트는 기존 색을
+# 1:1 재현하므로 라이트 모드 외관은 그대로다.
+_DRAFT_TMPL = """
+/* 다른 화면과 동일한 폰트로 통일 — 이 시트가 페이지 루트에만 적용되므로
+   전역(main_window) 과 같은 폰트 패밀리를 텍스트 위젯에 다시 명시한다. 배경 속성이
+   없는 폰트 전용 규칙이라 컨테이너 배경에는 영향이 없다. */
+QLabel, QPushButton, QToolButton, QLineEdit, QPlainTextEdit, QTextEdit, QCheckBox {
+	font-family: 'Segoe UI Variable', 'Segoe UI', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
+}
+
 QWidget#DraftScrollInner, QScrollArea#DraftScroll, QScrollArea#DraftScroll > QWidget > QWidget {
 	background: transparent;
 }
 
+/* 라벨을 감싸는 순수 컨테이너 — 전역 QWidget 배경(#F6F8FC)을 물려받아 라벨 뒤에
+   회색 박스로 비치지 않도록 투명 처리. id 선택자로 한정해 자식 위젯 배경
+   (예: Segmented 선택 강조, 입력창)에는 영향을 주지 않는다. */
+QWidget#DotStep, QWidget#FieldBox, QWidget#ResultBody {
+	background: transparent;
+}
+
 QFrame#PageHead {
-	background-color: #FFFFFF;
-	border-bottom: 1px solid #E5E7EB;
+	background-color: %(surface)s;
+	border-bottom: 1px solid %(border.gray)s;
 }
 QFrame#NavBar {
-	background-color: #F8FAFC;
-	border-top: 1px solid #E5E7EB;
+	background-color: %(surface.muted)s;
+	border-top: 1px solid %(border.gray)s;
 }
-QLabel#DraftH1 { color: #0F172A; font-size: 22px; font-weight: 800; }
-QLabel#DraftH2 { color: #0F172A; font-size: 18px; font-weight: 800; }
-QLabel#DraftSubtitle { color: #6B7280; font-size: 13px; }
-QLabel#NavHint { color: #94A3B8; font-size: 12px; }
+QLabel#DraftH1 { color: %(text.primary)s; font-size: 22px; font-weight: 800; }
+QLabel#DraftH2 { color: %(text.primary)s; font-size: 18px; font-weight: 800; }
+QLabel#DraftSubtitle { color: %(text.secondary.gray)s; font-size: 13px; }
+QLabel#NavHint { color: %(text.muted)s; font-size: 12px; }
 
 QLabel#Eyebrow {
-	color: #94A3B8; font-size: 11px; font-weight: 800; letter-spacing: 1.4px;
+	color: %(text.muted)s; font-size: 11px; font-weight: 800; letter-spacing: 1.4px;
 }
 QLabel#StepNum {
-	color: #4F46E5; font-size: 11px; font-weight: 800; letter-spacing: 0.8px;
+	color: %(accent)s; font-size: 11px; font-weight: 800; letter-spacing: 0.8px;
 }
-QLabel#Crumbs { color: #6B7280; font-size: 12px; font-weight: 600; }
+QLabel#Crumbs { color: %(text.secondary.gray)s; font-size: 12px; font-weight: 600; }
 
 QLabel#StatusPill {
-	color: #6B7280; background-color: #FFFFFF; border: 1px solid #D1D5DB;
+	color: %(text.secondary.gray)s; background-color: %(surface)s; border: 1px solid %(border.gray.strong)s;
 	border-radius: 11px; padding: 3px 10px; font-size: 11px; font-weight: 700;
 	letter-spacing: 0.6px;
 }
-QLabel#WorkspacePill {
-	color: #1F2937; background-color: #F8FAFC; border: 1px solid #E5E7EB;
-	border-radius: 14px; padding: 4px 12px; font-size: 12px; font-weight: 600;
-}
 
 QFrame#DraftCard {
-	background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 14px;
+	background-color: %(surface)s; border: 1px solid %(border.gray)s; border-radius: 14px;
 }
 QFrame#DraftCardFlat { background: transparent; border: none; }
 
 /* 시작 방식 선택 타일 */
 QPushButton#ChoiceTile {
-	background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 14px;
+	background-color: %(surface)s; border: 1px solid %(border.gray)s; border-radius: 14px;
 	text-align: left;
 }
-QPushButton#ChoiceTile:hover { border-color: #C7D2FE; background-color: #FBFBFE; }
-QPushButton#ChoiceTile:checked { border: 2px solid #4F46E5; background-color: #F5F5FF; }
-QLabel#IllChip { background-color: #EEF2FF; border-radius: 12px; }
-QLabel#ChoiceTitle { color: #0F172A; font-size: 16px; font-weight: 800; }
-QLabel#ChoiceDesc { color: #6B7280; font-size: 13px; }
-QFrame#ChoiceMeta { border: none; border-top: 1px dashed #E5E7EB; }
-QLabel#ChoiceMetaText { color: #94A3B8; font-size: 11px; font-weight: 700; letter-spacing: 0.8px; }
+QPushButton#ChoiceTile:hover { border-color: %(accent.subtle.border)s; background-color: %(surface.muted)s; }
+QPushButton#ChoiceTile:checked { border: 2px solid %(accent)s; background-color: %(accent.subtle.bg)s; }
+QLabel#IllChip { background-color: %(accent.subtle.bg)s; border-radius: 12px; }
+QLabel#ChoiceTitle { color: %(text.primary)s; font-size: 16px; font-weight: 800; }
+QLabel#ChoiceDesc { color: %(text.secondary.gray)s; font-size: 13px; }
+QFrame#ChoiceMeta { border: none; border-top: 1px dashed %(border.gray)s; }
+QLabel#ChoiceMetaText { color: %(text.muted)s; font-size: 11px; font-weight: 700; letter-spacing: 0.8px; }
 QLabel#ChoiceArrow {
-	color: #4F46E5; background-color: #EEF2FF; border-radius: 13px;
+	color: %(accent)s; background-color: %(accent.subtle.bg)s; border-radius: 13px;
 	font-size: 14px; font-weight: 800;
 }
 
 /* 카테고리 / 소분류 카드 */
 QPushButton#CatCard, QPushButton#SubCard {
-	background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 12px;
+	background-color: %(surface)s; border: 1px solid %(border.gray)s; border-radius: 12px;
 	text-align: left;
 }
-QPushButton#CatCard:hover, QPushButton#SubCard:hover { border-color: #C7D2FE; background-color: #FBFBFE; }
-QPushButton#CatCard:checked, QPushButton#SubCard:checked { border: 2px solid #4F46E5; background-color: #F5F5FF; }
-QLabel#CatIcon { background-color: #EEF2FF; border-radius: 10px; }
-QLabel#CatEyebrow { color: #94A3B8; font-size: 11px; font-weight: 800; letter-spacing: 1.2px; }
-QLabel#CatTitle { color: #0F172A; font-size: 16px; font-weight: 800; }
-QLabel#CatListItem { color: #6B7280; font-size: 12px; }
-QLabel#SubTitle { color: #0F172A; font-size: 15px; font-weight: 800; }
-QLabel#SecPreviewChip { color: #6B7280; font-size: 12px; }
+QPushButton#CatCard:hover, QPushButton#SubCard:hover { border-color: %(accent.subtle.border)s; background-color: %(surface.muted)s; }
+QPushButton#CatCard:checked, QPushButton#SubCard:checked { border: 2px solid %(accent)s; background-color: %(accent.subtle.bg)s; }
+QLabel#CatIcon { background-color: %(accent.subtle.bg)s; border-radius: 10px; }
+QLabel#CatEyebrow { color: %(text.muted)s; font-size: 11px; font-weight: 800; letter-spacing: 1.2px; }
+QLabel#CatTitle { color: %(text.primary)s; font-size: 16px; font-weight: 800; }
+QLabel#CatListItem { color: %(text.secondary.gray)s; font-size: 12px; }
+QLabel#SubTitle { color: %(text.primary)s; font-size: 15px; font-weight: 800; }
+QLabel#SecPreviewChip { color: %(text.secondary.gray)s; font-size: 12px; }
 
 /* 구성 — 섹션 행 */
-QFrame#SecRow { background-color: #F8FAFC; border: 1px solid #EEF0F3; border-radius: 8px; }
-QLabel#SecNum { color: #94A3B8; font-size: 11px; font-weight: 700; }
-QLabel#SecName { color: #0F172A; font-size: 13px; font-weight: 600; }
+QFrame#SecRow { background-color: %(surface.muted)s; border: 1px solid %(border)s; border-radius: 8px; }
+QLabel#SecNum { color: %(text.muted)s; font-size: 11px; font-weight: 700; }
+QLabel#SecName { color: %(text.primary)s; font-size: 13px; font-weight: 600; }
 QPushButton#SecDel {
-	color: #94A3B8; background: transparent; border: none; border-radius: 6px;
+	color: %(text.muted)s; background: transparent; border: none; border-radius: 6px;
 	font-size: 13px; font-weight: 700;
 }
-QPushButton#SecDel:hover { color: #DC2626; background-color: #FEF2F2; }
+QPushButton#SecDel:hover { color: %(danger.fg2)s; background-color: %(danger.bg)s; }
 
 /* 작성 옵션 */
-QLabel#DraftFieldLabel { color: #6B7280; font-size: 11px; font-weight: 700; letter-spacing: 0.4px; }
-QWidget#Segmented { background-color: #F1F5F9; border: 1px solid #E5E7EB; border-radius: 10px; }
+QLabel#DraftFieldLabel { color: %(text.secondary.gray)s; font-size: 11px; font-weight: 700; letter-spacing: 0.4px; }
+QWidget#Segmented { background-color: %(surface.inset)s; border: 1px solid %(border.gray)s; border-radius: 10px; }
 QPushButton#SegItem {
 	background: transparent; border: none; border-radius: 7px; padding: 6px 14px;
-	color: #6B7280; font-size: 12px; font-weight: 700;
+	color: %(text.secondary.gray)s; font-size: 12px; font-weight: 700;
 }
-QPushButton#SegItem:hover { color: #4F46E5; }
-QPushButton#SegItem:checked { background-color: #4F46E5; color: #FFFFFF; }
+QPushButton#SegItem:hover { color: %(accent)s; }
+QPushButton#SegItem:checked { background-color: %(accent)s; color: %(text.on_accent)s; }
 QLineEdit#DraftInput, QPlainTextEdit#DraftTextarea {
-	background-color: #FFFFFF; border: 1px solid #D1D5DB; border-radius: 8px;
-	padding: 8px 12px; color: #0F172A; font-size: 13px;
-	selection-background-color: #BFDBFE; selection-color: #0F172A;
+	background-color: %(surface)s; border: 1px solid %(border.gray.strong)s; border-radius: 8px;
+	padding: 8px 12px; color: %(text.primary)s; font-size: 13px;
+	selection-background-color: %(selection.bg)s; selection-color: %(selection.text)s;
 }
-QLineEdit#DraftInput:focus, QPlainTextEdit#DraftTextarea:focus { border-color: #4F46E5; }
+QLineEdit#DraftInput:focus, QPlainTextEdit#DraftTextarea:focus { border-color: %(accent)s; }
 
 /* 목차 */
 QLabel#OutlineStat {
-	color: #475569; background-color: #F1F5F9; border: 1px solid #E5E7EB;
+	color: %(text.slate600)s; background-color: %(surface.inset)s; border: 1px solid %(border.gray)s;
 	border-radius: 8px; padding: 5px 10px; font-size: 12px; font-weight: 600;
 }
-QFrame#OutlineRow { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 8px; }
-QLabel#OlHandle { color: #CBD5E1; font-size: 14px; font-weight: 800; }
-QLabel#OlNum { color: #94A3B8; font-size: 11px; font-weight: 700; }
+QFrame#OutlineRow { background-color: %(surface)s; border: 1px solid %(border.gray)s; border-radius: 8px; }
+QLabel#OlHandle { color: %(border.strong)s; font-size: 14px; font-weight: 800; }
+QLabel#OlNum { color: %(text.muted)s; font-size: 11px; font-weight: 700; }
 QLineEdit#OlName {
-	background: transparent; border: none; color: #0F172A; font-size: 13px; font-weight: 600;
+	background: transparent; border: none; color: %(text.primary)s; font-size: 13px; font-weight: 600;
 }
-QLineEdit#OlName:focus { background-color: #F8FAFC; border-radius: 6px; }
+QLineEdit#OlName:focus { background-color: %(surface.muted)s; border-radius: 6px; }
 QPushButton#OlAction {
-	color: #64748B; background: transparent; border: 1px solid #E5E7EB; border-radius: 6px;
+	color: %(text.secondary)s; background: transparent; border: 1px solid %(border.gray)s; border-radius: 6px;
 	font-size: 11px; font-weight: 700;
 }
-QPushButton#OlAction:hover { color: #4F46E5; border-color: #C7D2FE; background-color: #EEF2FF; }
+QPushButton#OlAction:hover { color: %(accent)s; border-color: %(accent.subtle.border)s; background-color: %(accent.subtle.bg)s; }
 
 /* 안내 노트 */
-QFrame#HelperNote { background-color: #F8FAFC; border: 1px solid #E5E7EB; border-radius: 10px; }
+QFrame#HelperNote { background-color: %(surface.muted)s; border: 1px solid %(border.gray)s; border-radius: 10px; }
 QLabel#HelperIcon {
-	color: #6B7280; background-color: #FFFFFF; border: 1px solid #D1D5DB;
+	color: %(text.secondary.gray)s; background-color: %(surface)s; border: 1px solid %(border.gray.strong)s;
 	border-radius: 9px; font-size: 10px; font-weight: 800;
 }
-QLabel#HelperText { color: #6B7280; font-size: 12px; }
+QLabel#HelperText { color: %(text.secondary.gray)s; font-size: 12px; }
 
 /* 결과 */
-QFrame#ResultCard { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 14px; }
-QFrame#ResultToolbar { background-color: #F8FAFC; border: none; border-bottom: 1px solid #E5E7EB; }
-QLabel#LiveDot { background-color: #4F46E5; border-radius: 4px; }
-QLabel#ResultStatus { color: #475569; font-size: 12px; font-weight: 700; }
-QLabel#MetaStrip { color: #94A3B8; font-size: 12px; }
+QFrame#ResultCard { background-color: %(surface)s; border: 1px solid %(border.gray)s; border-radius: 14px; }
+QFrame#ResultToolbar { background-color: %(surface.muted)s; border: none; border-bottom: 1px solid %(border.gray)s; }
+QLabel#LiveDot { background-color: %(accent)s; border-radius: 4px; }
+QLabel#ResultStatus { color: %(text.slate600)s; font-size: 12px; font-weight: 700; }
+QLabel#MetaStrip { color: %(text.muted)s; font-size: 12px; }
 QPushButton#ToolbarBtn {
-	color: #1F2937; background-color: #FFFFFF; border: 1px solid #D1D5DB; border-radius: 8px;
+	color: %(text.body)s; background-color: %(surface)s; border: 1px solid %(border.gray.strong)s; border-radius: 8px;
 	padding: 5px 12px; font-size: 12px; font-weight: 700;
 }
-QPushButton#ToolbarBtn:hover { border-color: #C7D2FE; color: #4F46E5; }
-QPushButton#ToolbarBtn:disabled { color: #CBD5E1; border-color: #EEF0F3; }
+QPushButton#ToolbarBtn:hover { border-color: %(accent.subtle.border)s; color: %(accent)s; }
+QPushButton#ToolbarBtn:disabled { color: %(border.strong)s; border-color: %(border)s; }
 QPushButton#ToolbarBtnPrimary {
-	color: #FFFFFF; background-color: #4F46E5; border: 1px solid #4F46E5; border-radius: 8px;
+	color: %(text.on_accent)s; background-color: %(accent)s; border: 1px solid %(accent)s; border-radius: 8px;
 	padding: 5px 12px; font-size: 12px; font-weight: 700;
 }
-QPushButton#ToolbarBtnPrimary:hover { background-color: #4338CA; }
-QPushButton#ToolbarBtnPrimary:disabled { background-color: #C7D2FE; border-color: #C7D2FE; }
+QPushButton#ToolbarBtnPrimary:hover { background-color: %(accent.hover)s; }
+QPushButton#ToolbarBtnPrimary:disabled { background-color: %(accent.subtle.border)s; border-color: %(accent.subtle.border)s; }
 QTextEdit#DraftOutput {
-	background-color: #FFFFFF; border: none; color: #111827; font-size: 14px;
-	selection-background-color: #BFDBFE; selection-color: #0F172A;
+	background-color: %(surface)s; border: none; color: %(text.primary2)s; font-size: 14px;
+	selection-background-color: %(selection.bg)s; selection-color: %(selection.text)s;
 }
-QLabel#SettingsNote { color: #94A3B8; font-size: 12px; }
+QLabel#SettingsNote { color: %(text.muted)s; font-size: 12px; }
 
 /* 자료 선택 — 등급 드롭다운 (연한 보라 배경 + 선택 시 보라 강조) */
 QLabel#DocSelectEmpty {
-	color: #6B7280; background-color: #F8FAFC; border: 1px dashed #CBD5E1;
+	color: %(text.secondary.gray)s; background-color: %(surface.muted)s; border: 1px dashed %(border.strong)s;
 	border-radius: 10px; padding: 16px; font-size: 13px;
 }
-QFrame#DocGroup { background-color: #EEF2FF; border: 1px solid #C7D2FE; border-radius: 12px; }
-QFrame#DocGroupHeader { background-color: #E0E7FF; border: none; border-bottom: 1px solid #C7D2FE; border-top-left-radius: 12px; border-top-right-radius: 12px; }
+QFrame#DocGroup { background-color: %(accent.subtle.bg)s; border: 1px solid %(accent.subtle.border)s; border-radius: 12px; }
+QFrame#DocGroupHeader { background-color: %(accent.subtle.bg.hover)s; border: none; border-bottom: 1px solid %(accent.subtle.border)s; border-top-left-radius: 12px; border-top-right-radius: 12px; }
 QFrame#DocGroupBody { background: transparent; border: none; }
 QToolButton#DocGroupToggle {
-	color: #4F46E5; background: transparent; border: none;
+	color: %(accent)s; background: transparent; border: none;
 	font-size: 15px; font-weight: 800; padding: 0 4px;
 }
-QToolButton#DocGroupToggle:hover { color: #3730A3; }
-QLabel#DocGroupCount { color: #6366F1; font-size: 12px; font-weight: 700; }
-QFrame#DocRow { background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; }
-QFrame#DocRow:hover { border-color: #818CF8; }
-QFrame#DocRow[checked="true"] { border: 1px solid #4F46E5; }
-QLabel#DocRowTitle { color: #0F172A; font-size: 13px; font-weight: 600; }
-QLabel#DocRowMeta { color: #6B7280; font-size: 11px; }
+QToolButton#DocGroupToggle:hover { color: %(accent.text)s; }
+QLabel#DocGroupCount { color: %(accent.glyph)s; font-size: 12px; font-weight: 700; }
+QFrame#DocRow { background-color: %(surface)s; border: 1px solid %(border)s; border-radius: 8px; }
+QFrame#DocRow:hover { border-color: %(accent.border.checked)s; }
+QFrame#DocRow[checked="true"] { border: 1px solid %(accent)s; }
+QLabel#DocRowTitle { color: %(text.primary)s; font-size: 13px; font-weight: 600; }
+QLabel#DocRowMeta { color: %(text.secondary.gray)s; font-size: 11px; }
 """
+
+
+def build_draft_qss(palette: dict[str, str]) -> str:
+	"""Render the draft page's QSS from a colour palette (``theme.palette()``)."""
+	return _DRAFT_TMPL % palette
+
+
+try:
+	from shiboken6 import isValid as _shiboken_is_valid
+except Exception:  # pragma: no cover - shiboken6 ships with PySide6
+	_shiboken_is_valid = None
+
+
+def _qt_is_alive(obj: object) -> bool:
+	"""True when *obj*'s underlying Qt C++ object still exists.
+
+	Icon-bearing rows (sections, outline items) are rebuilt on data changes, so a
+	registered icon widget can be deleted before the next theme toggle re-tints
+	it. Touching a freed widget would raise ``RuntimeError`` — this guard lets
+	:meth:`DraftPage._apply_theme` prune dead entries instead."""
+	if obj is None:
+		return False
+	if _shiboken_is_valid is None:
+		return True
+	try:
+		return bool(_shiboken_is_valid(obj))
+	except Exception:
+		return False
 
 
 def _mouse_through(widget: QWidget) -> QWidget:
@@ -287,12 +330,15 @@ def _mouse_through(widget: QWidget) -> QWidget:
 	return widget
 
 
-def _make_icon(kind: str, size: int = 22, color: str = "#4F46E5") -> QPixmap:
+def _make_icon(kind: str, size: int = 22, color: str | None = None) -> QPixmap:
 	"""Painter-drawn line icons — no font glyphs or asset files, crisp at any DPI.
 
 	Used for the category/source chips and the small row controls so they never
-	fall back to tofu boxes the way Unicode symbols can.
+	fall back to tofu boxes the way Unicode symbols can. ``color`` defaults to the
+	active accent so a caller that omits it follows the theme.
 	"""
+	if color is None:
+		color = theme.color("accent")
 	scale = 2
 	phys = size * scale
 	pixmap = QPixmap(phys, phys)
@@ -470,6 +516,9 @@ class WritingOptions(QWidget):
 
 	def _field(self, label: str, widget: QWidget) -> QWidget:
 		holder = QWidget()
+		# 라벨 뒤 회색 박스 방지 — _DRAFT_TMPL 의 QWidget#FieldBox 규칙으로 투명 처리.
+		# id 선택자라 자식 위젯(Segmented 선택 강조·입력창) 배경에는 영향이 없다.
+		holder.setObjectName("FieldBox")
 		v = QVBoxLayout(holder)
 		v.setContentsMargins(0, 0, 0, 0)
 		v.setSpacing(6)
@@ -502,14 +551,20 @@ class WritingOptions(QWidget):
 class _StyledCheckBox(QCheckBox):
 	"""텍스트 없는 체크박스 — 인디케이터를 직접 그린다.
 
-	선택 시 진한 보라(#4F46E5) 배경에 흰색 체크, 부분 선택(그룹)은 흰색 대시로
-	표시한다. 네이티브 체크박스 렌더링 대신 그려서 플랫폼과 무관하게 같은 모양을
-	보장한다. (자료 선택 위젯 전용 — 라벨이 없어 인디케이터만 그리면 된다.)"""
+	선택 시 강조색(accent) 배경에 흰색 체크, 부분 선택(그룹)은 흰색 대시로
+	표시한다. 색은 팔레트 토큰으로 칠해 라이트/다크 토글을 따른다. 네이티브 체크박스
+	렌더링 대신 그려서 플랫폼과 무관하게 같은 모양을 보장한다. (자료 선택 위젯 전용 —
+	라벨이 없어 인디케이터만 그리면 된다.)"""
 
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setCursor(Qt.PointingHandCursor)
 		self.setFixedSize(20, 20)
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		# Indicator is painted from theme tokens in paintEvent — just repaint.
+		self.update()
 
 	def paintEvent(self, event) -> None:  # type: ignore[override]
 		painter = QPainter(self)
@@ -517,14 +572,15 @@ class _StyledCheckBox(QCheckBox):
 		box = QRectF(self.rect()).adjusted(2, 2, -2, -2)
 		state = self.checkState()
 		if state == Qt.Unchecked:
-			painter.setPen(QPen(QColor("#CBD5E1"), 1.5))
-			painter.setBrush(QColor("#FFFFFF"))
+			painter.setPen(QPen(QColor(theme.color("border.strong")), 1.5))
+			painter.setBrush(QColor(theme.color("surface")))
 			painter.drawRoundedRect(box, 5, 5)
 			return
-		painter.setPen(QPen(QColor("#4F46E5"), 1.5))
-		painter.setBrush(QColor("#4F46E5"))
+		accent = QColor(theme.color("accent"))
+		painter.setPen(QPen(accent, 1.5))
+		painter.setBrush(accent)
 		painter.drawRoundedRect(box, 5, 5)
-		mark = QPen(QColor("#FFFFFF"), 2.0)
+		mark = QPen(QColor(theme.color("text.on_accent")), 2.0)
 		mark.setCapStyle(Qt.RoundCap)
 		mark.setJoinStyle(Qt.RoundJoin)
 		painter.setPen(mark)
@@ -829,6 +885,12 @@ class DotStepper(QWidget):
 	def __init__(self, steps: list[str], active: int, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("DotStepper")
+		# Collected so a light/dark toggle can restyle the dots/labels/connectors in
+		# place; the stepper is also rebuilt wholesale on each step change (see
+		# DraftPage._set_steps), which constructs a fresh instance with the live theme.
+		self._dots: list[tuple[QLabel, str]] = []
+		self._texts: list[tuple[QLabel, str]] = []
+		self._connectors: list[tuple[QFrame, bool]] = []
 		layout = QHBoxLayout(self)
 		layout.setContentsMargins(0, 0, 0, 0)
 		layout.setSpacing(6)
@@ -844,13 +906,16 @@ class DotStepper(QWidget):
 			if i < len(steps) - 1:
 				connector = QFrame()
 				connector.setFixedSize(22, 2)
-				color = "#4F46E5" if i < active else "#E5E7EB"
-				connector.setStyleSheet(f"background:{color}; border:none; border-radius:1px;")
+				self._connectors.append((connector, i < active))
 				layout.addWidget(connector, 0, Qt.AlignVCenter)
 		layout.addStretch(1)
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
 
 	def _step(self, num: int, label: str, state: str) -> QWidget:
 		holder = QWidget()
+		# 스텝 라벨 뒤 회색 박스 방지 — _DRAFT_TMPL 의 QWidget#DotStep 규칙으로 투명 처리.
+		holder.setObjectName("DotStep")
 		row = QHBoxLayout(holder)
 		row.setContentsMargins(0, 0, 0, 0)
 		row.setSpacing(8)
@@ -858,23 +923,40 @@ class DotStepper(QWidget):
 		dot = QLabel(str(num))
 		dot.setAlignment(Qt.AlignCenter)
 		dot.setFixedSize(24, 24)
-		if state == "done":
-			dot_css = "background:#4F46E5; color:#FFFFFF; border:1px solid #4F46E5;"
-			label_css = "color:#4F46E5; font-weight:600;"
-		elif state == "current":
-			dot_css = "background:#FFFFFF; color:#4F46E5; border:2px solid #4F46E5;"
-			label_css = "color:#0F172A; font-weight:700;"
-		else:
-			dot_css = "background:#F1F5F9; color:#94A3B8; border:1px solid #E5E7EB;"
-			label_css = "color:#94A3B8; font-weight:600;"
-		dot.setStyleSheet(f"QLabel{{border-radius:12px; font-size:11px; font-weight:800; {dot_css}}}")
+		self._dots.append((dot, state))
 
 		text = QLabel(label)
-		text.setStyleSheet(f"QLabel{{font-size:12px; {label_css} background:transparent;}}")
+		self._texts.append((text, state))
 
 		row.addWidget(dot)
 		row.addWidget(text)
 		return holder
+
+	def _apply_theme(self, *args) -> None:
+		"""(Re)apply token colours to every dot/label/connector for the active mode."""
+		accent = theme.color("accent")
+		for dot, state in self._dots:
+			if state == "done":
+				dot_css = f"background:{accent}; color:{theme.color('text.on_accent')}; border:1px solid {accent};"
+			elif state == "current":
+				dot_css = f"background:{theme.color('surface')}; color:{accent}; border:2px solid {accent};"
+			else:
+				dot_css = (
+					f"background:{theme.color('surface.inset')}; color:{theme.color('text.muted')}; "
+					f"border:1px solid {theme.color('border.gray')};"
+				)
+			dot.setStyleSheet(f"QLabel{{border-radius:12px; font-size:11px; font-weight:800; {dot_css}}}")
+		for text, state in self._texts:
+			if state == "done":
+				label_css = f"color:{accent}; font-weight:600;"
+			elif state == "current":
+				label_css = f"color:{theme.color('text.primary')}; font-weight:700;"
+			else:
+				label_css = f"color:{theme.color('text.muted')}; font-weight:600;"
+			text.setStyleSheet(f"QLabel{{font-size:12px; {label_css} background:transparent;}}")
+		for connector, on in self._connectors:
+			color = accent if on else theme.color("border.gray")
+			connector.setStyleSheet(f"background:{color}; border:none; border-radius:1px;")
 
 
 class DraftPage(QWidget):
@@ -901,6 +983,13 @@ class DraftPage(QWidget):
 		# 구조화 생성 후 결과 화면에서 저장된 설정/재생성을 보여주기 위한 기록.
 		self._last_draft_number: int | None = None
 		self._last_settings_file = ""
+
+		# Painter-drawn icons are baked into a pixmap/QIcon at build time, so a
+		# light/dark toggle can't restyle them via QSS. Track each (widget, kind,
+		# size, token, …) here and rebuild them in _apply_theme. Some live on rows
+		# that are rebuilt on data changes (sections/outline), so dead entries are
+		# pruned on toggle. Must exist before the page builders below run.
+		self._theme_icons: list[dict] = []
 
 		root = QVBoxLayout(self)
 		root.setContentsMargins(0, 0, 0, 0)
@@ -938,11 +1027,50 @@ class DraftPage(QWidget):
 
 		root.addWidget(self._build_nav_bar())
 
-		self.setStyleSheet(_DRAFT_QSS)
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
 
 		get_job_manager().busy_changed.connect(self._sync_busy_state)
 		self._show_source()
 		self._sync_busy_state()
+
+	# ------------------------------------------------------------------ 테마
+	def _apply_theme(self, *args) -> None:
+		"""Re-render the page QSS and re-tint painter-drawn icons for the active mode."""
+		self.setStyleSheet(build_draft_qss(theme.palette()))
+		live: list[dict] = []
+		for entry in self._theme_icons:
+			widget = entry["widget"]
+			if not _qt_is_alive(widget):
+				continue
+			pixmap = _make_icon(entry["kind"], entry["size"], theme.color(entry["token"]))
+			if entry["as_icon"]:
+				widget.setIcon(QIcon(pixmap))
+			else:
+				widget.setPixmap(pixmap)
+			live.append(entry)
+		self._theme_icons = live
+
+	def _register_icon(
+		self,
+		widget: QWidget,
+		kind: str,
+		size: int,
+		token: str,
+		*,
+		as_icon: bool = False,
+	) -> None:
+		"""Paint *widget*'s icon in the active *token* colour and track it for retint.
+
+		``as_icon`` selects ``setIcon`` (buttons) vs ``setPixmap`` (labels)."""
+		pixmap = _make_icon(kind, size, theme.color(token))
+		if as_icon:
+			widget.setIcon(QIcon(pixmap))
+		else:
+			widget.setPixmap(pixmap)
+		self._theme_icons.append(
+			{"widget": widget, "kind": kind, "size": size, "token": token, "as_icon": as_icon}
+		)
 
 	# ------------------------------------------------------------------ 헤더
 	def _build_header(self) -> QWidget:
@@ -961,11 +1089,6 @@ class DraftPage(QWidget):
 		self._mode_pill.setObjectName("StatusPill")
 		top.addWidget(self._mode_pill, 0, Qt.AlignVCenter)
 		top.addStretch(1)
-
-		self.workspace_label = QLabel(f"워크스페이스 · {self._workspace_id}")
-		self.workspace_label.setObjectName("WorkspacePill")
-		self.workspace_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-		top.addWidget(self.workspace_label, 0, Qt.AlignVCenter)
 
 		self.restart_button = AppButton("처음부터", variant="ghost")
 		self.restart_button.clicked.connect(self._reset)
@@ -1071,7 +1194,7 @@ class DraftPage(QWidget):
 		ill.setObjectName("IllChip")
 		ill.setFixedSize(48, 48)
 		ill.setAlignment(Qt.AlignCenter)
-		ill.setPixmap(_make_icon(icon, 26, "#4F46E5"))
+		self._register_icon(ill, icon, 26, "accent")
 		v.addWidget(_mouse_through(ill))
 
 		title_l = QLabel(title)
@@ -1095,7 +1218,7 @@ class DraftPage(QWidget):
 		arrow.setObjectName("ChoiceArrow")
 		arrow.setAlignment(Qt.AlignCenter)
 		arrow.setFixedSize(26, 26)
-		arrow.setPixmap(_make_icon("arrow", 15, "#4F46E5"))
+		self._register_icon(arrow, "arrow", 15, "accent")
 		mrow.addWidget(steps_l, 0, Qt.AlignVCenter)
 		mrow.addStretch(1)
 		mrow.addWidget(arrow, 0, Qt.AlignVCenter)
@@ -1194,7 +1317,7 @@ class DraftPage(QWidget):
 		icon.setObjectName("CatIcon")
 		icon.setFixedSize(40, 40)
 		icon.setAlignment(Qt.AlignCenter)
-		icon.setPixmap(_make_icon(cat["key"], 22, "#4F46E5"))
+		self._register_icon(icon, cat["key"], 22, "accent")
 		v.addWidget(_mouse_through(icon))
 
 		eyebrow = QLabel(CATEGORY_EYEBROWS.get(cat["key"], ""))
@@ -1308,7 +1431,7 @@ class DraftPage(QWidget):
 		delete.setObjectName("SecDel")
 		delete.setCursor(Qt.PointingHandCursor)
 		delete.setFixedSize(22, 22)
-		delete.setIcon(QIcon(_make_icon("close", 12, "#94A3B8")))
+		self._register_icon(delete, "close", 12, "text.muted", as_icon=True)
 		delete.setIconSize(QSize(12, 12))
 
 		h.addWidget(checkbox, 0)
@@ -1388,7 +1511,7 @@ class DraftPage(QWidget):
 		handle.setObjectName("OlHandle")
 		handle.setFixedWidth(16)
 		handle.setAlignment(Qt.AlignCenter)
-		handle.setPixmap(_make_icon("grip", 16, "#CBD5E1"))
+		self._register_icon(handle, "grip", 16, "border.strong")
 		num = QLabel(f"{index + 1:02d}")
 		num.setObjectName("OlNum")
 		edit = QLineEdit(name)
@@ -1412,7 +1535,7 @@ class DraftPage(QWidget):
 		button.setObjectName("OlAction")
 		button.setFixedSize(26, 24)
 		button.setCursor(Qt.PointingHandCursor)
-		button.setIcon(QIcon(_make_icon(icon, 13, "#64748B")))
+		self._register_icon(button, icon, 13, "text.secondary", as_icon=True)
 		button.setIconSize(QSize(13, 13))
 		button.clicked.connect(slot)
 		return button
@@ -1486,6 +1609,8 @@ class DraftPage(QWidget):
 		card_layout.addWidget(toolbar)
 
 		body = QWidget()
+		# 결과 카드 본문 — 메타/안내 라벨 뒤 회색 박스 방지(_DRAFT_TMPL QWidget#ResultBody).
+		body.setObjectName("ResultBody")
 		body_layout = QVBoxLayout(body)
 		body_layout.setContentsMargins(28, 22, 28, 24)
 		body_layout.setSpacing(12)
@@ -2068,11 +2193,10 @@ class DraftPage(QWidget):
 		self._show_source()
 
 	# ------------------------------------------------------------------ 외부 API
-	def set_workspace_by_name(self, workspace_name: str) -> None:
+	def set_workspace_by_name(self, _workspace_name: str) -> None:
 		# 사이드바가 갱신한 부트스트랩 캐시와 id 를 동기화 → 현재 보이는 워크스페이스
-		# 기준으로 초안을 생성한다.
+		# 기준으로 초안을 생성한다. (헤더의 워크스페이스 표시는 제거됨 — 사이드바가 담당)
 		self._workspace_id = current_workspace_id()
-		self.workspace_label.setText(f"워크스페이스 · {workspace_name or self._workspace_id}")
 		# 초안과 저장 설정은 만들어진 워크스페이스에 속하므로, 전환 시 위저드를 처음으로.
 		self._reset()
 
