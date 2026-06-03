@@ -11,6 +11,7 @@ from services.memory_tools_funcs.external_context.embedding_recall_store import 
 from services.memory_tools_funcs.external_context.fts_memory_store import FtsMemoryStore
 from services.memory_tools_funcs.store import MemoryStore
 from services.memory_tools_funcs.token_counter import TokenCounter
+from services.verification.indexing.rrf import reciprocal_rank_fusion
 
 
 class RecallStorage(FtsMemoryStore):
@@ -18,15 +19,9 @@ class RecallStorage(FtsMemoryStore):
 
     When an ``EmbeddingRecallStore`` is attached, every turn is mirrored into
     the dense index on append and ``search`` fuses the keyword and dense
-    result sets with Reciprocal Rank Fusion. Without one, behavior is the
-    plain FTS path of the parent class.
+    result sets with Reciprocal Rank Fusion (shared ``reciprocal_rank_fusion``
+    helper). Without one, behavior is the plain FTS path of the parent class.
     """
-
-    # RRF damping constant. Rank-based fusion sidesteps the scale mismatch
-    # between BM25 ranks and cosine distances; 60 is the standard default,
-    # large enough that the top few ranks from each list dominate without one
-    # list's tail crowding out the other's head.
-    _RRF_K = 60
 
     def __init__(
         self,
@@ -62,23 +57,24 @@ class RecallStorage(FtsMemoryStore):
             return keyword_hits
         return self._fuse(keyword_hits, dense_hits, limit=limit)
 
-    @classmethod
+    @staticmethod
     def _fuse(
-        cls,
         keyword_hits: list[dict[str, Any]],
         dense_hits: list[dict[str, Any]],
         *,
         limit: int,
     ) -> list[dict[str, Any]]:
         """Reciprocal Rank Fusion over two ranked recall-row lists by id."""
-        scores: dict[str, float] = {}
         rows: dict[str, dict[str, Any]] = {}
-        for ranked in (keyword_hits, dense_hits):
-            for rank, row in enumerate(ranked):
+        rankings: list[list[str]] = []
+        for hits in (keyword_hits, dense_hits):
+            ranking: list[str] = []
+            for row in hits:
                 row_id = str(row.get("id") or "").strip()
                 if not row_id:
                     continue
-                scores[row_id] = scores.get(row_id, 0.0) + 1.0 / (cls._RRF_K + rank + 1)
                 rows.setdefault(row_id, row)
-        order = sorted(scores, key=lambda rid: scores[rid], reverse=True)
-        return [rows[rid] for rid in order[: max(0, int(limit))]]
+                ranking.append(row_id)
+            rankings.append(ranking)
+        fused = reciprocal_rank_fusion(rankings, out_size=max(0, int(limit)))
+        return [rows[row_id] for row_id, _score in fused]

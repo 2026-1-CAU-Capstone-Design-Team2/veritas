@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 from pathlib import Path
 from typing import Any
@@ -18,16 +19,23 @@ class EmbeddingRecallStore:
     in chroma metadata so a hit reconstructs the same row shape the FTS
     path returns.
 
-    Every method degrades to a no-op (add) or empty result (search) when
-    the embedding endpoint or vector store is unavailable, and latches
-    ``_disabled`` on the first hard failure so a missing embedding server
-    leaves keyword recall fully intact.
+    Lives under ``<workspace>/memory/chromadb`` — a memory-owned store
+    separate from the research ``<workspace>/chromadb`` index, so the
+    "chromadb dir exists ⇒ research was indexed" invariant other code relies
+    on stays intact.
 
-    All ChromaDB access is serialized under one RLock. The background dense
-    backfill and a live chat turn can both touch the collection at once, and
-    ChromaDB's per-process SQLite/handle cache is not safe under concurrent
-    init or write; embedding HTTP calls stay outside the lock so a slow
-    embed never blocks another thread's ChromaDB access.
+    Every method degrades to a no-op (add) or empty result (search) when the
+    embedding endpoint or vector store is unavailable, latching ``_disabled``
+    on the first hard failure so a missing embedding server leaves keyword
+    recall fully intact. ChromaDB access is serialized under one RLock;
+    embedding HTTP calls stay outside it so a slow embed never blocks another
+    thread's ChromaDB access.
+
+    ``add`` is asynchronous: it enqueues the turn and returns, so the chat
+    hot path (prepare/commit) never waits on the store-side embedding HTTP
+    call — that turn is only needed for *future* retrieval, not the current
+    response. A single background worker drains the queue. ``search`` stays
+    synchronous because its query embedding is needed for this turn's answer.
     """
 
     COLLECTION_NAME = "recall_turns"
@@ -51,8 +59,14 @@ class EmbeddingRecallStore:
         self.raw_llm = raw_llm
         self.collection_name = collection_name or self.COLLECTION_NAME
         self._store: Any | None = None
-        self._disabled = False
+        # No embed method ⇒ permanently disabled; skip the wasted embed attempts.
+        self._disabled = not callable(getattr(raw_llm, "embed", None))
         self._lock = threading.RLock()
+        # Background dense-indexing queue + lazily-started worker. add() only
+        # enqueues; the worker runs the embed+upsert off the hot path.
+        self._index_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._worker: threading.Thread | None = None
+        self._worker_lock = threading.Lock()
 
     def _ensure_store(self) -> Any | None:
         """Lazily open the chroma collection; latch disabled on any failure.
@@ -62,14 +76,11 @@ class EmbeddingRecallStore:
             return None
         if self._store is not None:
             return self._store
-        if not callable(getattr(self.raw_llm, "embed", None)):
-            self._disabled = True
-            return None
         try:
             from storage.vector_store import VectorStore
 
             self._store = VectorStore(
-                persist_dir=self.workspace_root / "chromadb",
+                persist_dir=self.workspace_root / "memory" / "chromadb",
                 collection_name=self.collection_name,
                 embedding_fn=self.raw_llm.embed,
             )
@@ -96,41 +107,92 @@ class EmbeddingRecallStore:
                 text = text[: len(text) // 2]
         return None
 
-    def add(self, item: MemoryItem) -> None:
-        """Embed and upsert one turn. No-op when disabled or content empty."""
-        content = str(getattr(item, "content", "") or "").strip()
-        item_id = str(getattr(item, "id", "") or "").strip()
-        if not content or not item_id:
-            return
-        with self._lock:
-            if self._ensure_store() is None:
-                return
+    def _index_row(self, row: dict[str, Any]) -> bool:
+        """Embed and upsert one recall-row dict. Returns whether it indexed.
+
+        Shared by ``add`` (one live turn) and ``backfill`` (many old turns):
+        embed outside the lock, then upsert under it. An oversize turn whose
+        embed returns None is skipped; a ChromaDB write failure latches
+        ``_disabled`` so the caller stops touching a broken store."""
+        item_id = str(row.get("id") or "").strip()
+        content = str(row.get("content") or "").strip()
+        if not item_id or not content or self._disabled:
+            return False
         vec = self._embed_text(content)
         if vec is None:
-            return
+            return False
         with self._lock:
             store = self._ensure_store()
             if store is None:
-                return
+                return False
             try:
                 store.add_document(
                     doc_id=item_id,
                     content=content,
                     embedding=vec,
-                    metadata=self._item_metadata(item),
+                    metadata=self._row_metadata(row),
                 )
+                return True
             except Exception as e:
-                print(f"[memory][embedding_recall][warn] add failed: {type(e).__name__}: {e}")
+                print(f"[memory][embedding_recall][warn] index failed: {type(e).__name__}: {e}")
                 self._disabled = True
+                return False
+
+    def add(self, item: MemoryItem) -> None:
+        """Enqueue one turn for background dense indexing (non-blocking).
+
+        Returns immediately so the chat hot path never waits on the embedding
+        HTTP call; the worker runs the embed+upsert. No-op when disabled."""
+        if self._disabled:
+            return
+        self._ensure_worker()
+        self._index_queue.put(self._item_to_row(item))
+
+    def backfill(self, rows: list[dict[str, Any]]) -> int:
+        """Index recall rows that predate this store, one per request so a
+        single oversize turn cannot abort the pass. Returns indexed count.
+
+        Synchronous on purpose: it already runs on the background backfill
+        thread (``MemoryRuntime._embedding_backfill_worker``), so routing it
+        through the live-turn queue would only add hand-offs."""
+        return sum(1 for row in rows if self._index_row(row))
+
+    def _ensure_worker(self) -> None:
+        """Start the dense-index worker on first use (double-checked)."""
+        if self._worker is not None:
+            return
+        with self._worker_lock:
+            if self._worker is not None:
+                return
+            worker = threading.Thread(
+                target=self._index_worker, name="memory-dense-index", daemon=True
+            )
+            self._worker = worker
+            worker.start()
+
+    def _index_worker(self) -> None:
+        """Drain the queue, embedding+upserting each turn. ``None`` is the
+        shutdown sentinel."""
+        while True:
+            row = self._index_queue.get()
+            try:
+                if row is None:
+                    return
+                self._index_row(row)
+            except Exception as e:
+                print(f"[memory][embedding_recall][warn] async index failed: {type(e).__name__}: {e}")
+            finally:
+                self._index_queue.task_done()
+
+    def flush(self) -> None:
+        """Block until all queued dense writes are indexed (tests / shutdown)."""
+        self._index_queue.join()
 
     def search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
         """Cosine search, newest-relevant first. Empty list on failure/disable."""
         query = str(query or "").strip()
-        if not query or int(limit) <= 0:
+        if not query or int(limit) <= 0 or self._disabled:
             return []
-        with self._lock:
-            if self._ensure_store() is None:
-                return []
         qvec = self._embed_text(query)
         if qvec is None:
             return []
@@ -156,39 +218,14 @@ class EmbeddingRecallStore:
             except Exception:
                 return 0
 
-    def backfill(self, rows: list[dict[str, Any]]) -> int:
-        """Index recall rows that predate this store, one per request so a
-        single oversize turn cannot abort the pass. Returns indexed count."""
-        with self._lock:
-            if self._ensure_store() is None:
-                return 0
-        indexed = 0
-        for row in rows:
-            item_id = str(row.get("id") or "").strip()
-            content = str(row.get("content") or "").strip()
-            if not item_id or not content:
-                continue
-            vec = self._embed_text(content)
-            if vec is None:
-                continue
-            with self._lock:
-                store = self._ensure_store()
-                if store is None:
-                    break
-                try:
-                    store.add_document(
-                        doc_id=item_id,
-                        content=content,
-                        embedding=vec,
-                        metadata=self._row_metadata(row),
-                    )
-                    indexed += 1
-                except Exception as e:
-                    print(f"[memory][embedding_recall][warn] backfill row failed: {type(e).__name__}: {e}")
-        return indexed
-
     def close(self) -> None:
-        """Release the chroma client handle."""
+        """Drain pending dense writes, stop the worker, release the chroma handle."""
+        with self._worker_lock:
+            worker = self._worker
+            self._worker = None
+        if worker is not None:
+            self._index_queue.put(None)  # shutdown sentinel after queued rows
+            worker.join(timeout=10)
         with self._lock:
             store = self._store
             self._store = None
@@ -198,15 +235,14 @@ class EmbeddingRecallStore:
                 except Exception:
                     pass
 
-    @staticmethod
-    def _role_value(item: MemoryItem) -> str:
-        role = getattr(item, "role", None)
-        return role.value if hasattr(role, "value") else str(role or "")
-
     @classmethod
-    def _item_metadata(cls, item: MemoryItem) -> dict[str, Any]:
+    def _item_to_row(cls, item: MemoryItem) -> dict[str, Any]:
+        """Project a MemoryItem into the recall-row shape ``_index_row`` consumes."""
+        role = getattr(item, "role", None)
         return {
-            "role": cls._role_value(item),
+            "id": str(getattr(item, "id", "") or ""),
+            "content": str(getattr(item, "content", "") or ""),
+            "role": role.value if hasattr(role, "value") else str(role or ""),
             "source": str(getattr(item, "source", "") or ""),
             "created_at": str(getattr(item, "created_at", "") or ""),
             "token_count": int(getattr(item, "token_count", 0) or 0),

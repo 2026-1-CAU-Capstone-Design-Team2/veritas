@@ -70,12 +70,64 @@ class WorkingContextTests(unittest.TestCase):
         self.assertEqual(extract_explicit_facts("what is alpha memory?"), [])
         self.assertEqual(
             extract_explicit_facts("기억해줘: 내 프로젝트는 alpha memory layer야."),
-            ["내 프로젝트는 alpha memory layer야"],
+            [("remember", "내 프로젝트는 alpha memory layer야")],
         )
         self.assertEqual(
             extract_explicit_facts("my name is Dana. what do you remember?"),
-            ["Dana"],
+            [("name", "Dana")],
         )
+
+    def test_single_valued_category_replaces_old_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            working = WorkingContextManager(MemoryStore(Path(tmp)), _WordCounter())
+            self.assertTrue(working.append_fact("Dana", category="name"))
+            self.assertTrue(working.append_fact("Bob", category="name"))
+            self.assertEqual([r["text"] for r in working.records()], ["Bob"])
+
+    def test_single_valued_category_same_value_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            working = WorkingContextManager(MemoryStore(Path(tmp)), _WordCounter())
+            self.assertTrue(working.append_fact("Dana", category="name"))
+            self.assertFalse(working.append_fact("Dana", category="name"))
+            self.assertEqual(len(working.records()), 1)
+
+    def test_remember_category_accumulates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            working = WorkingContextManager(MemoryStore(Path(tmp)), _WordCounter())
+            self.assertTrue(working.append_fact("buy milk", category="remember"))
+            self.assertTrue(working.append_fact("call mom", category="remember"))
+            self.assertEqual(
+                {r["text"] for r in working.records()}, {"buy milk", "call mom"}
+            )
+
+    def test_name_and_project_categories_are_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            working = WorkingContextManager(MemoryStore(Path(tmp)), _WordCounter())
+            working.append_fact("Dana", category="name")
+            working.append_fact("veritas", category="project")
+            working.append_fact("Bob", category="name")  # replaces name, not project
+            self.assertEqual({r["text"] for r in working.records()}, {"Bob", "veritas"})
+
+    def test_prepare_name_change_replaces_old_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = MemoryRuntime(
+                raw_llm=_FakeRawLLM(), workspace_root=Path(tmp), max_context_tokens=8192
+            )
+            try:
+                for name in ("박서원", "김철수"):
+                    runtime.prepare(
+                        CallRequest(
+                            task_instruction="s",
+                            user_content="u",
+                            record_content=f"내 이름은 {name}",
+                            stream_label="chat",
+                        )
+                    )
+                joined = " ".join(r["text"] for r in runtime.working.records())
+                self.assertNotIn("박서원", joined)
+                self.assertIn("김철수", joined)
+            finally:
+                runtime.close()
 
     def test_prepare_heuristically_appends_explicit_user_fact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

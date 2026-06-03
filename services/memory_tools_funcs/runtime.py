@@ -56,13 +56,6 @@ class MemoryRuntime:
         self.max_context_tokens = int(max_context_tokens)
 
         self.token_counter = TokenCounter(raw_llm)
-        self.store = MemoryStore(self.workspace_root, reuse_connection=True)
-        self.embedding_recall = EmbeddingRecallStore(self.workspace_root, raw_llm)
-        self.recall = RecallStorage(
-            self.store, self.token_counter, embedding_store=self.embedding_recall
-        )
-        self.working = WorkingContextManager(self.store, self.token_counter)
-        self.queue = QueueManager(self.store, self.token_counter, self.recall)
         self.summarizer = MemorySummarizer(raw_llm)
         self.policy_dispatcher = ProfilePolicyDispatcher()
 
@@ -70,14 +63,10 @@ class MemoryRuntime:
         self._flush_lock = threading.Lock()
         self._flush_in_progress = False
 
-        self._launch_embedding_backfill()
+        self._build_storage()
 
-    def configure_workspace(self, workspace_root: Path) -> None:
-        """workspace 전환 시 storage 핸들을 새 디렉토리로 교체한다."""
-        self.store.close()
-        if getattr(self, "embedding_recall", None) is not None:
-            self.embedding_recall.close()
-        self.workspace_root = Path(workspace_root)
+    def _build_storage(self) -> None:
+        """현재 workspace_root 기준으로 storage 핸들을 만들고 dense 백필을 띄운다."""
         self.store = MemoryStore(self.workspace_root, reuse_connection=True)
         self.embedding_recall = EmbeddingRecallStore(self.workspace_root, self.raw_llm)
         self.recall = RecallStorage(
@@ -86,6 +75,14 @@ class MemoryRuntime:
         self.working = WorkingContextManager(self.store, self.token_counter)
         self.queue = QueueManager(self.store, self.token_counter, self.recall)
         self._launch_embedding_backfill()
+
+    def configure_workspace(self, workspace_root: Path) -> None:
+        """workspace 전환 시 storage 핸들을 새 디렉토리로 교체한다."""
+        self.store.close()
+        if getattr(self, "embedding_recall", None) is not None:
+            self.embedding_recall.close()
+        self.workspace_root = Path(workspace_root)
+        self._build_storage()
 
     def close(self) -> None:
         """Release runtime-owned storage resources."""
@@ -321,14 +318,15 @@ class MemoryRuntime:
           
         #  Heuristic explicit fact 추출해서 working context에 추가 (옵션이 켜져 있고, 기록 제약이 없을 때).
         #  append_fact() -> working 테이블에 저장. 
-            for fact in extract_explicit_facts(record_content):
+            for category, fact in extract_explicit_facts(record_content):
                 self.working.append_fact(
                     fact,
+                    category=category,
                     source="heuristic",
                     tags=["explicit_user"],
                     max_tokens=budget.working_context_tokens,
                 )
-                mem_debug("working", f"id={invocation_id[:8]} heuristic fact appended: {fact!r}")
+                mem_debug("working", f"id={invocation_id[:8]} heuristic fact appended: {category}={fact!r}")
         elif mem_debug_enabled():
             mem_debug(
                 "prepare",

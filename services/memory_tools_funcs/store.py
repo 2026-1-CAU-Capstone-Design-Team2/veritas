@@ -406,10 +406,9 @@ class MemoryStore:
 
     @staticmethod
     def format_working_records(records: list[dict[str, Any]]) -> str:
-        """Format working-context records for system prompt injection."""
-        """
-            record를 {text} 으로 join
-            binary search로 substring 자른다.    
+        """Format working-context records for system prompt injection.
+
+        Each record renders as a ``- {text}`` bullet line.
         """
         lines: list[str] = []
         for row in records:
