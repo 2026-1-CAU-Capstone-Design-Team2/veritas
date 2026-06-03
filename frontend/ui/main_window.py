@@ -45,7 +45,6 @@ from ..components.stepper import WorkflowStepper
 from .pages.dashboard_page import DashboardPage
 from .pages.document_page import DocumentPage
 from .pages.draft_page import DraftPage
-from .pages.feedback_page import FeedbackPage
 from .pages.guide_page import GuidePage
 from .pages.research_page import ResearchPage
 from .pages.settings_page import SettingsPage
@@ -198,7 +197,7 @@ class PlaceholderPage(QWidget):
 
 
 class MainWindow(QMainWindow):
-	STEP_ORDER = ["research", "document", "verify", "draft", "document_assist", "write", "feedback"]
+	STEP_ORDER = ["research", "document", "verify", "draft", "document_assist", "write"]
 
 	def __init__(self) -> None:
 		super().__init__()
@@ -313,7 +312,7 @@ class MainWindow(QMainWindow):
 		self.assist_toggle_button.clicked.connect(self.toggle_document_assist_window)
 		top_hero_layout.addWidget(self.assist_toggle_button, 0, Qt.AlignTop)
 
-		self.stepper = WorkflowStepper(["조사", "요약", "검증", "초안 생성", "문서 보조", "채팅", "피드백"])
+		self.stepper = WorkflowStepper(["조사", "요약", "검증", "초안 생성", "문서 보조", "채팅"])
 
 		self.pages = AnimatedStackedWidget()
 
@@ -343,7 +342,6 @@ class MainWindow(QMainWindow):
 		self._add_page("write", self.write_page)
 		self.document_page = DocumentPage()
 		self._add_page("document", self.document_page)
-		self._add_page("feedback", FeedbackPage())
 		self.settings_page = SettingsPage()
 		self.settings_page.defaultWorkspaceChanged.connect(self.sidebar.set_current_workspace)
 		self.sidebar.workspaceChanged.connect(self._on_workspace_changed)
@@ -821,7 +819,6 @@ class MainWindow(QMainWindow):
 			"document_assist": ("문서 보조", "실시간 문서 작성 보조 내용을 확인합니다."),
 			"write": ("AI 채팅", "워크스페이스 기반 AI와 채팅이 가능합니다."),
 			"document": ("요약", "최종 보고서 요약본을 확인합니다."),
-			"feedback": ("문서 피드백", "약한 주장과 저신뢰 문장을 우선 교정합니다."),
 			"settings": ("설정", "모델명과 로컬 접근 폴더를 구성합니다."),
 			"guide": ("가이드", "VERITAS 사용법을 단계별로 안내합니다."),
 		}

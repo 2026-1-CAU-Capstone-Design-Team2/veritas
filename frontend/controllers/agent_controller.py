@@ -125,17 +125,6 @@ class AgentController:
 		items = response.get("items", [])
 		return items if isinstance(items, list) else []
 
-	def upload_feedback_files(self, files: list[Path]) -> list[dict[str, str]]:
-		response = api_client.upload_files("/api/v1/feedback/files", files)
-		items = response.get("items", [])
-		return items if isinstance(items, list) else []
-
-	def analyze_feedback(self, file_ids: list[str]) -> dict[str, Any]:
-		return api_client.post("/api/v1/feedback/analyze", {"fileIds": file_ids})
-
-	def get_feedback_result(self, file_id: str) -> dict[str, Any]:
-		return api_client.get(f"/api/v1/feedback/results/{file_id}")
-
 	def update_model(self, model_id: str) -> dict[str, Any]:
 		return api_client.put(
 			"/api/v1/settings/model",
