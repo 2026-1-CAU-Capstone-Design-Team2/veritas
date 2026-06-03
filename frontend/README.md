@@ -78,11 +78,10 @@ python main.py
 ## 4. 현재 동작 범위
 
 - `frontend` UI만 실행합니다.
-- `MainWindow`, sidebar, dashboard, research, verify, draft, document assist, chat, document, feedback, settings 화면을 표시합니다.
+- `MainWindow`, sidebar, dashboard, research, verify, draft, document assist, chat, document, settings 화면을 표시합니다.
 - 실제 백엔드 API, AI 서버, Windows client 연동은 수행하지 않습니다.
 - workspace/settings 상태는 `frontend/api_common.py`의 mock/dummy 데이터입니다.
 - 채팅 응답과 문서/검증 화면 내용은 UI 확인용 임시 데이터입니다.
-- feedback 화면의 파일 업로드는 로컬 파일 텍스트 추출 미리보기 용도이며, 서버 분석을 호출하지 않습니다.
 
 ## 5. 문제 해결
 

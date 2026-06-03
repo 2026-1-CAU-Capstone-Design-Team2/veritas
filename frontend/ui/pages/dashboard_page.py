@@ -116,7 +116,6 @@ class DashboardPage(QWidget):
 		stats_row.setSpacing(12)
 		stats_row.addWidget(self._create_stat_tile("processed_docs", "처리 문서", "0"))
 		stats_row.addWidget(self._create_stat_tile("validated_workspaces", "검증 완료 워크스페이스", "0"))
-		stats_row.addWidget(self._create_stat_tile("feedback_rate", "피드백 완료율", "0%"))
 		root.addLayout(stats_row)
 
 		recent = CardWidget("최근 작업")
@@ -159,7 +158,7 @@ class DashboardPage(QWidget):
 		self._refresh_timer.stop()
 
 	def refresh(self) -> None:
-		"""Public hook for document, workspace, or feedback events."""
+		"""Public hook for document or workspace events."""
 		self.load_dashboard_data()
 
 	def load_dashboard_data(self) -> None:
@@ -183,7 +182,6 @@ class DashboardPage(QWidget):
 			self._last_data = data
 			self._stat_values["processed_docs"].setText(str(data["processed_docs"]))
 			self._stat_values["validated_workspaces"].setText(str(data["validated_workspaces"]))
-			self._stat_values["feedback_rate"].setText(f"{data['feedback_rate']}%")
 			self._render_recent_workspaces(data["recent_workspaces"])
 			self._render_recent_drafts(data.get("recent_drafts", []))
 
