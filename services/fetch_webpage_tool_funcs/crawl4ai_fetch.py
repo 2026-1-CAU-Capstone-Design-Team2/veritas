@@ -31,12 +31,21 @@ USER_AGENT = (
     "Chrome/123.0.0.0 Safari/537.36"
 )
 
-# fit_markdown (PruningContentFilter output) is only trusted when it preserves a
-# meaningful fraction of raw_markdown. If the filter is too aggressive on a given
-# page we keep raw_markdown instead, so the summarizer never silently loses body
-# content. This is the "loss-free" safety net.
+# fit_markdown (PruningContentFilter output) is the de-chromed body. We trust it
+# unless it collapses to almost nothing, in which case the filter over-stripped a
+# low-prose page (store/IR/link-list) and we keep raw_markdown so we never
+# silently lose body. Two floors guard against that:
+#   * _FIT_MIN_CHARS — an absolute floor; below it fit is too thin to trust.
+#   * _FIT_MIN_RATIO — fit must retain this share of raw_markdown.
+# On chrome-heavy news/blog pages the filter legitimately removes 60-75% (nav,
+# share bars, comment link-lists, related blocks), so a high ratio floor used to
+# revert clean articles back to the noisy raw_markdown — the exact cause of
+# "clean_md still full of chrome". Measured on archived raw_html, recoverable
+# article bodies cluster at fit/raw ≈ 0.27-0.40 while genuinely over-stripped
+# pages collapse to ≈ 0.04-0.05; 0.25 sits in that gap, so it keeps the clean
+# fit and still falls back to raw on the degenerate pages.
 _FIT_MIN_CHARS = 500
-_FIT_MIN_RATIO = 0.45
+_FIT_MIN_RATIO = 0.25
 
 # Minimum usable extraction length; below this the page is treated as a failure
 # so the caller can fall back or skip it.

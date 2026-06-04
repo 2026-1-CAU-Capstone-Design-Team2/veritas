@@ -6,6 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from services.document_cleanup_tool_funcs.html_body_extractor import (
+    is_structured_payload,
+    structured_punct_ratio,
+)
 from services.run_store_tool_funcs import RunStoreService
 from tools.document_cleanup_tool import DocumentCleanupTool
 from tools.loader import TOOLS_DIR, load_schema
@@ -119,6 +123,119 @@ def make_tool(store: RunStoreService, llm, cleanup_mode: str = "auto") -> Docume
     )
 
 
+# An article page wrapped in semantic chrome: <nav>/<header>/<aside>/<footer>
+# surround the real <article> body. Structural extraction should keep the
+# article (heading + paragraphs) and drop the chrome by tag/role alone.
+_ARTICLE_HTML = """<html><body>
+<nav>Home Products About Contact Sign In</nav>
+<header>Site Banner Logo</header>
+<article>
+<h1>Quantum Widgets Overview</h1>
+<p>Quantum widgets achieved a 42 percent efficiency gain in 2026 benchmarks
+across twelve datasets, outperforming the classical baseline by a wide margin
+in every category that the authors measured during the study.</p>
+<p>The architecture uses a layered transition model with explicit state
+caching, and the team reports stable convergence within fifty training epochs
+on commodity hardware without any specialized accelerators.</p>
+</article>
+<aside>Related Articles: Foo Bar Baz Newsletter Signup</aside>
+<footer>Copyright 2026 Share on Twitter Privacy Policy Cookie Settings</footer>
+</body></html>"""
+
+
+def _write_raw_html(store: RunStoreService, doc_id: str, html: str) -> None:
+    store.paths.raw_html_dir.mkdir(parents=True, exist_ok=True)
+    (store.paths.raw_html_dir / f"{doc_id}.html").write_text(html, encoding="utf-8")
+
+
+# Long, low-link article paragraphs so a multi-paragraph body comfortably clears
+# the prose-quality gate (real article bodies measured at 1,400-3,000 chars).
+_PARA_A = (
+    "삼성전자 반도체 부문은 인공지능 가속기에 쓰이는 고대역폭 메모리 수요 급증에 힘입어 분기 사상 최대 영업이익을 기록했다고 회사 측은 설명했다. "
+    "서버용 D램 가격이 분기 내내 가파르게 상승하면서 메모리 사업의 수익성이 큰 폭으로 개선되었고, 데이터센터 고객사의 선제적 재고 확보 움직임도 이어졌다. "
+    "특히 HBM3E 양산 물량이 본격적으로 확대되면서 고부가 제품 비중이 높아진 점이 실적 개선의 핵심 동력으로 작용했다고 분석된다."
+)
+_PARA_B = (
+    "회사는 다음 분기에도 AI 및 서버 수요를 중심으로 반도체 사업의 성장세가 이어질 것으로 전망하면서도, 글로벌 관세와 거시 경제 불확실성을 예의주시하겠다고 밝혔다. "
+    "수익성 확보 중심의 안정적인 경영 기조를 유지하는 한편, 차세대 HBM4 개발과 파운드리 선단 공정 경쟁력 강화에 투자를 집중하겠다는 계획도 함께 제시했다. "
+    "증권가는 메모리 슈퍼사이클이 내년까지 이어질 가능성에 무게를 두면서 목표주가를 일제히 상향 조정하는 분위기다."
+)
+
+
+def _nav(n: int) -> str:
+    return "<nav>" + "".join(f"<a href='#'>메뉴{i}</a>" for i in range(n)) + "</nav>"
+
+
+def _footer(n: int) -> str:
+    return "<footer>" + "".join(f"<a href='#'>푸터{i}</a>" for i in range(n)) + "</footer>"
+
+
+def _related_list(n: int) -> str:
+    # A trailing related/tags cluster: short link-only list items.
+    return "<ul>" + "".join(
+        f"<li><a href='#'>관련 기사 링크 {i}</a></li>" for i in range(n)
+    ) + "</ul>"
+
+
+# A real article buried in heavy chrome — the article text is a small fraction
+# of the whole page (well under 50% retention vs the noisy raw).
+_CHROME_HEAVY_ARTICLE_HTML = (
+    "<html><body>"
+    + _nav(40)
+    + "<div class='content'><h1>삼성전자 HBM 실적 분석</h1>"
+    + f"<p>{_PARA_A}</p><p>{_PARA_B}</p></div>"
+    + _related_list(12)
+    + _footer(40)
+    + "</body></html>"
+)
+
+# A page that is pure navigation / link lists — no real prose body.
+_NAV_ONLY_HTML = (
+    "<html><body>"
+    + _nav(20)
+    + "<ul>" + "".join(f"<li><a href='#'>섹션 {i}</a></li>" for i in range(30)) + "</ul>"
+    + _footer(20)
+    + "</body></html>"
+)
+
+# A related-articles <article> box appears BEFORE the real <main> body.
+_RELATED_FIRST_HTML = (
+    "<html><body>"
+    + "<article><h3>관련 기사</h3>"
+    + "<ul>" + "".join(f"<li><a href='#'>관련 링크 {i} 입니다</a></li>" for i in range(8)) + "</ul>"
+    + "</article>"
+    + f"<main><h1>본문 제목</h1><p>{_PARA_A}</p><p>{_PARA_B}</p></main>"
+    + "</body></html>"
+)
+
+# A data-table-heavy source (little prose) wrapped in chrome. The table is sized
+# like a real quarterly data table so the body clears the absolute-length floor.
+def _share_table() -> str:
+    rows = ["<tr><th>회사</th><th>Q1 2025</th><th>Q2 2025</th><th>Q3 2025</th><th>Q4 2025</th><th>전년 대비 증감</th></tr>"]
+    data = [
+        ("SK 하이닉스 메모리 사업부", "35%", "36%", "39%", "34%", "소폭 하락"),
+        ("삼성전자 디바이스솔루션", "38%", "34%", "33%", "40%", "반등 성공"),
+        ("마이크론 테크놀로지", "20%", "22%", "21%", "19%", "하락 전환"),
+        ("기타 군소 업체 합계", "7%", "8%", "7%", "7%", "보합 유지"),
+        ("난드 플래시 합산 점유율", "31%", "33%", "34%", "36%", "지속 상승"),
+    ]
+    for name, *vals in data:
+        rows.append("<tr><td>" + name + "</td>" + "".join(f"<td>{v}</td>" for v in vals) + "</tr>")
+    return "<table>" + "".join(rows) + "</table>"
+
+
+_TABLE_HEAVY_HTML = (
+    "<html><body>"
+    + _nav(30)
+    + "<div><h2>전세계 D램 및 HBM 시장 점유율 분기별 데이터</h2>"
+    + _share_table()
+    + "</div>"
+    + _related_list(10)
+    + _footer(30)
+    + "</body></html>"
+)
+
+
 class CleanupModeResolutionTests(unittest.TestCase):
     def test_auto_resolves_per_doc_for_local_llm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -191,18 +308,102 @@ class BatchModeTests(unittest.TestCase):
             self.assertEqual(result.data["failed_documents"], [])
             self.assertEqual(result.data["fallback_documents"], [])
 
-    def test_clean_md_is_raw_passthrough(self) -> None:
+    def test_clean_md_falls_back_to_raw_when_no_html(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = make_run_store(Path(tmp), doc_count=1)
+            store = make_run_store(Path(tmp), doc_count=1)  # raw_md only, no raw_html
             tool = make_tool(store, FakeOpenAIChatLLMClient())
 
             tool.run(doc_ids=["1"])
 
             raw = (store.paths.raw_md_dir / "1.md").read_text(encoding="utf-8")
             clean = (store.paths.clean_md_dir / "1.md").read_text(encoding="utf-8")
-            # Boilerplate removal is skipped on the batch path — the body is
-            # copied as-is so RAG / verification / batch summary inputs exist.
+            # No archived raw_html → structural extraction is unavailable, so the
+            # batch path conservatively keeps the raw_md body verbatim.
             self.assertEqual(clean, raw)
+
+    def test_clean_md_uses_structural_extraction_when_html_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = make_run_store(Path(tmp), doc_count=1)
+            _write_raw_html(store, "1", _ARTICLE_HTML)
+            tool = make_tool(store, FakeOpenAIChatLLMClient())
+
+            tool.run(doc_ids=["1"])
+
+            clean = (store.paths.clean_md_dir / "1.md").read_text(encoding="utf-8")
+            # Article body preserved...
+            self.assertIn("Quantum Widgets Overview", clean)
+            self.assertIn("42 percent efficiency", clean)
+            # ...page chrome dropped by tag/role (no keyword/selector list).
+            self.assertNotIn("Home Products", clean)
+            self.assertNotIn("Related Articles", clean)
+            self.assertNotIn("Copyright 2026", clean)
+
+    def test_batch_metadata_input_uses_sanitized_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = make_run_store(Path(tmp), doc_count=1)
+            _write_raw_html(store, "1", _ARTICLE_HTML)
+            llm = FakeOpenAIChatLLMClient()
+            tool = make_tool(store, llm)
+
+            tool.run(doc_ids=["1"])
+
+            self.assertTrue(llm.ask_json_inputs)
+            metadata_input = llm.ask_json_inputs[0]
+            # The sanitized body (not the chrome) is what the LLM sees.
+            self.assertIn("Quantum widgets achieved", metadata_input)
+            self.assertNotIn("Related Articles", metadata_input)
+            self.assertNotIn("Copyright 2026", metadata_input)
+
+    def test_batch_accepts_low_retention_article_with_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = make_run_store(Path(tmp), doc_count=1)
+            # Big noisy raw_md so the clean article is well under 50% retention.
+            (store.paths.raw_md_dir / "1.md").write_text("잡음 " * 4000, encoding="utf-8")
+            _write_raw_html(store, "1", _CHROME_HEAVY_ARTICLE_HTML)
+            tool = make_tool(store, FakeOpenAIChatLLMClient())
+
+            result = tool.run(doc_ids=["1"])
+
+            clean = (store.paths.clean_md_dir / "1.md").read_text(encoding="utf-8")
+            self.assertIn("삼성전자 반도체 부문", clean)  # article kept
+            self.assertNotIn("메뉴0", clean)              # nav/footer dropped
+            prov = {p["docId"]: p for p in result.data["cleanup_provenance"]}
+            self.assertTrue(prov["1"]["accepted"])
+            self.assertEqual(prov["1"]["reason"], "accepted")
+            # Accepted even though far smaller than the noisy raw (no retention gate).
+            self.assertLess(prov["1"]["extractedLen"], prov["1"]["rawLen"])
+
+    def test_cleanup_provenance_has_numbers_not_raw_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = make_run_store(Path(tmp), doc_count=1)
+            _write_raw_html(store, "1", _CHROME_HEAVY_ARTICLE_HTML)
+            tool = make_tool(store, FakeOpenAIChatLLMClient())
+
+            result = tool.run(doc_ids=["1"])
+
+            prov = result.data["cleanup_provenance"][0]
+            self.assertEqual(
+                set(prov)
+                >= {
+                    "docId", "accepted", "reason", "rawLen",
+                    "extractedLen", "proseLen", "tableCount", "linkDensity",
+                },
+                True,
+            )
+            # No raw body text leaks into provenance — only structural numbers.
+            for value in prov.values():
+                self.assertNotIn("삼성전자 반도체 부문", str(value))
+
+    def test_no_html_falls_back_with_provenance_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = make_run_store(Path(tmp), doc_count=1)  # raw_md only
+            tool = make_tool(store, FakeOpenAIChatLLMClient())
+
+            result = tool.run(doc_ids=["1"])
+
+            prov = result.data["cleanup_provenance"][0]
+            self.assertFalse(prov["accepted"])
+            self.assertEqual(prov["reason"], "no_html")
 
     def test_doc_metadata_written_from_batch_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -319,6 +520,104 @@ class PerDocModeRegressionTests(unittest.TestCase):
             doc_md = store.paths.summary_path_for(1).read_text(encoding="utf-8")
             self.assertIn("Local cleanup summary.", doc_md)
             self.assertIn("local point one", doc_md)
+
+
+class HtmlBodyExtractorTests(unittest.TestCase):
+    def test_drops_chrome_keeps_article_body(self) -> None:
+        from services.document_cleanup_tool_funcs import extract_main_text
+
+        out = extract_main_text(_ARTICLE_HTML)
+        self.assertIn("Quantum Widgets Overview", out)
+        self.assertIn("42 percent efficiency", out)
+        self.assertNotIn("Home Products", out)
+        self.assertNotIn("Related Articles", out)
+        self.assertNotIn("Copyright 2026", out)
+
+    def test_empty_html_returns_empty(self) -> None:
+        from services.document_cleanup_tool_funcs import extract_main_text
+
+        self.assertEqual(extract_main_text(""), "")
+        self.assertEqual(extract_main_text("   "), "")
+
+    def test_preserves_substantial_list_items_and_table_rows(self) -> None:
+        from services.document_cleanup_tool_funcs import extract_main_text
+
+        html = (
+            "<main>"
+            "<ul>"
+            "<li>첫 번째 항목은 실제 본문 근거를 담은 충분히 긴 내용으로 작성되어 있습니다 여기에 더 많은 단어</li>"
+            "<li>두 번째 항목 역시 구체적인 데이터 포인트를 자세히 설명하는 충분히 긴 본문 항목입니다 추가 단어</li>"
+            "</ul>"
+            "<table>"
+            "<tr><th>지역</th><th>점유율</th><th>전년 대비</th></tr>"
+            "<tr><td>아시아 태평양 시장 전체</td><td>사십이 퍼센트 수준</td><td>상승 추세 지속</td></tr>"
+            "<tr><td>북미 시장 합산 비중</td><td>이십팔 퍼센트 안팎</td><td>보합세 유지함</td></tr>"
+            "</table>"
+            "</main>"
+        )
+        out = extract_main_text(html)
+        self.assertIn("첫 번째 항목은 실제 본문", out)
+        self.assertIn("| 지역 | 점유율 | 전년 대비 |", out)
+        self.assertIn("아시아 태평양 시장 전체", out)
+
+    def test_accepts_article_below_half_retention(self) -> None:
+        # The real article is a small slice of a chrome-heavy page; the
+        # quality gate accepts it regardless of how small vs the raw page.
+        from services.document_cleanup_tool_funcs import extract_main_text_with_stats
+
+        r = extract_main_text_with_stats(_CHROME_HEAVY_ARTICLE_HTML)
+        self.assertTrue(r.accepted, r.reason)
+        self.assertIn("삼성전자 반도체 부문", r.text)
+        self.assertNotIn("메뉴0", r.text)       # nav dropped
+        self.assertNotIn("관련 기사 링크", r.text)  # trailing related cluster trimmed
+        self.assertNotIn("푸터0", r.text)        # footer dropped
+
+    def test_rejects_navigation_only_page(self) -> None:
+        from services.document_cleanup_tool_funcs import extract_main_text_with_stats
+
+        r = extract_main_text_with_stats(_NAV_ONLY_HTML)
+        self.assertFalse(r.accepted)
+        self.assertIn(r.reason, ("empty", "low_quality", "too_short"))
+
+    def test_picks_body_over_leading_related_article(self) -> None:
+        from services.document_cleanup_tool_funcs import extract_main_text
+
+        out = extract_main_text(_RELATED_FIRST_HTML)
+        self.assertIn("삼성전자 반도체 부문", out)  # the real <main> body
+        self.assertNotIn("관련 링크", out)          # the leading related <article> box
+
+    def test_table_heavy_source_accepted_despite_low_prose(self) -> None:
+        from services.document_cleanup_tool_funcs import extract_main_text_with_stats
+
+        r = extract_main_text_with_stats(_TABLE_HEAVY_HTML)
+        self.assertTrue(r.accepted, r.reason)
+        self.assertGreaterEqual(r.table_count, 1)
+        self.assertIn("| 회사 | Q1 2025 | Q2 2025 | Q3 2025 | Q4 2025 | 전년 대비 증감 |", r.text)
+        self.assertIn("| 삼성전자 디바이스솔루션 |", r.text)
+        self.assertNotIn("관련 기사 링크", r.text)
+
+
+class StructuredPayloadGuardTests(unittest.TestCase):
+    """Post-cleanup structural gate: bloated JSON/listing extractions → raw."""
+
+    def test_prose_has_low_structural_punct_ratio(self) -> None:
+        prose = "이 문서는 텍스트 확산 언어모델의 속도와 품질을 비교한다 " * 200
+        self.assertLess(structured_punct_ratio(prose), 0.05)
+
+    def test_json_listing_has_high_structural_punct_ratio(self) -> None:
+        payload = '{"items":[{"id":1,"name":"a"},{"id":2,"name":"b"}],"meta":{"k":"v"}}' * 50
+        self.assertGreaterEqual(structured_punct_ratio(payload), 0.12)
+
+    def test_bloated_json_payload_is_flagged(self) -> None:
+        payload = '{"id":1,"name":"x","tags":["a","b","c"]},' * 500
+        self.assertTrue(is_structured_payload(payload, raw_len=500))
+
+    def test_large_prose_article_is_not_flagged_even_if_bigger_than_raw(self) -> None:
+        article = "이 문단은 자연어 문장으로 구성된 본문이다 추가 설명이 이어진다 " * 300
+        self.assertFalse(is_structured_payload(article, raw_len=200))
+
+    def test_small_body_is_never_flagged(self) -> None:
+        self.assertFalse(is_structured_payload('{"a":1,"b":2}', raw_len=10))
 
 
 if __name__ == "__main__":

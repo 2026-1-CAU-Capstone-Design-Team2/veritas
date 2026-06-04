@@ -6,11 +6,21 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from core.models import IndexedDocRecord
+from services.autosurvey_source_quality import (
+    body_is_on_topic,
+    build_topic_terms,
+    rank_candidates,
+    topic_hit_count,
+)
 
 from .config import AutoSurveyConfig
 
 
 ProgressCallback = Callable[..., None]
+
+# A main-loop cycle that adds at most this many kept docs once we are already
+# past ``min_docs`` is treated as diminishing returns → early stop.
+_EARLY_STOP_MIN_GAIN = 1
 
 
 class AutoSurveyWorkflow:
@@ -33,6 +43,7 @@ class AutoSurveyWorkflow:
         self.max_docs = self._config.max_docs
         self.collect_batch_size = self._config.collect_batch_size
         self.scout_docs = self._config.scout_docs
+        self.min_docs = self._config.min_docs
         self.fetch_max_chars = self._config.fetch_max_chars
         self._progress_callback = progress_callback
 
@@ -146,6 +157,7 @@ class AutoSurveyWorkflow:
         grounding: dict[str, Any] | None = None,
         prior_plan: dict[str, Any] | None = None,
         gap_directions: list[str] | None = None,
+        memory_brief: str | None = None,
         save_request: bool = True,
     ) -> dict[str, Any]:
         if save_request:
@@ -173,6 +185,7 @@ class AutoSurveyWorkflow:
             prior_plan=prior_plan,
             gap_directions=gap_directions or [],
             used_queries=used_queries,
+            memory_brief=memory_brief if mode == "initial" else "",
             save=True,
         )
         if not result.success:
@@ -213,6 +226,7 @@ class AutoSurveyWorkflow:
         max_new_docs: int | None = None,
         queries: list[str] | None = None,
         phase_label: str = "main",
+        user_request: str = "",
     ) -> dict[str, Any]:
         kept_count = self._kept_record_count()
         remaining_capacity = max(0, self.max_docs - kept_count)
@@ -253,8 +267,15 @@ class AutoSurveyWorkflow:
         new_doc_ids: list[str] = []
         duplicate_doc_ids: list[str] = []
         fetch_error_doc_ids: list[str] = []
+        rejected_doc_ids: list[str] = []
         consumed_queries: list[str] = []
         skipped_used_queries: list[str] = []
+
+        # Core topic = user request + plan only (NO live query). A replan query
+        # can drift toward generic/adjacent terms; ranking may use that drift,
+        # but post-fetch *acceptance* must not — otherwise a query-only match
+        # lets an off-topic body in. So the body gate uses the core topic.
+        core_topic = build_topic_terms(user_request=user_request, plan=plan, query="")
 
         for query in search_queries:
             if len(new_doc_ids) >= target_new_docs:
@@ -287,11 +308,36 @@ class AutoSurveyWorkflow:
                 continue
 
             results = search_result.data.get("results", [])
+            # Score candidates BEFORE fetch: drop clearly off-topic hits and cap
+            # any one domain so they never cost a fetch, a cleanup LLM call, or a
+            # maxDocs slot. Ranking uses the full topic (core + live query — the
+            # query helps surface on-query results). Structural/lexical only.
+            full_topic = build_topic_terms(
+                user_request=user_request, plan=plan, query=query
+            )
+            ranked = rank_candidates(
+                results,
+                full_topic,
+                reference_domains=self._reference_domains(plan),
+            )
+            kept_candidates = [c for c in ranked if c.kept]
+            dropped_candidates = [c for c in ranked if not c.kept]
             print(
                 "[collect][search] "
-                f"phase={phase_label} query={query!r} results={len(results)}"
+                f"phase={phase_label} query={query!r} results={len(results)} "
+                f"kept={len(kept_candidates)} dropped={len(dropped_candidates)}"
             )
-            for item in results:
+            if dropped_candidates:
+                preview = ", ".join(
+                    f"{c.domain or '?'}@{c.score}:{c.reason}"
+                    for c in dropped_candidates[:5]
+                )
+                print(
+                    f"[collect][prefilter] phase={phase_label} "
+                    f"dropped={len(dropped_candidates)} ({preview})"
+                )
+            for candidate in kept_candidates:
+                item = candidate.item
                 if len(new_doc_ids) >= target_new_docs:
                     break
 
@@ -308,7 +354,9 @@ class AutoSurveyWorkflow:
                 if self._already_seen_url(records_now, url):
                     continue
 
-                fetch_result = self._fetch_one(title_hint=title, url=url, query=query)
+                fetch_result = self._fetch_one(
+                    title_hint=title, url=url, query=query, topic=core_topic
+                )
                 status = fetch_result.get("status")
                 doc_id = fetch_result.get("doc_id")
 
@@ -318,6 +366,11 @@ class AutoSurveyWorkflow:
                 elif status == "duplicate" and doc_id:
                     duplicate_doc_ids.append(doc_id)
                     print(f"[collect][duplicate] phase={phase_label} doc_id={doc_id}")
+                elif status == "rejected" and doc_id:
+                    # Off-topic body: does NOT consume a maxDocs slot (no kept
+                    # record), recorded only as a rejected note.
+                    rejected_doc_ids.append(doc_id)
+                    print(f"[collect][rejected] phase={phase_label} doc_id={doc_id}")
                 elif status == "fetch_error" and doc_id:
                     fetch_error_doc_ids.append(doc_id)
                     print(f"[collect][fetch-error] phase={phase_label} doc_id={doc_id}")
@@ -336,6 +389,8 @@ class AutoSurveyWorkflow:
             "new_doc_count": len(new_doc_ids),
             "duplicate_doc_ids": duplicate_doc_ids,
             "fetch_error_doc_ids": fetch_error_doc_ids,
+            "rejected_doc_ids": rejected_doc_ids,
+            "rejected_count": len(rejected_doc_ids),
             "consumed_queries": consumed_queries,
             "skipped_used_queries": skipped_used_queries,
             "target_new_docs": target_new_docs,
@@ -506,6 +561,7 @@ class AutoSurveyWorkflow:
         force_plan: bool = False,
         overwrite_summaries: bool = False,
         grounding: dict[str, Any] | None = None,
+        memory_brief: str | None = None,
     ) -> dict[str, Any]:
         self.run_store_service.save_request(user_request)
         self.run_store_service.reset_query_state()
@@ -548,6 +604,7 @@ class AutoSurveyWorkflow:
             force_plan=force_plan,
             mode="initial",
             grounding=grounding,
+            memory_brief=memory_brief,
             save_request=False,
         )
 
@@ -558,6 +615,7 @@ class AutoSurveyWorkflow:
             max_new_docs=self.scout_docs,
             queries=scout_queries,
             phase_label="scout",
+            user_request=user_request,
         )
 
         if scout_collect_result.get("new_doc_count", 0) > 0:
@@ -604,6 +662,10 @@ class AutoSurveyWorkflow:
         loop_index = 0
         empty_collect_replans = 0
         max_empty_collect_replans = 2
+        # Consecutive cycles whose marginal gain (newly kept docs) was negligible.
+        # Early stop on low gain requires this to build up (or queries to run
+        # out), so a single slow cycle while a gap is open does not end the run.
+        low_gain_streak = 0
         # Collect failures across the main-loop cleanup calls so the return
         # value's ``failed_documents`` reflects every cycle, not only the
         # last iteration.
@@ -615,6 +677,7 @@ class AutoSurveyWorkflow:
                 plan=active_plan,
                 max_new_docs=self.collect_batch_size,
                 phase_label=f"main-{loop_index}",
+                user_request=user_request,
             )
 
             if collect_result.get("new_doc_count", 0) == 0:
@@ -687,6 +750,39 @@ class AutoSurveyWorkflow:
                         "gap_directions": gap_directions,
                         "replan_changed": False,
                         "replan_skipped_reason": "max_docs_reached",
+                    }
+                )
+                break
+
+            # Early stop: enough coverage (past min_docs) and either no core gap
+            # remains, or — with a gap still open — recovery is exhausted
+            # (repeated low-gain cycles or no queries left). A single slow cycle
+            # does not stop; the loop replans/retries first.
+            accepted_this_cycle = collect_result.get("new_doc_count", 0)
+            low_gain_streak = (
+                low_gain_streak + 1 if accepted_this_cycle <= _EARLY_STOP_MIN_GAIN else 0
+            )
+            stop, stop_reason = self._early_stop_decision(
+                kept=self._kept_record_count(),
+                min_docs=self.min_docs,
+                gap_directions=gap_directions,
+                accepted_this_cycle=accepted_this_cycle,
+                low_gain_streak=low_gain_streak,
+                queries_exhausted=not self._remaining_search_queries(active_plan),
+            )
+            if stop:
+                print(
+                    f"[workflow] early stop ({stop_reason}): "
+                    f"kept={self._kept_record_count()} >= min_docs={self.min_docs}"
+                )
+                iterations.append(
+                    {
+                        "iteration": loop_index,
+                        "collect_result": collect_result,
+                        "summarize_result": summarize_result,
+                        "gap_directions": gap_directions,
+                        "replan_changed": False,
+                        "replan_skipped_reason": f"early_stop:{stop_reason}",
                     }
                 )
                 break
@@ -800,7 +896,9 @@ class AutoSurveyWorkflow:
             for r in records
         )
 
-    def _fetch_one(self, title_hint: str, url: str, query: str) -> dict[str, Any]:
+    def _fetch_one(
+        self, title_hint: str, url: str, query: str, *, topic=None
+    ) -> dict[str, Any]:
         # The doc_id is not pre-allocated here: it is assigned by the run store
         # at write time, and only kept (successfully fetched, non-duplicate)
         # documents get a contiguous ``doc_*`` number. Fetch errors and
@@ -854,6 +952,27 @@ class AutoSurveyWorkflow:
                 "duplicate_score": dup_score,
             }
 
+        # Post-fetch relevance gate: an off-topic body (anti-bot/redirect/wrong
+        # subject) is recorded as a rejected note and does NOT consume a maxDocs
+        # slot. Skipped when no topic is supplied (e.g. reference-site fetches,
+        # which the user explicitly pinned).
+        if topic is not None and not body_is_on_topic(fetched.text, topic):
+            rejected_id = self.run_store_service.write_rejected_note(
+                url=stored_url,
+                title=fetched.title or title_hint or "Untitled",
+                domain=fetched.domain,
+                search_query=query,
+                reason="off_topic",
+                score=topic_hit_count(fetched.text, topic),
+            )
+            self._emit_progress(
+                "doc_rejected",
+                f"문서 제외(주제 불일치): {domain}",
+                detail={"doc_id": rejected_id, "url": stored_url, "reason": "off_topic"},
+            )
+            print(f"[collect][reject] off_topic url={stored_url}")
+            return {"status": "rejected", "doc_id": rejected_id, "reason": "off_topic"}
+
         doc_id = self.run_store_service.write_fetched_record(
             title=fetched.title or title_hint or "Untitled",
             url=stored_url,
@@ -880,6 +999,55 @@ class AutoSurveyWorkflow:
 
     def _kept_record_count(self) -> int:
         return len(self.run_store_service.list_non_duplicate_records())
+
+    @staticmethod
+    def _early_stop_decision(
+        *,
+        kept: int,
+        min_docs: int,
+        gap_directions: list[str],
+        accepted_this_cycle: int,
+        low_gain_streak: int = 0,
+        queries_exhausted: bool = False,
+        min_gain: int = _EARLY_STOP_MIN_GAIN,
+        low_gain_patience: int = 2,
+    ) -> tuple[bool, str | None]:
+        """Whether to stop collecting before ``max_docs`` (pure decision).
+
+        Only once past ``min_docs``:
+
+        * **No core gap** → stop. Enough coverage and nothing unresolved remains.
+        * **Gap remains but low marginal gain** → stop *only* when recovery is
+          exhausted: this is not the first low-gain cycle
+          (``low_gain_streak >= low_gain_patience``) or there are no remaining
+          queries to try. A single slow cycle while a gap is open is NOT a stop —
+          the loop should replan/retry first.
+
+        Returns ``(stop, reason)`` so the caller can record why.
+        """
+        if kept < min_docs:
+            return False, None
+        if not gap_directions:
+            return True, "no_core_gap"
+        if accepted_this_cycle <= min_gain and (
+            queries_exhausted or low_gain_streak >= low_gain_patience
+        ):
+            return True, "low_marginal_gain"
+        return False, None
+
+    def _reference_domains(self, plan: dict[str, Any]) -> frozenset[str]:
+        """Domains the user explicitly pinned (``site:…``) — exempt from the
+        relevance gate and the per-domain diversity cap."""
+        domains: set[str] = set()
+        for site in plan.get("reference_sites", []) or []:
+            if not isinstance(site, dict):
+                continue
+            domain = str(site.get("domain") or "").lower().strip()
+            if domain.startswith("www."):
+                domain = domain[4:]
+            if domain:
+                domains.add(domain)
+        return frozenset(domains)
 
     def _extract_reference_sites(self, user_request: str) -> list[dict[str, str]]:
         sites: list[dict[str, str]] = []

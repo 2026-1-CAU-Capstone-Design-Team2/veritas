@@ -71,6 +71,10 @@ class AutoSurveyConfig:
     collect_batch_size: int = 5
     scout_docs: int = 3
     fetch_max_chars: int = 25_000
+    # Minimum kept docs before early stop may fire (0 → derived in post-init as
+    # ~60% of max_docs, floored at scout_docs). The early-stop check itself
+    # lives in the workflow loop.
+    min_docs: int = 0
 
     def __post_init__(self) -> None:
         # ``object.__setattr__`` is required on a frozen dataclass — assigning
@@ -91,6 +95,14 @@ class AutoSurveyConfig:
             "fetch_max_chars",
             max(1_000, int(self.fetch_max_chars)),
         )
+        # min_docs: 0/unset → derive (~60% of max_docs, never below scout_docs);
+        # otherwise clamp into [1, max_docs]. Done after the scout/max clamps so
+        # the derivation reads their final values.
+        if int(self.min_docs) <= 0:
+            resolved_min_docs = max(self.scout_docs, min(self.max_docs, round(self.max_docs * 0.6)))
+        else:
+            resolved_min_docs = max(1, min(int(self.min_docs), self.max_docs))
+        object.__setattr__(self, "min_docs", resolved_min_docs)
 
     @classmethod
     def from_env(
@@ -100,6 +112,7 @@ class AutoSurveyConfig:
         collect_batch_size: int | None = None,
         scout_docs: int | None = None,
         fetch_max_chars: int | None = None,
+        min_docs: int | None = None,
     ) -> "AutoSurveyConfig":
         """Resolve every field via ``_resolve_int`` and clamp via post-init.
 
@@ -114,6 +127,7 @@ class AutoSurveyConfig:
                 collect_batch_size, "VERITAS_BATCH_SIZE", 5
             ),
             scout_docs=_resolve_int(scout_docs, "VERITAS_SCOUT_DOCS", 3),
+            min_docs=_resolve_int(min_docs, "VERITAS_MIN_DOCS", 0),
             fetch_max_chars=_resolve_int_from_env_keys(
                 fetch_max_chars,
                 ("VERITAS_AUTOSURVEY_FETCH_MAX_CHARS", "VERITAS_FETCH_MAX_CHARS"),

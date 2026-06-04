@@ -10,7 +10,7 @@ import httpx
 from openai import OpenAI
 
 
-DEFAULT_AUTOSURVEY_OPENAI_MODEL = "gpt-5-nano"
+DEFAULT_AUTOSURVEY_OPENAI_MODEL = "gpt-5-mini"
 _SERVICE_TIERS = {"default", "flex", "priority"}
 # Valid OpenAI reasoning-effort levels (gpt-5 family reasoning models).
 _REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
@@ -47,15 +47,22 @@ class OpenAIChatLLMClient:
         stream_summary: bool = False,
         client: Any | None = None,
     ) -> None:
-        if client is None and not str(api_key or "").strip():
+        self._api_key = str(api_key or "").strip()
+        if client is None and not self._api_key:
             raise ValueError("OpenAIChatLLMClient requires an API key.")
-        self.client = client or OpenAI(api_key=api_key)
+        self._client = client
         self.model = str(model or DEFAULT_AUTOSURVEY_OPENAI_MODEL).strip()
         self.n_ctx = max(1, int(n_ctx))
         self.max_parallel = max(1, int(max_parallel))
         self.service_tier = self._normalize_service_tier(service_tier)
         self.trace_latency = bool(trace_latency)
         self.stream_summary = bool(stream_summary)
+
+    @property
+    def client(self) -> Any:
+        if self._client is None:
+            self._client = OpenAI(api_key=self._api_key)
+        return self._client
 
     def map_parallel(
         self,
