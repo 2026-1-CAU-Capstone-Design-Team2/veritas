@@ -7,3 +7,4 @@ __pycache__/
 .claude/
 services/screen_tool_funcs/test/outputs/
 test/
+logs/
