@@ -28,6 +28,13 @@ This README has been updated to match the current codebase.
   `main.py` and is capped at 5 newly collected documents per invocation.
 - In chat, `/autosurvey <request>` and `/rag <question>` bypass LLM tool
   selection and call the requested tool path explicitly.
+- Chat-triggered `autosurvey` now builds a bounded planning-only
+  `memory_brief` from structured working-context records. Only
+  `preference`, `profile`, `constraint`, and `project` records are included,
+  and the brief is passed only to the initial query planner.
+- Standalone AutoSurvey runs remain request-driven and memory-free by default.
+  Memory is not injected into document cleanup, summarization, final report
+  generation, source acceptance, or citations.
 - AutoSurvey recognizes explicit reference-site constraints such as
   `site:https://example.com` and forces those sites into the collection plan.
 - Standalone `--phase plan` calls the planner directly. The full `--phase all`
@@ -69,6 +76,8 @@ services/
   rag_service.py: indexing, retrieval, document-grounded answers
   run_store_tool_funcs/: output/state persistence
   screen_tool_funcs/: foreground-window OCR/UIA capture, intervention detector
+  memory_tools_funcs/: workspace memory runtime, working context, FIFO, recall
+  autosurvey_memory_brief.py: chat AutoSurvey planning-only memory adapter
 
 storage/
   vector_store.py: ChromaDB vector store wrapper
@@ -411,6 +420,22 @@ CLI AutoSurvey default max_docs = 15
 After a chat-triggered survey completes, the generated AutoSurvey summaries are
 indexed into RAG when `rag_service` and `run_store_service` are available.
 
+Chat-triggered AutoSurvey can use the active workspace's memory as planning
+preferences only. `AutoSurveyTool` builds a short `memory_brief` from structured
+working-context records tagged as `preference`, `profile`, `constraint`, or
+`project`, then passes that field through `AutoSurveyWorkflow.run_all()` to the
+initial `QueryPlanTool` call.
+
+The brief is deliberately not merged into `user_request`, `grounded_terms`,
+document text, clean Markdown, batch summaries, or citation data. It does not
+enter replan, document cleanup, document summarization, final report generation,
+source acceptance, or RAG indexing. The tool result stores only lightweight
+metadata such as `memory_brief_used` and `memory_brief_chars`; it does not store
+the raw memory text.
+
+CLI and research-page AutoSurvey runs call the workflow directly and do not
+provide a memory brief unless a future caller explicitly opts in.
+
 ## Chat Turn Handling
 
 `ChatAgent.ask_auto()` follows this sequence:
@@ -429,6 +454,31 @@ indexed into RAG when `rag_service` and `run_store_service` are available.
 Tool outputs are not dumped directly to the user unless the final-answer prompt
 chooses to present them. The final answer is generated from the current turn;
 recent history is context and should not override the current user message.
+
+## Memory Runtime
+
+Workspace memory is stored under the active workspace's `memory/memory.sqlite3`.
+It has three distinct roles:
+
+| Memory area | Purpose | Prompt behavior |
+|---|---|---|
+| Working context | Stable user facts and preferences | Can be injected as compact context for chat; AutoSurvey reads only selected categories for planning |
+| FIFO | Recent conversation turns | Short-lived recency context for memory-aware chat calls |
+| Recall | Searchable longer-term turn memory | Retrieved by memory-aware chat calls when relevant |
+
+`MemoryAwareLLMClient.call()`, `iter_call()`, and `call_json()` are the paths
+that can prepare, inject, and commit memory. Raw passthrough methods such as
+`ask()`, `ask_json()`, `embed()`, and `embed_batch()` do not inject or record
+memory on their own.
+
+AutoSurvey source-processing tools intentionally use the passthrough methods so
+workspace memory cannot contaminate evidence. The only AutoSurvey memory bridge
+is the chat-triggered `memory_brief`, and that bridge is limited to initial query
+planning.
+
+Screen-assist calls may read memory as context for the current workspace, but
+they use a no-record constraint for assist generation so screen captures and
+assistant interventions are not written back as ordinary chat turns.
 
 ## RAG Indexing
 

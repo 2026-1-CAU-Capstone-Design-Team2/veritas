@@ -157,6 +157,7 @@ class AutoSurveyWorkflow:
         grounding: dict[str, Any] | None = None,
         prior_plan: dict[str, Any] | None = None,
         gap_directions: list[str] | None = None,
+        memory_brief: str | None = None,
         save_request: bool = True,
     ) -> dict[str, Any]:
         if save_request:
@@ -184,6 +185,7 @@ class AutoSurveyWorkflow:
             prior_plan=prior_plan,
             gap_directions=gap_directions or [],
             used_queries=used_queries,
+            memory_brief=memory_brief if mode == "initial" else "",
             save=True,
         )
         if not result.success:
@@ -559,6 +561,7 @@ class AutoSurveyWorkflow:
         force_plan: bool = False,
         overwrite_summaries: bool = False,
         grounding: dict[str, Any] | None = None,
+        memory_brief: str | None = None,
     ) -> dict[str, Any]:
         self.run_store_service.save_request(user_request)
         self.run_store_service.reset_query_state()
@@ -601,6 +604,7 @@ class AutoSurveyWorkflow:
             force_plan=force_plan,
             mode="initial",
             grounding=grounding,
+            memory_brief=memory_brief,
             save_request=False,
         )
 

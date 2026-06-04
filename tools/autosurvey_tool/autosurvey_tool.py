@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from services.autosurvey_memory_brief import build_autosurvey_memory_brief
 from tools.tool import BaseTool, ToolResult
 
 
@@ -23,12 +24,14 @@ class AutoSurveyTool(BaseTool):
         workflow,
         rag_service=None,
         run_store_service=None,
+        memory_runtime=None,
         max_docs_cap: int = CHAT_MAX_DOCS_CAP,
     ) -> None:
         super().__init__(schema=schema)
         self.workflow = workflow
         self.rag_service = rag_service
         self.run_store_service = run_store_service or getattr(workflow, "run_store_service", None)
+        self.memory_runtime = memory_runtime
         self.max_docs_cap = max(1, min(int(max_docs_cap), self.CHAT_MAX_DOCS_CAP))
 
     @property
@@ -52,6 +55,10 @@ class AutoSurveyTool(BaseTool):
         original_scout_docs = getattr(self.workflow, "scout_docs", None)
         existing_kept_count = self._kept_record_count()
         effective_total_max_docs = existing_kept_count + effective_max_docs
+        memory_brief = build_autosurvey_memory_brief(
+            self.memory_runtime,
+            request_text,
+        )
 
         try:
             self.workflow.max_docs = effective_total_max_docs
@@ -64,6 +71,7 @@ class AutoSurveyTool(BaseTool):
                 user_request=request_text,
                 force_plan=bool(force_plan),
                 overwrite_summaries=bool(overwrite_summaries),
+                memory_brief=memory_brief,
             )
 
             indexed_chunks = None
@@ -88,6 +96,8 @@ class AutoSurveyTool(BaseTool):
                 "effective_total_max_docs": effective_total_max_docs,
                 "final_path": str(final_path) if final_path else None,
                 "indexed_chunks": indexed_chunks,
+                "memory_brief_used": bool(memory_brief),
+                "memory_brief_chars": len(memory_brief),
                 "final_report_excerpt": excerpt,
                 "workflow_result": self._compact_workflow_result(result),
             }

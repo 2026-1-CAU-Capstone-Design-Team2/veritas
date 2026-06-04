@@ -692,3 +692,40 @@ failure modes are:
   affect kept-document numbering or `maxDocs`.
 - Confirm citation linkification changes are presentation-only and preserve the
   canonical visible marker format `[doc_NNN]`.
+## Planning Note: 2026-06-05 Chat-Triggered AutoSurvey Memory Brief
+
+### Checklist
+- [x] Add an explicit AutoSurvey memory-brief builder instead of switching AutoSurvey tools from `ask/ask_json` to memory-aware `call`.
+- [x] Use the brief only when AutoSurvey is launched from the chat/search mode (`ChatAgent` -> `AutoSurveyTool`), where an existing workspace and chat memory already represent the user's working context.
+- [x] Keep the standalone/research-page AutoSurvey run memory-free by default. A first survey usually has no relevant KB/memory and should remain a clean request-driven research workflow.
+- [x] Include only stable user preferences and task context: working-context records tagged/category `preference`, `profile`, `constraint`, and `project`.
+- [x] Exclude raw FIFO history, full recall rows, assistant answers, local-private document/table contents, screen captures, and any source text from the memory brief.
+- [x] Pass the brief as a separate labelled section such as `User Research Preferences` / `Non-evidence Context`; never merge it into `user_request`, `grounded_terms`, `clean_md`, `batch_summaries`, or citations.
+- [x] Use the brief only in initial query planning. Do not inject it into final report generation, document cleanup/summarization, citations, source notes, or fetched document acceptance.
+- [x] Persist lightweight provenance metadata (`memory_brief_used`, character count), not the raw memory text, unless a user-visible audit view is intentionally added.
+
+### Architecture Constraints
+- AutoSurvey currently runs through `AgentRuntime.run_autosurvey()`: build `autosurvey_llm`, term-ground workspace naming, reserve/publish workspace, build a per-run registry with `autosurvey_llm` for research-generation tools and local `embedding_llm` for RAG indexing, then `AutoSurveyWorkflow.run_all()`.
+- Chat/search-mode AutoSurvey currently runs through `AgentRuntime.answer_chat_selection*()` -> `ChatAgent.ask_explicit_tool("autosurvey", ...)` -> `AutoSurveyTool.run()` against the active workspace's workflow and memory-bearing chat runtime.
+- AutoSurvey tools (`term_grounding`, `query_plan`, `document_cleanup`, `document_summarize`, `final_report`) call `ask()` / `ask_json()`, which are raw passthrough methods on `MemoryAwareLLMClient`; memory is not injected today.
+- Do not route AutoSurvey through `MemoryAwareLLMClient.call()` globally. That would inject FIFO/recall into cleanup/summarization/final prompts and can contaminate evidence, leak private context to OpenAI-backed AutoSurvey, and record survey internals as chat memory.
+- OpenAI AutoSurvey remains an external research-generation role. Any memory sent to it must be treated as exportable user preference text only; local/private evidence remains local-only.
+- Memory brief must be deterministic, bounded, and non-evidence. It can guide query style, language, depth, deliverable format, and project constraints, but fetched documents and their clean Markdown remain the only report evidence.
+
+### Recommended Injection Points
+- `AutoSurveyTool.run()` or the `ChatAgent.ask_explicit_tool("autosurvey", ...)` adapter: build `autosurvey_memory_brief` from the active workspace's `MemoryRuntime` and pass it into the workflow explicitly.
+- `QueryPlanTool.run()`: add `memory_brief` to `planner_input` under a labelled field. Prompt rule: use it only for preference/constraint interpretation and query style, not as source evidence.
+- Do not inject the brief into `FinalReportTool`. Final synthesis should remain driven by the original request, plan summary, run stats, and batch summaries only.
+- Avoid `DocumentCleanupTool` and `DocumentSummarizeTool` injection. Those are source-processing stages and should remain driven only by document text plus the original request.
+- `run_collect()` source ranking may use only explicit request/plan/reference URLs. Do not use memory-only topics to admit pages unless they are promoted into the plan as explicit must-cover constraints.
+
+### Verification Commands
+- `python -m py_compile services\autosurvey_memory_brief.py tools\autosurvey_tool\autosurvey_tool.py workflows\autosurvey_workflow.py tools\query_plan_tool\query_plan_tool.py core\prompts\autosurvey.py api\services\agent_runtime.py tests\test_autosurvey_memory_brief.py`
+- `python -m unittest tests.test_autosurvey_memory_brief tests.test_autosurvey_collect tests.test_autosurvey_source_quality`
+- Focused tests cover: memory brief category allowlist, no raw recall/FIFO leakage, chat-triggered AutoSurvey passes the brief to planning, and replan/final-adjacent paths do not receive memory.
+
+### Review Focus
+- Watch for accidental privacy regressions: memory brief must not contain local document/table text or screen OCR payloads.
+- Watch for evidence contamination: final claims must still be grounded only in `[doc_NNN]` source documents.
+- Watch entrypoint separation: chat/search-mode AutoSurvey can use a brief from the active workspace, but research-page AutoSurvey should remain clean unless the user explicitly asks to use memory.
+- Watch prompt leakage: the memory brief must never be printed in `final.md`; it should influence query planning only.
