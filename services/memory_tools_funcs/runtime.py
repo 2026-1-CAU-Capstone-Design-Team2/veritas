@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -18,9 +19,12 @@ from services.memory_tools_funcs.external_context.embedding_recall_store import 
     EmbeddingRecallStore,
 )
 from services.memory_tools_funcs.external_context.recall_storage import RecallStorage
-from services.memory_tools_funcs.main_context.heuristic_memory import extract_explicit_facts
+from services.memory_tools_funcs.main_context.llm_fact_extractor import LLMFactExtractor
 from services.memory_tools_funcs.main_context.queue_manage import QueueManager, utc_now_iso
-from services.memory_tools_funcs.main_context.working_context import WorkingContextManager
+from services.memory_tools_funcs.main_context.working_context import (
+    DEFAULT_WORKING_CONTEXT_TOKENS,
+    WorkingContextManager,
+)
 from services.memory_tools_funcs.store import MemoryStore
 from services.memory_tools_funcs.summerizer import MemorySummarizer
 from services.memory_tools_funcs.token_counter import TokenCounter
@@ -39,6 +43,10 @@ class PreparedCall:
     extra_sampling_params: dict[str, Any] | None = None
     timeout_sec: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Original user utterance to mine for working facts AFTER the response —
+    # empty when the turn is not recorded. Extraction is a ~2s LLM call, so it
+    # runs in the background on commit, off the response hot path.
+    record_content: str = ""
 
 
 class MemoryRuntime:
@@ -56,12 +64,19 @@ class MemoryRuntime:
         self.max_context_tokens = int(max_context_tokens)
 
         self.token_counter = TokenCounter(raw_llm)
+        self.fact_extractor = LLMFactExtractor(raw_llm)
         self.summarizer = MemorySummarizer(raw_llm)
         self.policy_dispatcher = ProfilePolicyDispatcher()
 
         # bg flush 동시성 제어. 동시 flush 1개로 제한, 다음 prepare는 옛 summary로 진행.
         self._flush_lock = threading.Lock()
         self._flush_in_progress = False
+
+        # working-fact 추출 큐. single worker가 FIFO로 처리해 같은 category
+        # 교체(예: 이름 변경)가 turn 순서대로 반영되게 한다.
+        self._fact_queue: queue.Queue = queue.Queue()
+        self._fact_worker: threading.Thread | None = None
+        self._fact_worker_lock = threading.Lock()
 
         self._build_storage()
 
@@ -86,6 +101,12 @@ class MemoryRuntime:
 
     def close(self) -> None:
         """Release runtime-owned storage resources."""
+        with self._fact_worker_lock:
+            worker = self._fact_worker
+            self._fact_worker = None
+        if worker is not None:
+            self._fact_queue.put(None)  # drain queued extractions, then stop
+            worker.join(timeout=5)
         self.store.close()
         if getattr(self, "embedding_recall", None) is not None:
             self.embedding_recall.close()
@@ -299,9 +320,9 @@ class MemoryRuntime:
             )
 
 
-        # should append -> append_event 수행, 
-        #   FIFO와 Recall에 USER turn 기록. 
-        #   heuristic fact 추출해서 working에도 추가.
+        # FIFO/Recall에 USER turn 기록. working fact 추출(LLM ~2s)은 응답 후
+        # commit에서 background로 돌려 hot path를 막지 않는다.
+        record_content = ""
         if self._should_record(req.constraints):
             record_content = req.record_content or req.user_content
             self.queue.append_event(
@@ -315,18 +336,6 @@ class MemoryRuntime:
                 f"id={invocation_id[:8]} recorded USER turn "
                 f"({self.token_counter.count(record_content)} tokens)",
             )
-          
-        #  Heuristic explicit fact 추출해서 working context에 추가 (옵션이 켜져 있고, 기록 제약이 없을 때).
-        #  append_fact() -> working 테이블에 저장. 
-            for category, fact in extract_explicit_facts(record_content):
-                self.working.append_fact(
-                    fact,
-                    category=category,
-                    source="heuristic",
-                    tags=["explicit_user"],
-                    max_tokens=budget.working_context_tokens,
-                )
-                mem_debug("working", f"id={invocation_id[:8]} heuristic fact appended: {category}={fact!r}")
         elif mem_debug_enabled():
             mem_debug(
                 "prepare",
@@ -343,6 +352,7 @@ class MemoryRuntime:
             sampling_params=req.sampling_params,
             extra_sampling_params=req.extra_sampling_params,
             timeout_sec=req.timeout_sec,
+            record_content=record_content,
             metadata={
                 "method_hint": req.method_hint,
                 "profile": req.profile,
@@ -376,9 +386,56 @@ class MemoryRuntime:
                     f"({self.token_counter.count(text)} tokens)",
                 )
 
+        if prepared.record_content:
+            self._launch_fact_extraction(prepared.record_content)
+
         if prepared.metadata.get("flush_pending"):
             mem_debug("commit", f"id={inv} flush_pending=True -> launching background flush")
             self._maybe_launch_bg_flush(str(prepared.metadata.get("profile") or "chat"))
+
+    def _launch_fact_extraction(self, record_content: str) -> None:
+        """Queue the user utterance for background working-fact extraction.
+
+        The LLM judgment is ~2s and working facts are only read on the *next*
+        turn, so this stays off the response path. A single worker drains the
+        queue in order, so same-category replacements (e.g. a name change)
+        apply in turn order. The current ``working`` handle is captured per
+        item so a workspace swap mid-flight does not retarget the write."""
+        self._ensure_fact_worker()
+        self._fact_queue.put((self.working, record_content))
+
+    def _ensure_fact_worker(self) -> None:
+        if self._fact_worker is not None:
+            return
+        with self._fact_worker_lock:
+            if self._fact_worker is not None:
+                return
+            worker = threading.Thread(
+                target=self._fact_worker_loop, name="memory-fact-extract", daemon=True
+            )
+            self._fact_worker = worker
+            worker.start()
+
+    def _fact_worker_loop(self) -> None:
+        while True:
+            item = self._fact_queue.get()
+            try:
+                if item is None:
+                    return
+                working, record_content = item
+                for category, fact in self.fact_extractor.extract(record_content):
+                    working.append_fact(
+                        fact,
+                        category=category,
+                        source="llm",
+                        tags=["explicit_user"],
+                        max_tokens=DEFAULT_WORKING_CONTEXT_TOKENS,
+                    )
+                    mem_debug("working", f"fact appended: {category}={fact!r}")
+            except Exception as e:
+                print(f"[memory][fact_extract][warn] {type(e).__name__}: {e}")
+            finally:
+                self._fact_queue.task_done()
 
     @staticmethod
     def _should_record(constraints: CallConstraints) -> bool:

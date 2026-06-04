@@ -115,7 +115,7 @@ class WorkingContextTests(unittest.TestCase):
             )
             try:
                 for name in ("박서원", "김철수"):
-                    runtime.prepare(
+                    prepared = runtime.prepare(
                         CallRequest(
                             task_instruction="s",
                             user_content="u",
@@ -123,6 +123,8 @@ class WorkingContextTests(unittest.TestCase):
                             stream_label="chat",
                         )
                     )
+                    runtime.commit(prepared, "ok")
+                runtime._fact_queue.join()  # background extraction, in order
                 joined = " ".join(r["text"] for r in runtime.working.records())
                 self.assertNotIn("박서원", joined)
                 self.assertIn("김철수", joined)
@@ -137,7 +139,7 @@ class WorkingContextTests(unittest.TestCase):
                 max_context_tokens=8192,
             )
 
-            runtime.prepare(
+            prepared = runtime.prepare(
                 CallRequest(
                     task_instruction="system",
                     user_content="large prompt",
@@ -145,6 +147,8 @@ class WorkingContextTests(unittest.TestCase):
                     stream_label="chat",
                 )
             )
+            runtime.commit(prepared, "ok")
+            runtime._fact_queue.join()  # wait for background extraction
 
             self.assertIn("alpha memory layer", runtime.working.load())
             runtime.close()
