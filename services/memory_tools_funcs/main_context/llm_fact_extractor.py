@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.memory_tools_funcs.debug import mem_debug
 from services.memory_tools_funcs.main_context.heuristic_memory import (
     _clean_fact,
     extract_explicit_facts,
@@ -57,13 +58,17 @@ class LLMFactExtractor:
             return []
         result = self._judge(cleaned)
         if result is None:
-            return extract_explicit_facts(text)
+            facts = extract_explicit_facts(text)
+            mem_debug("working", f"extract: LLM unavailable → regex fallback {facts} (utterance={cleaned!r})")
+            return facts
         fact = _clean_fact(result.get("fact") if isinstance(result, dict) else "")
         if not fact:
+            mem_debug("working", f"extract: rejected (no long-term fact) utterance={cleaned!r} llm_raw={result}")
             return []
         category = str((result.get("category") or "remember")).strip().lower()
         if category not in _VALID_CATEGORIES:
             category = "remember"
+        mem_debug("working", f"extract: selected {category}={fact!r} (utterance={cleaned!r} llm_raw={result})")
         return [(category, fact)]
 
     def _judge(self, text: str) -> dict[str, Any] | None:

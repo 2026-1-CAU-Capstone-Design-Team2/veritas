@@ -423,15 +423,19 @@ class MemoryRuntime:
                 if item is None:
                     return
                 working, record_content = item
+                mem_debug("working", f"extract start: {record_content!r}")
                 for category, fact in self.fact_extractor.extract(record_content):
-                    working.append_fact(
+                    appended = working.append_fact(
                         fact,
                         category=category,
                         source="llm",
                         tags=["explicit_user"],
                         max_tokens=DEFAULT_WORKING_CONTEXT_TOKENS,
                     )
-                    mem_debug("working", f"fact appended: {category}={fact!r}")
+                    mem_debug(
+                        "working",
+                        f"stored: {category}={fact!r} appended={appended}",
+                    )
             except Exception as e:
                 print(f"[memory][fact_extract][warn] {type(e).__name__}: {e}")
             finally:
