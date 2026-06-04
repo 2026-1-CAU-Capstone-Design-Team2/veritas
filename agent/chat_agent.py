@@ -12,6 +12,8 @@ from core.prompts import (
     ASSIST_GROUNDED_USER_TEMPLATE,
     ASSIST_PLAIN_USER_TEMPLATE,
     ASSIST_SYSTEM_PROMPTS,
+    AUTOSURVEY_REQUEST_REWRITE_PROMPT,
+    AUTOSURVEY_REQUEST_REWRITE_SYSTEM_PROMPT,
     CHAT_DOCUMENT_BLOCK_TEMPLATE,
     REFERENCE_BLOCK_TEMPLATE,
     SCREEN_INTERVENTION_DEFAULT_DOCUMENT_TYPE,
@@ -228,12 +230,13 @@ class ChatAgent:
                     return self.ask_rag(command_text, stream=stream)
                 tool_outputs = self._run_explicit_tool_command(
                     command=command,
-                    command_text=command_text,
+                    command_text=self._tool_command_text(command, command_text),
                 )
                 return self._answer_from_current_turn(
                     question=command_text or question,
                     tool_outputs=tool_outputs,
                     stream=stream,
+                    profile=self._profile_for_tool_outputs(tool_outputs, command=command),
                 )
 
             tool_outputs = self._collect_tool_outputs(question)
@@ -241,6 +244,7 @@ class ChatAgent:
                 question=question,
                 tool_outputs=tool_outputs,
                 stream=stream,
+                profile=self._profile_for_tool_outputs(tool_outputs),
             )
 
     def ask_explicit_tool(self, command: str, question: str, *, stream: bool = False) -> str:
@@ -257,12 +261,15 @@ class ChatAgent:
         with self._conversation_lock:
             tool_outputs = self._run_explicit_tool_command(
                 command=normalized_command,
-                command_text=command_text,
+                command_text=self._tool_command_text(normalized_command, command_text),
             )
             return self._answer_from_current_turn(
                 question=command_text,
                 tool_outputs=tool_outputs,
                 stream=stream,
+                profile=self._profile_for_tool_outputs(
+                    tool_outputs, command=normalized_command
+                ),
             )
 
     def ask_auto_iter(self, question: str, doc_context: str = "") -> Iterator[str]:
@@ -289,13 +296,16 @@ class ChatAgent:
                     return
                 tool_outputs = self._run_explicit_tool_command(
                     command=command,
-                    command_text=command_text,
+                    command_text=self._tool_command_text(command, command_text),
                 )
                 question_text = command_text or question
                 yield from self._stream_final_answer(
                     question=question_text,
                     tool_outputs=tool_outputs,
                     doc_context=doc_context,
+                    profile=self._profile_for_tool_outputs(
+                        tool_outputs, command=command
+                    ),
                 )
                 return
 
@@ -304,6 +314,7 @@ class ChatAgent:
                 question=question,
                 tool_outputs=tool_outputs,
                 doc_context=doc_context,
+                profile=self._profile_for_tool_outputs(tool_outputs),
             )
 
     def ask_explicit_tool_iter(
@@ -317,12 +328,15 @@ class ChatAgent:
         with self._conversation_lock:
             tool_outputs = self._run_explicit_tool_command(
                 command=normalized_command,
-                command_text=command_text,
+                command_text=self._tool_command_text(normalized_command, command_text),
             )
             yield from self._stream_final_answer(
                 question=command_text,
                 tool_outputs=tool_outputs,
                 doc_context=doc_context,
+                profile=self._profile_for_tool_outputs(
+                    tool_outputs, command=normalized_command
+                ),
             )
 
     def ask_rag_iter(
@@ -591,6 +605,7 @@ class ChatAgent:
         question: str,
         tool_outputs: list[dict[str, str]],
         doc_context: str = "",
+        profile: str = "chat",
     ) -> Iterator[str]:
         # No {history} slot: recent turns ride in as separate chat messages
         # via MemoryAwareLLMClient.iter_call (or are simply absent in the
@@ -610,6 +625,7 @@ class ChatAgent:
                         prompt=prompt,
                         record_content=question,
                         stream_label="chat:final" if tool_outputs else "chat",
+                        profile=profile,
                     )
                 )
             else:
@@ -673,6 +689,7 @@ class ChatAgent:
         prompt: str,
         record_content: str,
         stream_label: str,
+        profile: str = "chat",
     ) -> CallRequest:
         return CallRequest(
             task_instruction=system_prompt,
@@ -680,6 +697,7 @@ class ChatAgent:
             record_content=record_content,
             constraints=CallConstraints(),
             use_history=True,
+            profile=profile,
             stream_label=stream_label,
             method_hint="chat_final",
             timeout_sec=self.FINAL_ANSWER_TIMEOUT_SEC,
@@ -745,6 +763,63 @@ class ChatAgent:
             return None
 
         return command, tail.strip()
+
+    def _tool_command_text(self, command: str, command_text: str) -> str:
+        if str(command or "").strip().lower() == "autosurvey":
+            return self._rewrite_autosurvey_request_with_memory(command_text)
+        return command_text
+
+    def _rewrite_autosurvey_request_with_memory(self, request: str) -> str:
+        """Resolve workspace-local follow-up wording before running AutoSurvey.
+
+        This is only used by chat-triggered AutoSurvey inside an already-bound
+        workspace. New-workspace research jobs call AgentRuntime.run_autosurvey()
+        directly and do not pass through this ChatAgent path.
+        """
+        request_text = str(request or "").strip()
+        if not request_text or not self._supports_memory_calls():
+            return request_text
+
+        prompt = AUTOSURVEY_REQUEST_REWRITE_PROMPT.format(request=request_text)
+        try:
+            rewritten = self.llm.call(
+                CallRequest(
+                    task_instruction=AUTOSURVEY_REQUEST_REWRITE_SYSTEM_PROMPT,
+                    user_content=prompt,
+                    record_content=request_text,
+                    constraints=CallConstraints(no_record=True),
+                    use_history=True,
+                    profile="autosurvey",
+                    stream_label="autosurvey:rewrite",
+                    method_hint="autosurvey_request_rewrite",
+                    sampling_params={
+                        "temperature": 0.0,
+                        "top_p": 0.2,
+                        "presence_penalty": 0.0,
+                    },
+                    extra_sampling_params={
+                        "top_k": 5,
+                        "min_p": 0.0,
+                        "repeat_penalty": 1.0,
+                    },
+                    timeout_sec=20,
+                    enable_memory_tools=False,
+                )
+            )
+        except Exception as e:
+            print(f"[autosurvey][rewrite][warn] failed; using raw request: {e}")
+            return request_text
+
+        cleaned = self._clean_autosurvey_request_rewrite(rewritten)
+        return cleaned or request_text
+
+    def _clean_autosurvey_request_rewrite(self, text: str, *, max_chars: int = 1200) -> str:
+        cleaned = " ".join(str(text or "").split()).strip()
+        if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
+            cleaned = cleaned[1:-1].strip()
+        if len(cleaned) > max_chars:
+            cleaned = cleaned[:max_chars].rstrip()
+        return cleaned
 
     def _run_explicit_tool_command(
         self,
@@ -884,6 +959,7 @@ class ChatAgent:
         question: str,
         tool_outputs: list[dict[str, str]],
         stream: bool = False,
+        profile: str = "chat",
     ) -> str:
         # No {history} slot: recent turns ride in as separate chat messages
         # via MemoryAwareLLMClient.call (or are simply absent in the legacy
@@ -902,6 +978,7 @@ class ChatAgent:
                         prompt=prompt,
                         record_content=question,
                         stream_label=stream_label,
+                        profile=profile,
                     )
                 )
             else:
@@ -917,6 +994,30 @@ class ChatAgent:
             answer = f"[chat][error] failed to generate answer: {e}"
             print(answer)
         return answer.strip()
+
+    def _profile_for_tool_outputs(
+        self,
+        tool_outputs: list[dict[str, str]],
+        *,
+        command: str = "",
+    ) -> str:
+        """Memory profile for final answer synthesis after a tool-backed turn."""
+        normalized_command = str(command or "").strip().lower()
+        if normalized_command == "autosurvey":
+            return "autosurvey"
+        if normalized_command in {"rag", "rag_search"}:
+            return "rag"
+
+        tool_names = {
+            str(output.get("name") or "").strip().lower()
+            for output in tool_outputs
+            if isinstance(output, dict)
+        }
+        if "autosurvey" in tool_names:
+            return "autosurvey"
+        if "rag_search" in tool_names:
+            return "rag"
+        return "chat"
 
     def _format_tool_results(self, tool_outputs: list[dict[str, str]]) -> str:
         if not tool_outputs:

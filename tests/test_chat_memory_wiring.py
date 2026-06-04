@@ -8,6 +8,7 @@ from agent.chat_agent import ChatAgent
 from core.memory.request import CallRequest
 from llm.memory_aware_llm import MemoryAwareLLMClient
 from services.memory_tools_funcs.runtime import MemoryRuntime
+from tools.tool import ToolResult
 
 
 class _MemoryLLM:
@@ -19,11 +20,25 @@ class _MemoryLLM:
 
     def call(self, req: CallRequest) -> str:
         self.calls.append(req)
+        if req.method_hint == "autosurvey_request_rewrite":
+            return "rewritten autosurvey request"
         return "answer"
 
     def iter_call(self, req: CallRequest):
         self.iter_calls.append(req)
         yield "streamed"
+
+
+class _AutosurveyRegistry:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def call(self, name: str, **kwargs):
+        self.calls.append((name, kwargs))
+        return ToolResult(
+            success=True,
+            data={"final_path": "runs/ws/final.md", "final_report_excerpt": "ok"},
+        )
 
 
 class _StreamingRawLLM:
@@ -84,6 +99,28 @@ class ChatMemoryWiringTests(unittest.TestCase):
         self.assertEqual(req.record_content, "current question")
         self.assertIn("current question", req.user_content)
 
+    def test_explicit_autosurvey_final_answer_uses_autosurvey_profile(self) -> None:
+        llm = _MemoryLLM()
+        registry = _AutosurveyRegistry()
+        agent = ChatAgent(llm=llm, rag_service=None, tool_registry=registry)
+
+        answer = agent.ask_explicit_tool("autosurvey", "추가 자료를 조사해줘")
+
+        self.assertEqual(answer, "answer")
+        self.assertEqual(registry.calls[0][0], "autosurvey")
+        self.assertEqual(registry.calls[0][1]["request"], "rewritten autosurvey request")
+        self.assertEqual(len(llm.calls), 2)
+        rewrite_req = llm.calls[0]
+        self.assertEqual(rewrite_req.profile, "autosurvey")
+        self.assertEqual(rewrite_req.method_hint, "autosurvey_request_rewrite")
+        self.assertTrue(rewrite_req.constraints.no_record)
+        self.assertTrue(rewrite_req.use_history)
+        final_req = llm.calls[1]
+        self.assertEqual(final_req.profile, "autosurvey")
+        self.assertEqual(final_req.method_hint, "chat_final")
+        self.assertFalse(final_req.constraints.no_record)
+        self.assertTrue(final_req.use_history)
+
     def test_stream_final_answer_uses_iter_call_request(self) -> None:
         llm = _MemoryLLM()
         agent = ChatAgent(llm=llm, rag_service=None, tool_registry=None)
@@ -103,6 +140,28 @@ class ChatMemoryWiringTests(unittest.TestCase):
         self.assertFalse(req.enable_memory_tools)
         self.assertEqual(req.record_content, "current question")
         self.assertIn("current question", req.user_content)
+
+    def test_stream_explicit_autosurvey_final_answer_uses_autosurvey_profile(self) -> None:
+        llm = _MemoryLLM()
+        registry = _AutosurveyRegistry()
+        agent = ChatAgent(llm=llm, rag_service=None, tool_registry=registry)
+
+        chunks = list(agent.ask_explicit_tool_iter("autosurvey", "추가 자료를 조사해줘"))
+
+        self.assertEqual(chunks, ["streamed"])
+        self.assertEqual(registry.calls[0][0], "autosurvey")
+        self.assertEqual(registry.calls[0][1]["request"], "rewritten autosurvey request")
+        self.assertEqual(len(llm.calls), 1)
+        rewrite_req = llm.calls[0]
+        self.assertEqual(rewrite_req.profile, "autosurvey")
+        self.assertEqual(rewrite_req.method_hint, "autosurvey_request_rewrite")
+        self.assertTrue(rewrite_req.constraints.no_record)
+        self.assertTrue(rewrite_req.use_history)
+        self.assertEqual(len(llm.iter_calls), 1)
+        req = llm.iter_calls[0]
+        self.assertEqual(req.profile, "autosurvey")
+        self.assertEqual(req.method_hint, "chat_final")
+        self.assertTrue(req.use_history)
 
     def test_stream_final_answer_streams_chunks_through_real_wrapper(self) -> None:
         # Regression guard for the streaming regression: with the real
