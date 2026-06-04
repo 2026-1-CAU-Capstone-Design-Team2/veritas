@@ -80,6 +80,21 @@ class RunStoreService:
         except OSError:
             return ""
 
+    def read_raw_html(self, doc_id: str) -> str:
+        """Read the archived raw HTML for ``doc_id`` (``corpus/raw_html/<id>.html``).
+
+        Returns ``""`` when the file is missing. The batch cleanup path uses
+        this as a *structural-extraction input* and falls back to ``raw_md``
+        when the HTML is absent or the extraction is too thin.
+        """
+        path = self.paths.raw_html_dir / f"{doc_id}.html"
+        if not path.exists():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
     @property
     def index_path(self):
         return self.paths.index_path

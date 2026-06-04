@@ -229,13 +229,28 @@ class CitationPopup(QFrame):
 			)
 
 		if not isinstance(match, dict):
-			parts.append(
-				'<p style="color:#475569;">원문 위치를 확정하지 못했습니다.</p>'
-			)
+			# No reliable sentence-level anchor. When a document was still
+			# resolved (metadata present), say so honestly rather than
+			# highlighting an unrelated "closest" sentence.
+			if str(payload.get("resolution") or "") == "document_only" and (
+				payload.get("title") or payload.get("url")
+			):
+				parts.append(
+					'<p style="color:#475569;">이 인용은 문서 수준 근거로 연결되었지만,'
+					" 정확한 원문 문장 위치는 확정하지 못했습니다.</p>"
+				)
+			else:
+				parts.append(
+					'<p style="color:#475569;">원문 위치를 확정하지 못했습니다.</p>'
+				)
 			return "".join(parts)
 
-		confidence = str(match.get("confidence") or "low")
-		if confidence == "low":
+		if str(match.get("matchSource") or "") == "batch_anchor":
+			parts.append(
+				'<p style="color:#8A94A6; font-size:12px; margin:0 0 6px 0;">'
+				"이 인용을 뒷받침하는 가장 가까운 원문 근거 문장입니다.</p>"
+			)
+		elif str(match.get("confidence") or "low") == "low":
 			parts.append(
 				'<p style="color:#C2682B; font-size:12px; margin:0 0 6px 0;">'
 				"정확한 원문 위치를 확정하지 못했습니다 — 가장 가까운 원문 후보입니다.</p>"

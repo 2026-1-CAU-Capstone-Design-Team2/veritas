@@ -188,6 +188,7 @@ Rules:
 - For every Core Gap bullet, append " - Relevance: <short reason tied to user request>".
 - If a section has no items, write "- None".
 - Be concise and remove redundant statements.
+- Treat only document body content as evidence. Page chrome — site navigation, social/share widgets, related-links blocks, footers, and cookie/legal notices — is never a finding: do not turn it into a Repeated/New Finding, a citation, or a reliability note. (This is a general principle, not a fixed keyword list.)
 - Write the batch note in the original user request language. If the original request is Korean, write the section content in Korean while preserving fixed markdown headings if needed by downstream code.
 
 Citation policy — downstream verification needs to map every finding back to
@@ -197,6 +198,10 @@ inline doc citations of the form ``[doc_<id>]``:
 - Cite every supporting document. A finding repeated across three sources
   ends with ``[doc_001][doc_004][doc_009]``; a single-source finding ends with
   ``[doc_007]``.
+- A document earns a citation on a finding only when that document
+  *independently* supports that specific claim. When several ids are attached
+  to one finding, each id must support it on its own — never cite a document
+  merely because it is on a related topic.
 - Use ONLY the doc_ids that appear as ``=== doc_<id> ===`` headers in the
   input. Never invent or guess an id. Never abbreviate as ``doc_7`` — keep
   the original three-digit form.
@@ -237,6 +242,14 @@ Required sections:
 ## Source Notes
 ## Remaining Gaps
 Rules:
+- The text provided to you below is INTERNAL INPUT (the original request, a
+  short plan summary, run stats, and the batch summaries). Treat it strictly as
+  source material. NEVER reproduce that input verbatim and NEVER output JSON,
+  the plan object, search queries, run-stat keys, or the batch-summaries list as
+  report content.
+- The ``## User Request`` section must contain ONLY the user's original request
+  (a brief restatement or quote of it). Never place the plan, search queries,
+  batch summaries, keywords, or any JSON / payload keys in that section.
 - Deduplicate overlapping content.
 - Mention support frequency when relevant.
 - Be concrete and concise.
@@ -246,9 +259,14 @@ Rules:
   ``[doc_000]``. Never emit a bare ``doc_000`` (without brackets), not even in a
   table cell or the ``Doc ID`` column; the UI links only the bracketed form.
 - Attach a citation only where it backs a substantive claim drawn from that
-  source; do not decorate every sentence or cite non-evidentiary filler.
+  source; do not decorate every sentence or cite non-evidentiary filler. When
+  several documents are cited on one sentence, each must independently support
+  that sentence's specific claim — not merely share its topic.
 - The ``## Source Notes`` section MUST be a Markdown table, not bullets or
   paragraphs. Use one row per important source document.
+- Each ``## Source Notes`` row is a single-line Markdown table row delimited by
+  pipes (``| … | … |``) with NO leading bullet (`-`/`*`) and no line breaks
+  inside a cell; emit the header row and its ``|---|---|…|`` separator exactly.
 - The ``## Source Notes`` table MUST use these columns:
   ``Doc ID`` | ``Title / Type`` | ``Year`` | ``What it contributes`` |
   ``Reliability / Caveat``.

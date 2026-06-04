@@ -10,7 +10,7 @@ import httpx
 from openai import OpenAI
 
 
-DEFAULT_AUTOSURVEY_OPENAI_MODEL = "gpt-5-nano"
+DEFAULT_AUTOSURVEY_OPENAI_MODEL = "gpt-5-mini"
 _SERVICE_TIERS = {"default", "flex", "priority"}
 # Valid OpenAI reasoning-effort levels (gpt-5 family reasoning models).
 _REASONING_EFFORTS = {"minimal", "low", "medium", "high"}

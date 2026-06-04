@@ -45,6 +45,16 @@ _HANGUL_RE = re.compile(r"[가-힣]+")
 # and hard line breaks / list-item starts.
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|(?<=다\.)\s*|(?<=요\.)\s*|\n+")
 
+# Resolution thresholds for the layered citation lookup. A direct final-claim →
+# clean_md match at or above _DIRECT_STRONG_SCORE is trusted as the source
+# location. Below it we try a cited batch-summary finding as an anchor; if that
+# also fails we resolve at document level instead of highlighting an unrelated
+# "closest" sentence (which reads as a wrong highlight).
+_DIRECT_STRONG_SCORE = 0.50
+_ANCHOR_MIN_SCORE = 0.45          # a batch anchor's source match must be this strong
+_ANCHOR_CLAIM_MIN_OVERLAP = 0.20  # batch claim must be this related to the final claim
+_BATCH_MARKER_RE = re.compile(r"\[doc[_-]?(\d+)\]", re.IGNORECASE)
+
 
 # --------------------------------------------------------------------------
 # Public entry point
@@ -67,6 +77,10 @@ def get_citation(workspace_id: str, doc_id: str, claim: str) -> dict[str, Any]:
         "domain": "",
         "claim": claim_text,
         "match": None,
+        # How the source was resolved: "direct" (strong final-claim match),
+        # "batch_anchor" (bridged via a cited batch finding), or
+        # "document_only" (no reliable sentence — show a document-level note).
+        "resolution": "document_only",
     }
 
     stem = _normalize_doc_id(doc_id)
@@ -99,7 +113,27 @@ def get_citation(workspace_id: str, doc_id: str, claim: str) -> dict[str, Any]:
     if not source_text.strip() or not claim_text:
         return result
 
-    result["match"] = match_claim_in_source(claim_text, source_text)
+    # 1) Direct match of the clicked final.md claim against this doc's source.
+    direct = match_claim_in_source(claim_text, source_text)
+    if direct and direct.get("score", 0.0) >= _DIRECT_STRONG_SCORE:
+        direct["matchSource"] = "direct"
+        result["match"] = direct
+        result["resolution"] = "direct"
+        return result
+
+    # 2) Weak direct match — final.md sentences are paraphrased syntheses, so a
+    #    cited batch-summary finding for the same doc is often the better bridge
+    #    to a real source sentence.
+    anchor = _resolve_batch_anchor(workspace_id, resolved_stem, claim_text, source_text)
+    if anchor is not None:
+        result["match"] = anchor
+        result["resolution"] = "batch_anchor"
+        return result
+
+    # 3) Neither is strong enough — resolve at document level rather than
+    #    highlight an unrelated "closest" sentence (a wrong highlight is worse
+    #    than an honest document-level fallback).
+    result["resolution"] = "document_only"
     return result
 
 
@@ -298,6 +332,89 @@ def _window(sentences: list[str], index: int) -> str:
         return snippet
     # Too long with neighbours — fall back to the matched sentence alone.
     return sentences[index].strip()[:_MAX_PARAGRAPH_CHARS]
+
+
+# --------------------------------------------------------------------------
+# Batch-summary anchors — reliability fallback for weak direct matches
+# --------------------------------------------------------------------------
+def _summary_dir(workspace_id: str) -> Path | None:
+    if not workspace_id or any(sep in workspace_id for sep in ("/", "\\", "..")):
+        return None
+    path = _workspace_root() / workspace_id / "summary"
+    return path if path.is_dir() else None
+
+
+def _strip_markers(line: str) -> str:
+    """A batch-summary line with citation markers + leading Markdown removed."""
+    s = _CITATION_MARKER_RE.sub(" ", line)
+    s = re.sub(r"^[\s>#*\-+]+", " ", s).replace("|", " ")
+    return re.sub(r"\s+", " ", s).strip()[:_MAX_CLAIM_CHARS]
+
+
+def _batch_claims_for_doc(workspace_id: str, stem: str) -> list[str]:
+    """Marker-stripped batch-summary lines that cite ``stem`` via ``[doc_NNN]``."""
+    summary_dir = _summary_dir(workspace_id)
+    if summary_dir is None:
+        return []
+    try:
+        target = int(stem)
+    except ValueError:
+        return []
+    claims: list[str] = []
+    for path in sorted(summary_dir.glob("batch_*.md")):
+        for line in _read_text(path).splitlines():
+            ids = {int(m.group(1)) for m in _BATCH_MARKER_RE.finditer(line)}
+            if target not in ids:
+                continue
+            claim = _strip_markers(line)
+            if len(claim) >= 12:
+                claims.append(claim)
+    return claims
+
+
+def _claim_overlap(content: set[str], numbers: set[str], other: str) -> float:
+    denom = len(content) + len(numbers)
+    if denom == 0:
+        return 0.0
+    other_content, other_numbers = tokenize(other)
+    shared = len(content & other_content) + len(numbers & other_numbers)
+    return shared / denom
+
+
+def _resolve_batch_anchor(
+    workspace_id: str, stem: str, final_claim: str, source_text: str
+) -> dict[str, Any] | None:
+    """Bridge a weak direct match through a cited batch-summary finding.
+
+    Picks the batch finding (for this doc) most lexically related to the final
+    claim, matches *that* finding against the document source, and returns the
+    source sentence only when the match is strong enough. Returns ``None`` when
+    there is no related, well-anchored finding — the caller then resolves at the
+    document level. Pure scoring; no LLM call.
+    """
+    batch_claims = _batch_claims_for_doc(workspace_id, stem)
+    if not batch_claims:
+        return None
+    final_content, final_numbers = tokenize(final_claim)
+    ranked = sorted(
+        batch_claims,
+        key=lambda claim: _claim_overlap(final_content, final_numbers, claim),
+        reverse=True,
+    )
+    if _claim_overlap(final_content, final_numbers, ranked[0]) < _ANCHOR_CLAIM_MIN_OVERLAP:
+        return None
+    best: dict[str, Any] | None = None
+    best_claim = ""
+    for batch_claim in ranked[:3]:
+        candidate = match_claim_in_source(batch_claim, source_text)
+        if candidate and candidate["score"] > (best["score"] if best else -1.0):
+            best, best_claim = candidate, batch_claim
+    if best is None or best["score"] < _ANCHOR_MIN_SCORE:
+        return None
+    anchored = dict(best)
+    anchored["matchSource"] = "batch_anchor"
+    anchored["anchorClaim"] = best_claim
+    return anchored
 
 
 __all__ = [

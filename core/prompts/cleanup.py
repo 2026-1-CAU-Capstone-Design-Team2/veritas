@@ -157,6 +157,10 @@ markdown fences:
 
 Rules:
 - Include every document from the input exactly once, keyed by its doc_id.
+- Treat only the document body as evidence. Page chrome — navigation,
+  social/share widgets, related-links, footers, and cookie/legal notices — is
+  never evidence: do not derive summary claims, keywords, or key_points from
+  it. (A general principle, not a fixed keyword list.)
 - A document that is mostly empty or mostly chrome gets an empty summary,
   empty keywords, and empty key_points (but still appears in the output).
 - Language policy: write summary / keywords / key_points in each body's

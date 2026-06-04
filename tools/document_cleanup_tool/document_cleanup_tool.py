@@ -31,12 +31,24 @@ For each kept document:
 
 **batch mode (external API LLM — OpenAI).**
 One LLM call per *collect cycle* instead of per document. A large API model
-reads noisy bodies fine, so paragraph-level boilerplate removal is skipped
-entirely (the small local models need it; gpt-5-mini does not):
+reads noisy bodies fine, so paragraph-level *LLM* boilerplate removal is
+skipped (the small local models need it; gpt-5-mini does not):
 
-1. ``clean_md/<doc_id>.md`` is written as a pass-through copy of ``raw_md``
-   so every downstream consumer (RAG indexing, verification sentence
-   splitting, batch summary) keeps reading from the same place.
+1. ``clean_md/<doc_id>.md`` is built by a deterministic **block-run structural
+   extraction** of the archived ``corpus/raw_html/<id>.html``
+   (:func:`extract_main_text_with_stats`): page chrome
+   (``nav``/``footer``/``aside``/``script`` …) is dropped by HTML tag + ARIA
+   role, the main-body block run is isolated by a structural max-weight window
+   (link-/control-heavy edges trimmed), and the result is accepted on a
+   **quality verdict** (substantial prose or a table, low link density) rather
+   than a fixed retention ratio — never by keyword, class/id substring, or
+   site-specific selector. When there is no archived HTML or the extraction
+   fails the verdict (``empty`` / ``too_short`` / ``low_quality``), it falls
+   back to the ``raw_md`` body (a degraded path, not a failure); the per-doc
+   reason + structural numbers (no raw text) are reported in
+   ``cleanup_provenance``. Every downstream consumer (RAG indexing, verification
+   sentence splitting, batch summary, citation popup) keeps reading from this
+   one ``clean_md`` file, now with less boilerplate.
 2. ONE ``ask_json`` call with :data:`core.prompts.BATCH_DOC_METADATA_PROMPT`
    extracts per-document summary / keywords / key_points for every document
    in the cycle (chunked if the cycle is unusually large).
@@ -69,6 +81,7 @@ from core.prompts import BATCH_DOC_METADATA_PROMPT, DOCUMENT_CLEANUP_PROMPT
 from services.document_cleanup_tool_funcs import (
     annotate_paragraphs,
     apply_boilerplate_removal,
+    extract_main_text_with_stats,
     parse_cleanup_response,
     split_paragraphs,
     write_doc_metadata,
@@ -243,6 +256,7 @@ class DocumentCleanupTool(BaseTool):
         skipped_existing: list[str] = []
         failed_documents: list[dict[str, str]] = []
         fallback_documents: list[dict[str, str]] = []
+        cleanup_provenance: list[dict[str, Any]] = []
 
         # 1. Partition records: already-clean (skip) vs pending.
         pending: list[dict[str, Any]] = []
@@ -256,13 +270,20 @@ class DocumentCleanupTool(BaseTool):
                 continue
             pending.append(record)
 
-        # 2. Pass-through copy raw_md → clean_md (no LLM) and collect bodies.
+        # 2. Build clean_md from a structural HTML extraction of the archived
+        #    raw_html when available (drops nav/footer/aside/script chrome by
+        #    HTML tag + ARIA role only — no keyword/selector list), falling back
+        #    to the raw_md body when there is no HTML or the extraction is too
+        #    thin. No LLM call on this path. The sanitized body also becomes the
+        #    batch-metadata input, so removed chrome never reaches the LLM.
         bodies: dict[str, str] = {}
         prepared: list[dict[str, Any]] = []
         for record in pending:
             doc_id = str(record.get("doc_id") or "").strip()
             raw_text = self._run_store.read_raw_md(doc_id)
-            if not raw_text.strip():
+            body, provenance = self._batch_clean_body(doc_id, raw_text)
+            cleanup_provenance.append(provenance)
+            if not body.strip():
                 self._emit(progress_callback, _PROGRESS_KIND_FAILED, doc_id=doc_id, record=record)
                 failed_documents.append(
                     {
@@ -273,8 +294,8 @@ class DocumentCleanupTool(BaseTool):
                 )
                 continue
             self._emit(progress_callback, _PROGRESS_KIND_START, doc_id=doc_id, record=record)
-            self._run_store.write_clean_md(doc_id, raw_text)
-            bodies[doc_id] = raw_text
+            self._run_store.write_clean_md(doc_id, body)
+            bodies[doc_id] = body
             prepared.append(record)
 
         # 3. Batch metadata extraction — one ask_json call per chunk.
@@ -369,8 +390,68 @@ class DocumentCleanupTool(BaseTool):
                 "skipped_existing_doc_ids": skipped_existing,
                 "failed_documents": failed_documents,
                 "fallback_documents": fallback_documents,
+                # Structural-cleanup provenance: numbers + reason per doc, NO raw
+                # text (so it is safe to log / surface for review).
+                "cleanup_provenance": cleanup_provenance,
             },
         )
+
+    def _batch_clean_body(
+        self, doc_id: str, raw_text: str
+    ) -> tuple[str, dict[str, Any]]:
+        """Pick the batch-mode ``clean_md`` body and report cleanup provenance.
+
+        Runs the block-run structural extractor over the archived ``raw_html``
+        and accepts its output on a **quality verdict** (substantial prose or a
+        table, low link density) rather than a fixed retention ratio — so a good
+        article or data table is kept even when it is far smaller than the noisy
+        ``raw_md``, while promo/nav/empty extractions fall back to ``raw_md``.
+        Returns ``(body, provenance)`` where provenance carries only structural
+        numbers + a reason (never raw document text).
+        """
+        raw_len = len(raw_text.strip())
+        raw_html = self._run_store.read_raw_html(doc_id)
+        if not raw_html.strip():
+            return raw_text, self._provenance(doc_id, False, "no_html", raw_len)
+
+        result = extract_main_text_with_stats(raw_html)
+        provenance = self._provenance(
+            doc_id,
+            result.accepted,
+            result.reason,
+            raw_len,
+            extracted_len=result.extracted_len,
+            prose_len=result.prose_len,
+            table_count=result.table_count,
+            link_density=result.link_density,
+        )
+        if result.accepted and result.text.strip():
+            return result.text, provenance
+        return raw_text, provenance
+
+    @staticmethod
+    def _provenance(
+        doc_id: str,
+        accepted: bool,
+        reason: str,
+        raw_len: int,
+        *,
+        extracted_len: int = 0,
+        prose_len: int = 0,
+        table_count: int = 0,
+        link_density: float | None = None,
+    ) -> dict[str, Any]:
+        """Structural cleanup provenance — numbers + reason only, no body text."""
+        return {
+            "docId": doc_id,
+            "accepted": accepted,
+            "reason": reason,  # accepted | too_short | low_quality | empty | extractor_error | no_html
+            "rawLen": raw_len,
+            "extractedLen": extracted_len,
+            "proseLen": prose_len,
+            "tableCount": table_count,
+            "linkDensity": link_density,
+        }
 
     def _batch_input_budget(self) -> int:
         """Character budget for one batch-metadata call, from the model context."""

@@ -122,12 +122,63 @@ class DocumentCitationServiceTests(unittest.TestCase):
         self.assertIn("PLSM", match["text"])
         self.assertNotEqual(match["confidence"], "low")
 
-    def test_no_match_fallback_is_low_confidence(self) -> None:
+    def test_unrelated_claim_resolves_document_only(self) -> None:
+        # No reliable sentence and no batch anchor: resolve at document level
+        # instead of highlighting an unrelated "closest" sentence.
         result = svc.get_citation("WS", "doc_000", "고양이가 정원에서 잠을 잤다 맑음")
-        match = result["match"]
-        # Still returns the closest candidate rather than crashing/None.
-        self.assertIsNotNone(match)
-        self.assertEqual(match["confidence"], "low")
+        self.assertIsNone(result["match"])
+        self.assertEqual(result["resolution"], "document_only")
+
+    def test_strong_direct_match_is_marked_direct(self) -> None:
+        result = svc.get_citation(
+            "WS", "doc_000", "Atari 26 게임에서 평균 점수가 5.6 포인트 향상되었다"
+        )
+        self.assertEqual(result["resolution"], "direct")
+        self.assertEqual(result["match"]["matchSource"], "direct")
+
+    def test_weak_direct_uses_batch_anchor(self) -> None:
+        ws = self._root / "WS"
+        (ws / "clean_md" / "000.md").write_text(
+            "문서 영점 도입부.\n\n"
+            "PushT 성공률은 18 퍼센트 향상되었고 속도는 48 배 빨라졌다.",
+            encoding="utf-8",
+        )
+        (ws / "summary" / "batch_001.md").write_text(
+            "## New Findings\n"
+            "- PushT 성공률 18 퍼센트 개선과 속도 48 배 향상 [doc_000].\n",
+            encoding="utf-8",
+        )
+        # Paraphrase that does not strongly match the source sentence directly,
+        # but the cited batch finding bridges to it.
+        result = svc.get_citation("WS", "doc_000", "PushT 성공률 과 속도 개선")
+        self.assertEqual(result["resolution"], "batch_anchor")
+        self.assertIsNotNone(result["match"])
+        self.assertEqual(result["match"]["matchSource"], "batch_anchor")
+        self.assertIn("anchorClaim", result["match"])
+        self.assertIn("PushT", result["match"]["text"])
+
+    def test_multi_doc_each_resolves_to_own_batch_anchor(self) -> None:
+        ws = self._root / "WS"
+        (ws / "clean_md" / "000.md").write_text(
+            "도입부.\n\nPushT 성공률은 18 퍼센트 향상되었고 속도는 48 배 빨라졌다.",
+            encoding="utf-8",
+        )
+        (ws / "clean_md" / "001.md").write_text(
+            "도입부.\n\nAtari 평균 점수는 67 퍼센트에서 향상되었다.",
+            encoding="utf-8",
+        )
+        (ws / "summary" / "batch_001.md").write_text(
+            "## New Findings\n"
+            "- PushT 성공률 18 퍼센트 개선과 속도 48 배 향상 [doc_000].\n"
+            "- Atari 평균 점수 67 퍼센트 개선 [doc_001].\n",
+            encoding="utf-8",
+        )
+        r0 = svc.get_citation("WS", "doc_000", "PushT 성공률 과 속도 개선")
+        r1 = svc.get_citation("WS", "doc_001", "Atari 점수가 좋아졌다 개선")
+        self.assertEqual(r0["resolution"], "batch_anchor")
+        self.assertIn("PushT", r0["match"]["text"])
+        self.assertEqual(r1["resolution"], "batch_anchor")
+        self.assertIn("Atari", r1["match"]["text"])
 
     def test_missing_source_returns_metadata_without_match(self) -> None:
         result = svc.get_citation("WS", "doc_999", "anything")

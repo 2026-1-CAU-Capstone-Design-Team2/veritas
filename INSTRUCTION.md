@@ -213,3 +213,212 @@ python -m unittest discover tests
 - `C:\Users\asdf\.conda\envs\agent\python.exe -m unittest tests.test_document_citations -v` 통과: 21 tests.
 - `C:\Users\asdf\.conda\envs\agent\python.exe -m unittest tests.test_document_cleanup_modes -v` 통과: 12 tests.
 - `C:\Users\asdf\.conda\envs\agent\python.exe -m unittest discover tests` 실패: 251 tests 중 13 errors, 1 skipped. 실패는 OpenAI factory SSL 초기화와 기존 RAG/chat memory 누락(`ChatAgent._append_history`, `collected`, `RAGService._format_recent_history`)으로, 이번 citation diff와 직접 관련 없는 기존 실패로 분류한다.
+
+## Implementation Plan: External API Structural Cleanup
+
+### Problem
+외부 API cleanup batch mode는 현재 `raw_md -> clean_md`를 pass-through로 복사한다. 따라서 `document_summarize`의 batch summary와 최종 `final.md`가 boilerplate가 섞인 `clean_md`를 읽고, citation popup도 같은 noisy source에서 문장 후보를 찾는다. Local LLM per-doc mode는 LLM cleanup으로 boilerplate paragraph를 제거하므로 두 경로의 source quality가 달라진다.
+
+### Recommended Direction
+- 핵심 수정은 `tools/document_cleanup_tool/document_cleanup_tool.py`의 batch mode에서 `clean_md`를 raw pass-through가 아니라 `corpus/raw_html/<doc_id>.html` 기반 구조적 extraction 결과로 쓰는 것이다.
+- `FINAL_PROMPT`만 수정하는 것은 늦다. final report tool은 원문이 아니라 `summary/batch_*.md`만 보기 때문에, boilerplate citation은 이미 batch summary 단계에서 들어간다.
+- Prompt 보강은 보조 수단으로 `BATCH_DOC_METADATA_PROMPT`와 `BATCH_SUMMARY_PROMPT`에 적용한다. 단, 추가 LLM call은 만들지 않는다.
+
+### Claude Implementation Checklist
+- [ ] `services/document_cleanup_tool_funcs/html_body_extractor.py`를 추가한다.
+- [ ] BeautifulSoup 기반으로 HTML에서 semantic non-content tags만 제거한다: `script`, `style`, `noscript`, `template`, `svg`, `nav`, `footer`, `aside`, `form` 등 HTML tag/role 구조를 기준으로 한다.
+- [ ] 구현에서 특정 텍스트 키워드, class/id substring, 사이트별 selector list를 사용하지 않는다. 예: `tags`, `share`, `related`, `footer`, `광고` 같은 문자열 매칭으로 paragraph를 제거하지 않는다.
+- [ ] body 후보는 `article`, `main`, `[role=main]`, 이후 `body` fallback 순서로 고르고, 필요하면 link-density/text-length 같은 language/domain-agnostic structural score만 사용한다.
+- [ ] HTML extraction 결과를 markdown-ish text로 변환하되 headings, paragraphs, list items, code/pre, table rows 정도는 보존한다.
+- [ ] extraction 결과가 너무 짧거나 비어 있으면 기존 `raw_md` fallback을 사용한다. 실패는 hard failure가 아니라 degraded path로 처리한다.
+- [ ] `DocumentCleanupTool._run_batch_mode()`에서 `raw_text`를 그대로 `write_clean_md()`하지 말고, raw_html이 있으면 structural extraction 결과를 `clean_md`와 batch metadata input의 `bodies[doc_id]`에 사용한다.
+- [ ] local per-doc cleanup path(`_process_record`, `_cleanup_with_retry`)는 변경하지 않는다.
+- [ ] `core/prompts/cleanup.py`의 `BATCH_DOC_METADATA_PROMPT`와 `core/prompts/autosurvey.py`의 `BATCH_SUMMARY_PROMPT`에 "body evidence only; page chrome/social/footer/navigation is not evidence" 취지의 지시를 추가한다. 이것은 prompt guardrail이며 deterministic keyword filter가 아니다.
+- [ ] `ARCHITECTURE.md`의 implementation log에 외부 API batch cleanup이 raw pass-through에서 structural HTML cleanup으로 바뀌었음을 기록한다.
+
+### Tests Required
+- [ ] `tests/test_document_cleanup_modes.py`의 기존 `test_clean_md_is_raw_passthrough` 기대값을 수정한다. raw_html이 없거나 extraction 실패 시 raw fallback을 검증하는 테스트로 바꾼다.
+- [ ] raw_html에 `<nav>`, `<footer>`, `<aside>`와 `<article>` 본문이 있을 때 batch mode `clean_md`가 본문을 보존하고 semantic chrome tag 내용을 제거하는지 검증한다.
+- [ ] batch metadata `ask_json` 입력에도 sanitized body가 들어가고 removed semantic tag text가 들어가지 않는지 검증한다.
+- [ ] local per-doc mode의 LLM cleanup behavior가 그대로인지 기존 regression test를 유지한다.
+- [ ] 구현 후 실행: `C:\Users\asdf\.conda\envs\agent\python.exe -m unittest tests.test_document_cleanup_modes -v`
+- [ ] citation 흐름 회귀 확인: `C:\Users\asdf\.conda\envs\agent\python.exe -m unittest tests.test_document_citations -v`
+
+### Review Focus
+- deterministic cleanup이 text keyword list나 site-specific selector로 변질되지 않았는지 확인한다.
+- 외부 API batch mode의 LLM call count가 늘지 않았는지 확인한다.
+- `clean_md`가 downstream single source로 계속 쓰이는지 확인한다: batch summary, RAG, verify, citation popup.
+- HTML extraction 실패 시 raw fallback이 보수적으로 동작해 body 손실보다 leftover noise를 선택하는지 확인한다.
+
+## Implementation Plan: Citation Anchor Reliability + Source Notes Table
+
+### Problem
+현재 citation popup은 `final.md`의 같은 줄 claim을 `clean_md/<doc_id>.md`에 즉석 lexical matching한다. `final.md` 문장은 batch summary를 다시 종합한 paraphrase인 경우가 많고, 한 문장에 여러 `[doc_NNN]`가 붙으면 각 문서에 같은 claim을 던진다. 그 결과 낮은 confidence가 대량 발생하고, service가 "가장 가까운 후보"를 반환하면서 관련 없는 원문 문장을 highlight하는 문제가 생긴다.
+
+또한 `## Source Notes`는 prompt상 table을 요구해도 실제 출력에서 separator row가 빠지거나 각 row가 `- doc_001 | ...`처럼 bullet-prefixed pipe row로 생성되어 Markdown table rendering이 깨질 수 있다.
+
+### Recommended Direction
+- Citation popup은 low-confidence direct match를 원문 위치로 가장하지 않는다. 직접 match가 약하면 `summary/batch_*.md`의 source-proximal cited finding을 중간 anchor로 사용하고, 그래도 anchor가 없으면 문서 수준 fallback만 보여준다.
+- Source Notes는 prompt 보강에 더해 `final_report_tool` 저장 직전 deterministic markdown normalizer로 table 형태를 보정한다. 이 보정은 `## Source Notes` section에만 적용한다.
+
+### Claude Implementation Checklist: Citation Anchors
+- [ ] `api/services/document_citation_service.py` 또는 별도 `api/services/document_citation_anchor_service.py`에 batch-summary anchor lookup을 추가한다.
+- [ ] `summary/batch_*.md`에서 citation-bearing bullet/line을 파싱한다. 각 line의 `[doc_NNN]` marker를 추출하고, marker를 제거한 line text를 `batch_claim`으로 둔다.
+- [ ] 각 `(doc_id, batch_claim)`에 대해 기존 `match_claim_in_source()` 또는 동일 scoring helper로 `clean_md/<id>.md`에서 source sentence anchor를 찾는다.
+- [ ] low-confidence anchor는 "정확한 source sentence"로 채택하지 않는다. threshold는 direct source match와 anchor match에 명확히 둔다.
+- [ ] `get_citation(workspace_id, doc_id, final_claim)` 처리 순서:
+  1. final claim을 clean_md에 직접 match한다. `high` 또는 충분한 `medium`이면 반환한다.
+  2. direct match가 약하면 같은 doc_id의 batch anchors 중 final claim과 lexical/numeric overlap이 가장 높은 anchor를 찾는다.
+  3. batch anchor가 충분하면 그 anchor의 source sentence/paragraph를 반환하고 `matchSource: "batch_anchor"`, `anchorClaim`을 포함한다.
+  4. 둘 다 부족하면 임의의 low-confidence "closest sentence"를 반환하지 말고 `match=None`, `resolution: "document_only"`로 반환한다.
+- [ ] frontend popup은 `match=None`이면 unrelated sentence highlight를 보여주지 않는다. 대신 "이 인용은 문서 수준 근거로 연결되었지만 정확한 문장 위치는 확정되지 않았습니다."처럼 문서 수준 fallback으로 표시한다.
+- [ ] `BATCH_SUMMARY_PROMPT`와 `FINAL_PROMPT`를 보강한다: 각 `[doc_NNN]`는 그 문서가 같은 문장의 구체 claim을 직접 뒷받침할 때만 붙이고, 관련 문서라는 이유만으로 citation을 남발하지 말 것. 여러 문서를 한 문장에 붙일 때는 모든 문서가 같은 claim을 독립적으로 support해야 한다.
+
+### Claude Implementation Checklist: Source Notes Table
+- [ ] `core/report_markdown_normalizer.py` 또는 유사한 pure helper를 추가해 `normalize_final_report_markdown()`을 만든다.
+- [ ] `tools/final_report_tool/final_report_tool.py`에서 `clean_latex_in_markdown()` 이후, `save_final_report()` 이전에 final markdown normalizer를 호출한다.
+- [ ] normalizer는 `## Source Notes` section에만 적용한다.
+- [ ] Source Notes table header를 canonical form으로 보정한다:
+  `| Doc ID | Title / Type | Year | What it contributes | Reliability / Caveat |`
+  다음 줄에 `|---|---|---|---|---|`를 보장한다.
+- [ ] `- doc_001 | ...`, `- [doc_001] | ...`, `doc_001 | ...` 같은 row를 `| [doc_001] | ... |`로 보정한다.
+- [ ] table cell 안의 leading bullet marker는 제거하되, unknown value `-` 자체는 유지한다.
+- [ ] cell 내부 줄바꿈은 space 또는 semicolon으로 접고, literal pipe는 table delimiter와 혼동되지 않도록 escape 또는 안전하게 치환한다.
+- [ ] `FINAL_PROMPT`에도 Source Notes table은 leading bullet 없이 single-line pipe rows만 사용하라고 명시한다. 하지만 prompt만 믿지 말고 normalizer를 유지한다.
+
+### Tests Required
+- [ ] `tests/test_document_citations.py`: direct low-confidence final claim이 unrelated closest sentence를 반환하지 않고 `match=None`/`document_only`가 되는지 검증한다.
+- [ ] 같은 테스트에서 final claim은 paraphrase지만 같은 doc_id의 `batch_*.md` cited line이 source sentence에 더 잘 맞을 때 `batch_anchor`가 사용되는지 검증한다.
+- [ ] multi-doc final claim에서 각 doc_id가 자기 batch anchor로 resolve되는지 검증한다.
+- [ ] `tests/test_final_report_normalizer.py` 또는 관련 테스트 추가: bullet-prefixed Source Notes rows가 canonical table로 보정되는지 검증한다.
+- [ ] Source Notes에서 separator row가 누락된 경우 자동 삽입되는지 검증한다.
+- [ ] `[doc_1]`, `doc_1`, `doc-1` row id가 `[doc_001]`로 보정되는지 검증한다.
+- [ ] 실행: `C:\Users\asdf\.conda\envs\agent\python.exe -m unittest tests.test_document_citations -v`
+- [ ] 실행: `C:\Users\asdf\.conda\envs\agent\python.exe -m unittest tests.test_final_report_normalizer -v`
+
+### Review Focus
+- 낮은 confidence 문장을 highlight하지 않는지 확인한다. "틀린 highlight"보다 "문서 수준 fallback"이 낫다.
+- batch anchor index가 추가 LLM call 없이 기존 `batch_*.md`와 `clean_md`만 사용해 생성되는지 확인한다.
+- final report normalizer가 `## Source Notes` 외의 본문/수식/일반 표를 건드리지 않는지 확인한다.
+- citation 남발을 줄이는 prompt 변경이 keyword 기반 boilerplate filter로 변질되지 않았는지 확인한다.
+
+## Implementation Plan: Cleanup Quality After `runs/삼성전자-3` Review
+
+### Observed Quality
+`runs/삼성전자-3/raw_md`와 `clean_md` 23건을 비교한 결과, structural extraction이 채택된 문서는 10건(`000`, `002`, `008`, `009`, `010`, `012`, `017`, `019`, `020`, `021`)이고, 13건은 raw와 clean이 완전히 동일했다(`001`, `003`, `004`, `005`, `006`, `007`, `011`, `013`, `014`, `015`, `016`, `018`, `022`).
+
+품질은 부분 개선 수준이다. `009`는 본문 표 구조가 살아났지만 tail에 `Tags`, `Follow`, `Recent Posts`, unrelated post list가 여전히 남았다. `004`는 extractor 결과가 기사 본문 중심으로 2,227자까지 줄었지만 raw 대비 14%라서 `_MIN_STRUCTURAL_RETENTION=0.5` gate에 막혀 noisy raw가 그대로 clean으로 쓰였다. `001`은 extractor 자체가 삼성닷컴 프로모션/IR navigation 쪽을 고르는 실패 케이스라 retention만 낮추면 오히려 악화된다. `011`은 extractor 결과가 Counterpoint 표와 본문 중심으로 좋아 보이지만 raw 대비 30%라 fallback되었다.
+
+### Diagnosis
+- 현재 fallback gate는 noisy `raw_md` 길이를 기준으로 삼기 때문에, chrome이 많은 문서일수록 좋은 extraction을 버리는 역설이 생긴다.
+- `html_body_extractor._pick_body()`는 후보가 `article/main/[role=main]/body`에 한정되어 있고, 실제 뉴스 사이트처럼 main article이 non-semantic `div` 안에 있거나 잘못된 `<article>`이 관련기사 박스인 경우를 잘 못 다룬다.
+- 변환 후 문자열만 보면 footer link cluster가 일반 텍스트처럼 보인다. link-density 같은 구조 정보는 DOM block 단계에서 보존하고, 그 정보를 이용해 leading/trailing chrome을 잘라야 한다.
+- cleanup provenance가 기록되지 않아, 어느 문서가 structural extraction 채택/거절인지 UI나 리뷰에서 바로 확인하기 어렵다.
+
+### Recommended Direction
+- keyword/class/id/site selector는 계속 금지한다. `tags`, `related`, `share`, `footer`, `광고` 같은 문자열로 제거하지 않는다.
+- extractor를 단순 container 선택에서 "block-run extraction"으로 확장한다. DOM에서 heading/paragraph/list/table/pre 등 terminal block을 순서대로 수집하고, 각 block에 text length, link text length, href count, form/button/control count, table 여부, heading 여부를 함께 저장한다.
+- 후보 window를 연속 block 단위로 scoring한다. score는 language/domain-agnostic 구조 지표만 사용한다: prose length, paragraph/table count, heading continuity, low link density, low control density, non-empty text diversity.
+- leading/trailing block trimming을 추가한다. 본문 candidate 내부에서도 앞뒤의 link-heavy/list-heavy/control-heavy block run은 제거하고, middle body는 보존한다. 이 단계에서도 text keyword를 쓰지 않는다.
+- fallback gate를 retention 고정값에서 quality-based acceptance로 바꾼다. extraction이 충분한 본문 구조(예: 최소 길이, 여러 prose/table block, 낮은 link density)를 갖추면 raw 대비 50% 미만이어도 채택한다. 반대로 `001`처럼 추출물이 promo/navigation 성격이고 link/control density가 높으면 낮은 retention이어도 채택하지 않는다.
+- `_batch_clean_body()`는 `extract_main_text_with_stats()` 같은 새 helper를 사용해 `{text, accepted, reason, score, raw_len, extracted_len, link_density}` 형태의 provenance를 받을 수 있게 한다. raw text는 JSONL/metadata에 저장하지 말고 수치/원인만 이벤트나 result data에 둔다.
+- `raw_md`가 이미 좋은 `fit_markdown`일 수 있으므로 fallback 자체는 유지하되, fallback 사유가 `too_short`, `low_quality`, `no_html`, `extractor_error`처럼 구분되게 한다.
+- `summary/batch_*.md`, RAG, verification, citation popup은 계속 `clean_md`만 downstream source로 사용한다.
+
+### Claude Implementation Checklist
+- [ ] `services/document_cleanup_tool_funcs/html_body_extractor.py`에 block model과 stats-bearing extraction helper를 추가한다. 기존 `extract_main_text(html) -> str` API는 compatibility wrapper로 유지한다.
+- [ ] block 수집 시 DOM 구조에서 link/control/table/heading/prose 통계를 같이 보존한다.
+- [ ] candidate scoring과 leading/trailing trimming을 구조 통계 기반으로 구현한다.
+- [ ] `tools/document_cleanup_tool/document_cleanup_tool.py:_batch_clean_body()`를 fixed retention gate에서 quality-based gate로 변경한다.
+- [ ] `_run_batch_mode()` progress/result data에 cleanup provenance summary를 추가하되 raw text는 저장하지 않는다.
+- [ ] `ARCHITECTURE.md`에 삼성전자-3 재조사 진단과 새 gate 설계를 기록한다.
+- [ ] prompt 변경은 최소화한다. cleanup 개선은 prompt가 아니라 upstream source quality에서 해결한다.
+
+### Tests Required
+- [ ] `tests/test_document_cleanup_modes.py`에 "article body is accepted even when extraction/raw retention is below 0.5" 회귀 테스트를 추가한다.
+- [ ] 잘못된 promo/navigation extraction은 채택하지 않고 raw fallback하는 테스트를 추가한다.
+- [ ] 관련기사 `<article>`이 진짜 본문보다 먼저 나와도 block-run scoring이 본문 window를 고르는 테스트를 추가한다.
+- [ ] tail의 unrelated link cluster가 구조 통계로 잘리는 테스트를 추가한다.
+- [ ] table-heavy source(`Counterpoint` 유형)가 낮은 retention 때문에 버려지지 않는 테스트를 추가한다.
+- [ ] cleanup provenance에 reason/score/length fields가 있고 raw body text가 포함되지 않는지 검증한다.
+- [ ] 실행: `C:\Users\asdf\.conda\envs\agent\python.exe -m unittest tests.test_document_cleanup_modes -v`
+- [ ] 실행: `C:\Users\asdf\.conda\envs\agent\python.exe -m unittest tests.test_crawl4ai_fetch -v`
+
+### Review Focus
+- keyword/class/id/site-specific selector가 들어오지 않았는지 확인한다.
+- retention threshold를 단순히 낮추는 패치로 끝내지 않았는지 확인한다.
+- `001` 같은 bad extraction을 채택하지 않고, `004`/`011` 같은 good low-retention extraction은 채택하는지 fixture로 확인한다.
+- 추가 LLM call이 생기지 않았는지 확인한다.
+- 기존 local per-doc LLM cleanup path는 변경하지 않았는지 확인한다.
+
+## Codex Review Checkpoint: Current Diff Verification
+
+### Review Checklist
+- [ ] Review citation link presentation, API lookup, and document cleanup source-quality changes against repository guardrails.
+- [ ] Confirm `frontend/` does not read `runs/` or `clean_md/` directly and uses the HTTP API/controller boundary.
+- [ ] Confirm FastAPI handlers that perform file I/O remain plain `def` where applicable.
+- [ ] Check prompt changes keep canonical `[doc_000]` citation markers without adding deterministic boilerplate keyword stripping.
+- [ ] Inspect new tests for focused `unittest` regressions and meaningful coverage of fixed behavior.
+
+### Architecture Constraints
+- Keep UI responsibilities in `frontend/`, API routing thin, and matching/extraction logic in services/helpers.
+- Do not mutate stored `final.md` sources for presentation-only citation links.
+- Do not introduce extra LLM calls for citation preview or cleanup fallback.
+- Avoid language-, keyword-, or site-specific boilerplate deletion rules.
+
+### Verification Commands
+- `python -m unittest tests.test_document_citations -v`
+- `python -m unittest tests.test_document_cleanup_modes -v`
+- `python -m unittest tests.test_crawl4ai_fetch -v`
+- `python -m unittest tests.test_final_report_normalizer -v`
+- `python -m unittest discover tests`
+
+### Review Focus
+- Citation label normalization for bracketed and bare markers, including zero-padded `doc_007` variants.
+- Citation endpoint safety for workspace/doc IDs and source snippet size.
+- Cleanup extraction gate behavior for low-retention-but-good article bodies versus navigation/promo noise.
+- Final report normalization preserving canonical citation markers without altering source documents.
+
+## Implementation Plan: Final Report JSON Leakage Guard
+
+### Problem
+`runs/Multi_Armed_Bandit-2/final.md`에서 `## User Request` 아래에 `user_request`, `plan`, `batch_summaries`를 포함한 pretty-printed JSON payload가 그대로 출력되었다. 이는 `tools/final_report_tool/final_report_tool.py`가 final synthesis 입력을 하나의 JSON blob으로 만들고, `FINAL_PROMPT`가 `## User Request` 섹션에 무엇을 써야 하는지 명확히 제한하지 않아 모델이 입력 payload를 보고서 내용으로 오인한 결과다.
+
+이 문제는 특정 모델만의 결함으로 처리하지 않는다. `gpt-5-nano`가 이 취약한 prompt/input contract에 더 민감하게 반응했을 수는 있지만, 파이프라인은 어떤 LLM에서도 raw payload leakage가 구조적으로 불가능하도록 설계해야 한다.
+
+### Recommended Direction
+- `final_report_tool`은 raw JSON blob을 user prompt로 보내지 않는다.
+- final report input은 사람이 읽는 sectioned text로 렌더링한다:
+  - `Original User Request:`에는 `request.md` 또는 `user_request` 문자열만 넣는다.
+  - `Research Plan Summary:`에는 `topic`, `goal`, 핵심 `must_cover`만 짧게 넣는다.
+  - `Batch Summaries:`에는 `summary/batch_*.md` 내용만 넣는다.
+  - `kept_doc_count`, `duplicate_count`는 필요하면 `Run Stats:` 같은 짧은 metadata section으로 넣는다.
+- `FINAL_PROMPT`에 명시한다: 입력 payload, JSON keys, plan object, search queries, `batch_summaries` 배열을 그대로 재현하지 말 것. `## User Request` 섹션에는 원문 사용자 요청만 쓰고, plan/search_queries/batch summaries는 절대 포함하지 않는다.
+- 생성 후 deterministic leakage guard를 둔다. `final.md` 저장 전에 `## User Request` 섹션이 `{`, `"user_request"`, `"plan"`, `"batch_summaries"` 등 payload key로 시작하거나 포함하면 실패로 간주하고 repair 또는 retry한다.
+- repair는 추가 LLM call 없이 수행 가능해야 한다. 가장 안전한 fallback은 `## User Request` 섹션을 `request.md`의 원문 요청으로 교체하고, 누출된 JSON block만 제거하는 것이다. retry를 선택하더라도 최대 1회로 제한하고, prompt에 "previous output leaked internal JSON"을 명시한다.
+
+### Claude Implementation Checklist
+- [ ] `tools/final_report_tool/final_report_tool.py`에서 `json.dumps({...})` prompt 조립을 sectioned text renderer로 교체한다.
+- [ ] renderer helper를 pure function으로 분리한다. 예: `_render_final_report_input(user_request, plan, records, batch_summaries) -> str`.
+- [ ] renderer는 raw `plan` 전체를 dump하지 않고 allowlist fields만 출력한다: `topic`, `goal`, `must_cover` 일부, `keywords` 일부 정도.
+- [ ] `batch_summaries`는 Markdown 본문으로 구분자와 함께 넣되 JSON string escaping 형태로 넣지 않는다.
+- [ ] `core/prompts/autosurvey.py`의 `FINAL_PROMPT`에 internal payload/JSON key leakage 금지 규칙을 추가한다.
+- [ ] 저장 전 guard helper를 추가한다. 예: `_repair_user_request_section_if_leaked(final_markdown, user_request)`.
+- [ ] guard는 `## User Request` section에만 적용하고, 다른 본문/수식/Source Notes table은 건드리지 않는다.
+- [ ] leakage가 감지되면 raw JSON body를 저장하지 않는다. repair 결과를 저장하거나, 1회 retry 후에도 실패하면 repair fallback을 저장한다.
+- [ ] 이 변경으로 추가 LLM call이 기본 경로에 생기면 안 된다. retry는 leakage 감지 시에만 발생해야 한다.
+- [ ] `ARCHITECTURE.md`에 `Multi_Armed_Bandit-2` 사례와 final report 입력 계약 변경을 기록한다.
+
+### Tests Required
+- [ ] `tests/test_final_report_tool.py` 또는 관련 테스트를 추가해 final report prompt input에 literal `"batch_summaries": [` / `"plan": {` 같은 raw JSON structure가 포함되지 않는지 검증한다.
+- [ ] `## User Request` section에 JSON payload가 누출된 synthetic output을 repair하면 원문 request만 남고 `plan`, `search_queries`, `batch_summaries`가 제거되는지 검증한다.
+- [ ] 정상적인 `## User Request` section은 guard가 변경하지 않는지 검증한다.
+- [ ] Source Notes table normalizer와 guard가 서로 간섭하지 않는지 검증한다.
+- [ ] 실행: `C:\Users\asdf\.conda\envs\agent\python.exe -m unittest tests.test_final_report_tool -v`
+- [ ] 실행: `C:\Users\asdf\.conda\envs\agent\python.exe -m unittest tests.test_final_report_normalizer -v`
+
+### Review Focus
+- raw JSON leakage를 모델 품질 문제로만 치부하지 않고 prompt/input contract에서 차단했는지 확인한다.
+- `plan.json` 전체, `plan_history.json`, `query_state.json`, `batch_summaries` 배열이 final prompt에 JSON 형태로 노출되지 않는지 확인한다.
+- guard가 `## User Request` 외의 수식, citations, Source Notes table을 훼손하지 않는지 확인한다.
+- 기본 final report 생성 경로의 LLM call count가 늘지 않았는지 확인한다.
