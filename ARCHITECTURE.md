@@ -670,3 +670,85 @@ curl -X POST "http://127.0.0.1:8000/api/v1/proactive/reset?workspaceId=<ws>"
 - *섹션 격리*: guard는 `## User Request`만, normalizer는 `## Source Notes`만 — 서로/본문/수식과 무간섭(테스트로 보장).
 
 **테스트**: `tests.test_final_report_tool`(8) 통과. 실데이터 `Multi_Armed_Bandit-2/final.md`: guard가 누출 감지·`## User Request`를 원문 요청으로 복구(`"batch_summaries"` 제거) 확인. 전체 `discover tests` → 신규 회귀 0(잔존 실패는 무관한 OpenAI-factory 모듈).
+
+### 2026-06-04 (perf) — AutoSurvey pre-fetch source scoring + citation anchor combined-score
+
+**배경(INSTRUCTION "AutoSurvey Quality, Speed, and UX Review")**: collect 루프가 검색 결과를 순서대로 전부 fetch → 오프토픽 문서(예: 대체육 조사에 AI video / bath bomb market 리포트)가 fetch·cleanup LLM call·`maxDocs` 슬롯을 소비했다. 또 citation batch anchor가 상위 후보를 **source score 단독**으로 골라 클릭한 final claim과 무관한 source 문장을 highlight할 수 있었다.
+
+**변경 파일**
+- (new) `services/autosurvey_source_quality.py` — fetch **전** candidate scoring(pure). `build_topic_terms`(user request + plan topic/goal/must_cover/keywords + 현재 query 토큰 union, **search_queries 제외**), `score_candidate`(title/snippet/url 토큰 중 on-topic 비율 = precision — 오프토픽이 자기 주제어 때문에 generic market 단어를 공유해도 밀림), `rank_candidates`(score desc 정렬 + min_score gate + **domain diversity cap** + reference-site 예외). keyword/site/language list 없이 **구조적 토큰 overlap만**. topic 신호가 빈약하거나 전부 threshold 미만이면 **drop 없이 재정렬만** 해 수집을 starve 시키지 않는다(maxDocs·cleanup gate가 실제 backstop).
+- (edit) `workflows/autosurvey_workflow.py` `run_collect` — 검색 직후 `rank_candidates`로 **kept 후보만 fetch**, dropped count/사유 로깅. `_reference_domains(plan)` 헬퍼(plan.reference_sites의 domain → gate/cap 예외).
+- (edit) `api/services/document_citation_service.py` `_resolve_batch_anchor` — 상위 3개 anchor 후보를 source score가 아니라 **(source match + final-claim overlap) combined score**로 선택하고 overlap threshold 미만 후보는 제외. source는 강하지만 클릭 claim과 무관한 finding이 anchor를 가로채지 못한다.
+
+**엔지니어링 결정**
+- *성능 1차 레버는 fetch 전 filtering*: 오프토픽을 fetch 전에 떨궈 fetch·cleanup LLM·maxDocs를 절약(플랜의 "speed 개선은 먼저 fetch 전 filtering"과 일치).
+- *cleanup과 책임 분리*: source quality = 조사 적합성(fetch 전), cleanup = 본문 정제(fetch 후). 서로 섞지 않음.
+- *generalizable only*: cleanup 원칙과 동일하게 topic/site/keyword list 금지, 구조적 신호(토큰 overlap·domain·precision)만.
+
+**테스트**
+- (new) `tests/test_autosurvey_source_quality.py`(10): 오프토픽 < relevant 순위, clean 오프토픽 drop, domain cap(5→3 kept/2 capped), reference-site gate·cap 예외, thin-topic no-drop, search_queries 비포함.
+- (edit) `tests/test_document_citations.py` — anchor가 source 강한 무관 finding(Atari) 대신 claim 관련 finding(PushT)로 resolve하는 회귀(구 source-score-only 로직에선 Atari 누출 확인).
+
+**구현 범위(이번 increment)**: 플랜 항목 1·2·3(pre-fetch scoring·diversity·reference 예외)·8(anchor) 구현. 항목 **4**(post-fetch rejection metadata)·**5**(coverage ledger `summary/autosurvey_metrics.json`)·**6**(early stop)·**7**(fetch 동시성)·**9**(Research UI counts)와 "Demo Surprise" 플랜은 collect/cycle 루프 재구성·영속화·UI 변경이라 라이브 앱 검증 필요 → 후속 increment로 분리.
+
+**테스트 실행**: 위 신규/회귀 통과. 전체 `discover tests` → 신규 회귀 0(잔존 3 실패는 무관한 OpenAI-factory 모듈).
+
+### 2026-06-04 (perf) — AutoSurvey post-fetch rejection + early stop (플랜 항목 4·6)
+
+**배경**: 위 increment(항목 1·2·3·8)에 이어, fetch 후/cycle 단계 성능 레버를 추가. (4) snippet은 그럴듯했지만 **fetched body가 주제와 거의 안 겹치는** 문서(anti-bot/redirect/엉뚱한 주제)가 cleanup LLM·`maxDocs` 슬롯을 소비. (6) core gap이 없어도 루프가 `max_docs`까지 무조건 수집.
+
+**변경 파일**
+- (edit) `services/autosurvey_source_quality.py` — `topic_hit_count`(body가 포함한 distinct topic term 수), `body_is_on_topic`(thin topic이면 절대 reject 안 함; 아니면 hit ≥ `_MIN_BODY_TOPIC_HITS=2`). pre-fetch precision과 달리 **body는 near-zero 겹침만 reject**(보수적; pre-fetch gate가 이미 명백한 오프토픽 snippet 제거).
+- (edit) `services/run_store_tool_funcs/run_store_service.py` — `write_rejected_note`: rejected page를 `summary/rejected_*.md` **note로만** 기록(IndexedDocRecord·index.json 없음 → `doc_*` 번호·`maxDocs` 미소비). url/title/domain/query/reason/score만, **raw body 미저장**.
+- (edit) `workflows/config.py` — `min_docs` knob(`VERITAS_MIN_DOCS`; 0이면 `max(scout_docs, round(max_docs*0.6))`로 파생, else [1,max_docs] clamp).
+- (edit) `workflows/autosurvey_workflow.py` —
+  - `_fetch_one(..., topic=None)`: dedup 통과 후 `body_is_on_topic` 실패 시 `write_rejected_note` + `doc_rejected` progress emit + `status="rejected"` 반환(reference-site fetch는 `topic=None`이라 면제).
+  - `run_collect`: query별 `topic` 1회 생성해 pre-fetch ranking과 `_fetch_one`에 공유, `rejected_doc_ids`/`rejected_count`를 결과에 추가.
+  - `_early_stop_decision`(pure staticmethod) + `run_all` 루프 삽입: `kept ≥ min_docs` 이고 (core gap 없음 → `no_core_gap` | 직전 cycle accepted ≤ `_EARLY_STOP_MIN_GAIN=1` → `low_marginal_gain`)이면 final로 break, `replan_skipped_reason="early_stop:<reason>"` 기록.
+
+**엔지니어링 결정**
+- *rejection은 note-only*: kept numbering·maxDocs 불변(중복 record가 dedup용으로 index에 남는 것과 달리 rejected는 순수 note). raw text 비저장으로 JSONL/JSON 불변 준수.
+- *body gate는 보수적*: thin-topic 면제 + hit≥2로 relevant 문서 over-reject 방지. AI-video/bath-bomb류는 pre-fetch가 1차로 거름.
+- *early stop은 min_docs 이후에만*: 기본 max_docs의 ~60%(floor=scout) 확보 전엔 절대 조기 종료 안 함.
+
+**테스트**
+- (new) `tests/test_autosurvey_collect.py`(8): `_early_stop_decision` 4분기, `write_rejected_note`(kept 0·raw text 없음), `_fetch_one` 오프토픽 reject(kept 미소비)·온토픽 keep·topic=None 면제(fake fetch tool).
+- (edit) `tests/test_autosurvey_source_quality.py` — `body_is_on_topic`/`topic_hit_count`(relevant keep·offtopic reject·thin 면제).
+
+**테스트 실행**: 신규/회귀 통과. config `min_docs` 파생(15→9, 5→3, scout-floor) 확인. 전체 `discover tests` → 신규 회귀 0(잔존 3 실패는 무관한 OpenAI-factory 모듈).
+
+**잔여(후속)**: 항목 5(coverage ledger `autosurvey_metrics.json`)·7(fetch 동시성)·9(Research UI counts) + "Demo Surprise" 플랜.
+
+### 2026-06-04 (fix) — source-quality increment 리뷰 반영 (Codex feedback 최소 패치)
+
+**배경**: 위 source-quality/early-stop 증분에 대한 Codex 리뷰가 3가지 엔지니어링 리스크 지적.
+
+**변경 파일**
+- (edit) `workflows/autosurvey_workflow.py` — **early-stop 의미 강화**: gap이 남아 있는데 `accepted ≤ _EARLY_STOP_MIN_GAIN`이라고 **첫 cycle에 바로 멈추지 않음**. `_early_stop_decision`에 `low_gain_streak`·`queries_exhausted`(+`low_gain_patience=2`) 추가 — low-gain 종료는 **연속 low-gain(streak≥patience)** 이거나 **남은 query 소진** 시에만. `no_core_gap`(kept≥min_docs & gap 없음) 종료는 유지. `run_all`이 `low_gain_streak`를 cycle마다 누적/리셋하고 `_remaining_search_queries(active_plan)`로 소진 여부 전달.
+- (edit) `workflows/autosurvey_workflow.py` `run_collect(..., user_request="")` — **원문 user request를 source scoring에 전달**. `build_topic_terms(user_request=…, plan=…, query=…)`로 호출. `run_all`의 scout·main collect가 `user_request` 전달. `main.py`의 positional `run_collect(plan)`은 기본값 `""`로 하위호환.
+- (edit) `services/autosurvey_source_quality.py` — **reference 도메인 subdomain 매칭**: `_matches_reference(domain, refs)` = `domain == ref or domain.endswith("." + ref)`. pinned `samsung.com`이 `news.samsung.com`·`www.samsung.com`까지 relevance gate·domain cap에서 면제(`samsung.com.evil.com` 같은 suffix spoof는 불매칭). site allowlist 아님, 구조적 suffix.
+
+**테스트**
+- (edit) `tests/test_autosurvey_collect.py` — early-stop: 첫 low-gain+gap은 미정지, 연속 low-gain·query 소진 종료, good-gain은 query 소진에도 미정지.
+- (edit) `tests/test_autosurvey_source_quality.py` — request-only term이 TopicTerms·ranking에 반영되고 `search_queries`는 여전히 제외; parent-domain reference가 subdomain을 gate·cap에서 면제; `_matches_reference` parent/subdomain 매칭·lookalike 거부.
+
+**테스트 실행**: 위 3개 모듈 통과(51). 전체 `discover tests` → 신규 회귀 0(잔존 3 실패는 무관한 OpenAI-factory 모듈). 추가 LLM call 없음.
+
+### 2026-06-04 (fix) — Diffusion_LM-2 리뷰: 결정론적 품질/citation 보정 (플랜 항목 A·B·C·E)
+
+**배경**: `runs/Diffusion_LM-2` run 리뷰 — citation 미해결률 높음(82개 중 document_only 68), Source Notes row가 claim처럼 링크됨, query drift로 오프토픽 수집, 일부 `clean_md`가 embedded JSON/listing으로 raw보다 비대, final.md 말미 chat체 마무리. 이번 increment는 **결정론적·테스트 가능한 4개**만(LLM contract 변경 없는 범위).
+
+**변경 파일**
+- (A, edit) `workflows/autosurvey_workflow.py` `run_collect` — **query drift 차단**: pre-fetch ranking은 full topic(core+live query)로 하되, post-fetch body 수용 게이트(`_fetch_one`)는 **core topic(user request+plan, query 제외)** 으로. drift된 query 토큰만 겹치는 오프토픽 body가 통과하지 못함. `core_topic`은 루프 밖 1회 생성.
+- (B, edit) `services/document_cleanup_tool_funcs/html_body_extractor.py` — **structured-payload 가드**: `structured_punct_ratio`(JSON/listing 구조문자 `{}[]":,` 밀도) + `is_structured_payload(text, raw_len)`(raw 대비 1.5배↑ **그리고** punct 밀도 0.12↑ — 둘 다 충족 시만). (edit) `_batch_clean_body`가 채택 직전 호출해 bloated payload면 `raw_md` fallback + provenance `reason="structured_payload"`. 정상 장문 기사(저밀도)는 raw보다 커도 미플래그. keyword/site 규칙 없음.
+- (C, edit) `frontend/citation_links.py` — **Source Notes는 document-level**: `## Source Notes` 섹션(다음 heading 전까지) 내 marker는 claim 없이(`veritas-citation:doc_007`) 링크 → 표 row를 문장으로 증명하려 하지 않음. (edit) `frontend/ui/pages/document_page.py` 팝업: claim이 비면 "정확한 위치 확정 못함" 대신 **문서 출처 카드**("이 문서의 출처 정보입니다") 표시.
+- (E, edit) `core/prompts/autosurvey.py` `FINAL_PROMPT` — assistant-chat 마무리("If you want…/원하시면…") 금지, forward action은 `## Remaining Gaps` 하위 "Recommended next steps"로.
+
+**테스트**
+- (A) `test_autosurvey_source_quality.py`: drift query는 full topic을 통과하지만 core gate는 거부.
+- (B) `test_document_cleanup_modes.py`: prose 저밀도 / JSON 고밀도 / bloated payload 플래그 / 장문 prose 미플래그 / 소형 body 미플래그.
+- (C) `test_document_citations.py`: Source Notes marker는 claim 없는 document-level href(빈 claim round-trip), 다음 섹션 marker는 다시 claim 부여.
+
+**구현 범위/잔여**: 플랜 항목 **A·B·C·E** 구현. 항목 **D(citation evidence atoms)** — 문서 summary 출력 계약에 evidence atom(`evidence_id`/`localized_claim`/`source_quote`) 추가 → 결정론적 anchor 검증 → `summary/citation_evidence.json` sidecar → `final_citations.json` postprocessor → frontend/API가 evidence map 우선 해석 — 은 **summary LLM 계약 변경 + 신규 산출물 + frontend/API 교체**라 라이브 검증 필요한 대형 cross-cutting 작업으로 별도 increment 분리. (cross-language 미스매치·multi-citation 한 줄·batch-anchor 약함의 근본 해결은 D에 속함.) 항목 10(rejected post-cleanup 문서를 evidence에서 제외 + 대체 수집)도 D와 함께.
+
+**테스트 실행**: 위 4개 모듈 통과(83). 전체 `discover tests` → 신규 회귀 0(잔존 3 실패는 무관한 OpenAI-factory 모듈). 추가 LLM call 없음.

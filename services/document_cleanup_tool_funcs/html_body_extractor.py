@@ -68,6 +68,18 @@ _MIN_PROSE_CHARS = 400       # substantial-paragraph total to count as a prose b
 _MIN_TABLE_BODY_CHARS = 200  # table bodies are dense data → a lower floor
 _MAX_BODY_LINK_DENSITY = 0.50
 
+# Structured-payload guard: HTML extraction sometimes pulls an embedded
+# JSON/listing blob (``__NEXT_DATA__``, a product/record grid) that is large but
+# not prose, bloating ``clean_md`` far past ``raw_md`` and wasting summarization
+# budget. Such a body is punctuation-dense AND much larger than the already
+# de-chromed raw markdown. BOTH signals are required so a genuine long article
+# (which legitimately exceeds raw) is never flagged. Structural only — no keyword
+# or site rules.
+_PAYLOAD_PUNCT = frozenset('{}[]":,')
+_PAYLOAD_MIN_CHARS = 4_000      # only police large bodies; small ones are cheap
+_PAYLOAD_EXPANSION_RATIO = 1.5  # extraction this much larger than raw is suspect
+_PAYLOAD_PUNCT_RATIO = 0.12     # structural-punct share typical of JSON/listing
+
 
 @dataclass
 class _Block:
@@ -317,4 +329,34 @@ def _table_markdown(table) -> str:
     return "\n".join(rows)
 
 
-__all__ = ["extract_main_text", "extract_main_text_with_stats", "ExtractionResult"]
+def structured_punct_ratio(text: str) -> float:
+    """Share of non-space chars that are JSON/listing structural punctuation."""
+    non_space = sum(1 for c in text if not c.isspace())
+    if not non_space:
+        return 0.0
+    punct = sum(1 for c in text if c in _PAYLOAD_PUNCT)
+    return punct / non_space
+
+
+def is_structured_payload(text: str, raw_len: int) -> bool:
+    """Whether *text* is a bloated JSON/listing payload rather than prose.
+
+    Requires BOTH signals so a real (often smaller-than-raw) extraction is never
+    flagged: the body is much larger than the raw markdown *and* it is
+    structural-punctuation dense.
+    """
+    body = (text or "").strip()
+    if len(body) < _PAYLOAD_MIN_CHARS:
+        return False
+    expanded = raw_len > 0 and len(body) > raw_len * _PAYLOAD_EXPANSION_RATIO
+    dense = structured_punct_ratio(body) >= _PAYLOAD_PUNCT_RATIO
+    return expanded and dense
+
+
+__all__ = [
+    "extract_main_text",
+    "extract_main_text_with_stats",
+    "ExtractionResult",
+    "structured_punct_ratio",
+    "is_structured_payload",
+]

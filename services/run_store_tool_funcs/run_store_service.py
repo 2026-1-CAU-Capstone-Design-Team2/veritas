@@ -499,6 +499,36 @@ class RunStoreService:
         )
         return f"fetch_error_{error_id}"
 
+    def write_rejected_note(
+        self,
+        *,
+        url: str,
+        title: str,
+        domain: str,
+        search_query: str,
+        reason: str,
+        score: float | int = 0,
+    ) -> str:
+        """Record an off-topic fetched page as a standalone note; return its id.
+
+        Like a fetch error, a rejected page is not a document: it gets no
+        ``IndexedDocRecord`` and no ``index.json`` entry, so it never consumes a
+        ``doc_*`` number or a ``maxDocs`` slot. Only metadata (url/title/domain/
+        query/reason/score) is written — never the raw body text — under the
+        ``rejected_*`` namespace.
+        """
+        existing = list(self.paths.summary_dir.glob("rejected_*.md"))
+        rejected_id = f"{len(existing):03d}"
+        self.save_text(
+            self.paths.summary_dir / f"rejected_{rejected_id}.md",
+            (
+                "# Rejected Source\n\n"
+                f"URL: {url}\n\nTitle: {title}\n\nDomain: {domain}\n\n"
+                f"Query: {search_query}\n\nReason: {reason}\n\nTopic score: {score}\n"
+            ),
+        )
+        return f"rejected_{rejected_id}"
+
     def write_duplicate_record(
         self,
         *,

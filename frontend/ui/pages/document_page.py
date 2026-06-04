@@ -229,6 +229,14 @@ class CitationPopup(QFrame):
 			)
 
 		if not isinstance(match, dict):
+			# A document-level citation (no claim — e.g. a Source Notes Doc ID)
+			# is not an unresolved sentence: show it as a document-source card
+			# rather than apologizing for a missing anchor.
+			if not claim and (payload.get("title") or payload.get("url")):
+				parts.append(
+					'<p style="color:#475569;">이 문서의 출처 정보입니다 (문서 수준 미리보기).</p>'
+				)
+				return "".join(parts)
 			# No reliable sentence-level anchor. When a document was still
 			# resolved (metadata present), say so honestly rather than
 			# highlighting an unrelated "closest" sentence.

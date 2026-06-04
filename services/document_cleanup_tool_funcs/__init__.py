@@ -10,6 +10,7 @@ from .html_body_extractor import (
     ExtractionResult,
     extract_main_text,
     extract_main_text_with_stats,
+    is_structured_payload,
 )
 from .paragraph_index import (
     annotate_paragraphs,
@@ -24,6 +25,7 @@ __all__ = [
     "apply_boilerplate_removal",
     "extract_main_text",
     "extract_main_text_with_stats",
+    "is_structured_payload",
     "parse_cleanup_response",
     "split_paragraphs",
     "write_doc_metadata",

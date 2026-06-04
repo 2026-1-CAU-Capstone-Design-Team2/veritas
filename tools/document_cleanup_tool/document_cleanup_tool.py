@@ -82,6 +82,7 @@ from services.document_cleanup_tool_funcs import (
     annotate_paragraphs,
     apply_boilerplate_removal,
     extract_main_text_with_stats,
+    is_structured_payload,
     parse_cleanup_response,
     split_paragraphs,
     write_doc_metadata,
@@ -426,6 +427,20 @@ class DocumentCleanupTool(BaseTool):
             link_density=result.link_density,
         )
         if result.accepted and result.text.strip():
+            if is_structured_payload(result.text, raw_len):
+                # Extraction pulled an embedded JSON/listing payload (much larger
+                # than raw_md and punctuation-dense) — not prose. Fall back to
+                # raw_md so the bloat never reaches summarization/final synthesis.
+                return raw_text, self._provenance(
+                    doc_id,
+                    False,
+                    "structured_payload",
+                    raw_len,
+                    extracted_len=result.extracted_len,
+                    prose_len=result.prose_len,
+                    table_count=result.table_count,
+                    link_density=result.link_density,
+                )
             return result.text, provenance
         return raw_text, provenance
 

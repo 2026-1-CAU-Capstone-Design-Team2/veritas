@@ -65,6 +65,12 @@ _PROTECTED_RE = re.compile(
 _DIGITS_RE = re.compile(r"\d+")
 _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 _LEADING_MD_RE = re.compile(r"^[\s>#*+\-]+")
+# Any ATX heading, and specifically the ``## Source Notes`` heading. Markers in
+# the Source Notes table are document descriptions, not source-backed claims, so
+# they link at the document level (no claim) rather than trying to anchor a
+# specific source sentence.
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S")
+_SOURCE_NOTES_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+Source Notes\b", re.IGNORECASE)
 # Strip both bracketed and bare markers when building the claim text.
 _CLAIM_STRIP_RE = re.compile(r"\[?doc[_-]?\d+\]?", re.IGNORECASE)
 
@@ -80,6 +86,7 @@ def linkify_citations(text: str) -> str:
     out: list[str] = []
     in_fence = False
     fence_char = ""
+    in_source_notes = False
     for line in text.split("\n"):
         fence = _FENCE_RE.match(line)
         if fence:
@@ -90,14 +97,22 @@ def linkify_citations(text: str) -> str:
                 in_fence, fence_char = False, ""
             out.append(line)
             continue
-        out.append(line if in_fence else _linkify_line(line))
+        if not in_fence and _HEADING_RE.match(line):
+            # Entering/leaving the Source Notes section toggles document-level
+            # linking for the rows that follow until the next heading.
+            in_source_notes = bool(_SOURCE_NOTES_HEADING_RE.match(line))
+        out.append(
+            line if in_fence else _linkify_line(line, document_level=in_source_notes)
+        )
     return "\n".join(out)
 
 
-def _linkify_line(line: str) -> str:
+def _linkify_line(line: str, *, document_level: bool = False) -> str:
     if not _HAS_DOC_RE.search(line):
         return line
-    claim_enc = quote(extract_claim_from_line(line), safe="")
+    # Document-level markers (Source Notes rows) carry no claim: the popup opens
+    # a document-source card instead of trying to prove the table row.
+    claim_enc = None if document_level else quote(extract_claim_from_line(line), safe="")
     out: list[str] = []
     pos = 0
     for protected in _PROTECTED_RE.finditer(line):
@@ -108,7 +123,7 @@ def _linkify_line(line: str) -> str:
     return "".join(out)
 
 
-def _sub_markers(chunk: str, claim_enc: str) -> str:
+def _sub_markers(chunk: str, claim_enc: str | None) -> str:
     if not chunk or not _HAS_DOC_RE.search(chunk):
         return chunk
 
@@ -118,7 +133,13 @@ def _sub_markers(chunk: str, claim_enc: str) -> str:
         # doc_7, doc-7) renders and links as [doc_007] — keeping the label in
         # sync with FINAL_PROMPT's [doc_NNN] rule and the 3-digit clean_md files.
         doc = f"doc_{int(digits):03d}"
-        href = f"{CITATION_SCHEME}:{doc}?claim={claim_enc}"
+        # ``claim_enc is None`` → document-level link (no claim); the popup shows
+        # a document-source card rather than anchoring a sentence.
+        href = (
+            f"{CITATION_SCHEME}:{doc}"
+            if claim_enc is None
+            else f"{CITATION_SCHEME}:{doc}?claim={claim_enc}"
+        )
         # Nested brackets keep the visible label as [doc_007] after rendering.
         # (Escaped \[..\] would be mistaken for LaTeX display math upstream.)
         return f"[[{doc}]]({href})"

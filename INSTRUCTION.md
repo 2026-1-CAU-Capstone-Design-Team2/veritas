@@ -422,3 +422,273 @@ python -m unittest discover tests
 - `plan.json` 전체, `plan_history.json`, `query_state.json`, `batch_summaries` 배열이 final prompt에 JSON 형태로 노출되지 않는지 확인한다.
 - guard가 `## User Request` 외의 수식, citations, Source Notes table을 훼손하지 않는지 확인한다.
 - 기본 final report 생성 경로의 LLM call count가 늘지 않았는지 확인한다.
+
+## Implementation Plan: AutoSurvey Quality, Speed, and UX Review
+
+### PM Diagnosis
+AutoSurvey 구조는 합리적이다: `term_grounding -> initial plan -> scout collect -> cleanup -> batch summary -> gap/replan loop -> final_report -> RAG index` 흐름은 유지보수 가능한 파이프라인이다. 다만 현재 품질 병목은 모델 크기보다 수집 전 후보 선별과 수집 후 coverage 판단에 있다.
+
+최근 run 기준 15~23개 문서 수집에 약 475~711초가 걸렸고, `runs/국내`에서는 대체육 시장 조사에 AI video market, bath bomb market 등 오프토픽 시장 리포트가 섞였다. cleanup과 final prompt를 보강해도 오프토픽 문서가 이미 `clean_md`, batch summary, final synthesis로 들어오면 사용자 신뢰가 떨어진다.
+
+### Priority Direction
+- 문서를 더 많이 모으는 방향보다 같은 `maxDocs` 안에서 후보 품질을 높인다.
+- 추가 LLM call은 기본 경로에 넣지 않는다. 검색 결과 title/snippet/url/domain, query terms, `plan.must_cover`, `plan.keywords`, user request에서 나온 lexical/structural signal만 사용한다.
+- deterministic boilerplate keyword filtering은 금지한다. 기존 원칙대로 cleanup은 HTML/ARIA/구조 통계 기반으로 유지한다.
+- `maxDocs`는 목표치가 아니라 상한으로 취급한다. coverage가 충분하고 core gap이 없으면 조기 종료할 수 있어야 한다.
+
+### Claude Implementation Checklist
+- [ ] `workflows/autosurvey_workflow.py:209`의 collect 루프 앞단에 source-candidate scoring 단계를 추가한다. 검색 결과를 받은 즉시 title/snippet/url/domain/query와 plan/user-request 토큰으로 relevance score를 계산하고, 낮은 후보는 fetch 전에 제외한다.
+- [ ] scoring helper는 별도 pure module로 분리한다. 예: `services/autosurvey_source_quality.py`. topic-specific keyword list, site-specific selector, boilerplate keyword blocklist는 넣지 않는다.
+- [ ] domain diversity cap을 둔다. 한 도메인이 결과를 과점하지 않도록 하되, 사용자가 명시한 reference URL/site constraint는 예외로 우선 처리한다.
+- [ ] post-fetch acceptance metadata를 추가한다. fetched body가 user request / plan terms와 거의 겹치지 않으면 kept document로 소비하지 말고 rejected note/metadata로 남긴다. rejection은 `maxDocs`를 소모하지 않게 설계한다.
+- [ ] coverage ledger를 추가한다. batch summary의 Core Gap/Supporting Gap과 collected source metadata를 사용해 `must_cover` 항목별 상태를 `summary/autosurvey_metrics.json`에 저장한다.
+- [ ] early stop 조건을 넣는다. 최소 문서 수를 넘었고 core gap이 없거나 최근 cycle의 accepted-source marginal gain이 낮으면 final로 넘어간다.
+- [ ] speed 개선은 먼저 fetch 전 filtering으로 한다. 이후 필요하면 낮은 concurrency(예: 3~4) fetch를 도입하되, RunStore write는 순차화해서 doc id와 index 안정성을 유지한다.
+- [ ] `api/services/document_citation_service.py:384`의 batch anchor fallback을 수정한다. 상위 3개 anchor 후보 중 source score만으로 고르지 말고, 각 후보의 final-claim overlap을 다시 계산해 threshold 미만은 제외하고 combined score로 고른다.
+- [ ] Research UI에는 단순 문서 수뿐 아니라 accepted/rejected/fetch-error/duplicate count, 주요 remaining core gaps, source quality warning을 표시한다. 이미 있는 progress event/detail 경로를 우선 활용한다.
+
+### Tests Required
+- [ ] source scoring pure tests: query와 무관한 시장 리포트(title/snippet/domain)가 relevant 후보보다 뒤로 밀리는지 확인한다.
+- [ ] domain diversity tests: 동일 도메인 결과가 과점하지 않는지, 명시 reference URL은 예외 처리되는지 확인한다.
+- [ ] post-fetch rejection tests: 오프토픽 fetched body가 kept doc id를 소비하지 않고 rejected metadata로 남는지 확인한다.
+- [ ] coverage/early-stop tests: core gap이 없고 최소 문서 수를 넘으면 `maxDocs`까지 억지로 수집하지 않는지 확인한다.
+- [ ] citation anchor tests: paraphrased final claim과 관련 없는 exact source sentence가 있는 multi-finding 문서에서 unrelated anchor가 선택되지 않는지 확인한다.
+- [ ] UX/API tests: research job response나 progress detail에 rejected/fetch-error/duplicate/source-quality counts가 누락되지 않는지 확인한다.
+
+### Review Focus
+- 개선이 더 큰 LLM이나 추가 API call에 의존하지 않는지 확인한다.
+- source quality logic이 특정 키워드, 특정 사이트, 특정 언어에 과적합하지 않는지 확인한다.
+- cleanup과 candidate scoring 책임이 섞이지 않는지 확인한다. cleanup은 body 정제, source scoring은 조사 적합성 판단으로 분리한다.
+- fetch 병렬화를 도입했다면 shared RunStore/index/doc id write 경합이 없는지 확인한다.
+- UX가 사용자에게 “왜 이 문서가 선택/제외됐는지”를 짧게 설명하되, final.md 본문 품질을 UI 배지로 덮어 숨기지 않는지 확인한다.
+
+## Implementation Plan: AutoSurvey Demo Surprise and Performance Upgrades
+
+### Product Goal
+Improve demo impact without defaulting to bigger models or more API calls. The highest-value demo point is not “more documents,” but “the system visibly knows which evidence is useful, which evidence is rejected, and which gaps remain.”
+
+### High-Impact Features
+- [ ] Add a live Evidence Coverage panel: rows are `must_cover` items, columns show accepted source count, unresolved gap status, and confidence. This can be driven from `summary/autosurvey_metrics.json`.
+- [ ] Show rejected-source replacement live: when a result is anti-bot, off-topic, thin, or low-quality, mark it as rejected with a short reason and continue searching until the usable-document budget or early-stop condition is reached.
+- [ ] Add citation confidence indicators in the final report preview: exact source match, batch-anchor match, and document-level fallback should render differently so users know how strong each citation anchor is.
+- [ ] Add “Run follow-up for this gap” actions on Remaining Gaps / Core Gap items. This should generate targeted follow-up queries from the stored gap text and reuse the same workspace.
+- [ ] Add source clustering by claim/domain: repeated claims should show which documents independently support them, making the repeated-finding section visually persuasive during demos.
+- [ ] Add a Fast Demo mode that uses stricter pre-fetch scoring, lower `maxDocs`, early stop, and cached/resumable workspace artifacts. It must be an explicit mode, not the default research path.
+
+### Performance Constraints
+- Prefer fetch-before-LLM savings: candidate scoring, rejected-source replacement, and early stop should reduce downstream cleanup/batch/final work.
+- Keep new UI metrics deterministic and derived from existing artifacts where possible.
+- Do not add another LLM review pass for every document. If a stronger model is used, gate it behind an explicit Quality/Deep mode or failed coverage threshold.
+
+### Review Focus
+- Demo UI must not overstate evidence confidence; document-level fallback citations should be visibly weaker than exact anchors.
+- Follow-up gap actions must not mutate prior evidence or hide prior rejected-source reasons.
+- Fast Demo mode must be labeled as a speed-optimized mode and should not silently reduce quality in the normal AutoSurvey workflow.
+
+## Implementation Plan: AutoSurvey Review Fixes After Source-Quality Increment
+
+### Context
+The latest implementation added pre-fetch source scoring, post-fetch rejection,
+early stop, and citation anchor combined scoring. Targeted tests pass in the
+`agent` conda environment, but the review found three engineering risks that
+should be fixed before treating this increment as production-ready.
+
+### Claude Implementation Checklist
+- [ ] Tighten early-stop semantics in `workflows/autosurvey_workflow.py`. If
+  `gap_directions` is non-empty, do not stop only because
+  `accepted_this_cycle <= _EARLY_STOP_MIN_GAIN`. Replan/retry should be tried
+  first, and low-gain stop should require stronger evidence such as exhausted
+  remaining queries, repeated empty/low-gain cycles, or an explicit no-progress
+  state recorded in query state.
+- [ ] Keep the existing `no_core_gap` early stop: `kept >= min_docs` and no core
+  gap may still stop before `max_docs`.
+- [ ] Update `_early_stop_decision` tests in `tests/test_autosurvey_collect.py`
+  so "gap remains + low gain" does not stop on the first low-gain cycle. Add a
+  separate test for the new allowed low-gain terminal condition.
+- [ ] Pass the original user request into source scoring. `services/
+  autosurvey_source_quality.build_topic_terms()` already accepts
+  `user_request`, but `workflows/autosurvey_workflow.py` currently calls it with
+  only `plan` and `query`. Extend `run_collect(..., user_request: str = "")`
+  and pass the request from `run_all()` for scout and main cycles.
+- [ ] Preserve backwards compatibility for any direct `run_collect(plan=...)`
+  tests/callers by defaulting `user_request` to an empty string.
+- [ ] Add or update tests proving request-only constraints influence
+  `TopicTerms` and candidate ranking, while `plan.search_queries` remains
+  excluded from topic signal.
+- [ ] Make reference-domain matching include subdomains. A pinned domain such as
+  `samsung.com` should exempt `news.samsung.com` and `www.samsung.com` from the
+  relevance gate and domain cap. Use structural domain suffix matching:
+  `domain == ref or domain.endswith("." + ref)`.
+- [ ] Add tests in `tests/test_autosurvey_source_quality.py` for parent-domain
+  reference exemption and subdomain domain-cap exemption.
+
+### Required Tests
+- [ ] `C:/Users/asdf/.conda/envs/agent/python.exe -m unittest tests.test_autosurvey_source_quality -v`
+- [ ] `C:/Users/asdf/.conda/envs/agent/python.exe -m unittest tests.test_autosurvey_collect -v`
+- [ ] `C:/Users/asdf/.conda/envs/agent/python.exe -m unittest tests.test_document_citations -v`
+
+### Review Focus
+- Early stop must mean "enough evidence and no unresolved core gap" or
+  "recoverable collection paths are exhausted", not simply "collection was slow".
+- Source scoring must use user intent, plan fields, and the live query, but must
+  not use `plan.search_queries` as topic vocabulary.
+- Reference-site handling must honor user-pinned domains without introducing a
+  site-specific allowlist.
+- Keep the implementation deterministic and avoid adding LLM calls.
+
+## Implementation Plan: Diffusion_LM-2 Quality and Citation Reliability Fixes
+
+### Context From Run Review
+Workspace `runs/Diffusion_LM-2` produced a readable final report, but it did not
+meet the desired verification UX level. The report covers speed, quality, and
+structural differences well, and the Source Notes table renders correctly, but
+source verification is weak:
+
+- `final.md` contains 82 citation markers.
+- Citation preview resolution: `document_only=68`, `direct=8`,
+  `batch_anchor=6` (about 83% unresolved).
+- Executive Summary and Conflicts/Uncertainties citations all resolved as
+  `document_only`.
+- 30 kept documents were summarized; only 20 were cited in `final.md`.
+- 14 fetch errors were recorded and 0 rejected notes were produced.
+- Some accepted documents were peripheral or off-topic for text DLM comparison
+  (for example video Diffusion/DiT optimization and generic LLM benchmark pages).
+- Several `clean_md` files became much larger than `raw_md` because HTML
+  extraction pulled large embedded listing/JSON-like bodies; these pages wasted
+  cleanup/summarization budget.
+
+Important diagnosis: this is not primarily a RAG chunking problem. The citation
+popup does not use Chroma/RAG chunks; it reads `clean_md/<doc>.md` and performs
+deterministic lexical matching against the clicked final-report claim. The main
+failure modes are:
+
+1. Cross-language mismatch: final claims are Korean syntheses while many source
+   documents are English, so lexical sentence matching cannot bridge them.
+2. Claim granularity: `frontend/citation_links.py` attaches the whole Markdown
+   line as the claim. Lines with multiple citations or synthesized multi-part
+   claims are too broad for a single source sentence.
+3. Batch-anchor weakness: batch summaries are often Korean while source text is
+   English, so batch claims also fail to anchor back to source sentences.
+4. Source Notes rows are being linkified as evidence claims, but table rows are
+   metadata/document descriptions, not source-backed final-report claims.
+5. Query drift: `build_topic_terms()` currently treats the live query as topic
+   signal. If a replan query drifts toward generic DiT/video diffusion
+   optimization, the off-topic result can satisfy the gate using query-only
+   terms.
+
+### Claude Implementation Checklist
+- [ ] Add citation evidence atoms during document summarization without adding a
+  new LLM call. Extend the existing document-summary output contract so each key
+  point can include: `evidence_id`, `doc_id`, `localized_claim`, `source_quote`
+  or `source_sentence`, and optional `paragraph_index` / `sentence_index`.
+- [ ] After a document summary is produced, deterministically verify each
+  `source_quote` against `clean_md/<doc>.md`. Store only anchors that can be
+  found exactly or with a high lexical/fuzzy score. Unverified key points may be
+  kept as summary text but must not become clickable exact citations.
+- [ ] Persist verified anchors in a sidecar such as
+  `summary/citation_evidence.json` or `summary/citation_evidence/<doc>.json`.
+  Do not store long raw bodies; store bounded source snippets and stable
+  paragraph/sentence offsets or hashes.
+- [ ] Make batch summaries and final report generation cite evidence atoms, not
+  bare documents where possible. The final report can still render visible
+  labels as `[doc_004]`, but the linkifier/API must be able to resolve the
+  clicked occurrence to a specific evidence atom.
+- [ ] Add a final-report postprocessor that builds
+  `summary/final_citations.json`: for each marker occurrence, store
+  `doc_id`, final local claim text, matched `evidence_id`, resolution
+  (`evidence_anchor` / `document_only`), and confidence. Matching should compare
+  final Korean claim to `localized_claim`, not directly to English source text.
+- [ ] Update `frontend/citation_links.py` and
+  `api/services/document_citation_service.py` so citation clicks first use
+  `final_citations.json` / evidence ids. Fall back to current direct/batch
+  matching only when no evidence map exists.
+- [ ] Treat `## Source Notes` Doc IDs differently from claim citations. A Doc ID
+  in the Source Notes table should open a document-level source preview or
+  metadata card, not try to prove the whole table row as a source sentence.
+- [ ] Improve source-quality gating against query drift. Separate core topic
+  terms (user request + plan topic/goal/must_cover/keywords) from live query
+  terms. Query terms may help ranking but must not be sufficient for post-fetch
+  body acceptance.
+- [ ] Add a post-cleanup quality gate. If structural extraction expands
+  massively beyond `raw_md`, has high JSON/listing/repeated-record density, low
+  prose density, or is dominated by framework payload text, mark the document as
+  `rejected_clean` or exclude it from summarization/final synthesis. This must
+  be structural/statistical, not a hard-coded keyword/site blocklist.
+- [ ] Make rejected post-cleanup documents not count as usable evidence. If
+  practical, collect replacement candidates until the usable-document cap or a
+  safe early-stop condition is reached.
+- [ ] Tighten final-report prompt style: avoid assistant-chat closings such as
+  "If you want..." / "원하시면...". Use a report-native `Recommended Next Steps`
+  section instead.
+
+### Required Tests
+- [ ] Citation evidence tests: a Korean final claim citing an English source
+  resolves through `localized_claim -> source_quote` and returns a highlighted
+  source sentence without another LLM call.
+- [ ] Multi-citation line tests: two markers on the same line can resolve to
+  different evidence ids instead of sharing one oversized line claim.
+- [ ] Source Notes tests: Doc IDs inside `## Source Notes` route to
+  document-level preview and do not produce "exact location not determined" as
+  if they were unsupported claims.
+- [ ] Query drift tests: a live query containing generic/video diffusion terms
+  cannot make an otherwise non-text-DLM page pass post-fetch acceptance unless
+  the body also overlaps core topic terms.
+- [ ] Cleanup quality tests: HTML pages with embedded JSON/listing payloads or
+  huge structural expansion are rejected or trimmed without using site-specific
+  keywords.
+- [ ] Regression test on `runs/Diffusion_LM-2`-style fixture: unresolved citation
+  ratio should drop substantially for body sections, especially Executive
+  Summary and Conflicts/Uncertainties.
+
+### Review Focus
+- Do not add per-document extra LLM calls. Use the existing document-summary
+  call to emit evidence atoms, then verify anchors deterministically.
+- Do not rely on RAG chunking to fix citation preview. Citation preview must be
+  grounded by explicit source anchors or an honest document-level fallback.
+- Do not overstate weak evidence. If no verified evidence atom exists, show
+  document-level fallback with lower visual confidence.
+- Keep final report readability: visible citation labels should remain simple
+  (`[doc_NNN]`) even if the underlying link carries an evidence id.
+
+## Review Note: 2026-06-04 Source Quality / Citation Increment
+
+### Checklist
+- [ ] Ensure Korean topic matching does not require exact whitespace-token
+  equality. Normal Korean particles and compounds such as `대체육은` or
+  `시장규모는` must still count toward the post-fetch topic gate when the topic
+  contains `대체육` / `시장`.
+- [ ] Pass the original `user_request` through every `run_collect()` entrypoint,
+  including CLI `--phase collect`, so request-only constraints are available to
+  source scoring and post-fetch acceptance.
+- [ ] Keep Source Notes citations document-level only; body sections after
+  `## Source Notes` must return to claim-level citation links at the next
+  heading.
+- [ ] Keep structured-payload fallback statistical/structural only. Do not add
+  fixed boilerplate, framework, site, or language keyword blocklists.
+
+### Architecture Constraints
+- Source-quality gates must remain deterministic and must not add LLM/API calls.
+- Candidate scoring can use user request, plan topic/goal/must_cover/keywords,
+  current query, title/snippet/url/domain, and structural token overlap only.
+- Post-fetch acceptance should use core intent terms, not query-only drift
+  terms, and rejected sources must not allocate `doc_*` ids or store raw body
+  text.
+- Citation preview remains a presentation/read-only lookup over persisted
+  `clean_md` and summary metadata; it must not mutate `final.md` or source
+  documents.
+
+### Verification Commands
+- `python -m py_compile services/autosurvey_source_quality.py workflows/autosurvey_workflow.py frontend/citation_links.py api/services/document_citation_service.py`
+- `python -m unittest tests.test_autosurvey_source_quality tests.test_autosurvey_collect tests.test_document_cleanup_modes`
+- `python -m unittest tests.test_document_citations` after installing API/UI
+  dependencies such as FastAPI in the active environment.
+
+### Review Focus
+- Watch for false rejections in Korean-heavy surveys caused by tokenization,
+  particles, compounds, or cross-language title/body differences.
+- Watch for entrypoints that call `run_collect(plan)` without user intent and
+  therefore silently weaken source scoring.
+- Confirm rejected/fetch-error/duplicate notes remain metadata-only and do not
+  affect kept-document numbering or `maxDocs`.
+- Confirm citation linkification changes are presentation-only and preserve the
+  canonical visible marker format `[doc_NNN]`.

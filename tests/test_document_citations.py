@@ -157,6 +157,33 @@ class DocumentCitationServiceTests(unittest.TestCase):
         self.assertIn("anchorClaim", result["match"])
         self.assertIn("PushT", result["match"]["text"])
 
+    def test_anchor_ignores_unrelated_finding_with_strong_source_match(self) -> None:
+        # Two cited findings for doc_000: one is about the clicked claim (PushT),
+        # the other (Atari) matches its own source sentence almost exactly. The
+        # anchor must follow final-claim relatedness, not raw source score — so
+        # it resolves to the PushT sentence, never the unrelated Atari one.
+        ws = self._root / "WS"
+        (ws / "clean_md" / "000.md").write_text(
+            "PushT 성공률은 18 퍼센트 향상되었고 속도는 48 배 빨라졌다.\n\n"
+            "Atari 26 게임에서 평균 점수가 5.6 포인트 향상되었다.",
+            encoding="utf-8",
+        )
+        # F1 (PushT) is loosely related to BOTH the claim and source A; F2 (Atari)
+        # is an almost-verbatim copy of source B → very high source score but zero
+        # claim overlap. Source-score-only selection would wrongly pick F2.
+        (ws / "summary" / "batch_001.md").write_text(
+            "## New Findings\n"
+            "- PushT 성공률 18 퍼센트 향상 속도 48 배 [doc_000].\n"
+            "- Atari 26 게임에서 평균 점수가 5.6 포인트 향상 [doc_000].\n",
+            encoding="utf-8",
+        )
+        result = svc.get_citation("WS", "doc_000", "PushT 성공률 과 속도 개선")
+        self.assertEqual(result["resolution"], "batch_anchor")
+        self.assertIsNotNone(result["match"])
+        self.assertIn("PushT", result["match"]["text"])
+        self.assertNotIn("Atari", result["match"]["text"])
+        self.assertIn("PushT", result["match"]["anchorClaim"])
+
     def test_multi_doc_each_resolves_to_own_batch_anchor(self) -> None:
         ws = self._root / "WS"
         (ws / "clean_md" / "000.md").write_text(
@@ -291,6 +318,35 @@ class CitationLinkifyTests(unittest.TestCase):
         self.assertNotIn("doc_004", claim)
         self.assertNotIn("[", claim)
         self.assertNotIn("|", claim)
+
+    def test_source_notes_markers_link_document_level(self) -> None:
+        md = (
+            "## Consolidated Findings\n"
+            "성능이 향상되었다 [doc_001].\n\n"
+            "## Source Notes\n"
+            "| Doc ID | Title | Year | What | Caveat |\n"
+            "|---|---|---|---|---|\n"
+            "| [doc_001] | RLVR | 2025 | 기여 | High |\n"
+        )
+        out = linkify_citations(md)
+        # Body marker carries a claim; Source Notes marker is document-level.
+        self.assertIn(f"{CITATION_SCHEME}:doc_001?claim=", out)
+        self.assertIn(f"({CITATION_SCHEME}:doc_001)", out)
+        # The document-level href round-trips to an empty claim.
+        start = out.rindex(f"{CITATION_SCHEME}:doc_001)")
+        href = out[start : out.index(")", start)]
+        self.assertEqual(parse_citation_url(href), ("doc_001", ""))
+
+    def test_section_after_source_notes_links_with_claim_again(self) -> None:
+        md = (
+            "## Source Notes\n"
+            "| [doc_001] | RLVR | 2025 | 기여 | High |\n\n"
+            "## Remaining Gaps\n"
+            "추가 검증이 필요하다 [doc_001].\n"
+        )
+        out = linkify_citations(md)
+        # The Remaining Gaps marker is a claim again (section toggled off).
+        self.assertIn(f"{CITATION_SCHEME}:doc_001?claim=", out)
 
 
 if __name__ == "__main__":

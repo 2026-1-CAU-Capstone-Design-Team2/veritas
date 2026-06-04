@@ -6,6 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from services.document_cleanup_tool_funcs.html_body_extractor import (
+    is_structured_payload,
+    structured_punct_ratio,
+)
 from services.run_store_tool_funcs import RunStoreService
 from tools.document_cleanup_tool import DocumentCleanupTool
 from tools.loader import TOOLS_DIR, load_schema
@@ -591,6 +595,29 @@ class HtmlBodyExtractorTests(unittest.TestCase):
         self.assertIn("| 회사 | Q1 2025 | Q2 2025 | Q3 2025 | Q4 2025 | 전년 대비 증감 |", r.text)
         self.assertIn("| 삼성전자 디바이스솔루션 |", r.text)
         self.assertNotIn("관련 기사 링크", r.text)
+
+
+class StructuredPayloadGuardTests(unittest.TestCase):
+    """Post-cleanup structural gate: bloated JSON/listing extractions → raw."""
+
+    def test_prose_has_low_structural_punct_ratio(self) -> None:
+        prose = "이 문서는 텍스트 확산 언어모델의 속도와 품질을 비교한다 " * 200
+        self.assertLess(structured_punct_ratio(prose), 0.05)
+
+    def test_json_listing_has_high_structural_punct_ratio(self) -> None:
+        payload = '{"items":[{"id":1,"name":"a"},{"id":2,"name":"b"}],"meta":{"k":"v"}}' * 50
+        self.assertGreaterEqual(structured_punct_ratio(payload), 0.12)
+
+    def test_bloated_json_payload_is_flagged(self) -> None:
+        payload = '{"id":1,"name":"x","tags":["a","b","c"]},' * 500
+        self.assertTrue(is_structured_payload(payload, raw_len=500))
+
+    def test_large_prose_article_is_not_flagged_even_if_bigger_than_raw(self) -> None:
+        article = "이 문단은 자연어 문장으로 구성된 본문이다 추가 설명이 이어진다 " * 300
+        self.assertFalse(is_structured_payload(article, raw_len=200))
+
+    def test_small_body_is_never_flagged(self) -> None:
+        self.assertFalse(is_structured_payload('{"a":1,"b":2}', raw_len=10))
 
 
 if __name__ == "__main__":

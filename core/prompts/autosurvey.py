@@ -276,6 +276,11 @@ Rules:
 - Source notes should describe only substantive evidence or caveats from each
   document; do not turn non-evidentiary page chrome or source metadata into a
   finding.
+- Write in a report register throughout. Do NOT end with an assistant-style
+  offer or chat closing (for example "If you want, I can …" or
+  "원하시면 … 해 드리겠습니다"). If forward actions are worth stating, present them
+  tersely as report content — a short "Recommended next steps" list under
+  ``## Remaining Gaps`` — never as a conversational offer to the reader.
 """
 
 

@@ -405,10 +405,22 @@ def _resolve_batch_anchor(
         return None
     best: dict[str, Any] | None = None
     best_claim = ""
+    best_combined = -1.0
     for batch_claim in ranked[:3]:
+        # Re-check EACH candidate's relatedness to the final claim, not only the
+        # top one: a finding can match the source strongly yet be unrelated to
+        # what the user actually clicked. Candidates below the overlap threshold
+        # are not anchors, and the winner is chosen by a combined score (source
+        # match strength + final-claim overlap) rather than source score alone.
+        overlap = _claim_overlap(final_content, final_numbers, batch_claim)
+        if overlap < _ANCHOR_CLAIM_MIN_OVERLAP:
+            continue
         candidate = match_claim_in_source(batch_claim, source_text)
-        if candidate and candidate["score"] > (best["score"] if best else -1.0):
-            best, best_claim = candidate, batch_claim
+        if candidate is None:
+            continue
+        combined = candidate["score"] + overlap
+        if combined > best_combined:
+            best, best_claim, best_combined = candidate, batch_claim, combined
     if best is None or best["score"] < _ANCHOR_MIN_SCORE:
         return None
     anchored = dict(best)
