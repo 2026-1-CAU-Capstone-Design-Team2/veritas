@@ -49,7 +49,7 @@ in-process 모듈: [`services/fetch_webpage_tool_funcs/crawl4ai_fetch.py`](../..
 
 ### `fit_markdown` vs `raw_markdown` 자동 선택
 
-`PruningContentFilter`의 `fit_markdown`이 `raw_markdown` 대비 일정 비율(`_FIT_MIN_RATIO`, 45%) 미만으로 줄어들면 필터가 과하게 깎은 것으로 보고 `raw_markdown`을 사용합니다 — 노이즈만 제거하고 본문은 보존합니다.
+`PruningContentFilter`의 `fit_markdown`이 `raw_markdown` 대비 일정 비율(`_FIT_MIN_RATIO`, **25%**) 미만으로 줄어들거나 절대 길이가 `_FIT_MIN_CHARS`(500자) 미만이면, 필터가 본문까지 과하게 깎은 것으로 보고 `raw_markdown`을 사용합니다 — 그 외에는 de-chrome된 `fit_markdown`을 신뢰합니다. (초기값 45%는 chrome이 많은 뉴스/블로그에서 필터가 60~75%를 정상 제거한 깨끗한 본문까지 노이즈 raw로 되돌려, `clean_md`에 chrome이 남는 원인이었음. 실측상 복구 가능한 본문은 fit/raw≈0.27~0.40, 과깎임 페이지는 ≈0.04~0.05라 0.25가 그 사이 간격.)
 
 `max_chars`(workflow 기본 25000)는 `text`에만 적용되는 상한입니다. 상한을 넘는 초장문은 `document_summarize_tool`이 손실 없이 처리합니다.
 
