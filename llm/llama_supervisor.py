@@ -74,20 +74,72 @@ LLAMA_LLM_EXTRA_ARGS = ["-ctk", "q8_0", "-ctv", "q4_0"]
 LLAMA_EMBEDDING_EXTRA_ARGS = ["--embeddings"]
 
 
-def llama_server_bin() -> Path:
-    """Resolve the llama-server executable (env override → bundled → PATH)."""
-    env_path = os.getenv("VERITAS_LLAMA_SERVER_BIN")
-    if env_path:
-        return Path(env_path)
+def _expanded_path(value: str | None) -> Path | None:
+    if not value or not value.strip():
+        return None
+    return Path(os.path.expandvars(os.path.expanduser(value.strip())))
+
+
+def _windows_installer_roots() -> list[Path]:
+    """Known Windows installer locations that should not depend on PATH."""
+    if os.name != "nt":
+        return []
+
+    local_app_data = _expanded_path(os.getenv("LOCALAPPDATA"))
+    if local_app_data is None:
+        return []
+
+    roots = [
+        local_app_data / "VERITAS" / "bin",
+        local_app_data / "VERITAS" / "llama.cpp" / "bin",
+        local_app_data / "VERITAS" / "runtime" / "llama.cpp" / "bin",
+    ]
+
+    winget_packages = local_app_data / "Microsoft" / "WinGet" / "Packages"
+    if winget_packages.exists():
+        roots.extend(sorted(winget_packages.glob("ggml.llamacpp_*")))
+
+    return roots
+
+
+def llama_server_candidates(*, repo_root: Path | None = None) -> list[Path]:
+    """Return executable candidates in the order VERITAS should try them."""
     exe = "llama-server.exe" if os.name == "nt" else "llama-server"
-    repo_root = Path(__file__).resolve().parents[1]
-    for candidate in (
-        repo_root / "bin" / exe,
-        repo_root / "llama.cpp" / "build" / "bin" / exe,
-    ):
+    root = repo_root or Path(__file__).resolve().parents[1]
+
+    candidates: list[Path] = []
+    install_dir = _expanded_path(os.getenv("VERITAS_LLAMA_INSTALL_DIR"))
+    if install_dir is not None:
+        candidates.append(install_dir / exe)
+
+    candidates.extend(
+        [
+            root / "bin" / exe,
+            root / "llama.cpp" / "build" / "bin" / exe,
+        ]
+    )
+    candidates.extend(installer_root / exe for installer_root in _windows_installer_roots())
+    candidates.append(Path(exe))  # final fallback: rely on PATH
+    return candidates
+
+
+def llama_server_bin() -> Path:
+    """Resolve the llama-server executable.
+
+    Precedence:
+      1. VERITAS_LLAMA_SERVER_BIN exact executable override
+      2. VERITAS_LLAMA_INSTALL_DIR / bundled / known installer locations
+      3. PATH fallback
+    """
+    env_path = _expanded_path(os.getenv("VERITAS_LLAMA_SERVER_BIN"))
+    if env_path is not None:
+        return env_path
+
+    candidates = llama_server_candidates()
+    for candidate in candidates[:-1]:
         if candidate.exists():
             return candidate
-    return Path(exe)  # rely on PATH
+    return candidates[-1]
 
 
 def _http_ok(url: str, timeout: float = 1.0) -> bool:
@@ -196,12 +248,21 @@ class LlamaServer:
         try:
             log.write("$ " + " ".join(args) + "\n\n")
             log.flush()
-            self._proc = subprocess.Popen(
-                args,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                creationflags=_creation_flags(),
-            )
+            popen_kwargs = {
+                "stdout": log,
+                "stderr": subprocess.STDOUT,
+                "creationflags": _creation_flags(),
+            }
+            exe_path = Path(args[0])
+            if exe_path.is_absolute():
+                popen_kwargs["cwd"] = str(exe_path.parent)
+            try:
+                self._proc = subprocess.Popen(args, **popen_kwargs)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"failed to start {self.kind} llama-server "
+                    f"executable={args[0]!r}: {exc}"
+                ) from exc
         finally:
             log.close()  # child keeps its own inherited handle
         self._owned = True
@@ -224,6 +285,7 @@ class LlamaServer:
 __all__ = [
     "LlamaServer",
     "llama_server_bin",
+    "llama_server_candidates",
     "LLAMA_COMMON_ARGS",
     "LLAMA_LLM_EXTRA_ARGS",
     "LLAMA_EMBEDDING_EXTRA_ARGS",

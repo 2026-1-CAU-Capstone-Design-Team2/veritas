@@ -926,19 +926,9 @@ def needs_model_setup() -> bool:
 
 
 def llama_server_bin() -> Path:
-    env_path = os.getenv("VERITAS_LLAMA_SERVER_BIN")
-    if env_path:
-        return Path(env_path)
-    exe_name = "llama-server.exe" if os.name == "nt" else "llama-server"
-    candidates = [
-        Path(__file__).resolve().parent / "bin" / exe_name,
-        Path(__file__).resolve().parent / "llama.cpp" / "build" / "bin" / exe_name,
-        Path(exe_name),
-    ]
-    for candidate in candidates:
-        if candidate.exists() or candidate == Path(exe_name):
-            return candidate
-    return Path(exe_name)
+    from llm.llama_supervisor import llama_server_bin as resolve_llama_server_bin
+
+    return resolve_llama_server_bin()
 
 
 def wait_http(url: str, *, timeout: float = 120.0) -> bool:
