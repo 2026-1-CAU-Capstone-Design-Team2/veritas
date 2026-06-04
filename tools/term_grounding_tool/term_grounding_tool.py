@@ -58,6 +58,9 @@ class TermGroundingTool(BaseTool):
                 tools=None,
                 tool_runner=None,
                 max_tool_rounds=0,
+                # Term extraction is a shallow task — cap reasoning spend on
+                # API reasoning models (no-op for the local client).
+                reasoning_effort="low",
             )
         except Exception as e:
             return ToolResult(success=False, error=f"LLM term extraction failed: {e}")

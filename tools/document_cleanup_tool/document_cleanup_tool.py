@@ -1,6 +1,10 @@
 """Per-document cleanup: identify boilerplate paragraphs + extract summary/keywords/key-points.
 
-Replaces the previous per-doc summarize pass. For each kept document:
+Replaces the previous per-doc summarize pass. Two modes share this tool —
+the mode is resolved by ``cleanup_mode`` ("auto" picks by LLM client type):
+
+**per_doc mode (local llama-server LLM, the default path).**
+For each kept document:
 
 1. Read ``raw_md/<doc_id>.md`` (Crawl4AI's pre-cleanup output).
 2. Split into paragraphs and prefix each with ``[P0]``, ``[P1]`` … so the LLM
@@ -25,6 +29,24 @@ Replaces the previous per-doc summarize pass. For each kept document:
 6. Write ``summary/doc_<doc_id>.md`` directly from the workspace index +
    the cleanup output (no second LLM call).
 
+**batch mode (external API LLM — OpenAI).**
+One LLM call per *collect cycle* instead of per document. A large API model
+reads noisy bodies fine, so paragraph-level boilerplate removal is skipped
+entirely (the small local models need it; gpt-5-mini does not):
+
+1. ``clean_md/<doc_id>.md`` is written as a pass-through copy of ``raw_md``
+   so every downstream consumer (RAG indexing, verification sentence
+   splitting, batch summary) keeps reading from the same place.
+2. ONE ``ask_json`` call with :data:`core.prompts.BATCH_DOC_METADATA_PROMPT`
+   extracts per-document summary / keywords / key_points for every document
+   in the cycle (chunked if the cycle is unusually large).
+3. ``summary/doc_<doc_id>.md`` is written from that JSON — same file shape,
+   same verification-layer compatibility.
+
+Both modes emit identical per-document progress events and return the same
+result payload shape, so the workflow / API / frontend need no awareness of
+which mode ran.
+
 The tool emits per-document progress so the API ring buffer drives the
 research progress bar exactly the way it did for the old summarize loop;
 ``doc_cleanup_done`` carries ``summary_path`` so the frontend can flip the
@@ -43,7 +65,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-from core.prompts import DOCUMENT_CLEANUP_PROMPT
+from core.prompts import BATCH_DOC_METADATA_PROMPT, DOCUMENT_CLEANUP_PROMPT
 from services.document_cleanup_tool_funcs import (
     annotate_paragraphs,
     apply_boilerplate_removal,
@@ -67,19 +89,36 @@ _PROGRESS_KIND_FAILED = "doc_cleanup_failed"
 _RETENTION_RETRY_HIGH = 0.95
 _RETENTION_RETRY_LOW = 0.15
 
+# Valid ``cleanup_mode`` values. "auto" resolves by LLM client type at run
+# time: external API clients (OpenAI) take the batch path, local clients the
+# per-document path.
+_CLEANUP_MODES = ("auto", "per_doc", "batch")
+
 
 class DocumentCleanupTool(BaseTool):
     """LLM-driven raw_md → clean_md cleanup + doc metadata writer."""
+
+    # Batch-metadata call sizing (batch mode only). The per-call input budget
+    # is derived from the API model's context window the same way the
+    # summarize tool does it; the doc cap keeps one degenerate cycle (full
+    # rebuild over a large corpus) from packing 15+ bodies into one call.
+    _BATCH_METADATA_MAX_DOCS = 8
+    _CHARS_PER_TOKEN = 2.5
+    _INPUT_CONTEXT_FRACTION = 0.5
+    _MAX_BATCH_INPUT_CHARS = 300_000
 
     def __init__(
         self,
         schema: dict[str, Any],
         llm=None,
         run_store_service=None,
+        cleanup_mode: str = "auto",
     ) -> None:
         super().__init__(schema=schema)
         self._llm = llm
         self._run_store = run_store_service
+        mode = str(cleanup_mode or "auto").strip().lower()
+        self._cleanup_mode = mode if mode in _CLEANUP_MODES else "auto"
 
     @property
     def name(self) -> str:
@@ -108,6 +147,13 @@ class DocumentCleanupTool(BaseTool):
             if not target_set:
                 return ToolResult(success=True, data=self._empty_summary())
             records = [r for r in records if str(r.get("doc_id") or "") in target_set]
+
+        if self._resolve_mode() == "batch":
+            return self._run_batch_mode(
+                records,
+                overwrite=overwrite,
+                progress_callback=progress_callback,
+            )
 
         # Each document is cleaned end-to-end by ``_process_record`` and is
         # fully independent (its own raw_md input, its own clean_md / doc_<id>.md
@@ -158,6 +204,230 @@ class DocumentCleanupTool(BaseTool):
                 "fallback_documents": fallback_documents,
             },
         )
+
+    # -- batch mode (external API LLM) ---------------------------------------
+
+    def _resolve_mode(self) -> str:
+        """Resolve the effective cleanup mode for this run.
+
+        Explicit ``per_doc`` / ``batch`` wins; ``auto`` picks ``batch`` for an
+        external API client (OpenAI) and ``per_doc`` for the local
+        llama-server client. The type-name check mirrors
+        ``RAGService._ensure_local_generation_allowed``.
+        """
+        if self._cleanup_mode in ("per_doc", "batch"):
+            return self._cleanup_mode
+        return "batch" if self._is_external_llm() else "per_doc"
+
+    def _is_external_llm(self) -> bool:
+        module_name = type(self._llm).__module__.lower()
+        class_name = type(self._llm).__name__.lower()
+        return "openai" in module_name or "openai" in class_name
+
+    def _run_batch_mode(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        overwrite: bool,
+        progress_callback: Callable[..., None] | None,
+    ) -> ToolResult:
+        """Cycle-level cleanup for external API LLMs.
+
+        Boilerplate removal is skipped (clean_md = raw_md pass-through); one
+        ``ask_json`` call per ≤``_BATCH_METADATA_MAX_DOCS`` documents extracts
+        the per-doc metadata that ``summary/doc_<id>.md`` (and the
+        verification layer behind it) needs. Emits the same per-document
+        progress events and returns the same payload shape as per_doc mode.
+        """
+        cleaned_doc_ids: list[str] = []
+        skipped_existing: list[str] = []
+        failed_documents: list[dict[str, str]] = []
+        fallback_documents: list[dict[str, str]] = []
+
+        # 1. Partition records: already-clean (skip) vs pending.
+        pending: list[dict[str, Any]] = []
+        for record in records:
+            doc_id = str(record.get("doc_id") or "").strip()
+            if not doc_id:
+                continue
+            clean_path = self._run_store.clean_md_dir / f"{doc_id}.md"
+            if clean_path.exists() and not overwrite:
+                skipped_existing.append(doc_id)
+                continue
+            pending.append(record)
+
+        # 2. Pass-through copy raw_md → clean_md (no LLM) and collect bodies.
+        bodies: dict[str, str] = {}
+        prepared: list[dict[str, Any]] = []
+        for record in pending:
+            doc_id = str(record.get("doc_id") or "").strip()
+            raw_text = self._run_store.read_raw_md(doc_id)
+            if not raw_text.strip():
+                self._emit(progress_callback, _PROGRESS_KIND_FAILED, doc_id=doc_id, record=record)
+                failed_documents.append(
+                    {
+                        "docId": doc_id,
+                        "title": str(record.get("title") or doc_id),
+                        "reason": "raw_md 파일이 비어 있거나 없습니다.",
+                    }
+                )
+                continue
+            self._emit(progress_callback, _PROGRESS_KIND_START, doc_id=doc_id, record=record)
+            self._run_store.write_clean_md(doc_id, raw_text)
+            bodies[doc_id] = raw_text
+            prepared.append(record)
+
+        # 3. Batch metadata extraction — one ask_json call per chunk.
+        metadata_by_doc: dict[str, dict[str, Any]] = {}
+        for start in range(0, len(prepared), self._BATCH_METADATA_MAX_DOCS):
+            chunk = prepared[start : start + self._BATCH_METADATA_MAX_DOCS]
+            chunk_ids = [str(r.get("doc_id") or "") for r in chunk]
+            try:
+                payload = self._llm.ask_json(
+                    BATCH_DOC_METADATA_PROMPT,
+                    self._render_batch_metadata_input(chunk, bodies),
+                    reasoning=False,
+                    stream=False,
+                    stream_label="document-cleanup:batch",
+                    # Metadata extraction is a shallow task — cap reasoning
+                    # spend on API reasoning models (no-op for local clients).
+                    reasoning_effort="low",
+                )
+                metadata_by_doc.update(self._parse_batch_metadata(payload))
+            except Exception as exc:
+                # Degraded path, not a failure: clean_md is already written, so
+                # the documents stay usable downstream. The affected docs fall
+                # back to metadata-less doc_<id>.md files below.
+                print(
+                    "[cleanup][batch-metadata-failed] "
+                    f"docs={chunk_ids} reason={exc}"
+                )
+
+        # 4. Write summary/doc_<id>.md and emit done events.
+        for record in prepared:
+            doc_id = str(record.get("doc_id") or "").strip()
+            meta = metadata_by_doc.get(doc_id) or {}
+            summary_text = self._safe_text(meta.get("summary"))
+            keywords = self._safe_string_list(meta.get("keywords"), max_items=10)
+            key_points = self._safe_string_list(meta.get("key_points"), max_items=7)
+            used_fallback = not summary_text and not key_points
+
+            summary_path = self._run_store.paths.summary_path_for(int(doc_id))
+            try:
+                write_doc_metadata(
+                    summary_path=summary_path,
+                    record=record,
+                    summary=summary_text,
+                    keywords=keywords,
+                    key_points=key_points,
+                )
+            except Exception as exc:
+                self._emit(progress_callback, _PROGRESS_KIND_FAILED, doc_id=doc_id, record=record, error=str(exc))
+                failed_documents.append(
+                    {
+                        "docId": doc_id,
+                        "title": str(record.get("title") or doc_id),
+                        "reason": f"doc_*.md 작성 실패: {exc}",
+                    }
+                )
+                continue
+
+            paragraphs = split_paragraphs(bodies.get(doc_id, ""))
+            self._emit(
+                progress_callback,
+                _PROGRESS_KIND_DONE,
+                doc_id=doc_id,
+                record=record,
+                paragraphs=len(paragraphs),
+                dropped=0,
+                summary=summary_text,
+                keywords=keywords,
+                key_points=key_points,
+                summary_path=str(summary_path),
+                used_fallback=used_fallback,
+            )
+            cleaned_doc_ids.append(doc_id)
+            if used_fallback:
+                fallback_documents.append(
+                    {
+                        "docId": doc_id,
+                        "title": str(record.get("title") or doc_id),
+                        "reason": "배치 메타데이터 추출 결과가 없어 메타데이터 없이 기록했습니다.",
+                    }
+                )
+
+        return ToolResult(
+            success=True,
+            content=(
+                f"Cleaned {len(cleaned_doc_ids)} document(s) [batch mode]; "
+                f"skipped {len(skipped_existing)} existing; "
+                f"{len(fallback_documents)} fallback(s); "
+                f"{len(failed_documents)} failure(s)."
+            ),
+            data={
+                "cleaned_doc_ids": cleaned_doc_ids,
+                "skipped_existing_doc_ids": skipped_existing,
+                "failed_documents": failed_documents,
+                "fallback_documents": fallback_documents,
+            },
+        )
+
+    def _batch_input_budget(self) -> int:
+        """Character budget for one batch-metadata call, from the model context."""
+        n_ctx = getattr(self._llm, "n_ctx", 0) or 0
+        if n_ctx > 0:
+            derived = int(n_ctx * self._CHARS_PER_TOKEN * self._INPUT_CONTEXT_FRACTION)
+        else:
+            derived = 100_000
+        return max(20_000, min(derived, self._MAX_BATCH_INPUT_CHARS))
+
+    def _render_batch_metadata_input(
+        self,
+        records: list[dict[str, Any]],
+        bodies: dict[str, str],
+    ) -> str:
+        """Render the batch-metadata user prompt: ``=== doc_<id> ===`` sections.
+
+        The per-doc cap is a flat share of the call budget — unlike the batch
+        summary's redistributed caps, metadata extraction needs the *head* of
+        each document far more than the tail, so a simple split is enough.
+        """
+        per_doc_cap = max(2_000, self._batch_input_budget() // max(1, len(records)))
+        sections: list[str] = []
+        for record in records:
+            doc_id = str(record.get("doc_id") or "").strip()
+            header_lines = [f"=== doc_{doc_id} ==="]
+            title = str(record.get("title") or "").strip()
+            domain = str(record.get("domain") or "").strip()
+            url = str(record.get("url") or "").strip()
+            if title:
+                header_lines.append(f"Title: {title}")
+            if domain:
+                header_lines.append(f"Domain: {domain}")
+            if url:
+                header_lines.append(f"URL: {url}")
+            body = (bodies.get(doc_id) or "")[:per_doc_cap]
+            sections.append("\n".join(header_lines) + "\n\n" + body)
+        return "\n\n---\n\n".join(sections).strip() + "\n"
+
+    def _parse_batch_metadata(self, payload: Any) -> dict[str, dict[str, Any]]:
+        """Normalize the batch-metadata JSON into ``{doc_id: {summary, keywords, key_points}}``."""
+        documents = payload.get("documents") if isinstance(payload, dict) else None
+        parsed: dict[str, dict[str, Any]] = {}
+        for item in documents if isinstance(documents, list) else []:
+            if not isinstance(item, dict):
+                continue
+            doc_id = str(item.get("doc_id") or "").strip()
+            if doc_id.lower().startswith("doc_"):
+                doc_id = doc_id[4:]
+            if not doc_id:
+                continue
+            parsed[doc_id] = {
+                "summary": item.get("summary"),
+                "keywords": item.get("keywords"),
+                "key_points": item.get("key_points"),
+            }
+        return parsed
 
     # -- internals -----------------------------------------------------------
 
@@ -347,9 +617,15 @@ class DocumentCleanupTool(BaseTool):
             return first
 
         nudge = self._retry_nudge(first_retention)
+        # Log the retry direction only — NOT the nudge body. Printing the
+        # Korean nudge text crashed cleanup with UnicodeEncodeError on cp949
+        # consoles (Korean Windows default): the em-dash it contained is not
+        # representable in cp949, and the exception escaped to _process_record
+        # which then mis-classified the document as failed.
+        direction = "drop-more" if first_retention > _RETENTION_RETRY_HIGH else "keep-more"
         print(
             f"[cleanup][retry] doc_id={doc_id} retention={first_retention:.2f} "
-            f"nudge={nudge!r}"
+            f"direction={direction}"
         )
         try:
             second = self._call_llm(paragraphs, extra_user_hint=nudge)
@@ -386,6 +662,10 @@ class DocumentCleanupTool(BaseTool):
             reasoning=False,
             stream=False,
             stream_label="document-cleanup",
+            # Boilerplate flagging + metadata extraction is a shallow task —
+            # cap reasoning spend when an API reasoning model is forced onto
+            # this per-doc path (no-op for the local client).
+            reasoning_effort="low",
         )
         return parse_cleanup_response(text or "")
 
@@ -408,15 +688,19 @@ class DocumentCleanupTool(BaseTool):
 
     @staticmethod
     def _retry_nudge(first_retention: float) -> str:
-        """One-line hint prepended to the retry user payload."""
+        """One-line hint prepended to the retry user payload.
+
+        Plain hyphens only — no em-dash. The nudge is also echoed into logs,
+        and U+2014 is not representable in cp949 (Korean Windows console).
+        """
         if first_retention > _RETENTION_RETRY_HIGH:
             return (
-                "이전 시도에서는 거의 모든 단락을 본문으로 분류했습니다 — "
+                "이전 시도에서는 거의 모든 단락을 본문으로 분류했습니다. "
                 "내비게이션, 푸터, 메뉴, 광고, 쿠키 안내 같은 명백한 chrome "
                 "단락은 더 적극적으로 BOILERPLATE_PARAGRAPHS에 포함해 주세요."
             )
         return (
-            "이전 시도에서는 너무 많은 단락을 boilerplate로 분류했습니다 — "
+            "이전 시도에서는 너무 많은 단락을 boilerplate로 분류했습니다. "
             "본문 단락(정의, 설명, 예시, 수치, 표, 인용)은 BOILERPLATE_PARAGRAPHS에 "
             "포함하지 마세요. 명백히 chrome인 단락만 골라 주세요."
         )

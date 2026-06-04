@@ -17,7 +17,7 @@
         },
         "max_chars": {
           "type": "integer",
-          "description": "Maximum number of characters to keep from the extracted Markdown text. Raw HTML is archived separately for provenance and is not truncated.",
+          "description": "Maximum number of characters to keep from the extracted Markdown text. If omitted, uses VERITAS_FETCH_MAX_CHARS or 25000. Raw HTML is archived separately for provenance and is not truncated.",
           "default": 25000
         }
       },

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -42,6 +43,16 @@ def _clean_text_for_storage(text: str, *, max_chars: int | None = None) -> str:
     return value
 
 
+def _default_max_chars() -> int:
+    raw = os.getenv("VERITAS_FETCH_MAX_CHARS")
+    if raw is None:
+        return 25_000
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 25_000
+
+
 @dataclass
 class FetchedDocument:
     title: str
@@ -81,13 +92,19 @@ class FetchWebpageTool(BaseTool):
     def name(self) -> str:
         return "fetch_webpage"
 
-    def run(self, url: str, timeout_sec: int = 15, max_chars: int = 25000) -> ToolResult:
+    def run(
+        self,
+        url: str,
+        timeout_sec: int = 15,
+        max_chars: int | None = None,
+    ) -> ToolResult:
         url = (url or "").strip()
         if not url:
             return ToolResult(success=False, error="`url` must be a non-empty string.")
 
         fetch_url = _normalize_fetch_url(url)
-        max_chars = max(1000, int(max_chars))
+        resolved_max_chars = _default_max_chars() if max_chars is None else max_chars
+        max_chars = max(1000, int(resolved_max_chars))
         timeout_sec = max(1, int(timeout_sec))
 
         crawl_result = fetch_funcs.fetch_with_crawl4ai(fetch_url, timeout_sec, max_chars)

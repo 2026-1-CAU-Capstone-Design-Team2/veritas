@@ -38,6 +38,24 @@ def _resolve_int(explicit: int | None, env_key: str, default: int) -> int:
         return default
 
 
+def _resolve_int_from_env_keys(
+    explicit: int | None,
+    env_keys: tuple[str, ...],
+    default: int,
+) -> int:
+    if explicit is not None and int(explicit) > 0:
+        return int(explicit)
+    for env_key in env_keys:
+        raw = os.getenv(env_key)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
 @dataclass(frozen=True)
 class AutoSurveyConfig:
     """Knobs the AutoSurvey workflow lets the caller dial.
@@ -52,6 +70,7 @@ class AutoSurveyConfig:
     max_docs: int = 15
     collect_batch_size: int = 5
     scout_docs: int = 3
+    fetch_max_chars: int = 25_000
 
     def __post_init__(self) -> None:
         # ``object.__setattr__`` is required on a frozen dataclass — assigning
@@ -67,6 +86,11 @@ class AutoSurveyConfig:
             "scout_docs",
             max(1, min(int(self.scout_docs), self.max_docs)),
         )
+        object.__setattr__(
+            self,
+            "fetch_max_chars",
+            max(1_000, int(self.fetch_max_chars)),
+        )
 
     @classmethod
     def from_env(
@@ -75,18 +99,26 @@ class AutoSurveyConfig:
         max_docs: int | None = None,
         collect_batch_size: int | None = None,
         scout_docs: int | None = None,
+        fetch_max_chars: int | None = None,
     ) -> "AutoSurveyConfig":
         """Resolve every field via ``_resolve_int`` and clamp via post-init.
 
         Mirrors what :meth:`AgentRuntime.run_autosurvey` was doing inline,
         but in one place that's reusable from tests and CLI entrypoints.
         """
+        provider = os.getenv("VERITAS_AUTOSURVEY_LLM_PROVIDER", "local").strip().lower()
+        default_fetch_max_chars = 100_000 if provider == "openai" else 25_000
         return cls(
             max_docs=_resolve_int(max_docs, "VERITAS_MAX_DOCS", 15),
             collect_batch_size=_resolve_int(
                 collect_batch_size, "VERITAS_BATCH_SIZE", 5
             ),
             scout_docs=_resolve_int(scout_docs, "VERITAS_SCOUT_DOCS", 3),
+            fetch_max_chars=_resolve_int_from_env_keys(
+                fetch_max_chars,
+                ("VERITAS_AUTOSURVEY_FETCH_MAX_CHARS", "VERITAS_FETCH_MAX_CHARS"),
+                default_fetch_max_chars,
+            ),
         )
 
 

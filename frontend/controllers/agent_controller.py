@@ -125,17 +125,6 @@ class AgentController:
 		items = response.get("items", [])
 		return items if isinstance(items, list) else []
 
-	def upload_feedback_files(self, files: list[Path]) -> list[dict[str, str]]:
-		response = api_client.upload_files("/api/v1/feedback/files", files)
-		items = response.get("items", [])
-		return items if isinstance(items, list) else []
-
-	def analyze_feedback(self, file_ids: list[str]) -> dict[str, Any]:
-		return api_client.post("/api/v1/feedback/analyze", {"fileIds": file_ids})
-
-	def get_feedback_result(self, file_id: str) -> dict[str, Any]:
-		return api_client.get(f"/api/v1/feedback/results/{file_id}")
-
 	def update_model(self, model_id: str) -> dict[str, Any]:
 		return api_client.put(
 			"/api/v1/settings/model",
@@ -152,6 +141,37 @@ class AgentController:
 		return api_client.put(
 			"/api/v1/settings/research-method",
 			{"sampleCount": int(sample_count), "planCount": int(plan_count)},
+		)
+
+	def update_local_access(
+		self,
+		folder_paths: list[str],
+		workspace_id: str,
+	) -> dict[str, Any]:
+		cleaned = [str(path).strip() for path in folder_paths if str(path).strip()]
+		response = api_client.put(
+			"/api/v1/settings/local-access",
+			{"folderPaths": cleaned},
+		)
+		response["localCorpus"] = api_client.post(
+			"/api/v1/local-corpus/index",
+			{
+				"workspaceId": workspace_id,
+				"roots": cleaned,
+				"clearLocalFirst": True,
+			},
+		)
+		return response
+
+	def update_autosurvey_openai_api_key(
+		self,
+		api_key: str = "",
+		*,
+		clear: bool = False,
+	) -> dict[str, Any]:
+		return api_client.put(
+			"/api/v1/settings/autosurvey-openai",
+			{"apiKey": str(api_key or ""), "clear": bool(clear)},
 		)
 
 	def update_llm_parallel(self, value: int) -> dict[str, Any]:

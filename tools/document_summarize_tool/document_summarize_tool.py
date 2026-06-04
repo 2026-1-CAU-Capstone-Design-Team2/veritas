@@ -335,6 +335,9 @@ class DocumentSummarizeTool(BaseTool):
             max_retries=self._json_retries,
             stream=getattr(self._llm, "stream_summary", False),
             stream_label=f"summary:{record.doc_id}",
+            # Summaries are synthesis work — keep API reasoning models at
+            # their default (medium) effort (no-op for the local client).
+            reasoning_effort="medium",
         )
 
     def _summarize_map_reduce(self, record, text: str, budget: int) -> dict[str, Any]:
@@ -365,6 +368,7 @@ class DocumentSummarizeTool(BaseTool):
                 reasoning=False,
                 stream=getattr(self._llm, "stream_summary", False),
                 stream_label=f"summary:{record.doc_id}:chunk{index}/{len(chunks)}",
+                reasoning_effort="medium",
             )
             note = (note or "").strip()
             if note and note.lower() != "(no substantive content)":
@@ -401,6 +405,7 @@ class DocumentSummarizeTool(BaseTool):
                 max_retries=self._json_retries,
                 stream=getattr(self._llm, "stream_summary", False),
                 stream_label=f"summary:{record.doc_id}:reduce",
+                reasoning_effort="medium",
             )
         except Exception as e:
             # The reduce JSON failed even on compact notes. Rather than losing a
@@ -627,6 +632,9 @@ class DocumentSummarizeTool(BaseTool):
                 reasoning=False,
                 stream=getattr(self._llm, "stream_summary", False),
                 stream_label=f"batch:{batch_number:03d}",
+                # Batch summaries carry the gap analysis that drives the
+                # replan loop — keep API reasoning models at medium effort.
+                reasoning_effort="medium",
             )
             # Same LaTeX over-escape fix applied to the final report — batch
             # notes feed final.md, so math expressions inside repeated /
@@ -669,6 +677,9 @@ class DocumentSummarizeTool(BaseTool):
                 reasoning=False,
                 stream=getattr(self._llm, "stream_summary", False),
                 stream_label=f"batch:{next_batch_number:03d}",
+                # Batch summaries carry the gap analysis that drives the
+                # replan loop — keep API reasoning models at medium effort.
+                reasoning_effort="medium",
             )
             batch_markdown = clean_latex_in_markdown(batch_markdown)
             self._run_store_service.write_batch_summary(next_batch_number, batch_markdown)

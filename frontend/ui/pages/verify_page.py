@@ -40,25 +40,27 @@ from PySide6.QtWidgets import (
 from ...api_common import current_workspace_id
 from ...components.badges import Badge
 from ...components.buttons import AppButton
-from ...components.cards import CardWidget
+from ...components.cards import CardWidget, CollapsibleCard
 from ...components.progress import ResearchProgressBar
 from ...controllers import AgentController, JobCategory, get_job_manager
 from ...theme import theme
 
 _FILTERS = ("전체", "높음", "중간", "낮음")
-# Verification has three task pipelines; reaching "검증 완료" maps to 100%.
+# Verification has four task pipelines; reaching "검증 완료" maps to 100%.
 # Stages emitted in order: queued → start → sections → reliability →
-# consensus → persisting → completed. Hold a small floor for the prep
-# stages so the bar is not pinned at 0 while we wait for the first task to
-# finish. ``intent`` is kept on the table for legacy reruns that explicitly
-# request the deprecated pipeline; it sits between sections and consensus.
+# consensus → crosscheck → persisting → completed. Hold a small floor for
+# the prep stages so the bar is not pinned at 0 while we wait for the first
+# task to finish. ``intent`` is kept on the table for legacy reruns that
+# explicitly request the deprecated pipeline; it sits between sections and
+# consensus.
 _STAGE_PROGRESS = {
 	"queued": 4.0,
 	"start": 8.0,
 	"sections": 35.0,
-	"reliability": 65.0,
-	"intent": 65.0,
-	"consensus": 90.0,
+	"reliability": 60.0,
+	"intent": 60.0,
+	"consensus": 85.0,
+	"crosscheck": 93.0,
 	"persisting": 96.0,
 	"completed": 100.0,
 }
@@ -682,6 +684,22 @@ _FILTER_CHIP_QSS = (
 	"  border: 1px solid %(accent.hover)s;"
 	"}"
 )
+# Cross-check panel — one row per internal↔external mismatch. Mismatch rows
+# use the danger palette (a numeric conflict needs the user's attention);
+# the claim source lines stay subdued so the claim text reads first.
+_CROSSCHECK_ROW_QSS = (
+	"QFrame#CrosscheckFlagRow {"
+	"  background-color: %(danger.bg2)s; border: 1px solid %(danger.border2)s;"
+	"  border-radius: 10px;"
+	"}"
+	"QLabel#CrosscheckRelationBadge {"
+	"  background-color: %(danger.fg)s; color: %(text.on_accent)s;"
+	"  border-radius: 10px; padding: 3px 10px;"
+	"  font-size: 11px; font-weight: 800;"
+	"}"
+	"QLabel#CrosscheckClaimSource { font-size: 12px; font-weight: 800; color: %(text.primary)s; }"
+	"QLabel#CrosscheckClaimText { font-size: 12px; color: %(text.body)s; }"
+)
 _SECTION_CARD_QSS = (
 	"QFrame#SectionCard { background-color: %(surface)s; border: 1px solid %(border)s; border-radius: 10px; }"
 	"QFrame#SectionCard:hover { border-color: %(accent.glyph)s; }"
@@ -942,25 +960,29 @@ class _SectionCard(QFrame):
 		outer.addWidget(detail_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
 
 
-class _SectionsPanel(CardWidget):
+class _SectionsPanel(CollapsibleCard):
 	"""'보고서 흐름 구조' 패널 — ordered report-flow outline from Task 1.
 
 	Sits between the summary stripe and the per-doc results so the writer
 	first reads the *report structure* (introduction → body → conclusion)
 	before scrolling through per-doc ratings.
+
+	Collapsed by default — the section cards make the page long, so the
+	headline ("✓ 섹션 N개 분석됨") stays in the collapsed header and the user
+	expands only when they want the per-section breakdown.
 	"""
 
 	sectionClicked = Signal(int)
 
 	def __init__(self, parent: QWidget | None = None) -> None:
-		super().__init__(title="보고서 흐름 구조", parent=parent)
+		super().__init__(title="보고서 흐름 구조", expanded=False, parent=parent)
 		self._caption = QLabel(
 			"LLM 이 정한 보고서 작성 순서입니다. 각 섹션을 클릭하면 어떤 자료의"
 			" 문장이 배치되는지 볼 수 있습니다."
 		)
 		self._caption.setObjectName("CardSecondary")
 		self._caption.setWordWrap(True)
-		self.layout.addWidget(self._caption)
+		self.body_layout.addWidget(self._caption)
 
 		# Tiny fallback notice — switches on when ``flow_source != 'llm'``.
 		self._fallback_notice = QLabel("")
@@ -970,12 +992,12 @@ class _SectionsPanel(CardWidget):
 		)
 		self._fallback_notice.setWordWrap(True)
 		self._fallback_notice.setVisible(False)
-		self.layout.addWidget(self._fallback_notice)
+		self.body_layout.addWidget(self._fallback_notice)
 
 		self._cards_layout = QVBoxLayout()
 		self._cards_layout.setContentsMargins(0, 0, 0, 0)
 		self._cards_layout.setSpacing(8)
-		self.layout.addLayout(self._cards_layout)
+		self.body_layout.addLayout(self._cards_layout)
 
 	def apply(self, sections: list[dict[str, Any]], flow_source: str) -> None:
 		"""Rebuild the card stack from the latest sections overview payload."""
@@ -996,6 +1018,7 @@ class _SectionsPanel(CardWidget):
 			self._fallback_notice.setVisible(False)
 
 		if not sections:
+			self.set_status("")
 			empty = QLabel("섹션 구조가 아직 분석되지 않았습니다.")
 			empty.setObjectName("CardSecondary")
 			empty.setAlignment(Qt.AlignCenter)
@@ -1003,10 +1026,170 @@ class _SectionsPanel(CardWidget):
 			self._cards_layout.addWidget(empty)
 			return
 
+		# Collapsed-header badge: the analysed-section count survives folding.
+		if flow_source == "fallback":
+			self.set_status(f"⚠ 임시 구조 · 섹션 {len(sections)}개", tone="warning")
+		else:
+			self.set_status(f"✓ 섹션 {len(sections)}개 분석됨")
+
 		for section in sections:
 			card = _SectionCard(section)
 			card.clicked.connect(self.sectionClicked)
 			self._cards_layout.addWidget(card)
+
+
+class _CrosscheckFlagRow(QFrame):
+	"""One internal↔external mismatch — claim pair + sources.
+
+	Renders the local (사내 문서) claim above the external (웹 조사) claim so
+	the user reads "우리 문서에는 X라고 되어 있는데, 외부 자료는 Y라고 한다"
+	top-to-bottom.
+	"""
+
+	_RELATION_LABELS = {
+		"numeric_mismatch": "수치 불일치",
+		"contradicts": "모순",
+	}
+
+	def __init__(self, flag: dict[str, Any], parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self.setObjectName("CrosscheckFlagRow")
+
+		layout = QVBoxLayout(self)
+		layout.setContentsMargins(14, 12, 14, 12)
+		layout.setSpacing(6)
+
+		relation = str(flag.get("relation") or "")
+		badge = QLabel(self._RELATION_LABELS.get(relation, relation or "불일치"))
+		badge.setObjectName("CrosscheckRelationBadge")
+		badge_row = QHBoxLayout()
+		badge_row.setContentsMargins(0, 0, 0, 0)
+		badge_row.addWidget(badge, 0, Qt.AlignLeft)
+		badge_row.addStretch(1)
+		layout.addLayout(badge_row)
+
+		local = flag.get("local") if isinstance(flag.get("local"), dict) else {}
+		external = flag.get("external") if isinstance(flag.get("external"), dict) else {}
+
+		layout.addWidget(self._source_label("내부 문서", local))
+		layout.addWidget(self._claim_label(local))
+		layout.addWidget(self._source_label("외부 조사", external))
+		layout.addWidget(self._claim_label(external))
+
+		self._apply_theme()
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _source_label(self, prefix: str, side: dict[str, Any]) -> QLabel:
+		source = str(side.get("title") or side.get("label") or "").strip() or "(출처 미상)"
+		label = QLabel(f"{prefix} · {source}")
+		label.setObjectName("CrosscheckClaimSource")
+		label.setWordWrap(True)
+		return label
+
+	def _claim_label(self, side: dict[str, Any]) -> QLabel:
+		text = str(side.get("text") or "").strip() or "(주장 본문 없음)"
+		label = QLabel(f"“{text}”")
+		label.setObjectName("CrosscheckClaimText")
+		label.setWordWrap(True)
+		return label
+
+	def _apply_theme(self, *args) -> None:
+		self.setStyleSheet(_CROSSCHECK_ROW_QSS % theme.palette())
+
+
+class _CrosscheckPanel(CardWidget):
+	"""'Cross-check 결과' 패널 — 내부(로컬 폴더) 문서 ↔ 외부(웹 조사) 교차 검증.
+
+	검증 파이프라인의 crosscheck task가 산출한 claim 비교 결과를 보여준다.
+	내/외부 데이터 통합의 핵심 산출물이므로 접지 않고 항상 펼쳐 둔다. 표시
+	상태는 세 가지로 갈린다:
+
+	* 로컬 문서가 등록되지 않은 워크스페이스 → 등록 안내
+	* 불일치 0건 → "충돌 없음" 확인 메시지 (+ 일치/부분 일치 통계)
+	* 불일치 N건 → 한 건당 :class:`_CrosscheckFlagRow` 하나
+	"""
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(title="Cross-check 결과 (내부 자료 교차 검증)", parent=parent)
+
+		caption = QLabel(
+			"로컬 접근 폴더의 내부 문서와 웹 조사 결과를 비교해, 같은 주제를"
+			" 다루면서 수치나 내용이 다른 주장을 찾아냅니다. 내부 문서는 외부로"
+			" 전송되지 않으며 비교는 전부 로컬에서 수행됩니다."
+		)
+		caption.setObjectName("CardSecondary")
+		caption.setWordWrap(True)
+		self.layout.addWidget(caption)
+
+		self._headline = QLabel("")
+		self._headline.setObjectName("CardPrimary")
+		self._headline.setWordWrap(True)
+		self.layout.addWidget(self._headline)
+
+		self._rows_layout = QVBoxLayout()
+		self._rows_layout.setContentsMargins(0, 0, 0, 0)
+		self._rows_layout.setSpacing(8)
+		self.layout.addLayout(self._rows_layout)
+
+	def apply(self, crosscheck: dict[str, Any] | None) -> None:
+		"""Rebuild the panel from the summary's ``crosscheck`` payload."""
+		while self._rows_layout.count():
+			item = self._rows_layout.takeAt(0)
+			widget = item.widget() if item else None
+			if widget is not None:
+				widget.setParent(None)
+				widget.deleteLater()
+
+		payload = crosscheck if isinstance(crosscheck, dict) else {}
+		available = bool(payload.get("available"))
+		local_count = int(payload.get("localSourceCount") or 0)
+		external_count = int(payload.get("externalDocCount") or 0)
+		support = int(payload.get("supportCount") or 0)
+		partial = int(payload.get("partialSupportCount") or 0)
+		flags = [
+			flag for flag in (payload.get("flags") or []) if isinstance(flag, dict)
+		]
+
+		if not available:
+			self._set_headline(
+				"아직 교차 검증이 실행되지 않았습니다. ‘검증 시작’ 을 누르면 내부"
+				" 문서와 외부 조사 결과를 비교합니다.",
+				color_token="text.secondary",
+			)
+			return
+
+		if local_count == 0:
+			self._set_headline(
+				"이 워크스페이스에는 등록된 내부 문서가 없습니다 — 설정 → 로컬 접근"
+				" 폴더 설정에서 폴더를 등록하고 재검증하면 내부↔외부 교차 검증이"
+				" 수행됩니다.",
+				color_token="warning.fg2",
+			)
+			return
+
+		if not flags:
+			self._set_headline(
+				f"✓ 내부 문서 {local_count}건 ↔ 외부 조사 {external_count}건 비교 —"
+				f" 수치 불일치가 발견되지 않았습니다"
+				f" (일치 {support}건 · 부분 일치 {partial}건)",
+				color_token="success.strong",
+			)
+			return
+
+		self._set_headline(
+			f"⚠ 내부 문서 {local_count}건 ↔ 외부 조사 {external_count}건 비교 —"
+			f" 불일치 {len(flags)}건 발견"
+			f" (일치 {support}건 · 부분 일치 {partial}건)",
+			color_token="danger.fg",
+		)
+		for flag in flags:
+			self._rows_layout.addWidget(_CrosscheckFlagRow(flag))
+
+	def _set_headline(self, text: str, *, color_token: str) -> None:
+		self._headline.setText(text)
+		self._headline.setStyleSheet(
+			f"color: {theme.color(color_token)}; font-weight: 700;"
+		)
 
 
 class VerifySectionDetailDialog(QDialog):
@@ -1430,16 +1613,18 @@ class VerifyPage(QWidget):
 		self._sections_panel.sectionClicked.connect(self._on_section_clicked)
 		root.addWidget(self._sections_panel)
 
-		# Per-doc results header + filter chips. The page can grow long once
-		# the sections panel is populated, so we surface a prominent doc-count
-		# badge right under the title — the writer immediately sees how many
-		# items the filter chips control even before scrolling to the cards.
-		results_header = CardWidget("자료별 검증 결과")
+		# Per-doc results — collapsed by default so the page stays short; the
+		# collapsed header's status badge carries the per-level counts, so the
+		# writer can judge the outcome without expanding. Everything that
+		# belongs to this section (count badge, caption, filter chips, result
+		# cards, pagination) lives inside the collapsible body so it folds as
+		# one unit.
+		results_section = CollapsibleCard("자료별 검증 결과", expanded=False)
 
 		self._results_count_badge = QLabel("총 0개 자료")
 		self._results_count_badge.setObjectName("ResultsCountBadge")
 		self._results_count_badge.setStyleSheet(_COUNT_BADGE_QSS % theme.palette())
-		results_header.layout.addWidget(self._results_count_badge, 0, Qt.AlignLeft)
+		results_section.body_layout.addWidget(self._results_count_badge, 0, Qt.AlignLeft)
 
 		results_header_caption = QLabel(
 			"각 자료에 신뢰도 등급과 근거가 표시됩니다. 칩으로 등급별 필터링,"
@@ -1447,7 +1632,7 @@ class VerifyPage(QWidget):
 		)
 		results_header_caption.setObjectName("CardSecondary")
 		results_header_caption.setWordWrap(True)
-		results_header.layout.addWidget(results_header_caption)
+		results_section.body_layout.addWidget(results_header_caption)
 
 		filter_row = QHBoxLayout()
 		filter_row.setSpacing(8)
@@ -1464,19 +1649,16 @@ class VerifyPage(QWidget):
 			self._filter_buttons[label] = chip
 		filter_row.addStretch(1)
 		# Chip stylesheet — checked = brand color, unchecked = subdued. Applied
-		# on the filter row so chip count widgets inherit the same palette.
-		results_header.setStyleSheet(_FILTER_CHIP_QSS % theme.palette())
+		# on the section card so chip count widgets inherit the same palette.
+		results_section.setStyleSheet(_FILTER_CHIP_QSS % theme.palette())
 		self._filter_buttons[self._active_filter].setChecked(True)
-		results_header.layout.addLayout(filter_row)
-		root.addWidget(results_header)
-		self._results_header = results_header
-		# Re-tint results chrome + rebuild result cards on a light/dark toggle.
-		theme.themeChanged.connect(self._apply_theme)
+		results_section.body_layout.addLayout(filter_row)
 
+		# Per-doc result cards render inside the collapsible body.
 		self._content_layout = QVBoxLayout()
 		self._content_layout.setContentsMargins(0, 0, 0, 0)
 		self._content_layout.setSpacing(10)
-		root.addLayout(self._content_layout)
+		results_section.body_layout.addLayout(self._content_layout)
 
 		self._empty_label = QLabel("결과를 불러오는 중...")
 		self._empty_label.setObjectName("PageSubtitle")
@@ -1484,7 +1666,7 @@ class VerifyPage(QWidget):
 		self._empty_label.setWordWrap(True)
 		self._content_layout.addWidget(self._empty_label)
 
-		# Pagination row.
+		# Pagination row (inside the collapsible body so it folds with the cards).
 		pagination_row = QHBoxLayout()
 		pagination_row.setContentsMargins(0, 0, 0, 0)
 		pagination_row.setSpacing(8)
@@ -1498,7 +1680,17 @@ class VerifyPage(QWidget):
 		pagination_row.addWidget(self._prev_btn)
 		pagination_row.addWidget(self._page_label)
 		pagination_row.addWidget(self._next_btn)
-		root.addLayout(pagination_row)
+		results_section.body_layout.addLayout(pagination_row)
+
+		root.addWidget(results_section)
+		self._results_section = results_section
+		# Re-tint results chrome + rebuild result cards on a light/dark toggle.
+		theme.themeChanged.connect(self._apply_theme)
+
+		# Cross-check 결과 — 내부(로컬) 문서 ↔ 외부(웹) 조사 비교. 내/외부 데이터
+		# 통합의 핵심 산출물이므로 접지 않고 항상 표시한다.
+		self._crosscheck_panel = _CrosscheckPanel()
+		root.addWidget(self._crosscheck_panel)
 
 		root.addStretch(1)
 
@@ -1603,7 +1795,7 @@ class VerifyPage(QWidget):
 		"""Re-tint the results chrome and rebuild the (cached) result cards so
 		the verify page follows a light/dark toggle."""
 		self._results_count_badge.setStyleSheet(_COUNT_BADGE_QSS % theme.palette())
-		self._results_header.setStyleSheet(_FILTER_CHIP_QSS % theme.palette())
+		self._results_section.setStyleSheet(_FILTER_CHIP_QSS % theme.palette())
 		self._render_results()
 
 	# -- data loading ---------------------------------------------------------
@@ -1645,8 +1837,9 @@ class VerifyPage(QWidget):
 			self._workspace_id = str(response["workspaceId"])
 			self._update_workspace_label()
 
-		# Toggle the empty-state card + sections panel + results header against
-		# whatever the summary reports — one source of truth (``available``).
+		# Toggle the empty-state card + sections panel + results section +
+		# cross-check panel against whatever the summary reports — one source
+		# of truth (``available``).
 		available = bool(self._summary and self._summary.get("available"))
 		self._empty_state_card.setVisible(not available)
 		sections_overview = (
@@ -1662,10 +1855,18 @@ class VerifyPage(QWidget):
 		self._sections_panel.setVisible(available)
 		if available:
 			self._sections_panel.apply(sections_overview, flow_source)
-		self._results_header.setVisible(available)
-		self._prev_btn.setVisible(available)
-		self._next_btn.setVisible(available)
-		self._page_label.setVisible(available)
+		self._results_section.setVisible(available)
+
+		# Cross-check 패널 — 검증 결과가 있을 때만 표시. 로컬 문서 미등록 /
+		# 불일치 0건 같은 상태 구분은 패널의 apply()가 처리한다.
+		crosscheck_payload = (
+			self._summary.get("crosscheck")
+			if isinstance(self._summary, dict)
+			else None
+		)
+		self._crosscheck_panel.setVisible(available)
+		if available:
+			self._crosscheck_panel.apply(crosscheck_payload)
 
 		self._render_results()
 
@@ -1696,6 +1897,15 @@ class VerifyPage(QWidget):
 			f"총 {counts['전체']}개 자료 ·"
 			f" 높음 {counts['높음']} · 중간 {counts['중간']} · 낮음 {counts['낮음']}"
 		)
+		# Collapsed-header badge — the same counts stay visible while the
+		# section is folded, so the user can decide whether to expand.
+		if counts["전체"] > 0:
+			self._results_section.set_status(
+				f"✓ 총 {counts['전체']}개 ·"
+				f" 높음 {counts['높음']} · 중간 {counts['중간']} · 낮음 {counts['낮음']}"
+			)
+		else:
+			self._results_section.set_status("")
 
 		filtered = [
 			item for item in self._items

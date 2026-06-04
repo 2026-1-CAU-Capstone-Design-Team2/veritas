@@ -29,6 +29,13 @@ rag_tool/
   - RAGService.retrieve()를 호출하는 thin wrapper
   - chat-visible
 
+table_query_tool/
+  - table_query
+  - 로컬 접근 폴더에 등록된 .csv/.xlsx 원본 파일에 대한 구조화 질의
+    (list_tables / describe / query: 필터·집계·정렬)
+  - 임베딩/색인을 거치지 않고 원본 전체 데이터를 직접 읽음 (loss 없음)
+  - chat-visible
+
 autosurvey_tool/
   - AutoSurveyWorkflow를 하나의 high-level tool처럼 호출하는 adapter
   - chat-visible
@@ -54,7 +61,9 @@ final_report_tool/
 DEFAULT_OPTIONAL_TOOL_NAMES = (
     "current_time",
     "rag_search",
+    "table_query",
     "autosurvey",
+    "screen_context",
 )
 ```
 
@@ -155,6 +164,23 @@ tools/rag_tool/
 
 agent/chat_agent.py
   - rag_search 결과를 받아 최종 답변 생성
+```
+
+---
+
+## Local table query 관련 책임 분리
+
+```text
+services/local_corpus/table_query_service.py
+  - manifest에서 .csv/.xlsx 원본 경로 조회
+  - 전체 데이터 로드 + 필터/집계/정렬 실행
+
+tools/table_query_tool/
+  - table_query wrapper only
+  - 로컬 데이터 → 외부 LLM 전송 차단 가드 (rag_service와 동일 패턴)
+
+agent/chat_agent.py
+  - table_query 결과를 받아 최종 답변 생성 (항상 로컬 LLM)
 ```
 
 ---

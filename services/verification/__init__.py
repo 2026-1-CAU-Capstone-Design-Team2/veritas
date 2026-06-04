@@ -13,7 +13,6 @@ from .artifact_loader import ArtifactLoader
 from .indexing.dense_index import DenseIndex
 from .models import VerificationArtifacts, VerificationConfig
 from .persistence import VerificationPersistence
-from .service import ALL_TASKS, VerificationService
 
 __all__ = [
     "ALL_TASKS",
@@ -24,3 +23,11 @@ __all__ = [
     "VerificationPersistence",
     "VerificationService",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"ALL_TASKS", "VerificationService"}:
+        from .service import ALL_TASKS, VerificationService
+
+        return {"ALL_TASKS": ALL_TASKS, "VerificationService": VerificationService}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

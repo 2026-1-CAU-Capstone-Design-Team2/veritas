@@ -69,6 +69,11 @@ STATE: dict[str, Any] = {
             "sampleCount": 3,
             "planCount": 5,
         },
+        "autosurveyOpenAI": {
+            "provider": "local",
+            "apiKeySet": False,
+            "apiKeyPreview": "",
+        },
         # 병렬 디코딩 동시 요청 수 (설정 > 고급 설정 > 병렬 디코딩). Drives
         # LLMClient.max_parallel; 1 = serial (default). Rides the bootstrap
         # response into the frontend STATE so the stepper shows the live value.

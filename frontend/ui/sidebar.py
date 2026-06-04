@@ -236,7 +236,6 @@ class Sidebar(QFrame):
 			("\ucd08\uc548", "draft", "draft.svg", "draft_active.svg"),
 			("\ubb38\uc11c \ubcf4\uc870", "document_assist", "document_assist.svg", "document_assist_active.svg"),
 			("\ucc44\ud305", "write", "write.svg", "write_active.svg"),
-			("\ud53c\ub4dc\ubc31", "feedback", "feedback.svg", "feedback_active.svg"),
 			("\uc124\uc815", "settings", "settings.svg", "settings_active.svg"),
 			("\uac00\uc774\ub4dc", "guide", "guide.svg", "guide_active.svg"),
 		]
@@ -280,7 +279,7 @@ class Sidebar(QFrame):
 		self._refresh_workspace_footer()
 
 		# Workspace switching rebuilds the backend registry; it must not be
-		# triggered while research/feedback/etc. are in flight.
+		# triggered while research/etc. are in flight.
 		get_job_manager().busy_changed.connect(self._sync_busy_state)
 		self._sync_busy_state()
 

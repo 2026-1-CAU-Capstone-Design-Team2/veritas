@@ -3,7 +3,7 @@
 Design
 ------
 Every long-running call to the backend (LLM inference, AutoSurvey, workspace
-rebuild, feedback analysis, ...) goes through this manager so we never run
+rebuild, ...) goes through this manager so we never run
 blocking work on the UI thread. The manager also owns the "busy" model that
 the UI binds to so incompatible operations are *prevented* at input time —
 e.g. while AutoSurvey is running, the chat input is automatically disabled
@@ -40,12 +40,11 @@ class JobCategory:
 	RESEARCH = "research"
 	CHAT = "chat"
 	DRAFT = "draft"
-	FEEDBACK = "feedback"
 	DOC_ANALYZE = "doc_analyze"
 	WORKSPACE_SWITCH = "workspace_switch"
 	# Verification runs over a workspace's saved AutoSurvey artifacts. It is
-	# much lighter than research (no LLM calls, no fetching), so chat / draft /
-	# feedback can keep running in parallel — only research / workspace switch
+	# much lighter than research (no LLM calls, no fetching), so chat / draft
+	# can keep running in parallel — only research / workspace switch
 	# can race with it.
 	VERIFY = "verify"
 	# Inline ghost-writing in the standalone editor. Suggestions are tiny,
@@ -64,14 +63,12 @@ _BLOCKS_THIS: dict[str, set[str]] = {
 		JobCategory.RESEARCH,
 		JobCategory.CHAT,
 		JobCategory.DRAFT,
-		JobCategory.FEEDBACK,
 		JobCategory.DOC_ANALYZE,
 		JobCategory.WORKSPACE_SWITCH,
 		JobCategory.VERIFY,
 	},
 	JobCategory.CHAT: {JobCategory.RESEARCH, JobCategory.CHAT},
 	JobCategory.DRAFT: {JobCategory.RESEARCH, JobCategory.DRAFT},
-	JobCategory.FEEDBACK: {JobCategory.RESEARCH, JobCategory.FEEDBACK},
 	JobCategory.DOC_ANALYZE: {JobCategory.RESEARCH, JobCategory.DOC_ANALYZE},
 	JobCategory.WORKSPACE_SWITCH: {
 		JobCategory.RESEARCH,
