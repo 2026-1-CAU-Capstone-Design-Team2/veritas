@@ -209,7 +209,6 @@ class ChatAgent:
                 kwargs["source_scope_filter"] = source_scope_filter
                 kwargs["include_private_local"] = include_private_local
             answer = self.rag_service.answer(question, **kwargs)
-            self._append_history(question, answer)
             return answer
 
     def ask_auto(self, question: str, *, stream: bool = False) -> str:
@@ -347,7 +346,6 @@ class ChatAgent:
                     kwargs["source_scope_filter"] = source_scope_filter
                     kwargs["include_private_local"] = include_private_local
                 for chunk in self.rag_service.iter_answer(question, **kwargs):
-                    collected.append(chunk)
                     yield chunk
             except AttributeError:
                 # Defensive: older rag_service without iter_answer — one-shot.
@@ -360,9 +358,7 @@ class ChatAgent:
                     kwargs["source_scope_filter"] = source_scope_filter
                     kwargs["include_private_local"] = include_private_local
                 answer = self.rag_service.answer(question, **kwargs)
-                collected.append(answer)
                 yield answer
-            self._append_history(question, "".join(collected))
 
     # -- editor (standalone writer) surfaces ---------------------------------
     # Power the editor window's ghost-writing / quick actions / chat. They reuse

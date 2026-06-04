@@ -88,7 +88,6 @@ def console_logs_enabled() -> bool:
         "terminal",
     }
 
-
 def configure_console_logs_from_argv() -> None:
     global _CONSOLE_LOGS
     _CONSOLE_LOGS = console_logs_enabled()
@@ -112,10 +111,12 @@ def configure_screen_debug_from_argv() -> None:
     be filtered) and sets ``VERITAS_SCREEN_TRACE=1`` so the child emits the
     focused trace. Must run after :func:`configure_console_logs_from_argv` so it
     can override ``_CONSOLE_LOGS`` even when ``--console-logs`` was not passed."""
-    global _SCREEN_DEBUG, _CONSOLE_LOGS
+    global _SCREEN_DEBUG, _CONSOLE_LOGS, _MEMORY_DEBUG
     if "--screen-debug" in sys.argv:
         _SCREEN_DEBUG = True
         _CONSOLE_LOGS = True
+        _MEMORY_DEBUG = True  # screen debugging is most useful when paired with memory debugging
+        os.environ["VERITAS_MEMORY_DEBUG"] = "1"
         os.environ["VERITAS_SCREEN_TRACE"] = "1"
     while "--screen-debug" in sys.argv:
         sys.argv.remove("--screen-debug")
@@ -136,13 +137,62 @@ def configure_proactive_debug_from_argv() -> None:
     Same shape as :func:`configure_screen_debug_from_argv`: forces console
     streaming on (the relay needs the pipe to filter) and sets
     ``VERITAS_PROACTIVE_LOG=1`` so the API child emits the proactive lines."""
-    global _PROACTIVE_DEBUG, _CONSOLE_LOGS
+    global _PROACTIVE_DEBUG, _CONSOLE_LOGS, _MEMORY_DEBUG
     if "--proactive-debug" in sys.argv:
         _PROACTIVE_DEBUG = True
         _CONSOLE_LOGS = True
+        _MEMORY_DEBUG = True  # proactive logging is most useful when paired with memory debugging
+        os.environ["VERITAS_MEMORY_DEBUG"] = "1"
         os.environ["VERITAS_PROACTIVE_LOG"] = "1"
     while "--proactive-debug" in sys.argv:
         sys.argv.remove("--proactive-debug")
+
+
+_MEMORY_DEBUG: bool = False
+
+
+def memory_debug_enabled() -> bool:
+    return _MEMORY_DEBUG
+
+
+def _take_argv_value(flag: str, default: str) -> str | None:
+    """Remove ``flag`` (and its optional value) from argv.
+
+    Returns the following token as the value, ``default`` when the flag is bare
+    (next token is another flag or absent), or None when the flag is not given.
+    """
+    if flag not in sys.argv:
+        return None
+    index = sys.argv.index(flag)
+    value = default
+    if index + 1 < len(sys.argv) and not sys.argv[index + 1].startswith("-"):
+        value = sys.argv[index + 1]
+        del sys.argv[index + 1]
+    del sys.argv[index]
+    return value
+
+
+def configure_memory_debug_from_argv() -> None:
+    """``--mem-debug``: stream the memory pipeline trace (``[memory][*]``) to the
+    console. ``--mem-debug-file [PATH]``: also append it to a dedicated file
+    (implies ``--mem-debug``; default ``logs/memory_trace.log``).
+
+    Sets ``VERITAS_MEMORY_DEBUG=1`` (and ``VERITAS_MEMORY_DEBUG_FILE``) so the
+    spawned API child — which owns the memory runtime — emits the trace, and
+    forces console streaming on so the relay surfaces it. Must run after
+    :func:`configure_console_logs_from_argv` so it can override ``_CONSOLE_LOGS``
+    even when ``--console-logs`` was not passed."""
+    global _MEMORY_DEBUG, _CONSOLE_LOGS
+    file_path = _take_argv_value("--mem-debug-file", "logs/memory_trace.log")
+    enable = "--mem-debug" in sys.argv or file_path is not None
+    while "--mem-debug" in sys.argv:
+        sys.argv.remove("--mem-debug")
+    if enable:
+        _MEMORY_DEBUG = True
+        _CONSOLE_LOGS = True
+        os.environ["VERITAS_MEMORY_DEBUG"] = "1"
+    if file_path is not None:
+        os.environ["VERITAS_MEMORY_DEBUG_FILE"] = file_path
 
 
 class DownloadWorker(QObject):
@@ -1019,7 +1069,11 @@ def _start_output_stream(process: subprocess.Popen, name: str, path: Path) -> No
         # filters are mutually exclusive; if both are given we keep both.
         screen_only = screen_debug_enabled()
         proactive_only = proactive_debug_enabled()
-        focused = screen_only or proactive_only
+        # --mem-debug alone focuses the console on [memory] lines; paired with
+        # --screen-debug/--proactive-debug those take precedence (memory still
+        # reaches the log file + dedicated trace file via VERITAS_MEMORY_DEBUG).
+        memory_only = memory_debug_enabled() and not screen_only and not proactive_only
+        focused = screen_only or proactive_only or memory_only
         with path.open("a", encoding="utf-8", errors="replace") as log:
             for line in stream:
                 log.write(line)
@@ -1028,6 +1082,7 @@ def _start_output_stream(process: subprocess.Popen, name: str, path: Path) -> No
                     keep = (
                         (screen_only and "[screen_debug]" in line)
                         or (proactive_only and "[proactive]" in line)
+                        or (memory_only and "[memory]" in line)
                     )
                     if keep:
                         print(line, end="", flush=True)
@@ -1246,6 +1301,10 @@ def main() -> int:
     # screen trace that the relay then filters down to.
     configure_screen_debug_from_argv()
     configure_proactive_debug_from_argv()
+    # --mem-debug / --mem-debug-file: emit the memory pipeline trace from the
+    # API child and surface [memory] lines on the console. After the others so
+    # it can override the console mode like screen/proactive debug do.
+    configure_memory_debug_from_argv()
     # Guarantee no orphaned llama-server/API/UI even on a hard launcher kill.
     _install_kill_on_close_job()
     app = QApplication(sys.argv)

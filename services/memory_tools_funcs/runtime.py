@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -14,10 +15,16 @@ from core.memory.policy import ProfilePolicyDispatcher
 from core.memory.request import CallConstraints, CallRequest
 from services.memory_tools_funcs.context_builder import build_messages
 from services.memory_tools_funcs.debug import mem_debug, mem_debug_enabled
+from services.memory_tools_funcs.external_context.embedding_recall_store import (
+    EmbeddingRecallStore,
+)
 from services.memory_tools_funcs.external_context.recall_storage import RecallStorage
-from services.memory_tools_funcs.main_context.heuristic_memory import extract_explicit_facts
+from services.memory_tools_funcs.main_context.llm_fact_extractor import LLMFactExtractor
 from services.memory_tools_funcs.main_context.queue_manage import QueueManager, utc_now_iso
-from services.memory_tools_funcs.main_context.working_context import WorkingContextManager
+from services.memory_tools_funcs.main_context.working_context import (
+    DEFAULT_WORKING_CONTEXT_TOKENS,
+    WorkingContextManager,
+)
 from services.memory_tools_funcs.store import MemoryStore
 from services.memory_tools_funcs.summerizer import MemorySummarizer
 from services.memory_tools_funcs.token_counter import TokenCounter
@@ -36,6 +43,10 @@ class PreparedCall:
     extra_sampling_params: dict[str, Any] | None = None
     timeout_sec: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Original user utterance to mine for working facts AFTER the response —
+    # empty when the turn is not recorded. Extraction is a ~2s LLM call, so it
+    # runs in the background on commit, off the response hot path.
+    record_content: str = ""
 
 
 class MemoryRuntime:
@@ -53,10 +64,7 @@ class MemoryRuntime:
         self.max_context_tokens = int(max_context_tokens)
 
         self.token_counter = TokenCounter(raw_llm)
-        self.store = MemoryStore(self.workspace_root, reuse_connection=True)
-        self.recall = RecallStorage(self.store, self.token_counter)
-        self.working = WorkingContextManager(self.store, self.token_counter)
-        self.queue = QueueManager(self.store, self.token_counter, self.recall)
+        self.fact_extractor = LLMFactExtractor(raw_llm)
         self.summarizer = MemorySummarizer(raw_llm)
         self.policy_dispatcher = ProfilePolicyDispatcher()
 
@@ -64,18 +72,78 @@ class MemoryRuntime:
         self._flush_lock = threading.Lock()
         self._flush_in_progress = False
 
+        # working-fact 추출 큐. single worker가 FIFO로 처리해 같은 category
+        # 교체(예: 이름 변경)가 turn 순서대로 반영되게 한다.
+        self._fact_queue: queue.Queue = queue.Queue()
+        self._fact_worker: threading.Thread | None = None
+        self._fact_worker_lock = threading.Lock()
+
+        self._build_storage()
+
+    def _build_storage(self) -> None:
+        """현재 workspace_root 기준으로 storage 핸들을 만들고 dense 백필을 띄운다."""
+        self.store = MemoryStore(self.workspace_root, reuse_connection=True)
+        self.embedding_recall = EmbeddingRecallStore(self.workspace_root, self.raw_llm)
+        self.recall = RecallStorage(
+            self.store, self.token_counter, embedding_store=self.embedding_recall
+        )
+        self.working = WorkingContextManager(self.store, self.token_counter)
+        self.queue = QueueManager(self.store, self.token_counter, self.recall)
+        self._launch_embedding_backfill()
+
     def configure_workspace(self, workspace_root: Path) -> None:
         """workspace 전환 시 storage 핸들을 새 디렉토리로 교체한다."""
         self.store.close()
+        if getattr(self, "embedding_recall", None) is not None:
+            self.embedding_recall.close()
         self.workspace_root = Path(workspace_root)
-        self.store = MemoryStore(self.workspace_root, reuse_connection=True)
-        self.recall = RecallStorage(self.store, self.token_counter)
-        self.working = WorkingContextManager(self.store, self.token_counter)
-        self.queue = QueueManager(self.store, self.token_counter, self.recall)
+        self._build_storage()
 
     def close(self) -> None:
         """Release runtime-owned storage resources."""
+        with self._fact_worker_lock:
+            worker = self._fact_worker
+            self._fact_worker = None
+        if worker is not None:
+            self._fact_queue.put(None)  # drain queued extractions, then stop
+            worker.join(timeout=5)
         self.store.close()
+        if getattr(self, "embedding_recall", None) is not None:
+            self.embedding_recall.close()
+
+    # Upper bound on rows pulled into a one-shot dense backfill for a
+    # workspace whose recall predates the embedding index. Recall keeps every
+    # turn, so this caps embed cost to the most recent slice.
+    EMBED_BACKFILL_LIMIT = 2000
+
+    def _launch_embedding_backfill(self) -> None:
+        """Background one-shot: index pre-existing recall turns into the dense
+        store so a workspace opened before embedding recall existed still gets
+        semantic search, without blocking the first chat turn. Captures the
+        current recall/embedding handles so a workspace swap mid-backfill does
+        not retarget the worker."""
+        recall = self.recall
+        embedding_recall = self.embedding_recall
+        t = threading.Thread(
+            target=self._embedding_backfill_worker,
+            args=(recall, embedding_recall),
+            name="memory-embed-backfill",
+            daemon=True,
+        )
+        t.start()
+
+    def _embedding_backfill_worker(self, recall, embedding_recall) -> None:
+        try:
+            if embedding_recall.count() > 0:
+                return
+            rows = recall.tail(limit=self.EMBED_BACKFILL_LIMIT)
+            if not rows:
+                return
+            indexed = embedding_recall.backfill(rows)
+            if indexed:
+                mem_debug("embed", f"backfilled {indexed} recall turns into dense index")
+        except Exception as e:
+            print(f"[memory][embed_backfill][warn] {type(e).__name__}: {e}")
 
     def update_n_ctx(self, max_context_tokens: int) -> None:
         """모델 스왑 후 n_ctx를 갱신한다."""
@@ -183,12 +251,20 @@ class MemoryRuntime:
     def prepare(self, req: CallRequest) -> PreparedCall:
         """CallRequest를 받아 messages[]를 만들고 USER turn을 기록한다."""
         invocation_id = str(uuid.uuid4())
+        
+        """
+        MemoryBudget으로 만들어지면, 속성 결정됨
+            - usable_prompt_tokens : 응답 reserve를 뺀 입력 가능 token 수
+            - warning_tokens : memory pressure 경고 임계값.
+            - flush_tokens : FIFO evict + summarize 임계값.
+        """
         budget = MemoryBudget(
             max_context_tokens=self.max_context_tokens,
             system_tokens=self.token_counter.count(req.task_instruction),
             current_request_tokens=self.token_counter.count(req.user_content),
         )
 
+        # debug용 로그
         if mem_debug_enabled():
             c = req.constraints
             mem_debug(
@@ -205,17 +281,25 @@ class MemoryRuntime:
                 f"flush={self.queue.is_flush_pressure(budget)}]",
             )
 
+        # no_record 제약이 없으면 invocations.jsonl 한 줄 기록 
+        # (메모리 디버깅과 호출 패턴 분석용, 실제 LLM 프롬프트에는 영향 없음).
         if not req.constraints.no_record:
             self._log_invocation(invocation_id, req, budget)
 
-        # flush_pressure 감지 시 즉시 flush 안 함. 이번 호출은 옛 summary로 진행하고,
+        # 플래그만 마킹하고, flush_pressure 감지 시 즉시 flush 안 함. 
+        # 이번 호출은 옛 summary로 진행하고,
         # commit() 끝난 뒤 background thread로 처리 (1세대 stale 감수).
         flush_pending = (
             self._should_record(req.constraints)
             and self.queue.is_flush_pressure(budget)
         )
-
-        # USER turn 기록은 build_messages 뒤로 — history에 user_content가 중복 들어가는 것 방지.
+        """
+        =================================중요=================================
+         - build_messages()는 MemoryBudget을 받아서, 시스템 프롬프트 + FIFO
+            prompts 생성
+            # USER turn 기록은 build_messages 뒤로 
+            # — history에 user_content가 중복 들어가는 것 방지.
+        """
         messages = build_messages(
             req=req,
             budget=budget,
@@ -235,6 +319,10 @@ class MemoryRuntime:
                 f"system_tokens={self.token_counter.count(messages[0]['content']) if messages else 0}",
             )
 
+
+        # FIFO/Recall에 USER turn 기록. working fact 추출(LLM ~2s)은 응답 후
+        # commit에서 background로 돌려 hot path를 막지 않는다.
+        record_content = ""
         if self._should_record(req.constraints):
             record_content = req.record_content or req.user_content
             self.queue.append_event(
@@ -248,14 +336,6 @@ class MemoryRuntime:
                 f"id={invocation_id[:8]} recorded USER turn "
                 f"({self.token_counter.count(record_content)} tokens)",
             )
-            for fact in extract_explicit_facts(record_content):
-                self.working.append_fact(
-                    fact,
-                    source="heuristic",
-                    tags=["explicit_user"],
-                    max_tokens=budget.working_context_tokens,
-                )
-                mem_debug("working", f"id={invocation_id[:8]} heuristic fact appended: {fact!r}")
         elif mem_debug_enabled():
             mem_debug(
                 "prepare",
@@ -272,6 +352,7 @@ class MemoryRuntime:
             sampling_params=req.sampling_params,
             extra_sampling_params=req.extra_sampling_params,
             timeout_sec=req.timeout_sec,
+            record_content=record_content,
             metadata={
                 "method_hint": req.method_hint,
                 "profile": req.profile,
@@ -279,6 +360,14 @@ class MemoryRuntime:
             },
         )
 
+
+
+#########################################################################################
+#########################################################################################
+    """
+        ASSISTANT 저장 + flush 트리거 
+        append_event() 가 USER turn 저장과 똑같은 경로로 FIFO + Recall 에 동시 INSERT
+    """
     def commit(self, prepared: PreparedCall, assistant_text: str) -> None:
         """LLM 응답을 ASSISTANT turn으로 기록하고, flush가 마킹돼 있으면 bg launch."""
         inv = prepared.invocation_id[:8]
@@ -297,9 +386,60 @@ class MemoryRuntime:
                     f"({self.token_counter.count(text)} tokens)",
                 )
 
+        if prepared.record_content:
+            self._launch_fact_extraction(prepared.record_content)
+
         if prepared.metadata.get("flush_pending"):
             mem_debug("commit", f"id={inv} flush_pending=True -> launching background flush")
             self._maybe_launch_bg_flush(str(prepared.metadata.get("profile") or "chat"))
+
+    def _launch_fact_extraction(self, record_content: str) -> None:
+        """Queue the user utterance for background working-fact extraction.
+
+        The LLM judgment is ~2s and working facts are only read on the *next*
+        turn, so this stays off the response path. A single worker drains the
+        queue in order, so same-category replacements (e.g. a name change)
+        apply in turn order. The current ``working`` handle is captured per
+        item so a workspace swap mid-flight does not retarget the write."""
+        self._ensure_fact_worker()
+        self._fact_queue.put((self.working, record_content))
+
+    def _ensure_fact_worker(self) -> None:
+        if self._fact_worker is not None:
+            return
+        with self._fact_worker_lock:
+            if self._fact_worker is not None:
+                return
+            worker = threading.Thread(
+                target=self._fact_worker_loop, name="memory-fact-extract", daemon=True
+            )
+            self._fact_worker = worker
+            worker.start()
+
+    def _fact_worker_loop(self) -> None:
+        while True:
+            item = self._fact_queue.get()
+            try:
+                if item is None:
+                    return
+                working, record_content = item
+                mem_debug("working", f"extract start: {record_content!r}")
+                for category, fact in self.fact_extractor.extract(record_content):
+                    appended = working.append_fact(
+                        fact,
+                        category=category,
+                        source="llm",
+                        tags=["explicit_user"],
+                        max_tokens=DEFAULT_WORKING_CONTEXT_TOKENS,
+                    )
+                    mem_debug(
+                        "working",
+                        f"stored: {category}={fact!r} appended={appended}",
+                    )
+            except Exception as e:
+                print(f"[memory][fact_extract][warn] {type(e).__name__}: {e}")
+            finally:
+                self._fact_queue.task_done()
 
     @staticmethod
     def _should_record(constraints: CallConstraints) -> bool:
@@ -363,6 +503,9 @@ class MemoryRuntime:
         finally:
             with self._flush_lock:
                 self._flush_in_progress = False
+
+############################################################################################
+############################################################################################
 
     def _flush_fifo(self, *, profile: str = "chat") -> None:
         """FIFO 오래된 prefix를 evict하고 summary로 압축한다."""

@@ -24,7 +24,18 @@ def build_messages(
     retrieval_policy: RetrievalPolicy | None = None,
     history_limit: int = 6,
 ) -> list[dict[str, Any]]:
-    """Build messages[] while enforcing the per-tier memory budget."""
+    """
+        Build messages[] while enforcing the per-tier memory budget.
+    """
+    """
+        system prompt + working context + FIFO summary + retrieved memory rows 순으로 프롬프트에 넣으면서, 
+        MemoryBudget의 토큰 한도 내에서 최대한 많은 메모리를 활용하는 방식.
+
+        - base_system_msg: 메모리 블록이 없는 기본 시스템 프롬프트 (COMMON_GATEWAY_INSTRUCTIONS + task_instruction)
+        - required_tokens: 이번 호출에서 반드시 필요한 토큰의 하한 값(최소 토큰 개수)
+        - remaining_tokens: 메모리 블록에 채워질 수 있는 토큰 예산 (budget.usable_prompt_tokens - required_tokens)
+    """
+    
     c = req.constraints
     token_counter = queue.token_counter
     memory_allowed = (
@@ -40,9 +51,21 @@ def build_messages(
     required_tokens = token_counter.count(base_system_msg) + token_counter.count(req.user_content)
     remaining_tokens = max(0, budget.usable_prompt_tokens - required_tokens)
 
+###########################################################################################################
+###########################################################################################################  
+    """
+        working_context 우선 주입. @ working.load()
+            - working_context는 메모리에서 가장 최근에 만들어진 컨텍스트
+            - FIFO보다 최신 정보 담고 있을 가능성 높음.
+        내부적으로, WorkingContextManager.load() 호출
+
+    """
     working_context = ""
     if memory_allowed and not c.grounded and not working.is_empty() and remaining_tokens > 0:
         cap = min(budget.working_context_tokens, remaining_tokens)
+        # working.load() -> workingContextManger.load() 
+        #                -> MemoryStore.format_working_records()
+        # 만들어진 텍스트는, _trim_to_tokens로 cap 에 맞춰 잘린다.
         working_context = _trim_to_tokens(working.load(), token_counter, cap)
         remaining_tokens -= token_counter.count(working_context)
         if working_context:
@@ -52,6 +75,14 @@ def build_messages(
                 f"cap={cap}, remaining={remaining_tokens})",
             )
 
+###########################################################################################################
+###########################################################################################################
+    """  Latest Summary 주입 """
+    """
+        load_latest_summary()로 FIFO의 최신 summary를 가져와서, 남은 토큰 예산 내에서 최대한 주입.
+            - summary는 FIFO의 가장 최근 상태를 압축해서 담고 있을 가능성 높음.
+            - summary 토큰 수가 cap보다 많으면, _trim_to_tokens로 자름
+    """
     fifo_summary = ""
     if req.use_history and memory_allowed and not c.grounded and remaining_tokens > 0:
         summary = store.load_latest_summary()
@@ -70,6 +101,13 @@ def build_messages(
     # FIFO is only added to the prompt when use_history is True (see below), so
     # when it is False recall results must not be suppressed as "duplicates" of
     # rows that never enter the prompt.
+###########################################################################################################
+###########################################################################################################
+    """
+        FIFO 최근 행을 dedupe baseline 으로 설정.
+        -> QueueManager.recent_rows() -> FifoStorage.tail()
+        -> 6개의 최근 FIFO 행을 가져와서, 이 행들의 ID와 content를 중복 제외 기준으로 삼는다.
+    """
     recent_fifo_rows = (
         queue.recent_rows(limit=history_limit)
         if (req.use_history and memory_allowed)
@@ -77,6 +115,13 @@ def build_messages(
     )
     excluded_ids, excluded_contents = _memory_row_keys(recent_fifo_rows)
     query = (req.record_content or req.user_content or "").strip()
+    
+###########################################################################################################
+###########################################################################################################
+    # RetrievalPolicy에 따라 recall을 수행할지 여부와 recall 시 최대 몇 개의 행을 가져올지 결정한다.
+    """
+        _decide_retrieval -> chat profile 이면 recall_limit=3 이 반환
+    """
     retrieval_decision = _decide_retrieval(
         retrieval_policy=retrieval_policy,
         query=query,
@@ -84,8 +129,26 @@ def build_messages(
         memory_allowed=memory_allowed and not c.grounded,
     )
 
+###########################################################################################################
+###########################################################################################################
+    """ 
+    Recall 검색 
+    search -> _fts_query() -> _strip_particle() -> _search_sqlite , 
+    못잡으면 fallback(_like_fallback) -> _rerank()
+
+    "내 이름은 박서원이고, 삼성 주가가 어떻게 됐는지 알려줘" 가 query 로 오면:
+        regex 토큰: [내, 이름은, 박서원이고, 삼성, 주가가, 어떻게, 됐는지, 알려줘]
+        _strip_particle() 통과 후: [내, 이름, 박서원, 삼성, 주가, 어떻게, 됐는지, 알려줘]
+        길이 < 3 제거: [이름, 박서원, 삼성, 주가, 어떻게, 됐는지, 알려줘] (내, 길이 < 3 인 토큰 drop)
+        stopword 제거: 어떻게, 알려줘 제거 → [이름, 박서원, 삼성, 주가, 됐는지]
+        길이 desc 정렬: [박서원, 됐는지, 이름, 삼성, 주가]
+        상위 6개 (5개 그대로): "박서원" OR "됐는지" OR "이름" OR "삼성" OR "주가"
+    
+        _strip_particle() 
+    """
     recall_context = ""
     if retrieval_decision.recall_limit > 0 and remaining_tokens > 0:
+        # 
         recall_raw_hits = (
             queue.recall.search(query, limit=max(retrieval_decision.recall_limit * 3, retrieval_decision.recall_limit))
             if query
@@ -107,6 +170,7 @@ def build_messages(
             cap = min(budget.recall_tokens, remaining_tokens)
             recall_context = _trim_to_tokens(raw_recall, token_counter, cap)
             remaining_tokens -= token_counter.count(recall_context)
+            # _memory_rows_keys()로 앞에서 가져온 키와 일치하는 건 제외한다.
             recall_ids, recall_contents = _memory_row_keys(recall_rows)
             excluded_ids.update(recall_ids)
             excluded_contents.update(recall_contents)
@@ -117,6 +181,8 @@ def build_messages(
             )
 
     warn_pressure = memory_allowed and queue.is_warning_pressure(budget)
+    
+    # 시스템 메시지 조립. system_msg는 시스템 메시지 + working context + summary + recall context + 메모리 압박 경고 등을 담는다.
     system_msg = assemble_system_message(
         task_instruction=req.task_instruction,
         working_context=working_context,
@@ -126,6 +192,29 @@ def build_messages(
         json_strict=c.json_strict,
     )
 
+    # FIFO history 를 chat messages 로 변환
+    # as_chat_messages -
+    #  -> tail 부터 거꾸로 채우는 방식
+    #  ->가장 최근 turn 부터 토큰 cap 까지 채우다가 한 turn 이 cap 을 넘기면 멈춤
+    """ message 결과물
+                [
+            {
+                "role": "system",
+                "content": (
+                    "COMMON_GATEWAY_INSTRUCTIONS...\n\n"
+                    "(task_instruction)\n\n"
+                    "## Working Context\n- 사용자 이름: 박서원\n- 프로젝트: veritas\n\n"
+                    "## Recent Conversation Summary\n사용자는 ...\n\n"
+                    "## Retrieved Recall Context\n- user @ 2026-06-01: 삼성전자 시가총액...\n"
+                ),
+            },
+            {"role": "user", "content": "(직전 user turn)"},
+            {"role": "assistant", "content": "(직전 assistant turn)"},
+            ... (FIFO 최근 6 turn)
+            {"role": "user", "content": "내 이름은 박서원이고, 삼성 주가가 어떻게 됐는지 알려줘"},
+        ]
+
+    """
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_msg}]
 
     if req.use_history and memory_allowed and remaining_tokens > 0:

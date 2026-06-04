@@ -12,6 +12,15 @@ from services.memory_tools_funcs.token_counter import TokenCounter
 
 DEFAULT_WORKING_CONTEXT_TOKENS = 1200
 
+# Categories whose fact is single-valued: a new declaration replaces the prior
+# one instead of letting a contradiction accumulate (e.g. the user's name or
+# project). Other categories — including ``None`` and "remember" — accumulate.
+_SINGLE_VALUE_CATEGORIES = frozenset({"name", "project"})
+
+
+def _category_tag(category: str) -> str:
+    return f"category:{category}"
+
 
 def utc_now_iso() -> str:
     """Current UTC timestamp in ISO-8601."""
@@ -54,26 +63,45 @@ class WorkingContextManager:
         self,
         fact: str,
         *,
+        category: str | None = None,
         source: str = "heuristic",
         confidence: float = 1.0,
         tags: list[str] | None = None,
         max_tokens: int | None = None,
     ) -> bool:
-        """Append one stable fact record if it is not already present."""
+        """Append one stable fact record, replacing the prior value of a
+        single-valued ``category`` (name/project) so contradictions don't
+        accumulate. Returns False when nothing changed (exact duplicate, or the
+        category already holds this value)."""
         text = self._clean_fact(fact)
         if not text:
             return False
         current = self.records()
-        key = self._normalize_fact(text)
-        if key in {self._normalize_fact(row.get("text")) for row in current}:
-            return False
+        cat = str(category or "").strip()
+
+        if cat in _SINGLE_VALUE_CATEGORIES:
+            cat_tag = _category_tag(cat)
+            same_category = [row for row in current if cat_tag in (row.get("tags") or [])]
+            normalized = self._normalize_fact(text)
+            if any(self._normalize_fact(row.get("text")) == normalized for row in same_category):
+                return False
+            # Drop the stale value(s) for this category before adding the new one.
+            current = [row for row in current if cat_tag not in (row.get("tags") or [])]
+        else:
+            key = self._normalize_fact(text)
+            if key in {self._normalize_fact(row.get("text")) for row in current}:
+                return False
+
+        row_tags = list(tags or [])
+        if cat:
+            row_tags.append(_category_tag(cat))
         current.append(
             {
                 "id": str(uuid.uuid4()),
                 "text": text,
                 "source": str(source or "unknown"),
                 "confidence": float(confidence),
-                "tags": list(tags or []),
+                "tags": row_tags,
                 "updated_at": utc_now_iso(),
             }
         )

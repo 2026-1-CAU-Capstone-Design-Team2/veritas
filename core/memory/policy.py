@@ -107,6 +107,82 @@ class ImportanceAwareEvictionPolicy:
         )
 
 
+def _protect_recent_tokens(max_context_tokens: int) -> int:
+    """PC 환경(=llama-server가 결정한 n_ctx)별 최소 보호 토큰. 직전 1~2 turn은 항상 keep."""
+    if max_context_tokens <= 4096:
+        return 384
+    if max_context_tokens <= 8192:
+        return 768
+    if max_context_tokens <= 16384:
+        return 1280
+    if max_context_tokens <= 32768:
+        return 2048
+    return 3072
+
+
+def _target_fifo_tokens(max_context_tokens: int) -> int:
+    """PC 환경(=n_ctx)별 FIFO 점유 목표 토큰. evict 후 FIFO가 이 이하로 수렴."""
+    if max_context_tokens <= 4096:
+        return 1200
+    if max_context_tokens <= 8192:
+        return 2400
+    if max_context_tokens <= 16384:
+        return 4096
+    if max_context_tokens <= 32768:
+        return 8192
+    return 16384
+
+
+@dataclass(frozen=True)
+class TokenBudgetFIFOEvictionPolicy:
+    """Evict oldest FIFO rows so the surviving tail fits the token target.
+
+    최신부터 token을 누적해서 protect_recent_tokens까지는 무조건 keep,
+    그 뒤로는 target_fifo_tokens 이하인 동안만 keep, 초과 시 그 이전(오래된)
+    row는 모두 evict.
+    """
+
+    def select_eviction_candidates(
+        self,
+        items: list[MemoryItem],
+        budget: MemoryBudget,
+    ) -> EvictionDecision:
+        if not items:
+            return EvictionDecision(reason="empty")
+
+        max_ctx = int(getattr(budget, "max_context_tokens", 0) or 0)
+        protect_recent = _protect_recent_tokens(max_ctx)
+        target_fifo = _target_fifo_tokens(max_ctx)
+
+        keep_indexes: set[int] = set()
+        accumulated = 0
+        for idx in range(len(items) - 1, -1, -1):
+            item = items[idx]
+            tokens = int(item.token_count or 0)
+            if accumulated < protect_recent:
+                # 안전대: 직전 turn은 token target과 무관하게 항상 보존
+                keep_indexes.add(idx)
+                accumulated += tokens
+                continue
+            if accumulated + tokens <= target_fifo:
+                keep_indexes.add(idx)
+                accumulated += tokens
+                continue
+            break  # 이 이후 오래된 row는 모두 evict
+
+        evict_items = [item for idx, item in enumerate(items) if idx not in keep_indexes]
+        keep_items = [item for idx, item in enumerate(items) if idx in keep_indexes]
+
+        if not evict_items:
+            return EvictionDecision(keep_items=keep_items, reason="under_target")
+
+        return EvictionDecision(
+            evict_items=evict_items,
+            keep_items=keep_items,
+            reason=f"token_budget_target_{target_fifo}_protect_{protect_recent}",
+        )
+
+
 @dataclass(frozen=True)
 class FixedKRetrievalPolicy:
     """Deterministic fixed top-k retrieval limits."""
@@ -154,7 +230,7 @@ class ProfilePolicyDispatcher:
     @staticmethod
     def _default_profiles() -> dict[str, ProfilePolicySet]:
         chat = ProfilePolicySet(
-            eviction=FIFOTailEvictionPolicy(keep_tail=20),
+            eviction=TokenBudgetFIFOEvictionPolicy(),
             retrieval=FixedKRetrievalPolicy(recall_limit=3),
         )
         grounded = ProfilePolicySet(
