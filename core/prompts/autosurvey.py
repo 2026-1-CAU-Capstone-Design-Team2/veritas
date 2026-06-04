@@ -241,6 +241,23 @@ Rules:
 - Mention support frequency when relevant.
 - Be concrete and concise.
 - Write the report body in the original user request language. If the original request is Korean, write the report body in Korean while preserving technical terms, source titles, document IDs, and citations as-is.
+- Use one citation marker format everywhere — body prose AND inside table
+  cells: bracketed ``[doc_<id>]`` with the original three-digit id, for example
+  ``[doc_000]``. Never emit a bare ``doc_000`` (without brackets), not even in a
+  table cell or the ``Doc ID`` column; the UI links only the bracketed form.
+- Attach a citation only where it backs a substantive claim drawn from that
+  source; do not decorate every sentence or cite non-evidentiary filler.
+- The ``## Source Notes`` section MUST be a Markdown table, not bullets or
+  paragraphs. Use one row per important source document.
+- The ``## Source Notes`` table MUST use these columns:
+  ``Doc ID`` | ``Title / Type`` | ``Year`` | ``What it contributes`` |
+  ``Reliability / Caveat``.
+- In the ``Doc ID`` column, use the canonical bracketed marker
+  ``[doc_<id>]`` so the UI can link it consistently.
+- If a value is unknown, write ``-`` rather than inventing it.
+- Source notes should describe only substantive evidence or caveats from each
+  document; do not turn non-evidentiary page chrome or source metadata into a
+  finding.
 """
 
 

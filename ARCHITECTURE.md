@@ -218,6 +218,31 @@ crosscheck 의 claim 비교는 token overlap + 수치 비교의 순수 알고리
 crosscheck flag 는 초안(Draft) 생성 시 `KnowledgePackBuilder._load_conflict_notes()` 가
 "Cross-check Notes" 로 읽어 LLM 컨텍스트에도 주입된다.
 
+### 6) 문서 요약 인용 팝업 (Citation Source-Preview)
+```
+frontend ui/pages/document_page.py (요약 뷰 = QTextBrowser)
+   ← apply_markdown(linkify_citations(final.md))
+       # bracketed [doc_NNN] + bare doc_NNN/doc-NNN/docNNN 모두 →
+       #   [[doc_NNN]](veritas-citation:doc_NNN?claim=<enc>)
+       #   (라벨은 항상 [doc_NNN], 축약형 docN은 zero-pad [doc_00N])
+       # code fence / inline code / 기존 링크 target / URL·path 내부는 제외
+   사용자가 인용 클릭 → anchorClicked(QUrl)
+   → frontend/citation_links.parse_citation_url() → (doc_id, claim)
+   → controllers/agent_controller.get_document_citation()   (HTTP, off-thread)
+   → GET /api/v1/documents/{ws}/citations/{docId}?claim=...
+   → api/services/document_citation_service.get_citation()
+       1. doc_id/workspace 정규화 (digit-only, path-traversal 차단)
+       2. summary/index.json 에서 title/url/domain 조회
+       3. clean_md/<id>.md 읽어 paragraph/sentence 분할
+       4. claim ↔ 문장 결정론적 lexical scoring
+          (exact substring → 숫자/토큰 overlap) → best 후보 + confidence
+          **LLM 호출 없음, 추가 영속 artifact 없음**
+   → CitationPopup (Qt.Popup, 외부 클릭 시 자동 닫힘)
+       출처 메타데이터 + 하이라이트된 원문 문단 표시
+```
+링크화는 순수 presentation concern(`final.md` 원문 무수정), 매칭은 클릭 시점 read-only.
+웹 출처(`clean_md`)만 대상 — proactive/verification 파이프라인과 분리된 독립 capability.
+
 ---
 
 ## Proactive 서브시스템 (`services/proactive/`)
@@ -464,6 +489,7 @@ curl -X POST "http://127.0.0.1:8000/api/v1/proactive/reset?workspaceId=<ws>"
 | **Proactive 후보 type 추가** | `proposal_models.py`의 `TaskType` Literal + `candidates.py`에 `_maybe_*` 빌더 + `evaluator.py`의 `_need_signal`/`_task_fit` 분기 + `core/prompts/proactive.py`의 lead-in. README.md §3 업데이트 |
 | **Proactive 게이트 조정** | hard gate → `evaluator.py:check_hard_gates`. score 계수 → `evaluator.py:ScoreBreakdown.total`. threshold → `BASE_SHOW_THRESHOLD` 또는 `adjusted_threshold`. native reject ladder 상수 → `orchestrator.py:NATIVE_ANCHOR_REJECT_LIMIT` / `_COOLDOWN_S` |
 | **Proactive 영구화 layout 변경** | `policy_store.py`의 경로 + `adaptation.py`의 dataclass. 회귀 가드: raw text 누출 / bandit import 금지 테스트 깨지지 않게 주의 |
+| final.md 인용 팝업(citation source-preview) | 매칭 알고리즘 → `api/services/document_citation_service.py`(pure 헬퍼). route → `api/api_routes/documents.py`(얇게). 링크화/URL 파싱 → `frontend/citation_links.py`(Qt-free pure). UI/팝업 → `frontend/ui/pages/document_page.py`(`CitationPopup`) |
 
 피해야 할 패턴:
 - `chat_agent.py`의 키워드/정규식 라우터, user 메시지 단어 기반 tool 강제 호출 — 의도 판단은 프롬프트·스키마로.
@@ -471,3 +497,70 @@ curl -X POST "http://127.0.0.1:8000/api/v1/proactive/reset?workspaceId=<ws>"
 - **`services/proactive/legacy_bandit/`의 코드를 production에서 import** — 동일하게 가드 테스트가 fail.
 - **`services/proactive/generator.py`에 prompt 문자열 인라인** — 모든 prompt copy는 `core/prompts/proactive.py`로.
 - **Proactive 영구화 JSONL/JSON에 raw document text 저장** — 영구화는 char counts + anchor hash만.
+
+---
+
+## 변경 이력 (Implementation Log)
+
+> Codex `INSTRUCTION.md` 기반 구현 결과를 diff 중심으로 기록한다.
+> 항목별 형식: **기능 / 변경 파일 / 엔지니어링 결정 / 테스트**.
+
+### 2026-06-04 — final.md Citation Link Popup
+
+**기능**: 요약 뷰(`DocumentPage`)에서 `final.md`의 `[doc_NNN]` 인용 마커를 클릭 가능한 링크로 렌더링하고, 클릭 시 해당 `clean_md/<id>.md` 원문에서 근거 문장을 찾아 하이라이트한 팝업으로 보여준다. 팝업은 다른 곳을 클릭하면 자동으로 닫힌다. **추가 LLM 호출 없음, 추가 영속 artifact 없음.**
+
+**변경 파일**
+- (new) `api/services/document_citation_service.py` — `get_citation()` + 순수 매칭 헬퍼(`normalize_text`/`tokenize`/`split_paragraphs`/`split_sentences`/`score_sentence`/`match_claim_in_source`). 파일 I/O는 얇게, 스코어링은 전부 side-effect-free pure 함수.
+- (edit) `api/api_routes/documents.py` — `GET /api/v1/documents/{workspaceId}/citations/{docId}?claim=` 얇은 route wrapper 추가.
+- (edit) `frontend/controllers/agent_controller.py` — `get_document_citation()` HTTP wrapper.
+- (new) `frontend/citation_links.py` — Qt-free 순수 헬퍼: `linkify_citations()` / `extract_claim_from_line()` / `parse_citation_url()`.
+- (edit) `frontend/ui/pages/document_page.py` — 요약 뷰어 `QTextEdit`→`QTextBrowser`(anchorClicked), 렌더 직전 linkify, 비동기 인용 조회, `CitationPopup`(Qt.Popup).
+- (new) `tests/test_document_citations.py` — 서비스 매칭 + 링크화 14 케이스.
+
+**엔지니어링 결정**
+- *No new persisted span*: `final.md` 생성 단계에 sentence span을 저장하지 않고, 클릭 시점에 claim을 API로 보내 결정론적 lexical matching으로 원문을 찾는다. → AutoSurvey 파이프라인(`final_report_tool`/`document_*_tool`) 무변경, OpenAI/local 양쪽 추가비용 0.
+- *마커 형식 정규화(presentation layer)*: bracketed `[doc_NNN]`와 bare `doc_NNN`/`doc-NNN`/`docNNN`를 **모두** 링크화하되, 표시 라벨은 항상 `[doc_NNN]`로 정규화한다(nested-bracket `[[doc_NNN]](href)`). 원문이 bare였는지 bracketed였는지 사용자가 신경 쓰지 않게 한다. (※ 초기 구현은 bare를 제외했으나, 실데이터에 bare-only 보고서가 존재해 일부 인용이 클릭 불가 → 사용자 테스트 피드백으로 정정. 표 셀의 bare 인용도 inline 링크로 렌더되며 표 구조는 유지됨.)
+- *Path traversal 차단 2중*: `doc_id`는 digit-only 정규식(`^(?:doc[_-]?)?(\d+)$`) 통과만 허용하고, 최종 경로를 재-resolve 하여 `clean_md/` 직속인지 확인. `workspace_id`에 `/ \ ..` 포함 시 거부.
+- *링크 스킴*: `veritas-citation:doc_NNN?claim=<percent-encoded>` — doc_id는 path, claim은 **단일** query param. HTML 속성에서 `&`→`&amp;` escape로 깨지는 문제를 피하려 멀티 param을 쓰지 않음. 클릭 핸들러는 `QUrl.toString(FullyEncoded)`를 Qt-free pure parser에 넘겨 1회만 디코드.
+- *레이어 경계 준수*: frontend는 `runs/`를 직접 읽지 않고 `AgentController → HTTP → api/services`만 사용. route는 얇게, 파일읽기/매칭/메타조립은 service. linkify/parse는 Qt-free pure 모듈로 분리해 PySide 없이 단위테스트.
+- *비차단 UI*: 인용 조회는 `JobManager.run_detached`로 off-thread 실행. 팝업은 `Qt.Popup`이라 외부 클릭 시 Qt가 자동 close(수동 focus 추적 불필요).
+- *Pill vs hyperlink*: Qt rich text가 inline `<a>`의 border-radius/배경을 안정적으로 렌더하지 못해, INSTRUCTION의 fallback인 파란 하이퍼링크 스타일 채택.
+- *Low-confidence UX*: 매칭 점수가 낮아도 crash 없이 "가장 가까운 원문 후보"로 best 후보를 표시(confidence=`low` 경고). 원문 자체가 없으면 "원문 위치를 확정하지 못했습니다".
+
+**테스트**
+- `python -m unittest tests.test_document_citations -v` → **14 passed**.
+- 전체 `python -m unittest discover tests` → 본 기능과 무관한 **기존 실패 13건만 잔존**(RAG/OpenAI 모듈; 예: `RAGService._format_recent_history` 부재). 본 변경 전부 stash 시 동일하게 재현되어 회귀 아님을 확인.
+- 실데이터 스모크(`runs/World_Model`, doc_000): 인용 → exact 문장 `high`(score 0.62) 매칭 + 메타데이터 정상.
+
+### 2026-06-04 (follow-up) — Citation UX: 대괄호 라벨 + bare marker 링크화
+
+**배경(사용자 테스트 피드백)**: (1) 링크화 시 화면에서 대괄호가 사라져 `doc_000`만 보였다. (2) `final.md`에 bare `doc_NNN`만 쓴 보고서가 있어 일부 인용이 클릭 불가였다(실데이터 `World_Model/final.md` = bracketed 0 / bare 15).
+
+**변경 파일**
+- (edit) `frontend/citation_links.py` — bracketed + bare(`doc_000`/`doc-000`/`docNNN`) 모두 링크화, 라벨은 nested-bracket `[[doc_NNN]]`로 정규화. inline-protected 분할을 도입해 inline code / 기존 md 링크·이미지 / autolink / URL·path 내부 마커는 제외(기존엔 fenced code만 제외했음). `extract_claim_from_line`이 bare 마커도 제거.
+- (edit) `core/prompts/autosurvey.py` `FINAL_PROMPT` — "body·표 셀 어디서나 bracketed `[doc_NNN]`만, bare 금지" 로 규칙 보강 + "substantive claim에만 인용" 일반 원칙. **keyword 리스트 없음, LLM call 수 불변.**
+- (edit) `tests/test_document_citations.py` — bracket 보존(escaped)+렌더 라벨, bare linkify·정규화, inline/fence/링크-target/URL·path 제외, bare claim stripping 케이스 추가(총 19).
+- (edit) `ARCHITECTURE.md` — 위 "bare 제외" 결정 정정.
+
+**엔지니어링 결정**
+- *Bracket label (nested, not escaped)*: 라벨은 nested-bracket `[[doc_NNN]](href)`로 생성 → `[doc_NNN]` 텍스트 링크로 렌더. **escaped `[\[doc_NNN\]]`는 금지** — 요약 렌더러의 `markdown_view._extract_math`가 `\[ … \]`를 LaTeX display math로 인식해 라벨을 수식으로 삼켜버려(밑줄→subscript, 앞뒤 빈 줄 삽입) 링크가 깨진다. 실제 렌더 경로(`linkify → _extract_math → _normalize_for_qt → markdown`)로 회귀 테스트(`test_renders_through_document_math_pipeline`) 추가.
+- *정규화*: 어떤 spelling이든 digit만 추출해 canonical `doc_NNN` href + `[doc_NNN]` 라벨 → 클릭 대상이 service의 기존 `_normalize_doc_id` 허용 형식과 일치(서비스 무변경).
+- *오탐 차단*: bare 마커는 look-around(`(?<![\w./:-])…(?![\w-])`) + protected-span 분할로 `clean_md/doc_000.md`·`http://…/doc_000`·inline code·기존 링크 target을 건드리지 않음.
+- *Over-citation 비목표*: 외부 API cleanup에 keyword 기반 paragraph 삭제는 도입하지 않음(언어/도메인 일반화 불가·본문 손실). source 품질은 `FINAL_PROMPT` 지시처럼 일반화 가능한 수단으로만 유도. `raw_md→clean_md` pass-through 무변경.
+
+**테스트**: `python -m unittest tests.test_document_citations -v` → **19 passed**. 실데이터 `World_Model/final.md`: bare 15개 전부 `[doc_NNN]` 링크로 변환, 표 렌더 정상.
+
+### 2026-06-04 (follow-up #2) — Citation 정규화: zero-pad canonical id + endpoint plain def
+
+**배경(Codex 리뷰)**: (1) 축약형 `doc7`/`doc_7`/`doc-7`가 `[doc_7]`로 렌더되면 `FINAL_PROMPT`의 canonical `[doc_NNN]`(3-digit) 규칙과 UI presentation이 충돌. (2) citation endpoint가 `async def`면 동기 파일 읽기 + source sentence 스캔이 FastAPI event loop를 막는다.
+
+**변경 파일**
+- (edit) `frontend/citation_links.py` — 라벨/href의 doc id를 `f"doc_{int(digits):03d}"`로 zero-pad. `doc7`/`doc_7`/`doc-7`/`[doc_7]` 모두 `[doc_007]` 렌더 + `doc_007` href. (4자리 이상은 그대로 유지.)
+- (edit) `api/api_routes/documents.py` — `document_citation`을 `async def` → **plain `def`**로 변경(FastAPI threadpool 실행, event loop 비차단). summary/merged는 단순 1-파일 read라 범위 밖으로 유지(최소 수정).
+- (edit) `tests/test_document_citations.py` — `doc7`/`doc_7`/`doc-7`/`[doc_7]` → `[doc_007]`+`doc_007` 렌더 검증 + 단축 id가 3-digit `007.md`로 resolve되어 `docId=doc_007` 반환하는 service 케이스 추가(총 21).
+
+**엔지니어링 결정**
+- *Zero-pad는 presentation(frontend)에서만*: backend `_normalize_doc_id`/`_clean_md_path`는 무변경. frontend가 canonical `doc_007`을 보내고 backend의 기존 `int(stem):03d` fallback이 3-digit 파일과 매칭 → 라벨·href·파일명·프롬프트 규칙이 전부 3-digit으로 정렬.
+- *endpoint plain def 최소 범위*: Codex가 지적한 citation endpoint만 변경. 무거운 작업(문장 스캔)을 가진 핸들러만 threadpool로 내려 event loop를 보호(저장소 §"Threading 모델"의 "긴 작업은 plain def" 원칙 일치).
+
+**테스트**: `python -m unittest tests.test_document_citations -v` → **21 passed**. 전체 `discover tests` → 동일 사전-존재 실패 13건만, 신규 회귀 0. `inspect.iscoroutinefunction(document_citation) == False` 확인.

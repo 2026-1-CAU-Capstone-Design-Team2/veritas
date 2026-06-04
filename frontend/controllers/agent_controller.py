@@ -188,6 +188,20 @@ class AgentController:
 		response = api_client.get(f"/api/v1/documents/{workspace_id}/merged")
 		return str(response.get("mergedText") or "")
 
+	def get_document_citation(
+		self, workspace_id: str, doc_id: str, claim: str
+	) -> dict[str, Any]:
+		"""Look up the source snippet behind a clicked ``[doc_NNN]`` citation.
+
+		Returns the service payload (``docId``/``title``/``url``/``domain``/
+		``claim``/``match``); the matching is deterministic and runs server-side
+		with no LLM call. Blocking HTTP — call it off the UI thread.
+		"""
+		return api_client.get(
+			f"/api/v1/documents/{workspace_id}/citations/{doc_id}",
+			{"claim": claim},
+		)
+
 	def analyze_document(self, workspace_id: str, text: str, cursor: int | None = None) -> dict[str, Any]:
 		return api_client.post(
 			"/api/v1/document-assist/analyze",
