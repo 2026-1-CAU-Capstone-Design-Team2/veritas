@@ -82,10 +82,10 @@ class RAGService:
         return getattr(self.llm, "memory_runtime", None)
 
     def _recent_history_text(self) -> str:
-        """Flat recent-turn block from FIFO memory, used by query rewriting and
-        the empty-context grounded prompt. Thin wrapper over
-        :meth:`MemoryRuntime.recent_history_text` so this surface and ChatAgent
-        share a single definition of "recent history".
+        """Flat recent-turn block from FIFO memory, used by query rewriting.
+
+        Thin wrapper over :meth:`MemoryRuntime.recent_history_text` so this
+        surface and ChatAgent share a single definition of "recent history".
         """
         runtime = self._memory_runtime()
         if runtime is None:
@@ -551,7 +551,6 @@ class RAGService:
                 }
             )
         retrieved = self.retrieve(question, **retrieve_kwargs)
-        history = self._format_recent_history()
         context = self.format_retrieved_documents(retrieved) if retrieved else ""
         draft_block = (
             RAG_DRAFT_CONTEXT_TEMPLATE.format(draft=doc_context.strip())

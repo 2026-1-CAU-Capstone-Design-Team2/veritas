@@ -5,9 +5,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from core.memory.budget import MemoryBudget
 from core.memory.models import MemoryItem, MemoryRole, MemoryTier
 from core.memory.request import CallConstraints, CallRequest
 from llm.memory_aware_llm import MemoryAwareLLMClient
+from services.memory_tools_funcs.context_builder import build_messages
 from services.memory_tools_funcs.external_context.recall_storage import RecallStorage
 from services.memory_tools_funcs.main_context.queue_manage import QueueManager
 from services.memory_tools_funcs.runtime import MemoryRuntime
@@ -321,6 +323,89 @@ class MemoryRuntimePr1Tests(unittest.TestCase):
             self.assertIn("working_context_append", tool_names)
             self.assertIn("recall_search", tool_names)
             runtime.close()
+
+
+    def test_flush_evicts_by_tokens_even_under_20_rows(self) -> None:
+        # 10 rows but each ~376 tokens (fallback counter), so total ~3760 >
+        # target_fifo=2400 at 8192 ctx. Legacy keep_tail=20 would skip flush.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = MemoryRuntime(
+                raw_llm=_FakeRawLLM(),
+                workspace_root=Path(tmp),
+                max_context_tokens=8192,
+            )
+            try:
+                big_content = " ".join(["word"] * 300)
+                for i in range(10):
+                    runtime.queue.append_event(
+                        role=MemoryRole.USER if i % 2 == 0 else MemoryRole.ASSISTANT,
+                        content=f"row-{i} {big_content}",
+                        source="test",
+                    )
+
+                self.assertEqual(runtime.queue.fifo.count(), 10)
+                self.assertGreater(runtime.queue.total_fifo_tokens(), 2400)
+
+                runtime._flush_fifo(profile="chat")
+
+                self.assertEqual(runtime.store.load_latest_summary(), "summary")
+                remaining = runtime.queue.fifo.count()
+                self.assertLess(remaining, 10)
+                self.assertGreater(remaining, 0)
+
+                # recall preserves every turn; FIFO eviction does not touch recall.
+                recall_rows = runtime.recall.tail(limit=20)
+                self.assertEqual(len(recall_rows), 10)
+
+                # protect_recent guard keeps the newest row regardless of target.
+                recent = runtime.queue.recent_rows(limit=10)
+                self.assertIn("row-9", recent[-1]["content"])
+            finally:
+                runtime.close()
+
+    def test_summary_and_fifo_are_both_injected_after_flush(self) -> None:
+        # System prompt carries the new summary; chat history still carries the
+        # surviving FIFO tail.
+
+        class _TaggedSummaryRawLLM(_FakeRawLLM):
+            def ask(self, *_args, **_kwargs) -> str:
+                return "TAGGED_SUMMARY_42"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = MemoryRuntime(
+                raw_llm=_TaggedSummaryRawLLM(),
+                workspace_root=Path(tmp),
+                max_context_tokens=8192,
+            )
+            try:
+                big_content = " ".join(["word"] * 300)
+                for i in range(10):
+                    runtime.queue.append_event(
+                        role=MemoryRole.USER if i % 2 == 0 else MemoryRole.ASSISTANT,
+                        content=f"row-{i} {big_content}",
+                        source="test",
+                    )
+
+                runtime._flush_fifo(profile="chat")
+
+                messages = build_messages(
+                    req=CallRequest(task_instruction="system", user_content="follow up"),
+                    budget=MemoryBudget(max_context_tokens=8192),
+                    store=runtime.store,
+                    working=runtime.working,
+                    queue=runtime.queue,
+                    retrieval_policy=runtime.policy_dispatcher.retrieval_for("chat"),
+                )
+
+                system = str(messages[0]["content"])
+                self.assertIn("Recent Conversation Summary", system)
+                self.assertIn("TAGGED_SUMMARY_42", system)
+
+                self.assertGreater(len(messages), 2)
+                history = [str(m["content"]) for m in messages[1:-1]]
+                self.assertTrue(any("row-9" in c for c in history))
+            finally:
+                runtime.close()
 
 
 if __name__ == "__main__":
