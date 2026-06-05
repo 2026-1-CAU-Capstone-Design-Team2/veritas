@@ -31,12 +31,13 @@ from pathlib import Path
 
 
 # llama-server flag profile. The hardware-adaptable knobs (-ngl / -c / -np) are
-# read from env/settings at spawn time. By default VERITAS does not pass -ngl:
-# recent llama.cpp builds can fit GPU offload to available VRAM unless the user
-# hard-codes n_gpu_layers. Passing -ngl 99 by default makes large GGUFs abort
-# before that fit step can help.
+# read from env/settings at spawn time. Default GPU policy is "try fast first":
+# use full GPU offload, then retry with smaller offload counts if the server
+# exits before becoming healthy. This restores local speed for models that fit
+# in VRAM while still falling back for oversized combinations.
 _DEFAULT_CTX = "32768"
 _DEFAULT_NP = "1"
+_DEFAULT_NGL_RETRIES = ("99", "32", "16", "8", "0")
 
 
 def _flag(env_name: str, default: str) -> str:
@@ -44,11 +45,30 @@ def _flag(env_name: str, default: str) -> str:
     return value if value and value.strip() else default
 
 
-def _ngl_args() -> list[str]:
-    value = os.getenv("VERITAS_LLAMA_NGL")
-    if value and value.strip():
-        return ["-ngl", value.strip()]
+def _ngl_args(value: str | None = None) -> list[str]:
+    resolved = value if value is not None else _ngl_retry_values()[0]
+    if resolved and resolved.strip():
+        return ["-ngl", resolved.strip()]
     return []
+
+
+def _ngl_retry_values() -> tuple[str, ...]:
+    explicit = os.getenv("VERITAS_LLAMA_NGL")
+    if explicit and explicit.strip():
+        return (explicit.strip(),)
+
+    retries = os.getenv("VERITAS_LLAMA_NGL_RETRIES")
+    if retries and retries.strip():
+        values = tuple(part.strip() for part in retries.split(",") if part.strip())
+        if values:
+            return values
+
+    mode = os.getenv("VERITAS_LLAMA_GPU_MODE", "auto").strip().lower()
+    if mode in {"0", "off", "cpu", "none", "false"}:
+        return ("0",)
+    if mode in {"full", "max", "gpu"}:
+        return ("99",)
+    return _DEFAULT_NGL_RETRIES
 
 
 def _np_flag(kind: str = "llm") -> str:
@@ -148,20 +168,19 @@ def _context_flag(kind: str = "llm") -> str:
         return _DEFAULT_CTX
 
 
-def _common_args(kind: str = "llm") -> list[str]:
+def _common_args(kind: str = "llm", *, ngl: str | None = None) -> list[str]:
     """Common llama-server flags, with per-machine overrides read from env:
 
-      VERITAS_LLAMA_NGL → -ngl  GPU layers to offload (0 = CPU-only)  [auto]
+      VERITAS_LLAMA_NGL → -ngl  exact GPU layers override            [auto]
       VERITAS_LLAMA_CTX → -c    total context window                 [50000]
       VERITAS_LLAMA_NP  → -np   parallel decode slots                [1]
 
-    When ``VERITAS_LLAMA_NGL`` is unset we omit ``-ngl`` and let llama.cpp fit
-    GPU offload to available VRAM. The env override still lets a user force a
-    value (e.g. ``VERITAS_LLAMA_NGL=0`` for CPU-only). Read at spawn time so
-    overrides apply per launch.
+    With no explicit override we start with ``-ngl 99`` for speed; the spawn
+    path retries lower values if that does not become healthy. Read at spawn
+    time so overrides apply per launch.
     """
     return [
-        *_ngl_args(),
+        *_ngl_args(ngl),
         "-ub", "1024",
         "-b", "1024",
         "-np", _np_flag(kind),
@@ -342,14 +361,14 @@ class LlamaServer:
 
     # -- internals -----------------------------------------------------------
 
-    def _args(self, model_path: Path) -> list[str]:
+    def _args(self, model_path: Path, *, ngl: str | None = None) -> list[str]:
         model_path = Path(model_path)
         args = [
             str(llama_server_bin()),
             "-m", str(model_path),
             "--host", self.host,
             "--port", str(self.port),
-            *_common_args(self.kind),
+            *_common_args(self.kind, ngl=ngl),
         ]
         if self.kind == "llm":
             args += LLAMA_LLM_EXTRA_ARGS
@@ -360,11 +379,46 @@ class LlamaServer:
         return args
 
     def _spawn(self, model_path: Path, *, timeout: float) -> None:
-        args = self._args(Path(model_path))
-        log = (_log_dir() / f"llama-{self.kind}.log").open(
-            "w", encoding="utf-8", errors="replace"
+        log_path = _log_dir() / f"llama-{self.kind}.log"
+        errors: list[str] = []
+        attempts = _ngl_retry_values()
+        for index, ngl in enumerate(attempts):
+            try:
+                self._spawn_once(
+                    Path(model_path),
+                    timeout=timeout,
+                    ngl=ngl,
+                    log_path=log_path,
+                    append=index > 0,
+                )
+                return
+            except RuntimeError as exc:
+                errors.append(f"-ngl {ngl}: {exc}")
+                self.stop()
+                if index < len(attempts) - 1:
+                    continue
+                joined = "\n".join(errors)
+                raise RuntimeError(
+                    f"{self.kind} llama-server failed after GPU offload retries:\n"
+                    f"{joined}\nsee {log_path}"
+                ) from exc
+
+    def _spawn_once(
+        self,
+        model_path: Path,
+        *,
+        timeout: float,
+        ngl: str | None,
+        log_path: Path,
+        append: bool,
+    ) -> None:
+        args = self._args(Path(model_path), ngl=ngl)
+        log = log_path.open(
+            "a" if append else "w", encoding="utf-8", errors="replace"
         )
         try:
+            if append:
+                log.write("\n\n--- retry with lower GPU offload ---\n")
             log.write("$ " + " ".join(args) + "\n\n")
             log.flush()
             popen_kwargs = {
@@ -393,7 +447,7 @@ class LlamaServer:
             if self._proc.poll() is not None:
                 raise RuntimeError(
                     f"{self.kind} llama-server exited before becoming ready "
-                    f"(see {_log_dir() / f'llama-{self.kind}.log'})"
+                    f"(see {log_path})"
                 )
             time.sleep(0.3)
         raise RuntimeError(

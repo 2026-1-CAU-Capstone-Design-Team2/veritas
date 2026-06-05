@@ -12,7 +12,7 @@ from llm.hardware_policy import (
 )
 from llm.model_catalog import get_model, llm_models
 from llm.model_manager import _expand_split_gguf
-from llm.llama_supervisor import _common_args
+from llm.llama_supervisor import _common_args, _ngl_retry_values
 
 
 class ModelCatalogVariantTests(unittest.TestCase):
@@ -93,10 +93,10 @@ class HardwarePolicyTests(unittest.TestCase):
         self.assertIn(tokens, CONTEXT_TIERS)
         self.assertLessEqual(tokens, 90_000)
 
-    def test_llama_common_args_do_not_force_gpu_layers_by_default(self) -> None:
+    def test_llama_common_args_try_full_gpu_offload_by_default(self) -> None:
         with patch.dict("os.environ", {"VERITAS_LLAMA_NP": "1"}, clear=True):
             args = _common_args("llm")
-        self.assertNotIn("-ngl", args)
+        self.assertEqual(args[args.index("-ngl") + 1], "99")
         self.assertEqual(args[args.index("-np") + 1], "1")
 
     def test_llama_common_args_respect_explicit_gpu_layer_override(self) -> None:
@@ -105,6 +105,16 @@ class HardwarePolicyTests(unittest.TestCase):
             {"VERITAS_LLAMA_NGL": "0", "VERITAS_LLAMA_NP": "1"},
             clear=True,
         ):
+            args = _common_args("llm")
+        self.assertEqual(args[args.index("-ngl") + 1], "0")
+
+    def test_llama_gpu_cpu_mode_disables_offload_retries(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"VERITAS_LLAMA_GPU_MODE": "cpu", "VERITAS_LLAMA_NP": "1"},
+            clear=True,
+        ):
+            self.assertEqual(_ngl_retry_values(), ("0",))
             args = _common_args("llm")
         self.assertEqual(args[args.index("-ngl") + 1], "0")
 
