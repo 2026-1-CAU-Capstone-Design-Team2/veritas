@@ -36,6 +36,7 @@ class QueryPlanTool(BaseTool):
         prior_plan: dict[str, Any] | None = None,
         gap_directions: list[str] | None = None,
         used_queries: list[str] | None = None,
+        memory_brief: str | None = None,
         save: bool = True,
     ) -> ToolResult:
         user_request = (user_request or "").strip()
@@ -45,6 +46,10 @@ class QueryPlanTool(BaseTool):
         mode = (mode or "initial").strip().lower()
         if mode not in {"initial", "replan"}:
             return ToolResult(success=False, error="`mode` must be one of: initial, replan")
+
+        memory_brief_text = self._normalize_memory_brief(memory_brief)
+        if mode != "initial":
+            memory_brief_text = ""
 
         gap_directions = [
             str(item).strip()
@@ -75,6 +80,7 @@ class QueryPlanTool(BaseTool):
                 and not grounding
                 and not prior_plan
                 and not prepared_gap_directions
+                and not memory_brief_text
             )
 
             if can_use_cached_initial:
@@ -96,6 +102,8 @@ class QueryPlanTool(BaseTool):
                     "used_queries": used_queries,
                     "current_time_context": self._current_time_context(),
                 }
+                if memory_brief_text:
+                    planner_input["memory_brief"] = memory_brief_text
 
                 plan = self._llm.ask_json(
                     planner_prompt,
@@ -736,6 +744,14 @@ class QueryPlanTool(BaseTool):
 
     def _normalize_query(self, query: str) -> str:
         return " ".join(str(query).lower().split())
+
+    def _normalize_memory_brief(self, memory_brief: str | None) -> str:
+        text = str(memory_brief or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"\s+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text[:1200].strip()
 
     def _build_llm_tooling(self, _user_request: str):
         if not self.LLM_EXPOSED_TOOL_NAMES:
