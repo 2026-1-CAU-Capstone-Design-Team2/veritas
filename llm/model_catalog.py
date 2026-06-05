@@ -218,6 +218,10 @@ def default_model_settings() -> dict:
         "launcher": {
             "initialModelSelected": False,
         },
+        "llamaContext": {
+            "mode": "auto",
+            "tokens": 32768,
+        },
     }
 
 

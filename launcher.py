@@ -11,7 +11,7 @@ import time
 import urllib.request
 
 from core.stdio_utf8 import force_utf8_stdio
-from db.db import get_app_data_dir
+from db.db import get_app_data_dir, get_connection, init_db
 from PySide6.QtCore import (
     QByteArray,
     QObject,
@@ -51,10 +51,17 @@ from llm.model_catalog import (
     selected_embedding_from_settings,
     selected_model_from_settings,
 )
+from llm.context_settings import (
+    CONTEXT_TIERS,
+    context_risk,
+    detect_memory,
+    recommended_context_tokens,
+)
 from llm.model_manager import available_bytes, download_model, ensure_model_dirs
 from llm.model_settings import (
     launcher_initial_model_selected,
     load_settings,
+    save_settings,
     save_selected_models,
 )
 
@@ -279,6 +286,96 @@ def _short_path(path: Path) -> str:
     return f"{parts[0]}…{os.sep}{parts[-2]}{os.sep}{parts[-1]}"
 
 
+def _launcher_output_root() -> Path:
+    return Path(os.getenv("VERITAS_OUTPUT_DIR", "runs")).expanduser().resolve()
+
+
+def _launcher_current_workspace_id() -> str:
+    try:
+        init_db()
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT value FROM app_state WHERE key = ?",
+                ("current_workspace_id",),
+            ).fetchone()
+            return str(row["value"] or "").strip() if row else "default"
+        finally:
+            conn.close()
+    except Exception:
+        return "default"
+
+
+def _save_launcher_workspace(workspace_id: str) -> None:
+    workspace_id = str(workspace_id or "").strip() or "default"
+    try:
+        init_db()
+        conn = get_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO app_state (key, value, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                ("current_workspace_id", workspace_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _launcher_workspace_names() -> dict[str, str]:
+    try:
+        init_db()
+        conn = get_connection()
+        try:
+            rows = conn.execute("SELECT id, name FROM workspaces").fetchall()
+            return {str(row["id"]): str(row["name"] or row["id"]) for row in rows}
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+
+def _launcher_workspaces() -> list[dict[str, str]]:
+    names = _launcher_workspace_names()
+    root = _launcher_output_root()
+    items: list[dict[str, str]] = []
+    if root.exists():
+        for path in sorted(root.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
+            if not path.is_dir() or path.name.startswith("_") or path.name == "__pycache__":
+                continue
+            summary_dir = path / "summary"
+            if not (
+                (path / "final.md").exists()
+                or (summary_dir / "index.json").exists()
+                or (summary_dir / "request.md").exists()
+                or (summary_dir.exists() and any(summary_dir.glob("doc_*.md")))
+            ):
+                continue
+            items.append(
+                {
+                    "workspaceId": path.name,
+                    "name": names.get(path.name, path.name),
+                    "detail": _short_path(path),
+                }
+            )
+    if not items:
+        items.append(
+            {
+                "workspaceId": "default",
+                "name": "default",
+                "detail": "기본 워크스페이스",
+            }
+        )
+    return items
+
+
 _ICON_MODEL = (
     '<rect x="4" y="4" width="16" height="16" rx="3"></rect>'
     '<path d="M9 9h6v6H9z"></path>'
@@ -301,6 +398,10 @@ _ICON_LOCK = (
 _ICON_DOWNLOAD = '<path d="M12 3v12M7 10l5 5 5-5M5 21h14"></path>'
 _ICON_CARET = '<path d="M6 9l6 6 6-6"></path>'
 _ICON_LOGO_V = '<path d="M4 4l8 16L20 4"></path>'
+_ICON_FOLDER = (
+    '<path d="M4 5h6l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4'
+    'a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"></path>'
+)
 
 
 _DIALOG_QSS = """
@@ -348,11 +449,11 @@ _DIALOG_QSS = """
 #pleft, #pright { color: #8A94A6; font-size: 12px; }
 
 QProgressBar#pbar {
-    background: #E9EDF4; border: none; border-radius: 5px;
+    background: #E9EDF4; border: none; border-radius: 0px;
     min-height: 8px; max-height: 8px;
 }
 QProgressBar#pbar::chunk {
-    border-radius: 5px;
+    border-radius: 0px;
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2E5BFF, stop:1 #5B83FF);
 }
 
@@ -435,7 +536,7 @@ class _ClickableFrame(QFrame):
 class ModelSetupDialog(QDialog):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("VERITAS Model Setup")
+        self.setWindowTitle("VERITAS Startup Setup")
         # Frameless, translucent rounded card — the same chrome convention the
         # app's main / editor / assist windows use.
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
@@ -444,9 +545,33 @@ class ModelSetupDialog(QDialog):
 
         self._settings = load_settings()
         self._selected_embedding_id = DEFAULT_EMBEDDING_MODEL_ID
+        self._workspaces = _launcher_workspaces()
+        current_workspace_id = _launcher_current_workspace_id()
         selected_llm = selected_model_from_settings(self._settings)
         selected_embedding = selected_embedding_from_settings(self._settings)
         self._selected_embedding_id = selected_embedding.id
+
+        self.workspace_combo = QComboBox(self)
+        for workspace in self._workspaces:
+            self.workspace_combo.addItem(
+                str(workspace.get("name") or workspace.get("workspaceId") or "default"),
+                str(workspace.get("workspaceId") or "default"),
+            )
+        workspace_index = max(0, self.workspace_combo.findData(current_workspace_id))
+        self.workspace_combo.setCurrentIndex(workspace_index)
+        self.workspace_combo.hide()
+
+        self.context_combo = QComboBox(self)
+        self.context_combo.addItem(self._context_auto_label(), "auto")
+        for tokens in CONTEXT_TIERS:
+            self.context_combo.addItem(self._context_manual_label(tokens), str(tokens))
+        context_settings = self._settings.get("llamaContext")
+        if isinstance(context_settings, dict) and context_settings.get("mode") == "manual":
+            context_index = self.context_combo.findData(str(context_settings.get("tokens") or ""))
+        else:
+            context_index = self.context_combo.findData("auto")
+        self.context_combo.setCurrentIndex(max(0, context_index))
+        self.context_combo.hide()
 
         # Hidden data model behind the styled selector: keeps selected_llm_id()
         # and the currentIndexChanged -> refresh wiring identical to before.
@@ -485,9 +610,13 @@ class ModelSetupDialog(QDialog):
 
         # Re-wire the original refresh trigger now that the widgets exist.
         self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        self.workspace_combo.currentIndexChanged.connect(self._sync_workspace_display)
+        self.context_combo.currentIndexChanged.connect(self._sync_context_display)
 
         self._thread: QThread | None = None
         self._worker: DownloadWorker | None = None
+        self._sync_workspace_display()
+        self._sync_context_display()
         self._sync_combo_display()
         self._refresh_status()
 
@@ -519,6 +648,8 @@ class ModelSetupDialog(QDialog):
         title.setObjectName("headTitle")
         subtitle = QLabel("VERITAS · 로컬 AI 모델 준비")
         subtitle.setObjectName("headSub")
+        title.setText("시작 설정")
+        subtitle.setText("VERITAS · 워크스페이스와 AI 모델 선택")
         txt.addWidget(title)
         txt.addWidget(subtitle)
         txt.addStretch(1)
@@ -548,16 +679,38 @@ class ModelSetupDialog(QDialog):
         )
         lead.setObjectName("lead")
         lead.setTextFormat(Qt.RichText)
+        lead.setText(
+            "시작할 "
+            '<span style="color:#0E1726; font-weight:700;">워크스페이스와 AI 모델</span>'
+            "을 선택하세요."
+        )
         lead.setWordWrap(True)
         lay.addWidget(lead)
         lay.addSpacing(20)
 
+        workspace_field = QLabel("워크스페이스")
+        workspace_field.setObjectName("fieldLabel")
+        lay.addWidget(workspace_field)
+        lay.addSpacing(8)
+
+        lay.addWidget(self._build_workspace_combo())
+        lay.addSpacing(16)
+
         field = QLabel("AI 모델")
         field.setObjectName("fieldLabel")
+        field.setText("AI 모델")
         lay.addWidget(field)
         lay.addSpacing(8)
 
         lay.addWidget(self._build_combo())
+        lay.addSpacing(18)
+
+        context_field = QLabel("컨텍스트 크기")
+        context_field.setObjectName("fieldLabel")
+        lay.addWidget(context_field)
+        lay.addSpacing(8)
+
+        lay.addWidget(self._build_context_combo())
         lay.addSpacing(18)
 
         lay.addWidget(self._build_rows(embedding_spec))
@@ -565,6 +718,47 @@ class ModelSetupDialog(QDialog):
 
         lay.addWidget(self._build_statusbox())
         return body
+
+    def _build_workspace_combo(self) -> QWidget:
+        combo = _ClickableFrame()
+        combo.setObjectName("combo")
+        combo.setCursor(Qt.PointingHandCursor)
+        combo.clicked.connect(self._open_workspace_menu)
+        self._workspace_frame = combo
+        lay = QHBoxLayout(combo)
+        lay.setContentsMargins(15, 13, 15, 13)
+        lay.setSpacing(12)
+
+        icon = QFrame()
+        icon.setObjectName("riBlue")
+        icon.setFixedSize(34, 34)
+        icon_lay = QVBoxLayout(icon)
+        icon_lay.setContentsMargins(0, 0, 0, 0)
+        icon_lbl = QLabel()
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setPixmap(_svg_pixmap(_line_icon(_ICON_FOLDER, "#2E5BFF"), 18))
+        icon_lay.addWidget(icon_lbl)
+        lay.addWidget(icon, 0, Qt.AlignVCenter)
+
+        info_w = QWidget()
+        info = QVBoxLayout(info_w)
+        info.setContentsMargins(0, 0, 0, 0)
+        info.setSpacing(2)
+        info.addStretch(1)
+        self._workspace_name = QLabel("—")
+        self._workspace_name.setObjectName("comboName")
+        self._workspace_meta = QLabel("—")
+        self._workspace_meta.setObjectName("comboMeta")
+        info.addWidget(self._workspace_name)
+        info.addWidget(self._workspace_meta)
+        info.addStretch(1)
+        lay.addWidget(info_w, 1)
+
+        caret = QLabel()
+        caret.setAlignment(Qt.AlignCenter)
+        caret.setPixmap(_svg_pixmap(_line_icon(_ICON_CARET, "#8A94A6", width=2), 18))
+        lay.addWidget(caret, 0, Qt.AlignVCenter)
+        return combo
 
     def _build_combo(self) -> QWidget:
         combo = _ClickableFrame()
@@ -604,6 +798,47 @@ class ModelSetupDialog(QDialog):
         self._combo_badge = QLabel("미설치")
         self._combo_badge.setAlignment(Qt.AlignCenter)
         lay.addWidget(self._combo_badge, 0, Qt.AlignVCenter)
+
+        caret = QLabel()
+        caret.setAlignment(Qt.AlignCenter)
+        caret.setPixmap(_svg_pixmap(_line_icon(_ICON_CARET, "#8A94A6", width=2), 18))
+        lay.addWidget(caret, 0, Qt.AlignVCenter)
+        return combo
+
+    def _build_context_combo(self) -> QWidget:
+        combo = _ClickableFrame()
+        combo.setObjectName("combo")
+        combo.setCursor(Qt.PointingHandCursor)
+        combo.clicked.connect(self._open_context_menu)
+        self._context_frame = combo
+        lay = QHBoxLayout(combo)
+        lay.setContentsMargins(15, 13, 15, 13)
+        lay.setSpacing(12)
+
+        icon = QFrame()
+        icon.setObjectName("riSlate")
+        icon.setFixedSize(34, 34)
+        icon_lay = QVBoxLayout(icon)
+        icon_lay.setContentsMargins(0, 0, 0, 0)
+        icon_lbl = QLabel()
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setPixmap(_svg_pixmap(_line_icon(_ICON_MODEL, "#5A6678"), 18))
+        icon_lay.addWidget(icon_lbl)
+        lay.addWidget(icon, 0, Qt.AlignVCenter)
+
+        info_w = QWidget()
+        info = QVBoxLayout(info_w)
+        info.setContentsMargins(0, 0, 0, 0)
+        info.setSpacing(2)
+        info.addStretch(1)
+        self._context_name = QLabel("—")
+        self._context_name.setObjectName("comboName")
+        self._context_meta = QLabel("—")
+        self._context_meta.setObjectName("comboMeta")
+        info.addWidget(self._context_name)
+        info.addWidget(self._context_meta)
+        info.addStretch(1)
+        lay.addWidget(info_w, 1)
 
         caret = QLabel()
         caret.setAlignment(Qt.AlignCenter)
@@ -765,7 +1000,10 @@ class ModelSetupDialog(QDialog):
     def _set_downloading(self, on: bool) -> None:
         self._progress_area.setVisible(on)
         self._set_dot("busy" if on else "ready")
-        self.install_button.setText("설치 중…" if on else "설치하고 계속")
+        if on:
+            self.install_button.setText("설치 중...")
+        else:
+            self._sync_primary_button_text()
 
     def _set_combo_badge(self, installed: bool) -> None:
         if installed:
@@ -781,6 +1019,71 @@ class ModelSetupDialog(QDialog):
                 " padding: 3px 9px; font-size: 11px; font-weight: 700;"
             )
 
+    def _sync_primary_button_text(self) -> None:
+        self.install_button.setText(
+            "설치하고 시작" if self._required_specs() else "선택하고 시작"
+        )
+
+    def _sync_workspace_display(self) -> None:
+        workspace_id = self.selected_workspace_id()
+        workspace = next(
+            (
+                item
+                for item in self._workspaces
+                if str(item.get("workspaceId") or "") == workspace_id
+            ),
+            None,
+        )
+        if workspace is None:
+            self._workspace_name.setText(workspace_id or "default")
+            self._workspace_meta.setText("기본 워크스페이스")
+            return
+        self._workspace_name.setText(str(workspace.get("name") or workspace_id))
+        self._workspace_meta.setText(str(workspace.get("detail") or workspace_id))
+
+    def _context_auto_label(self) -> str:
+        tokens = recommended_context_tokens(model_limit=self._selected_model_limit())
+        memory = detect_memory()
+        return f"자동 권장 · {tokens // 1024 if tokens % 1024 == 0 else tokens // 1000}K · 적합 · 여유 RAM {memory.available_gb:.1f}GB"
+
+    def _context_manual_label(self, tokens: int) -> str:
+        auto_tokens = recommended_context_tokens(model_limit=self._selected_model_limit())
+        return f"{tokens // 1024 if tokens % 1024 == 0 else tokens // 1000}K tokens · {context_risk(tokens, auto_tokens)}"
+
+    def _selected_model_limit(self) -> int | None:
+        try:
+            if not hasattr(self, "model_combo"):
+                return selected_model_from_settings(self._settings).context_tokens
+            return get_model(self.selected_llm_id(), kind="llm").context_tokens
+        except Exception:
+            return None
+
+    def _selected_context_payload(self) -> dict:
+        value = str(self.context_combo.currentData() or "auto")
+        if value == "auto":
+            return {"mode": "auto", "tokens": recommended_context_tokens(model_limit=self._selected_model_limit())}
+        try:
+            tokens = int(value)
+        except ValueError:
+            tokens = recommended_context_tokens(model_limit=self._selected_model_limit())
+        return {"mode": "manual", "tokens": tokens}
+
+    def _sync_context_display(self) -> None:
+        payload = self._selected_context_payload()
+        auto_tokens = recommended_context_tokens(model_limit=self._selected_model_limit())
+        memory = detect_memory()
+        tokens = int(payload["tokens"])
+        if payload["mode"] == "auto":
+            self._context_name.setText(f"자동 권장 · {tokens:,} tokens")
+            self._context_meta.setText(
+                f"현재 PC 기준 적합 · 여유 RAM {memory.available_gb:.1f}GB"
+            )
+        else:
+            self._context_name.setText(f"{tokens:,} tokens")
+            self._context_meta.setText(
+                f"{context_risk(tokens, auto_tokens)} · 자동 권장 {auto_tokens:,} tokens · 여유 RAM {memory.available_gb:.1f}GB"
+            )
+
     def _sync_combo_display(self) -> None:
         spec = get_model(self.selected_llm_id(), kind="llm")
         self._combo_name.setText(spec.name)
@@ -791,7 +1094,61 @@ class ModelSetupDialog(QDialog):
 
     def _on_model_changed(self) -> None:
         self._sync_combo_display()
+        self._refresh_context_options()
+        self._sync_context_display()
         self._refresh_status()
+
+    def _refresh_context_options(self) -> None:
+        current = str(self.context_combo.currentData() or "auto")
+        self.context_combo.blockSignals(True)
+        self.context_combo.clear()
+        self.context_combo.addItem(self._context_auto_label(), "auto")
+        for tokens in CONTEXT_TIERS:
+            self.context_combo.addItem(self._context_manual_label(tokens), str(tokens))
+        index = self.context_combo.findData(current)
+        self.context_combo.setCurrentIndex(max(0, index))
+        self.context_combo.blockSignals(False)
+
+    def _open_workspace_menu(self) -> None:
+        menu = QMenu(self)
+        menu.setObjectName("modelMenu")
+        menu.setMinimumWidth(self._workspace_frame.width())
+        current = self.workspace_combo.currentIndex()
+        for i in range(self.workspace_combo.count()):
+            workspace_id = str(self.workspace_combo.itemData(i) or "")
+            workspace = next(
+                (
+                    item
+                    for item in self._workspaces
+                    if str(item.get("workspaceId") or "") == workspace_id
+                ),
+                {},
+            )
+            detail = str(workspace.get("detail") or workspace_id)
+            action = menu.addAction(f"{self.workspace_combo.itemText(i)}    ·    {detail}")
+            action.setData(i)
+            action.setCheckable(True)
+            action.setChecked(i == current)
+        pos = self._workspace_frame.mapToGlobal(QPoint(0, self._workspace_frame.height() + 6))
+        chosen = menu.exec(pos)
+        if chosen is not None and chosen.data() is not None:
+            self.workspace_combo.setCurrentIndex(int(chosen.data()))
+
+    def _open_context_menu(self) -> None:
+        self._refresh_context_options()
+        menu = QMenu(self)
+        menu.setObjectName("modelMenu")
+        menu.setMinimumWidth(self._context_frame.width())
+        current = self.context_combo.currentIndex()
+        for i in range(self.context_combo.count()):
+            action = menu.addAction(self.context_combo.itemText(i))
+            action.setData(i)
+            action.setCheckable(True)
+            action.setChecked(i == current)
+        pos = self._context_frame.mapToGlobal(QPoint(0, self._context_frame.height() + 6))
+        chosen = menu.exec(pos)
+        if chosen is not None and chosen.data() is not None:
+            self.context_combo.setCurrentIndex(int(chosen.data()))
 
     def _open_model_menu(self) -> None:
         menu = QMenu(self)
@@ -824,6 +1181,9 @@ class ModelSetupDialog(QDialog):
     def selected_llm_id(self) -> str:
         return str(self.model_combo.currentData())
 
+    def selected_workspace_id(self) -> str:
+        return str(self.workspace_combo.currentData() or "default")
+
     def _required_specs(self) -> list:
         specs = [
             get_model(self.selected_llm_id(), kind="llm"),
@@ -846,9 +1206,14 @@ class ModelSetupDialog(QDialog):
         else:
             self.status_label.setText("필요한 모델 파일이 모두 설치되어 있어요.")
         self._set_dot("ready")
+        self._sync_primary_button_text()
 
     def _install_or_accept(self) -> None:
         missing = self._required_specs()
+        _save_launcher_workspace(self.selected_workspace_id())
+        settings = load_settings()
+        settings["llamaContext"] = self._selected_context_payload()
+        save_settings(settings)
         if not missing:
             save_selected_models(
                 llm_model_id=self.selected_llm_id(),
@@ -909,6 +1274,127 @@ class ModelSetupDialog(QDialog):
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
         self.accept()
+
+
+class StartupSplashDialog(QDialog):
+    """Small launcher-owned progress window shown while API/model/UI boot."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._drag_start: QPoint | None = None
+        self.setWindowTitle("VERITAS")
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setStyleSheet(_DIALOG_QSS)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(36, 28, 36, 40)
+        outer.setSpacing(0)
+
+        card = QFrame()
+        card.setObjectName("dialog")
+        card.setFixedWidth(430)
+        shadow = QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(36)
+        shadow.setXOffset(0)
+        shadow.setYOffset(14)
+        shadow.setColor(QColor(12, 18, 32, 70))
+        card.setGraphicsEffect(shadow)
+        outer.addWidget(card)
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(28, 26, 28, 26)
+        layout.setSpacing(18)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(14)
+
+        logo = QFrame()
+        logo.setObjectName("logo")
+        logo.setFixedSize(44, 44)
+        logo_lay = QVBoxLayout(logo)
+        logo_lay.setContentsMargins(0, 0, 0, 0)
+        logo_icon = QLabel()
+        logo_icon.setAlignment(Qt.AlignCenter)
+        logo_icon.setPixmap(_svg_pixmap(_line_icon(_ICON_LOGO_V, "#FFFFFF", width=2.8), 24))
+        logo_lay.addWidget(logo_icon)
+        header.addWidget(logo, 0, Qt.AlignVCenter)
+
+        text = QVBoxLayout()
+        text.setContentsMargins(0, 0, 0, 0)
+        text.setSpacing(3)
+        title = QLabel("VERITAS")
+        title.setObjectName("comboName")
+        subtitle = QLabel("AI 문서 보조 어시스턴트를 시작하는 중")
+        subtitle.setObjectName("comboMeta")
+        text.addWidget(title)
+        text.addWidget(subtitle)
+        header.addLayout(text, 1)
+        layout.addLayout(header)
+
+        line = QFrame()
+        line.setObjectName("statusbox")
+        line_layout = QHBoxLayout(line)
+        line_layout.setContentsMargins(15, 13, 15, 13)
+        line_layout.setSpacing(9)
+        self._status_dot = QFrame()
+        self._status_dot.setFixedSize(8, 8)
+        self._status_dot.setStyleSheet("background: #2E5BFF; border-radius: 4px;")
+        line_layout.addWidget(self._status_dot, 0, Qt.AlignVCenter)
+        self.status_label = QLabel("시작 준비 중...")
+        self.status_label.setObjectName("statusText")
+        self.status_label.setWordWrap(False)
+        line_layout.addWidget(self.status_label, 1)
+        layout.addWidget(line)
+
+        self.progress = QProgressBar()
+        self.progress.setObjectName("pbar")
+        self.progress.setTextVisible(False)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(8)
+        layout.addWidget(self.progress)
+
+    def set_status(self, text: str, progress: int | None = None) -> None:
+        self.status_label.setText(text)
+        if progress is not None:
+            self.progress.setValue(max(0, min(100, int(progress))))
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            geometry = self.frameGeometry()
+            geometry.moveCenter(screen.availableGeometry().center())
+            self.move(geometry.topLeft())
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            handle = self.windowHandle()
+            if handle is not None and handle.startSystemMove():
+                event.accept()
+                return
+            self._drag_start = (
+                event.globalPosition().toPoint()
+                - self.frameGeometry().topLeft()
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._drag_start is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_start)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        self._drag_start = None
+        super().mouseReleaseEvent(event)
 
 
 def needs_model_setup() -> bool:
@@ -1108,8 +1594,11 @@ def wait_service(
     deadline = time.monotonic() + timeout
     path = log_path(name)
     while time.monotonic() < deadline:
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
         try:
-            with urllib.request.urlopen(url, timeout=1.0):
+            with urllib.request.urlopen(url, timeout=0.08):
                 return
         except Exception:
             pass
@@ -1117,7 +1606,10 @@ def wait_service(
             tail = _tail(path)
             detail = f"\n\nLast log lines from {path}:\n{tail}" if tail else f"\n\nLog: {path}"
             raise RuntimeError(f"{name} exited before it became ready.{detail}")
-        time.sleep(0.25)
+        time.sleep(0.03)
+    app = QApplication.instance()
+    if app is not None:
+        app.processEvents()
     tail = _tail(path)
     detail = f"\n\nLast log lines from {path}:\n{tail}" if tail else f"\n\nLog: {path}"
     raise RuntimeError(f"{name} did not become ready within {int(timeout)}s.{detail}")
@@ -1308,11 +1800,11 @@ def main() -> int:
     # Guarantee no orphaned llama-server/API/UI even on a hard launcher kill.
     _install_kill_on_close_job()
     app = QApplication(sys.argv)
-    if needs_model_setup():
-        dialog = ModelSetupDialog()
-        if dialog.exec() != QDialog.Accepted:
-            return 1
+    dialog = ModelSetupDialog()
+    if dialog.exec() != QDialog.Accepted:
+        return 1
 
+    splash: StartupSplashDialog | None = None
     settings = load_settings()
     llm_spec = selected_model_from_settings(settings)
     embedding_spec = selected_embedding_from_settings(settings)
@@ -1341,9 +1833,14 @@ def main() -> int:
 
     processes: list[subprocess.Popen | None] = []
     try:
+        splash = StartupSplashDialog()
+        splash.show()
+        splash.set_status("Python 실행 환경을 확인하는 중...", 15)
         check_python_dependencies()
+        splash.set_status("API와 모델 서버를 시작하는 중...", 35)
         api_process = start_api(api_port)
         processes.append(api_process)
+        splash.set_status("API와 모델 서버가 준비되기를 기다리는 중...", 60)
         wait_service(
             api_process,
             f"http://127.0.0.1:{api_port}/api/v1/health",
@@ -1351,10 +1848,18 @@ def main() -> int:
             timeout=300.0,
         )
 
+        splash.set_status("VERITAS UI를 시작하는 중...", 85)
         ui_process = start_ui(api_port)
         processes.append(ui_process)
+        splash.set_status("시작이 완료되었습니다.", 100)
+        splash.close()
+        app.processEvents()
         return ui_process.wait()
     except Exception as exc:  # noqa: BLE001 - user-facing launcher boundary
+        if splash is not None:
+            splash.set_status("시작 중 오류가 발생했습니다.")
+            splash.close()
+            app.processEvents()
         QMessageBox.critical(None, "VERITAS failed to launch", str(exc))
         return 1
     finally:

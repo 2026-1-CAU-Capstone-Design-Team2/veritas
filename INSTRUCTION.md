@@ -692,3 +692,71 @@ failure modes are:
   affect kept-document numbering or `maxDocs`.
 - Confirm citation linkification changes are presentation-only and preserve the
   canonical visible marker format `[doc_NNN]`.
+## Implementation Plan: Startup Loading UI, Adaptive Context, and Custom Model Setup
+
+### User Requests
+1. The app currently shows no visible boot/loading window while the launcher starts the API, local model servers, and UI.
+2. The llama-server context size is currently fixed. It should be selected from the user's machine memory/hardware situation instead of using one hard-coded value.
+3. The first-install/model setup screen should let users configure a model directly, not only choose from the bundled catalog.
+
+### Brief Plan
+- Add a launcher-owned splash/loading dialog that appears after model setup and remains visible while dependency checks, API startup, llama-server startup, health checks, and UI startup happen.
+- Move context sizing into a single hardware/profile helper used by the API-owned llama supervisor. Persist the selected profile and expose an override path for advanced users.
+- Extend the setup/settings model UI so catalog models and user-provided local GGUF paths share the same validation, persistence, and restart flow.
+
+### Architecture Constraints
+- `launcher.py` should own only the startup UX and environment handoff. Since `VERITAS_MANAGE_LLAMA=1` makes the API own llama-server lifecycle, final llama flags must be computed in `llm/llama_supervisor.py` or a helper it calls.
+- Keep one source of truth for llama-server knobs: context tokens (`-c`), parallel slots (`-np` / `llmParallel`), GPU layer behavior (`-ngl`), and batch/ubatch sizes should not be duplicated between launcher and API paths.
+- Persist user-facing model choices through `llm/model_settings.py` / app-state settings so launcher setup, API settings, and frontend settings stay synchronized.
+- Custom local GGUF support must never copy arbitrary user model paths into the repo. Store only the selected absolute path in app state and validate that it exists, is a file, and has a `.gguf` extension before starting llama-server.
+- Automatic context sizing must be conservative. Prefer a stable app over maximum context. Clamp to model `context_tokens` and a safe upper/lower bound.
+- Environment variables such as `VERITAS_LLAMA_CTX`, `VERITAS_LLAMA_NGL`, and `VERITAS_LLM_PARALLEL` should remain manual overrides and should win over automatic recommendations.
+
+### Implementation Checklist
+- [ ] Add a small `StartupSplashDialog` or equivalent in `launcher.py` with status text and an indeterminate/progress indicator.
+- [ ] Run the long launcher startup sequence on a worker thread or otherwise keep the Qt event loop alive while startup progresses.
+- [ ] Emit user-visible startup stages: dependency check, API start, model server start/health wait, UI start, failure.
+- [ ] Make failures close/update the splash and show the existing `QMessageBox.critical` with the real error text and log hint.
+- [ ] Inspect and update `llm/llama_supervisor.py`; this is the active API-owned llama-server flag path.
+- [ ] Add a hardware/profile helper, for example `llm/hardware_profile.py`, that reads total/available RAM and, where feasible, GPU/VRAM information.
+- [ ] Compute a recommended context token value from model size, available memory, and model `context_tokens`. Suggested initial tiers: low memory 8192-16384, mid memory 32768, high memory 50000-90000, never above the model limit.
+- [ ] Keep `VERITAS_LLAMA_CTX` as an explicit override. If it is set, skip automatic context sizing and log that the override was used.
+- [ ] Persist the chosen auto profile and last computed context in settings, for display/debugging, without requiring users to understand tokens.
+- [ ] Update downstream context consumers that use hard-coded assumptions only if needed; `llm/llama_server_llm.py` already detects `/props` `n_ctx`, and memory runtime updates from it.
+- [ ] Extend `llm/model_catalog.ModelSpec` or add a parallel custom-model record so selected models can be either catalog IDs or validated local GGUF paths.
+- [ ] Update `selected_model_from_settings()`, `save_selected_models()`, and API repository/settings helpers to round-trip custom local model settings.
+- [ ] Extend the initial `ModelSetupDialog` with a direct local GGUF picker/input and clear validation status.
+- [ ] Ensure custom model selection can skip download while still requiring the bundled embedding model unless a future embedding override is explicitly implemented.
+- [ ] Extend `frontend/ui/pages/settings_page.py` so users can change between catalog models and a custom local GGUF after installation.
+- [ ] On model switch, reuse the existing API settings flow so llama-server restarts and `LLMClient.refresh_model_info()` updates `n_ctx`.
+- [ ] Add clear UX copy for recommended vs custom model path, estimated memory/context profile, and disk/download requirements.
+
+### Verification Commands
+- [ ] `python -m py_compile launcher.py llm/llama_supervisor.py llm/model_catalog.py llm/model_settings.py api/services/settings_service.py api/repositories/state_repository.py frontend/ui/pages/settings_page.py`
+- [ ] `python -m unittest discover tests`
+- [ ] Manual: start with no model installed and confirm the setup dialog still works.
+- [ ] Manual: start with models installed and confirm the splash appears while API/model/UI startup is in progress.
+- [ ] Manual: set `VERITAS_LLAMA_CTX=8192` and confirm llama-server starts with the override, not the auto value.
+- [ ] Manual: choose a valid local `.gguf` and confirm startup uses that path without downloading an LLM.
+- [ ] Manual: choose an invalid/nonexistent path and confirm the UI blocks save/start with a clear error.
+
+### Review Focus
+- Confirm the splash does not freeze, orphan processes, or hide startup failures.
+- Confirm llama-server flags are produced by one active code path; avoid fixing only the inactive `launcher.py start_llama()` path.
+- Confirm auto context selection is conservative and clamped by both hardware estimate and `ModelSpec.context_tokens`.
+- Confirm custom model paths are validated, persisted outside the repo, and never committed or copied into source control.
+- Confirm setup UI and settings UI use the same persisted model shape and do not diverge.
+- Confirm tests cover both catalog model IDs and custom local GGUF settings.
+
+### Context Size Unit Decision
+- The internal unit must be **tokens**, because llama-server's `-c` / context-size flag is token-based and downstream code reads `n_ctx` from `/props`.
+- The user-facing unit should be a profile label plus approximate token count, for example `안정형 (16K tokens)`, `표준형 (32K tokens)`, `확장형 (50K tokens)`, `고용량 (90K tokens)`.
+- Hardware detection should read memory in bytes/GB, then map it to token tiers. Do not ask users to reason directly in RAM math.
+- Recommended first-pass tiers:
+  - available RAM under 8 GB: `8192`
+  - available RAM 8-16 GB: `16384`
+  - available RAM 16-32 GB: `32768`
+  - available RAM 32-64 GB: `50000`
+  - available RAM 64 GB or more: `90000`
+- Always clamp the recommended value to the selected model's `context_tokens` and to an app maximum. Prefer stability over maximum context.
+- `VERITAS_LLAMA_CTX` remains the explicit override and must win over auto sizing.

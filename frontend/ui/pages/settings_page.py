@@ -4,6 +4,7 @@ from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
 	QButtonGroup,
+	QComboBox,
 	QFileDialog,
 	QFrame,
 	QHBoxLayout,
@@ -50,6 +51,15 @@ MAX_RESEARCH_PLAN_COUNT = 9999
 DEFAULT_LLM_PARALLEL = 1
 MIN_LLM_PARALLEL = 1
 MAX_LLM_PARALLEL = 5
+
+CONTEXT_OPTIONS = [
+	("자동 권장", "auto"),
+	("8K tokens", "8192"),
+	("16K tokens", "16384"),
+	("32K tokens", "32768"),
+	("50K tokens", "50000"),
+	("90K tokens", "90000"),
+]
 
 
 class _CollapsibleHeader(QPushButton):
@@ -362,6 +372,8 @@ class SettingsPage(QWidget):
 		section.add_widget(self._divider())
 		section.add_widget(self._build_research_method_section())
 		section.add_widget(self._divider())
+		section.add_widget(self._build_llama_context_section())
+		section.add_widget(self._divider())
 		section.add_widget(self._build_llm_parallel_section())
 		return section
 
@@ -529,6 +541,56 @@ class SettingsPage(QWidget):
 		layout.addWidget(self.llm_parallel_status)
 
 		self._load_llm_parallel_settings()
+		return section
+
+	def _build_llama_context_section(self) -> QWidget:
+		section = QWidget()
+		layout = QVBoxLayout(section)
+		layout.setContentsMargins(0, 0, 0, 0)
+		layout.setSpacing(12)
+
+		layout.addWidget(self._subsection_title("컨텍스트 크기"))
+
+		subtitle = QLabel(
+			"AI 모델이 한 번에 기억하고 처리할 수 있는 토큰 범위입니다. "
+			"자동 권장은 현재 PC의 여유 메모리를 기준으로 안정적인 값을 선택합니다."
+		)
+		subtitle.setObjectName("PageSubtitle")
+		subtitle.setWordWrap(True)
+		layout.addWidget(subtitle)
+
+		self.llama_context_combo = QComboBox()
+		self.llama_context_combo.setObjectName("SettingsInput")
+		self.llama_context_combo.setMinimumWidth(260)
+		for label, value in CONTEXT_OPTIONS:
+			self.llama_context_combo.addItem(label, value)
+		self.llama_context_combo.currentIndexChanged.connect(self._update_llama_context_status)
+
+		layout.addWidget(
+			self._research_param_row(
+				"컨텍스트 프로파일",
+				"현재 PC 기준으로 여유, 적합, 위험 상태를 함께 표시합니다. 값을 높이면 긴 문서를 더 많이 담지만 메모리 사용량이 커집니다.",
+				self.llama_context_combo,
+			)
+		)
+
+		action_row = QHBoxLayout()
+		action_row.setSpacing(8)
+		action_row.addStretch(1)
+		reset_button = AppButton("자동 권장", variant="ghost")
+		reset_button.clicked.connect(self._reset_llama_context_settings)
+		save_button = AppButton("컨텍스트 설정 저장")
+		save_button.clicked.connect(self._save_llama_context_settings)
+		action_row.addWidget(reset_button)
+		action_row.addWidget(save_button)
+		layout.addLayout(action_row)
+
+		self.llama_context_status = QLabel()
+		self.llama_context_status.setObjectName("SettingsStatus")
+		self.llama_context_status.setWordWrap(True)
+		layout.addWidget(self.llama_context_status)
+
+		self._load_llama_context_settings()
 		return section
 
 	def _research_param_row(self, title: str, hint: str, field: QWidget) -> QFrame:
@@ -862,6 +924,83 @@ class SettingsPage(QWidget):
 		except (TypeError, ValueError):
 			self.llm_parallel_input.setValue(DEFAULT_LLM_PARALLEL)
 		self._update_llm_parallel_status()
+
+	def _load_llama_context_settings(self) -> None:
+		settings = self._settings.get("llamaContext", {})
+		if not isinstance(settings, dict):
+			settings = {}
+		self._refresh_llama_context_options(settings)
+		mode = str(settings.get("mode") or "auto")
+		if mode == "manual":
+			value = str(settings.get("tokens") or "")
+		else:
+			value = "auto"
+		index = self.llama_context_combo.findData(value)
+		self.llama_context_combo.setCurrentIndex(max(0, index))
+		self._update_llama_context_status()
+
+	def _refresh_llama_context_options(self, settings: dict) -> None:
+		auto_tokens = int(settings.get("lastAutoTokens") or settings.get("tokens") or 32768)
+		current = str(self.llama_context_combo.currentData() or "auto")
+		self.llama_context_combo.blockSignals(True)
+		self.llama_context_combo.clear()
+		self.llama_context_combo.addItem(f"자동 권장 · {auto_tokens:,} tokens · 적합", "auto")
+		for _label, value in CONTEXT_OPTIONS[1:]:
+			tokens = int(value)
+			risk = "여유" if tokens < auto_tokens else "적합" if tokens == auto_tokens else "위험"
+			self.llama_context_combo.addItem(f"{tokens:,} tokens · {risk}", value)
+		index = self.llama_context_combo.findData(current)
+		self.llama_context_combo.setCurrentIndex(max(0, index))
+		self.llama_context_combo.blockSignals(False)
+
+	def _reset_llama_context_settings(self) -> None:
+		index = self.llama_context_combo.findData("auto")
+		self.llama_context_combo.setCurrentIndex(max(0, index))
+		self._save_llama_context_settings()
+
+	def _save_llama_context_settings(self) -> None:
+		value = str(self.llama_context_combo.currentData() or "auto")
+		mode = "auto" if value == "auto" else "manual"
+		tokens = None if mode == "auto" else int(value)
+		try:
+			payload = AgentController().update_llama_context(mode, tokens)
+		except Exception as e:
+			self._update_llama_context_status(f"저장 중 오류가 발생했습니다: {e}")
+			return
+		context = payload.get("llamaContext") if isinstance(payload, dict) else None
+		if isinstance(context, dict):
+			self._settings["llamaContext"] = context
+			self._refresh_llama_context_options(context)
+		if payload.get("restartApplied") is False:
+			self._update_llama_context_status(
+				f"설정은 저장됐지만 모델 서버 재시작은 실패했습니다: {payload.get('restartError')}"
+			)
+			return
+		self._update_llama_context_status("컨텍스트 설정이 저장되고 모델 서버에 적용됐습니다.")
+
+	def _update_llama_context_status(self, prefix: str | None = None) -> None:
+		if not hasattr(self, "llama_context_status"):
+			return
+		settings = self._settings.get("llamaContext", {})
+		if not isinstance(settings, dict):
+			settings = {}
+		auto_tokens = int(settings.get("lastAutoTokens") or settings.get("tokens") or 32768)
+		memory = settings.get("memory") if isinstance(settings.get("memory"), dict) else {}
+		available_gb = memory.get("availableGb")
+		value = str(self.llama_context_combo.currentData() or "auto")
+		if value == "auto":
+			tokens = auto_tokens
+			risk = "적합"
+			label = "자동 권장"
+		else:
+			tokens = int(value)
+			risk = "여유" if tokens < auto_tokens else "적합" if tokens == auto_tokens else "위험"
+			label = f"{tokens:,} tokens"
+		lead = f"{prefix} · " if prefix else ""
+		mem_text = f" · 여유 RAM {available_gb}GB" if available_gb is not None else ""
+		self.llama_context_status.setText(
+			f"{lead}{label} · {risk} · 자동 권장 {auto_tokens:,} tokens{mem_text}"
+		)
 
 	def _reset_llm_parallel_settings(self) -> None:
 		self.llm_parallel_input.setValue(DEFAULT_LLM_PARALLEL)

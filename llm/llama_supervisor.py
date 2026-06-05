@@ -34,7 +34,7 @@ from pathlib import Path
 # read from env at spawn time so a machine without an NVIDIA GPU or with little
 # memory can recover without a code change.
 _DEFAULT_NGL = "99"
-_DEFAULT_CTX = "50000"
+_DEFAULT_CTX = "32768"
 _DEFAULT_NP = "5"
 
 
@@ -43,7 +43,35 @@ def _flag(env_name: str, default: str) -> str:
     return value if value and value.strip() else default
 
 
-def _common_args() -> list[str]:
+def _context_flag(kind: str = "llm") -> str:
+    env_value = os.getenv("VERITAS_LLAMA_CTX")
+    if env_value and env_value.strip():
+        return env_value.strip()
+    try:
+        from llm.context_settings import effective_context_tokens
+        from llm.model_settings import load_settings
+        from llm.model_catalog import (
+            selected_embedding_from_settings,
+            selected_model_from_settings,
+        )
+
+        settings = load_settings()
+        model = (
+            selected_embedding_from_settings(settings)
+            if kind == "embedding"
+            else selected_model_from_settings(settings)
+        )
+        return str(
+            effective_context_tokens(
+                settings,
+                model_limit=getattr(model, "context_tokens", None),
+            )
+        )
+    except Exception:
+        return _DEFAULT_CTX
+
+
+def _common_args(kind: str = "llm") -> list[str]:
     """Common llama-server flags, with per-machine overrides read from env:
 
       VERITAS_LLAMA_NGL → -ngl  GPU layers to offload (0 = CPU-only)  [99]
@@ -62,7 +90,7 @@ def _common_args() -> list[str]:
         "-b", "1024",
         "-np", _flag("VERITAS_LLAMA_NP", _DEFAULT_NP),
         "--cont-batching",
-        "-c", _flag("VERITAS_LLAMA_CTX", _DEFAULT_CTX),
+        "-c", _context_flag(kind),
         "-fa", "on",
     ]
 
@@ -183,7 +211,7 @@ class LlamaServer:
             "-m", str(model_path),
             "--host", self.host,
             "--port", str(self.port),
-            *_common_args(),
+            *_common_args(self.kind),
         ]
         args += LLAMA_LLM_EXTRA_ARGS if self.kind == "llm" else LLAMA_EMBEDDING_EXTRA_ARGS
         return args

@@ -181,6 +181,11 @@ class SettingsLlmParallelRequest(BaseModel):
     value: int = Field(default=1, ge=1, le=5)
 
 
+class SettingsLlamaContextRequest(BaseModel):
+    mode: Literal["auto", "manual"] = "auto"
+    tokens: int | None = Field(default=None, ge=1024, le=262144)
+
+
 class TypingContextRequest(BaseModel):
     sessionId: str
     workspaceId: str

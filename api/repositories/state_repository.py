@@ -344,6 +344,24 @@ def set_llm_parallel_settings(value: int) -> int:
     return clamped
 
 
+def set_llama_context_settings(mode: str, tokens: int | None = None) -> dict[str, Any]:
+    _ensure_settings_loaded()
+    from llm.context_settings import normalize_context_settings
+    from llm.model_catalog import selected_model_from_settings
+
+    model = selected_model_from_settings(STATE["settings"])
+    payload: dict[str, Any] = {"mode": str(mode or "auto")}
+    if tokens is not None:
+        payload["tokens"] = int(tokens)
+    normalized = normalize_context_settings(
+        payload,
+        model_limit=getattr(model, "context_tokens", None),
+    )
+    STATE["settings"]["llamaContext"] = normalized
+    _persist_settings()
+    return normalized
+
+
 def get_current_workspace_id() -> str:
     return STATE["current_workspace_id"]
 

@@ -57,6 +57,10 @@ STATE: dict[str, object] = {
             "apiKeyPreview": "",
         },
         "llmParallel": 1,
+        "llamaContext": {
+            "mode": "auto",
+            "tokens": 32768,
+        },
     },
 }
 
