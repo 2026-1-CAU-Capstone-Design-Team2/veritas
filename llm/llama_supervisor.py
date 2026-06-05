@@ -134,35 +134,72 @@ def _parallel_slots_for_model(model, settings: dict) -> int:
         return requested
 
 
+def _settings_and_model(kind: str):
+    from llm.model_settings import load_settings
+    from llm.model_catalog import (
+        selected_embedding_from_settings,
+        selected_model_from_settings,
+    )
+
+    settings = load_settings()
+    model = (
+        selected_embedding_from_settings(settings)
+        if kind == "embedding"
+        else selected_model_from_settings(settings)
+    )
+    return settings, model
+
+
+def _context_plan(kind: str = "llm") -> tuple[int, int, int]:
+    """Return ``(parallel_slots, per_slot_context, total_context)``.
+
+    llama-server's ``-c`` flag is the total context pool shared by ``-np``
+    slots. Prompt budgeting elsewhere needs the per-request/per-slot value.
+    """
+    from llm.context_settings import effective_context_tokens
+
+    settings, model = _settings_and_model(kind)
+    parallel_slots = _parallel_slots_for_model(model, settings)
+    per_slot = effective_context_tokens(
+        settings,
+        model_limit=getattr(model, "context_tokens", None),
+        model=model,
+        parallel_slots=parallel_slots,
+    )
+    per_slot = max(1, int(per_slot))
+    total = per_slot * parallel_slots
+    model_limit = getattr(model, "context_tokens", None)
+    if model_limit and model_limit > 0:
+        total = min(total, int(model_limit))
+        per_slot = max(1, total // parallel_slots)
+    return parallel_slots, per_slot, total
+
+
+def effective_context_per_slot(kind: str = "llm") -> int:
+    """Return the context window available to one llama-server request."""
+    env_value = os.getenv("VERITAS_LLAMA_CTX")
+    if env_value and env_value.strip():
+        try:
+            total = max(1, int(env_value.strip()))
+            slots = max(1, int(_np_flag(kind)))
+            return max(1, total // slots)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return _context_plan(kind)[1]
+    except Exception:
+        try:
+            return max(1, int(_DEFAULT_CTX) // max(1, _parallel_slots()))
+        except Exception:
+            return int(_DEFAULT_CTX)
+
+
 def _context_flag(kind: str = "llm") -> str:
     env_value = os.getenv("VERITAS_LLAMA_CTX")
     if env_value and env_value.strip():
         return env_value.strip()
     try:
-        from llm.context_settings import effective_context_tokens
-        from llm.model_settings import load_settings
-        from llm.model_catalog import (
-            selected_embedding_from_settings,
-            selected_model_from_settings,
-        )
-
-        settings = load_settings()
-        model = (
-            selected_embedding_from_settings(settings)
-            if kind == "embedding"
-            else selected_model_from_settings(settings)
-        )
-        parallel_slots = _parallel_slots_for_model(model, settings)
-        per_slot = effective_context_tokens(
-            settings,
-            model_limit=getattr(model, "context_tokens", None),
-            model=model,
-            parallel_slots=parallel_slots,
-        )
-        total = per_slot * parallel_slots
-        model_limit = getattr(model, "context_tokens", None)
-        if model_limit and model_limit > 0:
-            total = min(total, int(model_limit))
+        _, _, total = _context_plan(kind)
         return str(total)
     except Exception:
         return _DEFAULT_CTX

@@ -80,12 +80,17 @@ class AgentRuntime:
             embed_port=embed_port,
             trace_latency=os.getenv("VERITAS_TRACE_LATENCY", "1") != "0",
         )
+        runtime_context_tokens = self._llm_context_per_slot_tokens()
+        try:
+            self.raw_llm.n_ctx = runtime_context_tokens
+        except Exception:
+            pass
         # MemoryRuntime은 workspace 결정 전이라 placeholder로 만들고,
         # _configure_workspace_runtime에서 configure_workspace로 갈아 끼운다.
         self.memory_runtime = MemoryRuntime(
             raw_llm=self.raw_llm,
             workspace_root=self.output_root / "api",
-            max_context_tokens=int(getattr(self.raw_llm, "n_ctx", 8192) or 8192),
+            max_context_tokens=runtime_context_tokens,
         )
         # self.llm은 wrapper. callers는 동일한 surface(.ask/.iter_ask/.call/...)를 본다.
         self.llm = MemoryAwareLLMClient(
@@ -116,6 +121,30 @@ class AgentRuntime:
             self.workspace_id = "default"
             self.output_dir = self.output_root / "api"
         self._configure_workspace_runtime(self.output_dir)
+
+    def _llm_context_per_slot_tokens(self) -> int:
+        """Context budget for one request, not llama-server's total ``-c``."""
+        try:
+            from llm.llama_supervisor import effective_context_per_slot
+
+            tokens = int(effective_context_per_slot("llm"))
+        except Exception:
+            tokens = int(getattr(self.raw_llm, "n_ctx", 8192) or 8192)
+        return max(1, int(tokens))
+
+    def _sync_llm_context_budget(self) -> int:
+        tokens = self._llm_context_per_slot_tokens()
+        try:
+            self.raw_llm.n_ctx = tokens
+        except Exception:
+            pass
+        memory_runtime = getattr(self, "memory_runtime", None)
+        if memory_runtime is not None:
+            try:
+                memory_runtime.update_n_ctx(tokens)
+            except Exception:
+                pass
+        return tokens
 
     def _configure_workspace_runtime(self, output_dir: Path) -> None:
         # Release the previous workspace's ChromaDB handles before swapping in a
@@ -279,6 +308,7 @@ class AgentRuntime:
 
         emit("refresh", "모델 정보 갱신 중...", {})
         self.llm.refresh_model_info()
+        self._sync_llm_context_budget()
         return spec
 
     def restart_llm_server(self) -> None:
@@ -295,6 +325,7 @@ class AgentRuntime:
             raise RuntimeError(f"selected model is not downloaded: {spec.name}")
         self._llm_server.restart(_Path(path))
         self.llm.refresh_model_info()
+        self._sync_llm_context_budget()
 
     def shutdown(self) -> None:
         """Stop any llama-servers this process owns (best effort, idempotent)."""

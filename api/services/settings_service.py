@@ -96,7 +96,25 @@ def update_llm_parallel(value: int) -> dict[str, Any]:
 
 
 def update_llama_context(mode: str, tokens: int | None = None) -> dict[str, Any]:
+    previous = repo.get_settings().get("llamaContext", {})
     context = repo.set_llama_context_settings(mode, tokens)
+    try:
+        previous_tokens = int(
+            previous.get("tokens") if isinstance(previous, dict) else 0
+        )
+    except (TypeError, ValueError):
+        previous_tokens = 0
+    try:
+        current_tokens = int(context.get("tokens") or 0)
+    except (TypeError, ValueError):
+        current_tokens = 0
+    if previous_tokens == current_tokens:
+        return {
+            "llamaContext": context,
+            "updated": True,
+            "restartApplied": True,
+            "restartSkipped": True,
+        }
     try:
         from .agent_runtime import get_runtime
 

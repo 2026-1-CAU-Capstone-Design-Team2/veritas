@@ -20,8 +20,8 @@ if TYPE_CHECKING:
 
 CONTEXT_TIERS = (8192, 16384, 32768, 50000, 90000)
 DEFAULT_CONTEXT_MODE = "auto"
-DEFAULT_CONTEXT_TOKENS = 32768
 APP_MAX_CONTEXT_TOKENS = 90000
+CONTEXT_MODE_AUTO_ONLY = True
 
 
 @dataclass(frozen=True)
@@ -79,15 +79,13 @@ def normalize_context_settings(
     model: "ModelSpec | None" = None,
     parallel_slots: int = 1,
 ) -> dict[str, Any]:
-    payload = payload if isinstance(payload, dict) else {}
-    mode = str(payload.get("mode") or DEFAULT_CONTEXT_MODE).strip().lower()
-    if mode not in {"auto", "manual"}:
-        mode = DEFAULT_CONTEXT_MODE
-    try:
-        tokens = int(payload.get("tokens") or DEFAULT_CONTEXT_TOKENS)
-    except (TypeError, ValueError):
-        tokens = DEFAULT_CONTEXT_TOKENS
+    """Normalize persisted context settings.
 
+    Context sizing is intentionally automatic-only. Older UI surfaces may still
+    send ``{"mode": "manual", "tokens": ...}``; keep accepting that payload
+    shape, but ignore its value so runtime sizing always follows the selected
+    model, parallel-slot count, and current available RAM.
+    """
     snapshot = detect_memory()
     auto_tokens = recommended_context_tokens(
         available_bytes=snapshot.available_bytes,
@@ -95,21 +93,18 @@ def normalize_context_settings(
         model=model,
         parallel_slots=parallel_slots,
     )
-    if mode == "auto":
-        tokens = auto_tokens
-    else:
-        tokens = clamp_context_tokens(tokens, model_limit=model_limit)
 
     result: dict[str, Any] = {
-        "mode": mode,
-        "tokens": tokens,
+        "mode": DEFAULT_CONTEXT_MODE,
+        "tokens": auto_tokens,
         "lastAutoTokens": auto_tokens,
+        "autoOnly": CONTEXT_MODE_AUTO_ONLY,
         "memory": memory_payload(snapshot),
     }
     if model is not None:
         estimate = estimate_runtime(
             model,
-            context_per_slot_tokens=tokens,
+            context_per_slot_tokens=auto_tokens,
             parallel_slots=parallel_slots,
             available_bytes=snapshot.available_bytes,
         )

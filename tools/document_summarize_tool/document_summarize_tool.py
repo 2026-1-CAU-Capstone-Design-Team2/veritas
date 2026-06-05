@@ -22,15 +22,15 @@ class DocumentSummarizeTool(BaseTool):
     # reached; it only guards against pathologically large inputs.
     _MAX_DOC_CHUNKS = 16
 
-    # The single-pass budget is derived from the llama-server context window:
-    #   n_ctx (tokens) * _CHARS_PER_TOKEN * _INPUT_CONTEXT_FRACTION
-    # The remainder of the window is reserved for the system prompt and the
-    # generated summary. _CHARS_PER_TOKEN is deliberately conservative for
-    # mixed Korean/English text. This keeps ordinary long articles on the fast
-    # single-pass path; map-reduce only triggers for documents that genuinely
-    # cannot fit the model context.
-    _CHARS_PER_TOKEN = 2.5
-    _INPUT_CONTEXT_FRACTION = 0.5
+    # The single-pass budget is derived from the llama-server context window.
+    # Reserve tokens for the system prompt, JSON wrapper, and answer, then use
+    # a conservative mixed Korean/English chars-per-token estimate. Do not let
+    # the legacy max_context floor override a smaller real n_ctx: that can make
+    # llama-server reject the request with exceed_context_size_error.
+    _SAFE_CHARS_PER_TOKEN = 1.0
+    _PROMPT_TOKEN_RESERVE = 1536
+    _CONTEXT_TOKEN_HEADROOM = 256
+    _TOKENIZE_TIMEOUT_SEC = 0.75
     _MAX_SINGLE_PASS_CHARS = 200000
 
     # Cap on the number of batch summary files a full rebuild produces. The
@@ -327,8 +327,8 @@ class DocumentSummarizeTool(BaseTool):
         """
         n_ctx = getattr(self._llm, "n_ctx", 0) or 0
         if n_ctx > 0:
-            derived = int(n_ctx * self._CHARS_PER_TOKEN * self._INPUT_CONTEXT_FRACTION)
-            budget = max(self._max_context, derived)
+            usable_tokens = max(1024, int(n_ctx) - self._PROMPT_TOKEN_RESERVE)
+            budget = int(usable_tokens * self._SAFE_CHARS_PER_TOKEN)
         else:
             budget = self._max_context
         return max(2000, min(budget, self._MAX_SINGLE_PASS_CHARS))
@@ -343,24 +343,43 @@ class DocumentSummarizeTool(BaseTool):
         """
         text = text or ""
         if len(text) <= budget:
-            return self._summarize_single_pass(record, text, budget)
+            try:
+                return self._summarize_single_pass(record, text, budget)
+            except Exception as e:
+                if not self._is_context_overflow_error(e):
+                    raise
+                retry_budget = max(1000, budget // 2)
+                print(
+                    f"[summarize][context-retry] doc_id={record.doc_id} "
+                    f"budget={budget} retry_budget={retry_budget} reason={e}"
+                )
+                return self._summarize_map_reduce(record, text, retry_budget)
         return self._summarize_map_reduce(record, text, budget)
 
     def _summarize_single_pass(self, record, text: str, budget: int) -> dict[str, Any]:
-        return self._llm.ask_json(
-            DOC_SUMMARY_PROMPT,
-            json.dumps(
+        def build_prompt(body: str) -> str:
+            return json.dumps(
                 {
                     "title_hint": record.title,
                     "url": record.url,
                     "final_url": record.final_url,
                     "domain": record.domain,
                     "title": record.title,
-                    "text": text[:budget],
+                    "text": body,
                 },
                 ensure_ascii=False,
                 indent=2,
-            ),
+            )
+
+        user_prompt = self._fit_text_to_context(
+            DOC_SUMMARY_PROMPT,
+            text,
+            build_prompt,
+            max_chars=budget,
+        )
+        return self._llm.ask_json(
+            DOC_SUMMARY_PROMPT,
+            user_prompt,
             reasoning=False,
             max_retries=self._json_retries,
             stream=getattr(self._llm, "stream_summary", False),
@@ -380,17 +399,25 @@ class DocumentSummarizeTool(BaseTool):
 
         notes: list[str] = []
         for index, chunk in enumerate(chunks, start=1):
-            chunk_input = json.dumps(
-                {
-                    "title": record.title,
-                    "url": record.url,
-                    "domain": record.domain,
-                    "chunk_index": index,
-                    "chunk_total": len(chunks),
-                    "text": chunk,
-                },
-                ensure_ascii=False,
-                indent=2,
+            def build_chunk_prompt(body: str) -> str:
+                return json.dumps(
+                    {
+                        "title": record.title,
+                        "url": record.url,
+                        "domain": record.domain,
+                        "chunk_index": index,
+                        "chunk_total": len(chunks),
+                        "text": body,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            chunk_input = self._fit_text_to_context(
+                DOC_CHUNK_NOTES_PROMPT,
+                chunk,
+                build_chunk_prompt,
+                max_chars=budget,
             )
             note = self._llm.ask(
                 DOC_CHUNK_NOTES_PROMPT,
@@ -414,18 +441,26 @@ class DocumentSummarizeTool(BaseTool):
         if len(joined_notes) > budget:
             joined_notes = joined_notes[:budget]
 
-        reduce_input = json.dumps(
-            {
-                "title_hint": record.title,
-                "url": record.url,
-                "final_url": record.final_url,
-                "domain": record.domain,
-                "title": record.title,
-                "chunk_count": len(chunks),
-                "notes": joined_notes,
-            },
-            ensure_ascii=False,
-            indent=2,
+        def build_reduce_prompt(notes_body: str) -> str:
+            return json.dumps(
+                {
+                    "title_hint": record.title,
+                    "url": record.url,
+                    "final_url": record.final_url,
+                    "domain": record.domain,
+                    "title": record.title,
+                    "chunk_count": len(chunks),
+                    "notes": notes_body,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        reduce_input = self._fit_text_to_context(
+            DOC_SUMMARY_REDUCE_PROMPT,
+            joined_notes,
+            build_reduce_prompt,
+            max_chars=budget,
         )
         try:
             return self._llm.ask_json(
@@ -656,9 +691,9 @@ class DocumentSummarizeTool(BaseTool):
             batch_path = self._run_store_service.get_batch_summary_path(batch_number)
 
             documents = self._read_batch_documents(batch_records)
-            batch_markdown = self._llm.ask(
-                BATCH_SUMMARY_PROMPT,
-                self._build_batch_prompt_input(batch_records, documents),
+            batch_markdown = self._ask_batch_summary(
+                batch_records,
+                documents,
                 reasoning=False,
                 stream=getattr(self._llm, "stream_summary", False),
                 stream_label=f"batch:{batch_number:03d}",
@@ -701,9 +736,9 @@ class DocumentSummarizeTool(BaseTool):
             batch_path = self._run_store_service.get_batch_summary_path(next_batch_number)
 
             documents = self._read_batch_documents(batch_records)
-            batch_markdown = self._llm.ask(
-                BATCH_SUMMARY_PROMPT,
-                self._build_batch_prompt_input(batch_records, documents),
+            batch_markdown = self._ask_batch_summary(
+                batch_records,
+                documents,
                 reasoning=False,
                 stream=getattr(self._llm, "stream_summary", False),
                 stream_label=f"batch:{next_batch_number:03d}",
@@ -717,6 +752,51 @@ class DocumentSummarizeTool(BaseTool):
             batch_files.append(str(batch_path))
 
         return {"batch_files": batch_files, "count": len(batch_files)}
+
+    def _ask_batch_summary(
+        self,
+        batch_records,
+        documents: list[str],
+        **kwargs: Any,
+    ) -> str:
+        stream_label = str(kwargs.get("stream_label") or "")
+        prompt_input = self._fit_batch_prompt_input(batch_records, documents)
+        try:
+            return self._llm.ask(
+                BATCH_SUMMARY_PROMPT,
+                prompt_input,
+                reasoning=False,
+                stream=getattr(self._llm, "stream_summary", False),
+                stream_label=stream_label,
+                # Batch summaries carry the gap analysis that drives the
+                # replan loop, so keep API reasoning models at medium effort.
+                reasoning_effort="medium",
+            )
+        except Exception as e:
+            if not self._is_context_overflow_error(e):
+                raise
+
+            total = sum(len(doc or "") for doc in documents)
+            retry_budget = max(1000, total // 2)
+            nominal_cap = max(1, retry_budget // max(1, len(documents)))
+            retry_documents = self._redistribute_caps(
+                [doc or "" for doc in documents],
+                budget=retry_budget,
+                nominal_cap=nominal_cap,
+            )
+            print(
+                f"[summarize][batch-context-retry] label={stream_label} "
+                f"chars={total} retry_chars={sum(len(doc) for doc in retry_documents)} "
+                f"reason={e}"
+            )
+            return self._llm.ask(
+                BATCH_SUMMARY_PROMPT,
+                self._fit_batch_prompt_input(batch_records, retry_documents),
+                reasoning=False,
+                stream=getattr(self._llm, "stream_summary", False),
+                stream_label=stream_label,
+                reasoning_effort="medium",
+            )
 
     def _build_batch_prompt_input(self, batch_records, documents: list[str]) -> str:
         """Render the batch summary user prompt.
@@ -757,3 +837,101 @@ class DocumentSummarizeTool(BaseTool):
             "\n\n---\n\n".join(rendered_docs),
         ]
         return "\n".join(sections).strip() + "\n"
+
+    def _fit_batch_prompt_input(self, batch_records, documents: list[str]) -> str:
+        prompt_input = self._build_batch_prompt_input(batch_records, documents)
+        if self._prompt_fits_context(BATCH_SUMMARY_PROMPT, prompt_input):
+            return prompt_input
+
+        total = sum(len(doc or "") for doc in documents)
+        if total <= 0:
+            return prompt_input
+
+        low = 0
+        high = total
+        best = self._build_batch_prompt_input(batch_records, ["" for _ in documents])
+        best_chars = 0
+        raw_docs = [doc or "" for doc in documents]
+        while low <= high:
+            mid = (low + high) // 2
+            nominal_cap = max(1, mid // max(1, len(raw_docs)))
+            candidate_docs = self._redistribute_caps(
+                raw_docs,
+                budget=mid,
+                nominal_cap=nominal_cap,
+            )
+            candidate = self._build_batch_prompt_input(batch_records, candidate_docs)
+            if self._prompt_fits_context(BATCH_SUMMARY_PROMPT, candidate):
+                best = candidate
+                best_chars = sum(len(doc) for doc in candidate_docs)
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        print(f"[summarize][batch-fit] chars={total} fitted_chars={best_chars}")
+        return best
+
+    def _fit_text_to_context(
+        self,
+        system_prompt: str,
+        text: str,
+        build_user_prompt: Callable[[str], str],
+        *,
+        max_chars: int,
+    ) -> str:
+        text = text or ""
+        max_chars = max(0, min(len(text), int(max_chars)))
+        user_prompt = build_user_prompt(text[:max_chars])
+        if self._prompt_fits_context(system_prompt, user_prompt):
+            return user_prompt
+
+        low = 0
+        high = max_chars
+        best = build_user_prompt("")
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = build_user_prompt(text[:mid])
+            if self._prompt_fits_context(system_prompt, candidate):
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best
+
+    def _prompt_fits_context(self, system_prompt: str, user_prompt: str) -> bool:
+        n_ctx = getattr(self._llm, "n_ctx", 0) or 0
+        if n_ctx <= 0:
+            return True
+
+        count_tokens = getattr(self._llm, "tokenize_count", None)
+        if not callable(count_tokens):
+            return True
+
+        prompt = "\n".join(
+            [
+                system_prompt.strip(),
+                "Return a strict JSON object only.",
+                "/no_think",
+                user_prompt,
+            ]
+        )
+        try:
+            token_count = count_tokens(prompt, timeout_sec=self._TOKENIZE_TIMEOUT_SEC)
+        except TypeError:
+            token_count = count_tokens(prompt)
+        except Exception:
+            return True
+
+        if token_count is None:
+            return True
+        limit = max(1024, int(n_ctx) - self._CONTEXT_TOKEN_HEADROOM)
+        return int(token_count) <= limit
+
+    @staticmethod
+    def _is_context_overflow_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "exceed_context_size" in message
+            or "exceeds the available context size" in message
+            or ("n_prompt_tokens" in message and "n_ctx" in message)
+        )

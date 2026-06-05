@@ -17,8 +17,8 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
-from llm.context_settings import context_risk, detect_memory, recommended_context_tokens
-from llm.hardware_policy import max_parallel_slots
+from llm.context_settings import detect_memory, recommended_context_tokens
+from llm.hardware_policy import estimate_runtime, max_parallel_slots
 from llm.model_catalog import (
 	DEFAULT_LLM_MODEL_ID,
 	ModelSpec,
@@ -118,16 +118,6 @@ MAX_RESEARCH_PLAN_COUNT = 9999
 DEFAULT_LLM_PARALLEL = 1
 MIN_LLM_PARALLEL = 1
 MAX_LLM_PARALLEL = 5
-
-CONTEXT_OPTIONS = [
-	("자동 권장", "auto"),
-	("8K tokens", "8192"),
-	("16K tokens", "16384"),
-	("32K tokens", "32768"),
-	("50K tokens", "50000"),
-	("90K tokens", "90000"),
-]
-
 
 class _CollapsibleHeader(QPushButton):
 	"""Flat, full-width header for a CollapsibleSection.
@@ -638,30 +628,25 @@ class SettingsPage(QWidget):
 		subtitle.setWordWrap(True)
 		layout.addWidget(subtitle)
 
-		self.llama_context_combo = QComboBox()
-		self.llama_context_combo.setObjectName("SettingsInput")
-		self.llama_context_combo.setMinimumWidth(260)
-		for label, value in CONTEXT_OPTIONS:
-			self.llama_context_combo.addItem(label, value)
-		self.llama_context_combo.currentIndexChanged.connect(self._on_llama_context_changed)
-		self.llama_context_combo.activated.connect(self._on_llama_context_activated)
+		self.llama_context_value = QLabel()
+		self.llama_context_value.setObjectName("SettingsStatus")
+		self.llama_context_value.setMinimumWidth(260)
+		self.llama_context_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+		self.llama_context_value.setWordWrap(True)
 
 		layout.addWidget(
 			self._research_param_row(
-				"컨텍스트 프로파일",
-				"현재 PC 기준으로 여유, 적합, 위험 상태를 함께 표시합니다. 값을 높이면 긴 문서를 더 많이 담지만 메모리 사용량이 커집니다.",
-				self.llama_context_combo,
+				"자동 컨텍스트",
+				"선택한 모델과 병렬 처리 한도, 현재 PC 메모리를 기준으로 자동 산정합니다. 사용자가 토큰 수를 직접 선택하지 않습니다.",
+				self.llama_context_value,
 			)
 		)
 
 		action_row = QHBoxLayout()
 		action_row.setSpacing(8)
 		action_row.addStretch(1)
-		self._llama_context_reset_button = AppButton("자동 권장", variant="ghost")
-		self._llama_context_reset_button.clicked.connect(self._reset_llama_context_settings)
-		self._llama_context_save_button = AppButton("컨텍스트 설정 저장")
+		self._llama_context_save_button = AppButton("자동 설정 적용")
 		self._llama_context_save_button.clicked.connect(self._save_llama_context_settings)
-		action_row.addWidget(self._llama_context_reset_button)
 		action_row.addWidget(self._llama_context_save_button)
 		layout.addLayout(action_row)
 
@@ -785,21 +770,7 @@ class SettingsPage(QWidget):
 				return DEFAULT_LLM_PARALLEL
 
 	def _selected_context_tokens_for_parallel(self) -> int:
-		try:
-			value = str(self.llama_context_combo.currentData() or "auto")
-		except Exception:
-			value = "auto"
-		if value == "auto":
-			model = self._selected_model_spec()
-			return recommended_context_tokens(
-				model_limit=getattr(model, "context_tokens", None),
-				model=model,
-				parallel_slots=1,
-			)
-		try:
-			return int(value)
-		except ValueError:
-			return self._recommended_context_for_selected_model()
+		return self._recommended_context_for_selected_model()
 
 	def _recommended_context_for_selected_model(self) -> int:
 		model = self._selected_model_spec()
@@ -816,6 +787,14 @@ class SettingsPage(QWidget):
 			hard_limit=MAX_LLM_PARALLEL,
 		)
 
+	def _estimate_selected_context_runtime(self, tokens: int | None = None):
+		return estimate_runtime(
+			self._selected_model_spec(),
+			context_per_slot_tokens=tokens or self._recommended_context_for_selected_model(),
+			parallel_slots=self._selected_parallel_slots(),
+			hard_parallel_limit=MAX_LLM_PARALLEL,
+		)
+
 	def _sync_llm_parallel_limit(self) -> None:
 		if not hasattr(self, "llm_parallel_input"):
 			return
@@ -823,32 +802,17 @@ class SettingsPage(QWidget):
 		self.llm_parallel_input.setMaximum(limit)
 		self._update_llm_parallel_status()
 
-	def _context_risk_for_selected_model(self, tokens: int, auto_tokens: int) -> str:
-		return context_risk(
-			tokens,
-			auto_tokens,
-			model=self._selected_model_spec(),
-			parallel_slots=self._selected_parallel_slots(),
-		)
-
 	def _sync_model_context_review_state(self) -> None:
-		self._context_review_required = self._selected_model() != self._applied_model_id
+		self._context_review_required = False
 		settings = self._settings.get("llamaContext", {})
 		self._refresh_llama_context_options(settings if isinstance(settings, dict) else {})
 		self._sync_llm_parallel_limit()
-		if self._context_review_required:
-			self._update_model_status("선택한 모델입니다. 컨텍스트를 다시 확인해 주세요.")
-			self._update_llama_context_status("모델 변경 후 컨텍스트 확인 필요")
-			return
 		self._update_model_status("선택한 모델입니다.")
 		self._update_llama_context_status()
 
 	def _mark_context_reviewed(self) -> None:
-		if not self._context_review_required:
-			return
 		self._context_review_required = False
-		self._update_model_status("컨텍스트 확인 완료")
-		self._update_llama_context_status("컨텍스트 확인 완료")
+		self._update_llama_context_status()
 
 	def _reset_model_settings(self) -> None:
 		self._set_selected_model(DEFAULT_MODEL_ID)
@@ -860,10 +824,6 @@ class SettingsPage(QWidget):
 		# stream progress so the settings window stays responsive. Guard against
 		# overlapping switches.
 		if self._model_switch_thread is not None:
-			return
-		if self._selected_model() != self._applied_model_id and self._context_review_required:
-			self._update_model_status("모델 변경 후 컨텍스트를 먼저 확인해 주세요.")
-			self._update_llama_context_status("모델 변경 후 컨텍스트 확인 필요")
 			return
 		model_id = self._selected_model()
 		self._set_model_controls_enabled(False)
@@ -1120,28 +1080,12 @@ class SettingsPage(QWidget):
 		if not isinstance(settings, dict):
 			settings = {}
 		self._refresh_llama_context_options(settings)
-		mode = str(settings.get("mode") or "auto")
-		if mode == "manual":
-			value = str(settings.get("tokens") or "")
-		else:
-			value = "auto"
-		index = self.llama_context_combo.findData(value)
-		self.llama_context_combo.setCurrentIndex(max(0, index))
 		self._update_llama_context_status()
 
 	def _refresh_llama_context_options(self, settings: dict) -> None:
-		auto_tokens = self._recommended_context_for_selected_model()
-		current = str(self.llama_context_combo.currentData() or "auto")
-		self.llama_context_combo.blockSignals(True)
-		self.llama_context_combo.clear()
-		self.llama_context_combo.addItem(f"자동 권장 · {auto_tokens:,} tokens · 적합", "auto")
-		for _label, value in CONTEXT_OPTIONS[1:]:
-			tokens = int(value)
-			risk = self._context_risk_for_selected_model(tokens, auto_tokens)
-			self.llama_context_combo.addItem(f"{tokens:,} tokens · {risk}", value)
-		index = self.llama_context_combo.findData(current)
-		self.llama_context_combo.setCurrentIndex(max(0, index))
-		self.llama_context_combo.blockSignals(False)
+		if isinstance(settings, dict):
+			self._settings["llamaContext"] = settings
+		self._update_llama_context_value()
 
 	def _on_llama_context_changed(self, *_args) -> None:
 		self._sync_llm_parallel_limit()
@@ -1159,18 +1103,13 @@ class SettingsPage(QWidget):
 		self._update_llama_context_status()
 
 	def _reset_llama_context_settings(self) -> None:
-		index = self.llama_context_combo.findData("auto")
-		self.llama_context_combo.setCurrentIndex(max(0, index))
 		self._mark_context_reviewed()
 		self._save_llama_context_settings()
 
 	def _save_llama_context_settings(self) -> None:
 		self._mark_context_reviewed()
-		value = str(self.llama_context_combo.currentData() or "auto")
-		mode = "auto" if value == "auto" else "manual"
-		tokens = None if mode == "auto" else int(value)
 		try:
-			payload = AgentController().update_llama_context(mode, tokens)
+			payload = AgentController().update_llama_context("auto", None)
 		except Exception as e:
 			self._update_llama_context_status(f"저장 중 오류가 발생했습니다: {e}")
 			return
@@ -1184,14 +1123,14 @@ class SettingsPage(QWidget):
 				f"설정은 저장됐지만 모델 서버 재시작은 실패했습니다: {payload.get('restartError')}"
 			)
 			return
-		self._update_llama_context_status("컨텍스트 설정이 저장되고 모델 서버에 적용됐습니다.")
+		if payload.get("restartSkipped"):
+			self._update_llama_context_status("자동 컨텍스트가 이미 최신 상태입니다.")
+			return
+		self._update_llama_context_status("자동 컨텍스트가 모델 서버에 적용됐습니다.")
 
 	def _persist_llama_context_after_model_switch(self) -> None:
-		value = str(self.llama_context_combo.currentData() or "auto")
-		mode = "auto" if value == "auto" else "manual"
-		tokens = None if mode == "auto" else int(value)
 		try:
-			payload = AgentController().update_llama_context(mode, tokens)
+			payload = AgentController().update_llama_context("auto", None)
 		except Exception as e:
 			self._update_llama_context_status(f"모델은 전환됐지만 컨텍스트 적용 중 오류가 발생했습니다: {e}")
 			return
@@ -1216,21 +1155,40 @@ class SettingsPage(QWidget):
 		auto_tokens = self._recommended_context_for_selected_model()
 		memory = detect_memory()
 		available_gb = round(memory.available_gb, 1)
-		value = str(self.llama_context_combo.currentData() or "auto")
-		if value == "auto":
-			tokens = auto_tokens
-			risk = "적합"
-			label = "자동 권장"
-		else:
-			tokens = int(value)
-			risk = self._context_risk_for_selected_model(tokens, auto_tokens)
-			label = f"{tokens:,} tokens"
-		if self._context_review_required and prefix is None:
-			prefix = "모델 변경 후 컨텍스트 확인 필요"
+		tokens = auto_tokens
+		try:
+			estimate = self._estimate_selected_context_runtime(tokens)
+			risk = estimate.risk
+			parallel_limit = estimate.max_parallel_slots
+		except Exception:
+			risk = str(settings.get("risk") or "적합")
+			parallel_limit = self._max_parallel_for_selected_runtime()
+		label = "자동 최적화"
 		lead = f"{prefix} · " if prefix else ""
 		mem_text = f" · 여유 RAM {available_gb}GB"
 		self.llama_context_status.setText(
-			f"{lead}{label} · {risk} · 자동 권장 {auto_tokens:,} tokens{mem_text}"
+			f"{lead}{label} · {tokens:,} tokens · {risk} · 최대 병렬 {parallel_limit}개{mem_text}"
+		)
+		self._update_llama_context_value(tokens=tokens, risk=risk, parallel_limit=parallel_limit)
+
+	def _update_llama_context_value(
+		self,
+		*,
+		tokens: int | None = None,
+		risk: str | None = None,
+		parallel_limit: int | None = None,
+	) -> None:
+		if not hasattr(self, "llama_context_value"):
+			return
+		tokens = tokens if tokens is not None else self._recommended_context_for_selected_model()
+		risk = risk or "적합"
+		if parallel_limit is None:
+			try:
+				parallel_limit = self._max_parallel_for_selected_runtime()
+			except Exception:
+				parallel_limit = MAX_LLM_PARALLEL
+		self.llama_context_value.setText(
+			f"자동 · {int(tokens):,} tokens · {risk} · 병렬 {parallel_limit}개"
 		)
 
 	def _reset_llm_parallel_settings(self) -> None:

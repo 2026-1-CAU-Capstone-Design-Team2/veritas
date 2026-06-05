@@ -8,11 +8,12 @@ from llm.hardware_policy import (
     RISK_RISKY,
     estimate_runtime,
     max_parallel_slots,
+    model_fit_context_tokens,
     recommended_context_tokens,
 )
 from llm.model_catalog import get_model, llm_models
 from llm.model_manager import _expand_split_gguf
-from llm.llama_supervisor import _common_args, _ngl_retry_values
+from llm.llama_supervisor import _common_args, _context_flag, _ngl_retry_values, effective_context_per_slot
 
 
 class ModelCatalogVariantTests(unittest.TestCase):
@@ -93,11 +94,83 @@ class HardwarePolicyTests(unittest.TestCase):
         self.assertIn(tokens, CONTEXT_TIERS)
         self.assertLessEqual(tokens, 90_000)
 
+    def test_model_fit_context_caps_small_and_mid_models(self) -> None:
+        self.assertEqual(
+            model_fit_context_tokens(get_model("qwen35-0.8b-q8_0", kind="llm")),
+            8192,
+        )
+        self.assertEqual(
+            model_fit_context_tokens(get_model("qwen35-4b-q4", kind="llm")),
+            8192,
+        )
+        self.assertEqual(
+            model_fit_context_tokens(get_model("qwen35-9b-q4", kind="llm")),
+            8192,
+        )
+        self.assertEqual(
+            model_fit_context_tokens(get_model("qwen35-27b-q4", kind="llm")),
+            16384,
+        )
+        self.assertEqual(
+            model_fit_context_tokens(get_model("qwen35-35b-a3b-q4", kind="llm")),
+            32768,
+        )
+
+    def test_recommendation_prioritizes_five_parallel_slots_over_max_context(self) -> None:
+        model = get_model("qwen35-9b-q4", kind="llm")
+        tokens = recommended_context_tokens(
+            model,
+            context_tiers=CONTEXT_TIERS,
+            available_bytes=96 * 1024**3,
+            parallel_slots=1,
+            app_limit=90_000,
+            prefer_installed_file=False,
+        )
+        self.assertEqual(tokens, 8_192)
+        self.assertEqual(
+            max_parallel_slots(
+                model,
+                context_per_slot_tokens=tokens,
+                available_bytes=96 * 1024**3,
+                prefer_installed_file=False,
+            ),
+            5,
+        )
+
+    def test_large_model_auto_context_still_preserves_five_parallel_slots(self) -> None:
+        model = get_model("qwen35-35b-a3b-q4", kind="llm")
+        tokens = recommended_context_tokens(
+            model,
+            context_tiers=CONTEXT_TIERS,
+            available_bytes=128 * 1024**3,
+            parallel_slots=1,
+            app_limit=90_000,
+            prefer_installed_file=False,
+        )
+        self.assertEqual(tokens, 32_768)
+        self.assertEqual(
+            max_parallel_slots(
+                model,
+                context_per_slot_tokens=tokens,
+                available_bytes=128 * 1024**3,
+                prefer_installed_file=False,
+            ),
+            5,
+        )
+
     def test_llama_common_args_try_full_gpu_offload_by_default(self) -> None:
         with patch.dict("os.environ", {"VERITAS_LLAMA_NP": "1"}, clear=True):
             args = _common_args("llm")
         self.assertEqual(args[args.index("-ngl") + 1], "99")
         self.assertEqual(args[args.index("-np") + 1], "1")
+
+    def test_llama_memory_context_uses_per_slot_context(self) -> None:
+        with (
+            patch.dict("os.environ", {"VERITAS_LLAMA_CTX": "40960"}, clear=True),
+            patch("llm.llama_supervisor._np_flag", return_value="5"),
+        ):
+            self.assertEqual(_context_flag("llm"), "40960")
+            self.assertEqual(effective_context_per_slot("llm"), 8192)
 
     def test_llama_common_args_respect_explicit_gpu_layer_override(self) -> None:
         with patch.dict(

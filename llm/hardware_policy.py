@@ -229,6 +229,22 @@ def max_parallel_slots(
     return maximum
 
 
+def model_fit_context_tokens(model: ModelSpec, *, app_limit: int | None = None) -> int:
+    """Largest automatic context tier that fits the model size class."""
+    params = float(model.parameter_size_b or 0.0)
+    if params <= 9.0:
+        target = 8192
+    elif params <= 27.0:
+        target = 16384
+    else:
+        target = 32768
+
+    limit = app_limit if app_limit and app_limit > 0 else target
+    if model.context_tokens and model.context_tokens > 0:
+        limit = min(limit, int(model.context_tokens))
+    return max(1, min(target, int(limit)))
+
+
 def estimate_runtime(
     model: ModelSpec,
     *,
@@ -296,6 +312,15 @@ def recommended_context_tokens(
         limit = min(limit, int(model_limit))
     if model.context_tokens and model.context_tokens > 0:
         limit = min(limit, int(model.context_tokens))
+    limit = min(limit, model_fit_context_tokens(model, app_limit=app_limit))
+    target_parallel_slots = max(
+        clamp_parallel_slots(parallel_slots),
+        MAX_PARALLEL_SLOTS,
+    )
+    if model.context_tokens and model.context_tokens > 0:
+        per_slot_parallel_limit = int(model.context_tokens) // target_parallel_slots
+        if per_slot_parallel_limit > 0:
+            limit = min(limit, per_slot_parallel_limit)
     candidates = sorted({tokens for tokens in context_tiers if tokens <= limit})
     if not candidates:
         return max(1, min(context_tiers[0], limit))
@@ -305,7 +330,7 @@ def recommended_context_tokens(
         estimate = estimate_runtime(
             model,
             context_per_slot_tokens=tokens,
-            parallel_slots=parallel_slots,
+            parallel_slots=target_parallel_slots,
             available_bytes=snapshot.available_bytes,
             prefer_installed_file=prefer_installed_file,
         )
