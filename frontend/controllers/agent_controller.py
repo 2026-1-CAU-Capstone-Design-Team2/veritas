@@ -180,6 +180,12 @@ class AgentController:
 			{"value": int(value)},
 		)
 
+	def update_llama_context(self, mode: str, tokens: int | None = None) -> dict[str, Any]:
+		payload: dict[str, Any] = {"mode": str(mode or "auto")}
+		if tokens is not None:
+			payload["tokens"] = int(tokens)
+		return api_client.put("/api/v1/settings/llama-context", payload)
+
 	def get_document_summary(self, workspace_id: str) -> str:
 		response = api_client.get(f"/api/v1/documents/{workspace_id}/summary")
 		return str(response.get("summary") or "")

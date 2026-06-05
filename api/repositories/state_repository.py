@@ -338,10 +338,51 @@ def set_llm_parallel_settings(value: int) -> int:
     The clamped value is what callers should apply to ``LLMClient.max_parallel``.
     """
     _ensure_settings_loaded()
-    clamped = max(1, min(5, int(value)))
+    requested = max(1, min(5, int(value)))
+    clamped = requested
+    try:
+        from llm.context_settings import effective_context_tokens
+        from llm.hardware_policy import max_parallel_slots
+        from llm.model_catalog import selected_model_from_settings
+
+        model = selected_model_from_settings(STATE["settings"])
+        context_tokens = effective_context_tokens(
+            STATE["settings"],
+            model_limit=getattr(model, "context_tokens", None),
+            model=model,
+            parallel_slots=1,
+        )
+        limit = max_parallel_slots(
+            model,
+            context_per_slot_tokens=context_tokens,
+            hard_limit=5,
+        )
+        clamped = min(requested, limit)
+    except Exception:
+        clamped = requested
     STATE["settings"]["llmParallel"] = clamped
     _persist_settings()
     return clamped
+
+
+def set_llama_context_settings(mode: str, tokens: int | None = None) -> dict[str, Any]:
+    _ensure_settings_loaded()
+    from llm.context_settings import normalize_context_settings
+    from llm.model_catalog import selected_model_from_settings
+
+    model = selected_model_from_settings(STATE["settings"])
+    payload: dict[str, Any] = {"mode": str(mode or "auto")}
+    if tokens is not None:
+        payload["tokens"] = int(tokens)
+    normalized = normalize_context_settings(
+        payload,
+        model_limit=getattr(model, "context_tokens", None),
+        model=model,
+        parallel_slots=int(STATE["settings"].get("llmParallel", 1) or 1),
+    )
+    STATE["settings"]["llamaContext"] = normalized
+    _persist_settings()
+    return normalized
 
 
 def get_current_workspace_id() -> str:

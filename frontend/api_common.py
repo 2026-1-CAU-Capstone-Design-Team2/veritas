@@ -31,7 +31,7 @@ STATE: dict[str, object] = {
     "settings": {
         "model": {
             "modelId": "qwen35-0.8b-q8_0",
-            "modelName": "Qwen3.5 0.8B 8-bit",
+            "modelName": "Qwen3.5 0.8B Q8",
         },
         "embeddingModel": {
             "modelId": "granite-embedding-97m-r2-q8_0",
@@ -57,6 +57,10 @@ STATE: dict[str, object] = {
             "apiKeyPreview": "",
         },
         "llmParallel": 1,
+        "llamaContext": {
+            "mode": "auto",
+            "tokens": 32768,
+        },
     },
 }
 

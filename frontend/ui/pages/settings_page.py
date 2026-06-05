@@ -4,6 +4,7 @@ from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
 	QButtonGroup,
+	QComboBox,
 	QFileDialog,
 	QFrame,
 	QHBoxLayout,
@@ -16,6 +17,17 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
+from llm.context_settings import context_risk, detect_memory, recommended_context_tokens
+from llm.hardware_policy import max_parallel_slots
+from llm.model_catalog import (
+	DEFAULT_LLM_MODEL_ID,
+	ModelSpec,
+	bytes_label,
+	get_model,
+	llm_models,
+	selected_model_from_settings,
+)
+
 from ...api_common import STATE, current_workspace_id
 from ...components.buttons import AppButton
 from ...components.cards import CardWidget
@@ -24,14 +36,70 @@ from ...theme import theme
 from .research_page import DocCountStepper
 
 
-MODEL_OPTIONS = [
-	("0.8B 8bit", "qwen35-0.8b-q8_0"),
-	("2B 8bit", "qwen35-2b-q8_0"),
-	("4B 4bit", "qwen35-4b-q4"),
-	("9B 4bit", "qwen35-9b-q4"),
-]
-DEFAULT_MODEL_ID = "qwen35-0.8b-q8_0"
-MODEL_LABELS = {model_id: label for label, model_id in MODEL_OPTIONS}
+DEFAULT_MODEL_ID = DEFAULT_LLM_MODEL_ID
+
+
+def _model_size_key(spec: ModelSpec) -> str:
+	prefix = "qwen35-"
+	suffix = f"-{spec.quantization_key}"
+	if spec.id.startswith(prefix) and spec.id.endswith(suffix):
+		return spec.id[len(prefix) : -len(suffix)]
+	return spec.parameter_label or spec.id
+
+
+def _model_size_label(spec: ModelSpec) -> str:
+	if spec.active_parameter_size_b:
+		active = int(spec.active_parameter_size_b)
+		return f"{spec.parameter_label}-A{active}B"
+	return spec.parameter_label or spec.short_name.rsplit(" ", 1)[0]
+
+
+def _model_size_options() -> list[tuple[str, str]]:
+	options: list[tuple[str, str]] = []
+	seen: set[str] = set()
+	for spec in sorted(llm_models(), key=lambda model: model.display_order):
+		size_key = _model_size_key(spec)
+		if size_key in seen:
+			continue
+		seen.add(size_key)
+		options.append((_model_size_label(spec), size_key))
+	return options
+
+
+def _model_variants_for_size(size_key: str) -> list[ModelSpec]:
+	return [
+		spec
+		for spec in sorted(llm_models(), key=lambda model: model.display_order)
+		if _model_size_key(spec) == size_key
+	]
+
+
+def _model_variant(size_key: str, quantization_key: str) -> ModelSpec:
+	for spec in _model_variants_for_size(size_key):
+		if spec.quantization_key == quantization_key:
+			return spec
+	return get_model(DEFAULT_MODEL_ID, kind="llm")
+
+
+def _default_quantization_for_size(size_key: str) -> str:
+	variants = _model_variants_for_size(size_key)
+	for spec in variants:
+		if spec.recommended:
+			return spec.quantization_key
+	for preferred in ("q4", "q8_0", "q6", "q5", "q3", "q2", "bf16"):
+		for spec in variants:
+			if spec.quantization_key == preferred:
+				return spec.quantization_key
+	return variants[0].quantization_key if variants else get_model(DEFAULT_MODEL_ID, kind="llm").quantization_key
+
+
+def _model_label(model_id: str) -> str:
+	return get_model(model_id, kind="llm").name
+
+
+def _model_meta(spec: ModelSpec) -> str:
+	arch = "MoE" if spec.architecture == "moe" else "Dense"
+	return f"{arch} · {spec.quantization} · 약 {bytes_label(spec.size_bytes)}"
 
 # 조사 진행 방식 — defaults + frontend-enforced bounds for how the AutoSurvey
 # LLM paces its research. The plan count has no real upper limit, so
@@ -50,6 +118,15 @@ MAX_RESEARCH_PLAN_COUNT = 9999
 DEFAULT_LLM_PARALLEL = 1
 MIN_LLM_PARALLEL = 1
 MAX_LLM_PARALLEL = 5
+
+CONTEXT_OPTIONS = [
+	("자동 권장", "auto"),
+	("8K tokens", "8192"),
+	("16K tokens", "16384"),
+	("32K tokens", "32768"),
+	("50K tokens", "50000"),
+	("90K tokens", "90000"),
+]
 
 
 class _CollapsibleHeader(QPushButton):
@@ -188,7 +265,7 @@ class SettingsPage(QWidget):
 			{
 				"model": {
 					"modelId": DEFAULT_MODEL_ID,
-					"modelName": MODEL_LABELS[DEFAULT_MODEL_ID],
+					"modelName": _model_label(DEFAULT_MODEL_ID),
 				},
 				"embeddingModel": {
 					"modelId": "granite-embedding-97m-r2-q8_0",
@@ -200,6 +277,8 @@ class SettingsPage(QWidget):
 			},
 		)
 		self._settings.setdefault("model", {}).setdefault("modelId", DEFAULT_MODEL_ID)
+		self._applied_model_id = str(self._settings.get("model", {}).get("modelId") or DEFAULT_MODEL_ID)
+		self._context_review_required = False
 		self._settings.setdefault("localAccess", {})
 		research_defaults = self._settings.setdefault("research", {})
 		research_defaults.setdefault("sampleCount", DEFAULT_RESEARCH_SAMPLE_COUNT)
@@ -209,7 +288,6 @@ class SettingsPage(QWidget):
 		autosurvey_openai_defaults.setdefault("apiKeySet", False)
 		autosurvey_openai_defaults.setdefault("apiKeyPreview", "")
 		self._settings.setdefault("llmParallel", DEFAULT_LLM_PARALLEL)
-		self._model_buttons: dict[str, QPushButton] = {}
 		self._local_access_thread: QThread | None = None
 		self._local_access_worker: _LocalAccessWorker | None = None
 
@@ -266,22 +344,31 @@ class SettingsPage(QWidget):
 		subtitle.setWordWrap(True)
 		card.layout.addWidget(subtitle)
 
-		self.model_group = QButtonGroup(self)
-		self.model_group.setExclusive(True)
+		self.model_size_combo = QComboBox()
+		self.model_size_combo.setObjectName("SettingsInput")
+		self.model_size_combo.setMinimumWidth(190)
+		for label, size_key in _model_size_options():
+			self.model_size_combo.addItem(label, size_key)
+		card.layout.addWidget(
+			self._research_param_row(
+				"모델 크기",
+				"파라미터 규모입니다. 큰 모델일수록 품질은 좋아질 수 있지만 메모리와 다운로드 용량이 커집니다.",
+				self.model_size_combo,
+			)
+		)
 
-		toggle_row = QHBoxLayout()
-		toggle_row.setSpacing(8)
-		for label, model_name in MODEL_OPTIONS:
-			button = QPushButton(label)
-			button.setObjectName("SettingsModelToggle")
-			button.setCheckable(True)
-			button.setCursor(Qt.PointingHandCursor)
-			button.clicked.connect(lambda _checked, value=model_name: self._select_model(value))
-			self.model_group.addButton(button)
-			self._model_buttons[model_name] = button
-			toggle_row.addWidget(button)
-		toggle_row.addStretch(1)
-		card.layout.addLayout(toggle_row)
+		self.model_quant_combo = QComboBox()
+		self.model_quant_combo.setObjectName("SettingsInput")
+		self.model_quant_combo.setMinimumWidth(190)
+		card.layout.addWidget(
+			self._research_param_row(
+				"양자화",
+				"가중치 압축 수준입니다. BF16/Q8은 품질 우선, Q4/Q3/Q2는 메모리 절약에 유리합니다.",
+				self.model_quant_combo,
+			)
+		)
+		self.model_size_combo.currentIndexChanged.connect(self._on_model_size_changed)
+		self.model_quant_combo.currentIndexChanged.connect(self._on_model_quant_changed)
 
 		self.model_status = QLabel()
 		self.model_status.setObjectName("SettingsStatus")
@@ -361,6 +448,8 @@ class SettingsPage(QWidget):
 		section.add_widget(self._build_openai_api_key_section())
 		section.add_widget(self._divider())
 		section.add_widget(self._build_research_method_section())
+		section.add_widget(self._divider())
+		section.add_widget(self._build_llama_context_section())
 		section.add_widget(self._divider())
 		section.add_widget(self._build_llm_parallel_section())
 		return section
@@ -503,6 +592,7 @@ class SettingsPage(QWidget):
 			MAX_LLM_PARALLEL,
 			DEFAULT_LLM_PARALLEL,
 		)
+		self.llm_parallel_input.valueChanged.connect(self._on_llm_parallel_changed)
 		layout.addWidget(
 			self._research_param_row(
 				"동시 처리 개수",
@@ -515,12 +605,12 @@ class SettingsPage(QWidget):
 		action_row = QHBoxLayout()
 		action_row.setSpacing(8)
 		action_row.addStretch(1)
-		reset_button = AppButton("기본값", variant="ghost")
-		reset_button.clicked.connect(self._reset_llm_parallel_settings)
-		save_button = AppButton("병렬 설정 저장")
-		save_button.clicked.connect(self._save_llm_parallel_settings)
-		action_row.addWidget(reset_button)
-		action_row.addWidget(save_button)
+		self._llm_parallel_reset_button = AppButton("기본값", variant="ghost")
+		self._llm_parallel_reset_button.clicked.connect(self._reset_llm_parallel_settings)
+		self._llm_parallel_save_button = AppButton("병렬 설정 저장")
+		self._llm_parallel_save_button.clicked.connect(self._save_llm_parallel_settings)
+		action_row.addWidget(self._llm_parallel_reset_button)
+		action_row.addWidget(self._llm_parallel_save_button)
 		layout.addLayout(action_row)
 
 		self.llm_parallel_status = QLabel()
@@ -529,6 +619,58 @@ class SettingsPage(QWidget):
 		layout.addWidget(self.llm_parallel_status)
 
 		self._load_llm_parallel_settings()
+		self._sync_llm_parallel_limit()
+		return section
+
+	def _build_llama_context_section(self) -> QWidget:
+		section = QWidget()
+		layout = QVBoxLayout(section)
+		layout.setContentsMargins(0, 0, 0, 0)
+		layout.setSpacing(12)
+
+		layout.addWidget(self._subsection_title("컨텍스트 크기"))
+
+		subtitle = QLabel(
+			"AI 모델이 한 번에 기억하고 처리할 수 있는 토큰 범위입니다. "
+			"자동 권장은 현재 PC의 여유 메모리를 기준으로 안정적인 값을 선택합니다."
+		)
+		subtitle.setObjectName("PageSubtitle")
+		subtitle.setWordWrap(True)
+		layout.addWidget(subtitle)
+
+		self.llama_context_combo = QComboBox()
+		self.llama_context_combo.setObjectName("SettingsInput")
+		self.llama_context_combo.setMinimumWidth(260)
+		for label, value in CONTEXT_OPTIONS:
+			self.llama_context_combo.addItem(label, value)
+		self.llama_context_combo.currentIndexChanged.connect(self._on_llama_context_changed)
+		self.llama_context_combo.activated.connect(self._on_llama_context_activated)
+
+		layout.addWidget(
+			self._research_param_row(
+				"컨텍스트 프로파일",
+				"현재 PC 기준으로 여유, 적합, 위험 상태를 함께 표시합니다. 값을 높이면 긴 문서를 더 많이 담지만 메모리 사용량이 커집니다.",
+				self.llama_context_combo,
+			)
+		)
+
+		action_row = QHBoxLayout()
+		action_row.setSpacing(8)
+		action_row.addStretch(1)
+		self._llama_context_reset_button = AppButton("자동 권장", variant="ghost")
+		self._llama_context_reset_button.clicked.connect(self._reset_llama_context_settings)
+		self._llama_context_save_button = AppButton("컨텍스트 설정 저장")
+		self._llama_context_save_button.clicked.connect(self._save_llama_context_settings)
+		action_row.addWidget(self._llama_context_reset_button)
+		action_row.addWidget(self._llama_context_save_button)
+		layout.addLayout(action_row)
+
+		self.llama_context_status = QLabel()
+		self.llama_context_status.setObjectName("SettingsStatus")
+		self.llama_context_status.setWordWrap(True)
+		layout.addWidget(self.llama_context_status)
+
+		self._load_llama_context_settings()
 		return section
 
 	def _research_param_row(self, title: str, hint: str, field: QWidget) -> QFrame:
@@ -567,17 +709,9 @@ class SettingsPage(QWidget):
 		return line
 
 	def _load_model_settings(self) -> None:
-		model_settings = self._settings.get("model", {})
-		model_id = model_settings.get("modelId")
-		if not model_id:
-			legacy_name = str(model_settings.get("modelName") or "")
-			model_id = {
-				"0.8B": "qwen35-0.8b-q8_0",
-				"2B": "qwen35-2b-q8_0",
-				"4B": "qwen35-4b-q4",
-				"9B": "qwen35-9b-q4",
-			}.get(legacy_name, DEFAULT_MODEL_ID)
-		self._set_selected_model(str(model_id))
+		model = selected_model_from_settings(self._settings)
+		self._applied_model_id = model.id
+		self._set_selected_model(model.id)
 		self._update_model_status("현재 모델이 적용되어 있습니다.")
 
 	def _load_local_access_settings(self) -> None:
@@ -592,20 +726,129 @@ class SettingsPage(QWidget):
 			self._add_folder_item(str(folder_path))
 		self._update_local_folder_status()
 
-	def _select_model(self, model_name: str) -> None:
-		self._set_selected_model(model_name)
-		self._update_model_status("선택한 모델입니다.")
-
 	def _set_selected_model(self, model_name: str) -> None:
-		if model_name not in self._model_buttons:
-			model_name = DEFAULT_MODEL_ID
-		self._model_buttons[model_name].setChecked(True)
+		if not hasattr(self, "model_size_combo") or not hasattr(self, "model_quant_combo"):
+			return
+		spec = get_model(model_name, kind="llm")
+		size_key = _model_size_key(spec)
+		previous_size_blocked = self.model_size_combo.blockSignals(True)
+		index = self.model_size_combo.findData(size_key)
+		self.model_size_combo.setCurrentIndex(max(0, index))
+		self.model_size_combo.blockSignals(previous_size_blocked)
+		self._refresh_model_quant_options(spec.quantization_key)
 
 	def _selected_model(self) -> str:
-		for model_name, button in self._model_buttons.items():
-			if button.isChecked():
-				return model_name
-		return DEFAULT_MODEL_ID
+		if not hasattr(self, "model_size_combo") or not hasattr(self, "model_quant_combo"):
+			return DEFAULT_MODEL_ID
+		size_key = str(self.model_size_combo.currentData() or "")
+		quantization_key = str(self.model_quant_combo.currentData() or "")
+		return _model_variant(size_key, quantization_key).id
+
+	def _refresh_model_quant_options(self, preferred_quantization: str | None = None) -> None:
+		if not hasattr(self, "model_quant_combo"):
+			return
+		size_key = str(self.model_size_combo.currentData() or _model_size_options()[0][1])
+		current = preferred_quantization or str(self.model_quant_combo.currentData() or "")
+		if not current:
+			current = _default_quantization_for_size(size_key)
+		previous_blocked = self.model_quant_combo.blockSignals(True)
+		self.model_quant_combo.clear()
+		for spec in _model_variants_for_size(size_key):
+			label = f"{spec.quantization} · 약 {bytes_label(spec.size_bytes)}"
+			if spec.recommended:
+				label = f"{label} · 권장"
+			self.model_quant_combo.addItem(label, spec.quantization_key)
+		index = self.model_quant_combo.findData(current)
+		if index < 0:
+			index = self.model_quant_combo.findData(_default_quantization_for_size(size_key))
+		self.model_quant_combo.setCurrentIndex(max(0, index))
+		self.model_quant_combo.blockSignals(previous_blocked)
+
+	def _on_model_size_changed(self, *_args) -> None:
+		size_key = str(self.model_size_combo.currentData() or "")
+		self._refresh_model_quant_options(_default_quantization_for_size(size_key))
+		self._sync_model_context_review_state()
+
+	def _on_model_quant_changed(self, *_args) -> None:
+		self._sync_model_context_review_state()
+
+	def _selected_model_spec(self):
+		return get_model(self._selected_model(), kind="llm")
+
+	def _selected_parallel_slots(self) -> int:
+		try:
+			return int(self.llm_parallel_input.value())
+		except Exception:
+			try:
+				return int(self._settings.get("llmParallel", DEFAULT_LLM_PARALLEL))
+			except (TypeError, ValueError):
+				return DEFAULT_LLM_PARALLEL
+
+	def _selected_context_tokens_for_parallel(self) -> int:
+		try:
+			value = str(self.llama_context_combo.currentData() or "auto")
+		except Exception:
+			value = "auto"
+		if value == "auto":
+			model = self._selected_model_spec()
+			return recommended_context_tokens(
+				model_limit=getattr(model, "context_tokens", None),
+				model=model,
+				parallel_slots=1,
+			)
+		try:
+			return int(value)
+		except ValueError:
+			return self._recommended_context_for_selected_model()
+
+	def _recommended_context_for_selected_model(self) -> int:
+		model = self._selected_model_spec()
+		return recommended_context_tokens(
+			model_limit=getattr(model, "context_tokens", None),
+			model=model,
+			parallel_slots=self._selected_parallel_slots(),
+		)
+
+	def _max_parallel_for_selected_runtime(self) -> int:
+		return max_parallel_slots(
+			self._selected_model_spec(),
+			context_per_slot_tokens=self._selected_context_tokens_for_parallel(),
+			hard_limit=MAX_LLM_PARALLEL,
+		)
+
+	def _sync_llm_parallel_limit(self) -> None:
+		if not hasattr(self, "llm_parallel_input"):
+			return
+		limit = self._max_parallel_for_selected_runtime()
+		self.llm_parallel_input.setMaximum(limit)
+		self._update_llm_parallel_status()
+
+	def _context_risk_for_selected_model(self, tokens: int, auto_tokens: int) -> str:
+		return context_risk(
+			tokens,
+			auto_tokens,
+			model=self._selected_model_spec(),
+			parallel_slots=self._selected_parallel_slots(),
+		)
+
+	def _sync_model_context_review_state(self) -> None:
+		self._context_review_required = self._selected_model() != self._applied_model_id
+		settings = self._settings.get("llamaContext", {})
+		self._refresh_llama_context_options(settings if isinstance(settings, dict) else {})
+		self._sync_llm_parallel_limit()
+		if self._context_review_required:
+			self._update_model_status("선택한 모델입니다. 컨텍스트를 다시 확인해 주세요.")
+			self._update_llama_context_status("모델 변경 후 컨텍스트 확인 필요")
+			return
+		self._update_model_status("선택한 모델입니다.")
+		self._update_llama_context_status()
+
+	def _mark_context_reviewed(self) -> None:
+		if not self._context_review_required:
+			return
+		self._context_review_required = False
+		self._update_model_status("컨텍스트 확인 완료")
+		self._update_llama_context_status("컨텍스트 확인 완료")
 
 	def _reset_model_settings(self) -> None:
 		self._set_selected_model(DEFAULT_MODEL_ID)
@@ -617,6 +860,10 @@ class SettingsPage(QWidget):
 		# stream progress so the settings window stays responsive. Guard against
 		# overlapping switches.
 		if self._model_switch_thread is not None:
+			return
+		if self._selected_model() != self._applied_model_id and self._context_review_required:
+			self._update_model_status("모델 변경 후 컨텍스트를 먼저 확인해 주세요.")
+			self._update_llama_context_status("모델 변경 후 컨텍스트 확인 필요")
 			return
 		model_id = self._selected_model()
 		self._set_model_controls_enabled(False)
@@ -666,10 +913,15 @@ class SettingsPage(QWidget):
 		self._set_model_controls_enabled(True)
 		if success:
 			model_id = self._selected_model()
+			model_changed = model_id != self._applied_model_id
+			self._applied_model_id = model_id
+			self._context_review_required = False
 			self._settings["model"] = {
 				"modelId": model_id,
-				"modelName": MODEL_LABELS.get(model_id, model_id),
+				"modelName": _model_label(model_id),
 			}
+			if model_changed:
+				self._persist_llama_context_after_model_switch()
 			self._update_model_status("모델이 전환되었습니다.")
 		else:
 			self._update_model_status(f"모델 전환 실패: {message}")
@@ -677,8 +929,8 @@ class SettingsPage(QWidget):
 	def _set_model_controls_enabled(self, enabled: bool) -> None:
 		self._model_save_button.setEnabled(enabled)
 		self._model_reset_button.setEnabled(enabled)
-		for button in self._model_buttons.values():
-			button.setEnabled(enabled)
+		self.model_size_combo.setEnabled(enabled)
+		self.model_quant_combo.setEnabled(enabled)
 
 	def _browse_local_folder(self) -> None:
 		folder_path = QFileDialog.getExistingDirectory(
@@ -861,7 +1113,125 @@ class SettingsPage(QWidget):
 			self.llm_parallel_input.setValue(int(value))
 		except (TypeError, ValueError):
 			self.llm_parallel_input.setValue(DEFAULT_LLM_PARALLEL)
+		self._sync_llm_parallel_limit()
+
+	def _load_llama_context_settings(self) -> None:
+		settings = self._settings.get("llamaContext", {})
+		if not isinstance(settings, dict):
+			settings = {}
+		self._refresh_llama_context_options(settings)
+		mode = str(settings.get("mode") or "auto")
+		if mode == "manual":
+			value = str(settings.get("tokens") or "")
+		else:
+			value = "auto"
+		index = self.llama_context_combo.findData(value)
+		self.llama_context_combo.setCurrentIndex(max(0, index))
+		self._update_llama_context_status()
+
+	def _refresh_llama_context_options(self, settings: dict) -> None:
+		auto_tokens = self._recommended_context_for_selected_model()
+		current = str(self.llama_context_combo.currentData() or "auto")
+		self.llama_context_combo.blockSignals(True)
+		self.llama_context_combo.clear()
+		self.llama_context_combo.addItem(f"자동 권장 · {auto_tokens:,} tokens · 적합", "auto")
+		for _label, value in CONTEXT_OPTIONS[1:]:
+			tokens = int(value)
+			risk = self._context_risk_for_selected_model(tokens, auto_tokens)
+			self.llama_context_combo.addItem(f"{tokens:,} tokens · {risk}", value)
+		index = self.llama_context_combo.findData(current)
+		self.llama_context_combo.setCurrentIndex(max(0, index))
+		self.llama_context_combo.blockSignals(False)
+
+	def _on_llama_context_changed(self, *_args) -> None:
+		self._sync_llm_parallel_limit()
+		self._update_llama_context_status()
+
+	def _on_llama_context_activated(self, *_args) -> None:
+		self._mark_context_reviewed()
+		self._sync_llm_parallel_limit()
+		self._update_llama_context_status()
+
+	def _on_llm_parallel_changed(self, *_args) -> None:
+		settings = self._settings.get("llamaContext", {})
+		self._refresh_llama_context_options(settings if isinstance(settings, dict) else {})
 		self._update_llm_parallel_status()
+		self._update_llama_context_status()
+
+	def _reset_llama_context_settings(self) -> None:
+		index = self.llama_context_combo.findData("auto")
+		self.llama_context_combo.setCurrentIndex(max(0, index))
+		self._mark_context_reviewed()
+		self._save_llama_context_settings()
+
+	def _save_llama_context_settings(self) -> None:
+		self._mark_context_reviewed()
+		value = str(self.llama_context_combo.currentData() or "auto")
+		mode = "auto" if value == "auto" else "manual"
+		tokens = None if mode == "auto" else int(value)
+		try:
+			payload = AgentController().update_llama_context(mode, tokens)
+		except Exception as e:
+			self._update_llama_context_status(f"저장 중 오류가 발생했습니다: {e}")
+			return
+		context = payload.get("llamaContext") if isinstance(payload, dict) else None
+		if isinstance(context, dict):
+			self._settings["llamaContext"] = context
+			self._refresh_llama_context_options(context)
+		self._sync_llm_parallel_limit()
+		if payload.get("restartApplied") is False:
+			self._update_llama_context_status(
+				f"설정은 저장됐지만 모델 서버 재시작은 실패했습니다: {payload.get('restartError')}"
+			)
+			return
+		self._update_llama_context_status("컨텍스트 설정이 저장되고 모델 서버에 적용됐습니다.")
+
+	def _persist_llama_context_after_model_switch(self) -> None:
+		value = str(self.llama_context_combo.currentData() or "auto")
+		mode = "auto" if value == "auto" else "manual"
+		tokens = None if mode == "auto" else int(value)
+		try:
+			payload = AgentController().update_llama_context(mode, tokens)
+		except Exception as e:
+			self._update_llama_context_status(f"모델은 전환됐지만 컨텍스트 적용 중 오류가 발생했습니다: {e}")
+			return
+		context = payload.get("llamaContext") if isinstance(payload, dict) else None
+		if isinstance(context, dict):
+			self._settings["llamaContext"] = context
+			self._refresh_llama_context_options(context)
+		self._sync_llm_parallel_limit()
+		if payload.get("restartApplied") is False:
+			self._update_llama_context_status(
+				f"모델은 전환됐지만 컨텍스트 재적용은 실패했습니다: {payload.get('restartError')}"
+			)
+			return
+		self._update_llama_context_status("모델 변경 후 컨텍스트 설정을 다시 적용했습니다.")
+
+	def _update_llama_context_status(self, prefix: str | None = None) -> None:
+		if not hasattr(self, "llama_context_status"):
+			return
+		settings = self._settings.get("llamaContext", {})
+		if not isinstance(settings, dict):
+			settings = {}
+		auto_tokens = self._recommended_context_for_selected_model()
+		memory = detect_memory()
+		available_gb = round(memory.available_gb, 1)
+		value = str(self.llama_context_combo.currentData() or "auto")
+		if value == "auto":
+			tokens = auto_tokens
+			risk = "적합"
+			label = "자동 권장"
+		else:
+			tokens = int(value)
+			risk = self._context_risk_for_selected_model(tokens, auto_tokens)
+			label = f"{tokens:,} tokens"
+		if self._context_review_required and prefix is None:
+			prefix = "모델 변경 후 컨텍스트 확인 필요"
+		lead = f"{prefix} · " if prefix else ""
+		mem_text = f" · 여유 RAM {available_gb}GB"
+		self.llama_context_status.setText(
+			f"{lead}{label} · {risk} · 자동 권장 {auto_tokens:,} tokens{mem_text}"
+		)
 
 	def _reset_llm_parallel_settings(self) -> None:
 		self.llm_parallel_input.setValue(DEFAULT_LLM_PARALLEL)
@@ -874,24 +1244,46 @@ class SettingsPage(QWidget):
 		# (which replaces STATE["settings"] wholesale) and is applied live to
 		# the shared LLM client's max_parallel.
 		try:
-			AgentController().update_llm_parallel(value)
+			payload = AgentController().update_llm_parallel(value)
 		except Exception as e:
 			self._update_llm_parallel_status(f"저장 중 오류가 발생했습니다: {e}")
+			return
+		applied = value
+		if isinstance(payload, dict):
+			try:
+				applied = int(payload.get("llmParallel", value))
+			except (TypeError, ValueError):
+				applied = value
+		self._settings["llmParallel"] = applied
+		self._sync_llm_parallel_limit()
+		self.llm_parallel_input.setValue(applied)
+		if applied != value:
+			self._update_llm_parallel_status(
+				f"현재 모델/컨텍스트 기준 최대 {applied}개로 조정되었습니다."
+			)
 			return
 		self._update_llm_parallel_status("병렬 디코딩 설정이 저장되었습니다.")
 
 	def _update_llm_parallel_status(self, prefix: str | None = None) -> None:
 		lead = f"{prefix} · " if prefix else ""
 		value = self.llm_parallel_input.value()
+		limit = MAX_LLM_PARALLEL
+		try:
+			limit = self._max_parallel_for_selected_runtime()
+		except Exception:
+			pass
 		mode = "순차 처리" if value <= 1 else f"동시 {value}개"
-		self.llm_parallel_status.setText(f"{lead}{mode}")
+		self.llm_parallel_status.setText(
+			f"{lead}{mode} · 현재 모델/컨텍스트 기준 최대 {limit}개"
+		)
 
 	def set_default_workspace_by_name(self, _workspace_name: str) -> None:
 		return
 
 	def _update_model_status(self, prefix: str) -> None:
 		model_id = self._selected_model()
-		self.model_status.setText(f"{prefix} · {MODEL_LABELS.get(model_id, model_id)}")
+		spec = get_model(model_id, kind="llm")
+		self.model_status.setText(f"{prefix} · {spec.name} · {_model_meta(spec)}")
 
 	def _update_local_folder_status(self, prefix: str | None = None) -> None:
 		folder_paths = self._folder_paths()

@@ -25,6 +25,8 @@ def update_model(model_id: str | None, legacy_name: str | None = None) -> dict[s
         "2B": "qwen35-2b-q8_0",
         "4B": "qwen35-4b-q4",
         "9B": "qwen35-9b-q4",
+        "27B": "qwen35-27b-q4",
+        "35B": "qwen35-35b-a3b-q4",
     }
     resolved_model_id = model_id or legacy_map.get(str(legacy_name or ""), DEFAULT_LLM_MODEL_ID)
     # Lazy import: model_service pulls in agent_runtime's heavy dependency graph.
@@ -91,3 +93,19 @@ def update_llm_parallel(value: int) -> dict[str, Any]:
     except Exception:
         pass
     return {"llmParallel": parallel, "updated": True}
+
+
+def update_llama_context(mode: str, tokens: int | None = None) -> dict[str, Any]:
+    context = repo.set_llama_context_settings(mode, tokens)
+    try:
+        from .agent_runtime import get_runtime
+
+        get_runtime().restart_llm_server()
+    except Exception as exc:
+        return {
+            "llamaContext": context,
+            "updated": True,
+            "restartApplied": False,
+            "restartError": str(exc),
+        }
+    return {"llamaContext": context, "updated": True, "restartApplied": True}

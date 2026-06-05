@@ -8,6 +8,7 @@ from ..api_models import (
     SettingsAutosurveyOpenAIRequest,
     SettingsDocumentToolsRequest,
     SettingsEmbeddingModelRequest,
+    SettingsLlamaContextRequest,
     SettingsLlmParallelRequest,
     SettingsLocalAccessRequest,
     SettingsModelRequest,
@@ -73,3 +74,8 @@ async def settings_autosurvey_openai_update(payload: SettingsAutosurveyOpenAIReq
 @router.put("/api/v1/settings/llm-parallel")
 async def settings_llm_parallel_update(payload: SettingsLlmParallelRequest) -> dict[str, Any]:
     return settings_service.update_llm_parallel(payload.value)
+
+
+@router.put("/api/v1/settings/llama-context")
+def settings_llama_context_update(payload: SettingsLlamaContextRequest) -> dict[str, Any]:
+    return settings_service.update_llama_context(payload.mode, payload.tokens)
