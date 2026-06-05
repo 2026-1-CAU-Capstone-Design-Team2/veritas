@@ -480,6 +480,7 @@ QProgressBar#pbar::chunk {
 
 QMenu#modelMenu {
     background: #FFFFFF; border: 1px solid #D7DCE5; border-radius: 10px; padding: 6px;
+    menu-scrollable: 1;
 }
 QMenu#modelMenu::item {
     padding: 9px 14px; border-radius: 7px; color: #0E1726; font-size: 13px;
@@ -1211,6 +1212,9 @@ class ModelSetupDialog(QDialog):
         menu = QMenu(self)
         menu.setObjectName("modelMenu")
         menu.setMinimumWidth(self._combo_frame.width())
+        # The LLM catalog is 42 entries — cap the height so the menu scrolls
+        # (wheel + scroll arrows) instead of running the full screen height.
+        menu.setMaximumHeight(360)
         current = self.model_combo.currentIndex()
         for i in range(self.model_combo.count()):
             spec = get_model(str(self.model_combo.itemData(i)), kind="llm")
