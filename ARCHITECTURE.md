@@ -752,3 +752,33 @@ curl -X POST "http://127.0.0.1:8000/api/v1/proactive/reset?workspaceId=<ws>"
 **구현 범위/잔여**: 플랜 항목 **A·B·C·E** 구현. 항목 **D(citation evidence atoms)** — 문서 summary 출력 계약에 evidence atom(`evidence_id`/`localized_claim`/`source_quote`) 추가 → 결정론적 anchor 검증 → `summary/citation_evidence.json` sidecar → `final_citations.json` postprocessor → frontend/API가 evidence map 우선 해석 — 은 **summary LLM 계약 변경 + 신규 산출물 + frontend/API 교체**라 라이브 검증 필요한 대형 cross-cutting 작업으로 별도 increment 분리. (cross-language 미스매치·multi-citation 한 줄·batch-anchor 약함의 근본 해결은 D에 속함.) 항목 10(rejected post-cleanup 문서를 evidence에서 제외 + 대체 수집)도 D와 함께.
 
 **테스트 실행**: 위 4개 모듈 통과(83). 전체 `discover tests` → 신규 회귀 0(잔존 3 실패는 무관한 OpenAI-factory 모듈). 추가 LLM call 없음.
+
+### 2026-06-05 — Diffusion_LM-2 항목 D: citation evidence atoms (cross-language anchor) + CLI run_collect 수정
+
+**배경**: 직전 increment에서 별도로 분리해 둔 **항목 D**를 구현. 근본 문제는 RAG 청킹이 아니라, final claim은 한국어 합성인데 source 문서는 영어라 클릭 시 `clean_md`에 대한 lexical 문장 매칭이 cross-language를 못 넘는 것(이 때문에 `document_only` 미해결률이 높았다). 해결의 핵심: **요약 LLM이 이미 읽은 문서에서 verbatim quote를 함께 내보내고, 클릭은 한국어 final claim ↔ 한국어 localized claim(동일 언어)으로 매칭하되 atom이 이미 검증된 원문(영어) 문장을 보유**하게 한다. **추가 LLM call 없음**(기존 per-doc summary 호출의 출력 계약만 확장).
+
+**변경 파일**
+- (new) `services/citation_match.py` — 순수 lexical 매칭 헬퍼(`normalize_text`/`tokenize`/`split_paragraphs`/`split_sentences`/`score_sentence`/`match_claim_in_source`/`claim_overlap`/`confidence_for`)를 `document_citation_service`에서 **추출(단일 출처)**. AutoSurvey 파이프라인이 `api/`를 import하지 않고 재사용하도록 `services/`에 위치. `document_citation_service`는 re-export로 기존 import 하위호환.
+- (new) `services/citation_evidence.py` — `build_evidence_atoms()`(payload의 `evidence[{claim, quote}]`를 `clean_md`에 결정론적 검증 후 채택), `match_claim_to_evidence()`(클릭 claim ↔ atom `localizedClaim` 동일언어 overlap), `load_atoms_from_payload()`.
+- (new) `services/final_citations.py` — `build_final_citations()`: 저장된 `final.md`의 body `[doc_NNN]` occurrence별 resolution(`evidence_anchor`/`document_only`) 맵 생성. 라이브 팝업과 **동일 matcher** 사용. 펜스/`## Source Notes`는 document-level.
+- (edit) `core/prompts/autosurvey.py` — `DOC_SUMMARY_PROMPT`·`DOC_SUMMARY_REDUCE_PROMPT`에 optional `evidence[]` 계약 추가. quote는 문서 본문에서 **verbatim 복사**(번역/패러프레이즈 금지, 원문 언어), claim은 요약 언어. 빠지거나 깨져도 무해.
+- (edit) `api/services/document_citation_service.py` — resolution **step 0(evidence_anchor)** 추가: `_load_evidence_atoms()`(sidecar 로더, path-traversal 가드 동일) → `match_claim_to_evidence()`. 우선순위 `evidence_anchor → direct → batch_anchor → document_only`. 순수 헬퍼는 `services/citation_match`에서 import.
+- (edit) `tools/document_summarize_tool/document_summarize_tool.py` — per-doc 요약 직후 `_persist_citation_evidence()`로 atom 빌드+검증(`clean_md` 대조, raw fallback)+sidecar 저장. best-effort(예외 삼킴, 요약 실패 안 시킴).
+- (edit) `tools/final_report_tool/final_report_tool.py` — `save_final_report` 직후 `_persist_final_citations()`로 `final_citations.json` 생성(best-effort).
+- (edit) `services/run_store_tool_funcs/{path_manager,run_store_service}.py` — `summary/citation_evidence/<id>.json`·`summary/final_citations.json` 경로 + `write/load_citation_evidence`/`load_all_citation_evidence`/`save_final_citations`.
+- (edit) `frontend/ui/pages/document_page.py` — 팝업이 `matchSource=="evidence_anchor"`를 **검증된 근거**("문서 요약 단계에서 검증된 원문 근거 문장입니다")로 렌더(batch_anchor/ low보다 강한 신뢰).
+- (new) `tests/test_citation_evidence.py` — atom 빌드/검증, 미검증 quote 폐기, KO claim→EN source 해소, evidence-first `get_citation`, `final_citations`(Source Notes document-level·펜스 무시) 23 케이스.
+- (edit, B) `main.py` — `--phase collect`의 `run_collect(plan)`에 `user_request=` 전달(누락 시 source-quality 게이트 약화). workflow 내부 호출은 이미 전달 중.
+
+**엔지니어링 결정**
+- *Cross-language bridge*: 클릭 해소를 final claim(KO)→atom `localizedClaim`(KO) **동일언어** 매칭으로 옮기고, atom은 검증된 원문(EN) 문장·offset을 보유. direct(KO→EN)·batch-anchor 약점을 우회. (multi-citation 한 줄도 같은 줄 claim을 각 doc의 atom에 매칭 → doc별로 다른 atom으로 해소.)
+- *결정론적 검증*: LLM verbatim quote를 `clean_md`(팝업이 읽는 동일 source)에 `match_claim_in_source`로 대조, `score≥0.5`만 채택. 못 찾은 key point는 요약 텍스트로는 남되 clickable exact citation은 아님.
+- *No keyword/sentinel*: 전부 연속 점수 임계값(검증 0.5 / claim overlap 0.4)·구조적 토크나이즈만. keyword 사전·site·언어 special-case·sentinel 값 **없음**(기존 `_DIRECT_STRONG_SCORE` 등과 동일 성격).
+- *프롬프트 안정성*: `BATCH_SUMMARY_PROMPT`/`FINAL_PROMPT`에 `evidence_id`를 **주입하지 않음**. occurrence→atom 연결은 클릭/후처리의 claim↔localizedClaim 매칭으로 처리해 batch/final 출력 형식을 건드리지 않음.
+- *Graceful fallback*: sidecar 없거나 atom 0개면 step 0는 `None`→기존 direct/batch/document_only로 그대로. 기존 21 케이스 회귀 0.
+- *영속화/privacy*: sidecar는 bounded snippet(text≤500 / paragraphText≤700)·offset만, raw body 미저장.
+- *레이어 경계*: 순수 헬퍼를 `services/`로 이동해 `tools/`가 `api/`를 import하지 않음. `document_citation_service`는 re-export로 하위호환.
+
+**테스트 실행**: `test_citation_evidence`(23)+`test_document_citations`(21) 통과, 인접(`final_report_tool`/`final_report_normalizer`/`document_cleanup_modes`/`autosurvey_collect`/`autosurvey_source_quality`) 72 통과, 전체 `discover tests` **385 OK**(신규 회귀 0). 추가 LLM call 없음.
+
+**잔여**: 항목 10(post-cleanup에서 비대/구조-payload `clean_md`를 evidence·요약에서 제외 + 대체 수집)은 본 increment 범위 밖(별도). batch/final이 atom을 직접 인용하도록 강제하는 변경도 의도적으로 하지 않음(프롬프트 안정성 우선).

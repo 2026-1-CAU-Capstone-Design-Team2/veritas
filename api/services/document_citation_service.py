@@ -4,15 +4,26 @@ When the user clicks a ``[doc_NNN]`` citation marker rendered in the
 ``final.md`` summary preview, the frontend sends the *claim text* around the
 marker plus the ``docId`` here. This service finds the closest
 sentence/paragraph in that document's ``clean_md/<id>.md`` source using
-**deterministic lexical matching only** — no LLM call, no new persisted
-artifact. It exists purely as a read-only source-preview capability for the
-document summary page and is intentionally kept out of the AutoSurvey,
-verification, and proactive pipelines.
+**deterministic lexical matching only** — no LLM call. It exists purely as a
+read-only source-preview capability for the document summary page and is
+intentionally kept out of the AutoSurvey, verification, and proactive pipelines.
 
-The public entry point is :func:`get_citation`. The scoring helpers below it
-(``normalize_text`` / ``tokenize`` / ``split_paragraphs`` / ``split_sentences``
-/ ``score_sentence`` / ``match_claim_in_source``) are pure functions so they
-can be unit-tested without any filesystem or HTTP setup.
+The pure scoring helpers live in :mod:`services.citation_match` (shared with the
+AutoSurvey-side evidence builder); this module is the thin filesystem + lookup
+layer on top of them.
+
+Resolution order for a click (most to least reliable):
+
+1. **evidence_anchor** — a verified citation-evidence atom whose *localized*
+   claim matches the clicked claim. The atom was emitted in the source language
+   alongside a verbatim quote during summarization and its quote was confirmed
+   against ``clean_md``, so this bridges a Korean final claim to its English
+   source sentence that raw lexical matching cannot.
+2. **direct** — a strong direct match of the clicked claim against ``clean_md``.
+3. **batch_anchor** — a cited batch-summary finding for the doc, used as a
+   bridge when the direct match is weak.
+4. **document_only** — no reliable sentence; show a document-level note rather
+   than highlight an unrelated "closest" sentence.
 """
 
 from __future__ import annotations
@@ -23,27 +34,28 @@ import re
 from pathlib import Path
 from typing import Any
 
+from services.citation_evidence import load_atoms_from_payload, match_claim_to_evidence
+from services.citation_match import (
+    CITATION_MARKER_RE,
+    claim_overlap,
+    match_claim_in_source,
+    normalize_text,
+    score_sentence,
+    split_paragraphs,
+    split_sentences,
+    tokenize,
+)
+
 
 # A claim is the prose around one citation marker; cap it so a runaway
 # table row or merged line can't blow up the matcher or the response.
 _MAX_CLAIM_CHARS = 500
-# Display window for the popup — the matched sentence plus a neighbour or two.
-_MAX_PARAGRAPH_CHARS = 700
-_MAX_SENTENCE_CHARS = 500
 
 # ``doc_000`` / ``000`` / ``doc-7`` → the digit run. Anything with a path
 # separator, ``..`` or other noise fails this match and is rejected, which is
 # the first half of the path-traversal guard (the second half re-resolves the
 # final path and checks it stays under ``clean_md/``).
 _DOC_ID_RE = re.compile(r"^(?:doc[_-]?)?(\d+)$", re.IGNORECASE)
-
-_CITATION_MARKER_RE = re.compile(r"\[doc[_-]?\d+\]", re.IGNORECASE)
-_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
-_LATIN_RE = re.compile(r"[a-z]+")
-_HANGUL_RE = re.compile(r"[가-힣]+")
-# Sentence boundaries: ASCII terminators, Korean declarative/polite endings,
-# and hard line breaks / list-item starts.
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|(?<=다\.)\s*|(?<=요\.)\s*|\n+")
 
 # Resolution thresholds for the layered citation lookup. A direct final-claim →
 # clean_md match at or above _DIRECT_STRONG_SCORE is trusted as the source
@@ -64,10 +76,10 @@ def get_citation(workspace_id: str, doc_id: str, claim: str) -> dict[str, Any]:
 
     Always returns a dict with ``docId``/``title``/``url``/``domain``/``claim``
     and a ``match`` field. ``match`` is ``None`` when the document source is
-    unavailable or no claim was supplied; otherwise it is the best lexical
-    candidate (even a weak one, flagged ``confidence: "low"``) so the UI can
-    show a "closest source" rather than failing. Never raises for bad input —
-    an invalid or path-traversal id yields ``match=None`` with an ``error`` note.
+    unavailable or no claim was supplied; otherwise it is the resolved source
+    sentence (see the module docstring for the resolution order). Never raises
+    for bad input — an invalid or path-traversal id yields ``match=None`` with
+    an ``error`` note.
     """
     claim_text = (claim or "").strip()[:_MAX_CLAIM_CHARS]
     result: dict[str, Any] = {
@@ -77,9 +89,10 @@ def get_citation(workspace_id: str, doc_id: str, claim: str) -> dict[str, Any]:
         "domain": "",
         "claim": claim_text,
         "match": None,
-        # How the source was resolved: "direct" (strong final-claim match),
-        # "batch_anchor" (bridged via a cited batch finding), or
-        # "document_only" (no reliable sentence — show a document-level note).
+        # How the source was resolved: "evidence_anchor" (verified summary-time
+        # evidence atom), "direct" (strong final-claim match), "batch_anchor"
+        # (bridged via a cited batch finding), or "document_only" (no reliable
+        # sentence — show a document-level note).
         "resolution": "document_only",
     }
 
@@ -113,6 +126,18 @@ def get_citation(workspace_id: str, doc_id: str, claim: str) -> dict[str, Any]:
     if not source_text.strip() or not claim_text:
         return result
 
+    # 0) Verified evidence atoms (built at summary time, in the source language,
+    #    and confirmed against clean_md). Matching the clicked claim to an
+    #    atom's *localized* claim bridges cross-language citations that direct
+    #    source matching cannot. This is the most reliable anchor when present.
+    atom = match_claim_to_evidence(
+        claim_text, _load_evidence_atoms(workspace_id, {stem, resolved_stem})
+    )
+    if atom is not None:
+        result["match"] = _atom_to_match(atom)
+        result["resolution"] = "evidence_anchor"
+        return result
+
     # 1) Direct match of the clicked final.md claim against this doc's source.
     direct = match_claim_in_source(claim_text, source_text)
     if direct and direct.get("score", 0.0) >= _DIRECT_STRONG_SCORE:
@@ -137,8 +162,25 @@ def get_citation(workspace_id: str, doc_id: str, claim: str) -> dict[str, Any]:
     return result
 
 
+def _atom_to_match(atom: dict[str, Any]) -> dict[str, Any]:
+    """Shape a verified evidence atom into a popup ``match`` record."""
+    return {
+        "text": atom.get("text", ""),
+        "paragraphText": atom.get("paragraphText", ""),
+        "paragraphIndex": atom.get("paragraphIndex", 0),
+        "sentenceIndex": atom.get("sentenceIndex", 0),
+        "score": atom.get("score", 0.0),
+        # Evidence atoms are verbatim-verified, so present them with confidence
+        # even if the verbatim quote was short; the localized claim is the anchor.
+        "confidence": atom.get("confidence", "high"),
+        "matchSource": "evidence_anchor",
+        "anchorClaim": atom.get("localizedClaim", ""),
+        "evidenceId": atom.get("evidenceId", ""),
+    }
+
+
 # --------------------------------------------------------------------------
-# Filesystem access (kept thin; everything below is pure)
+# Filesystem access (kept thin; everything scoring-related is pure)
 # --------------------------------------------------------------------------
 def _workspace_root() -> Path:
     return Path(os.getenv("VERITAS_OUTPUT_DIR", "runs")).expanduser().resolve()
@@ -199,139 +241,36 @@ def _read_text(path: Path) -> str:
         return ""
 
 
-# --------------------------------------------------------------------------
-# Pure matching helpers (unit-tested directly)
-# --------------------------------------------------------------------------
-def normalize_text(text: str) -> str:
-    """Lowercase and strip citation markers + Markdown noise; collapse spaces."""
-    s = _CITATION_MARKER_RE.sub(" ", str(text or ""))
-    # Markdown link → keep the visible label, drop the target.
-    s = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", s)
-    s = s.lower()
-    # Heading/bullet/table/quote/emphasis/code punctuation → space.
-    s = re.sub(r"[#>*`~|]+", " ", s)
-    s = re.sub(r"(^|\s)[-+]\s", " ", s)
-    s = s.replace("​", "").replace("﻿", "")
-    return re.sub(r"\s+", " ", s).strip()
+def _load_evidence_atoms(workspace_id: str, stems: set[str]) -> list[dict[str, Any]]:
+    """Read the verified citation-evidence sidecar for a doc, if any.
 
-
-def tokenize(text: str) -> tuple[set[str], set[str]]:
-    """Return ``(content_tokens, number_tokens)`` from normalized text.
-
-    Content tokens are Latin words and Korean syllable runs of length ≥ 2;
-    numbers are kept separately so the scorer can weight a shared figure (a
-    strong citation signal) above ordinary word overlap.
+    The sidecar (``summary/citation_evidence/<stem>.json``) is written at
+    summary time and holds only bounded snippets + offsets, never raw bodies.
+    Tries each candidate stem and its zero-padded form; missing/corrupt files
+    resolve to an empty list so the caller falls through to direct matching.
     """
-    norm = normalize_text(text)
-    content = {t for t in _LATIN_RE.findall(norm) if len(t) >= 2}
-    content |= {t for t in _HANGUL_RE.findall(norm) if len(t) >= 2}
-    numbers = set(_NUMBER_RE.findall(norm))
-    return content, numbers
-
-
-def split_paragraphs(text: str) -> list[str]:
-    """Split on blank-line boundaries; drop empties."""
-    blocks = re.split(r"\n\s*\n", str(text or ""))
-    return [b.strip() for b in blocks if b.strip()]
-
-
-def split_sentences(paragraph: str) -> list[str]:
-    """Lightweight sentence split (ASCII + Korean endings + line breaks)."""
-    parts = _SENTENCE_SPLIT_RE.split(str(paragraph or ""))
-    return [p.strip() for p in parts if p and p.strip()]
-
-
-def _is_boilerplate(sentence: str, content: set[str], numbers: set[str]) -> bool:
-    norm = normalize_text(sentence)
-    if len(norm) < 10:
-        return True
-    return len(content) + len(numbers) < 2
-
-
-def score_sentence(
-    claim_norm: str,
-    claim_content: set[str],
-    claim_numbers: set[str],
-    sentence: str,
-) -> float:
-    """Score one source *sentence* against the (pre-normalized) claim → 0..1.
-
-    Exact normalized-substring containment dominates; otherwise the score is a
-    blend of content-token overlap and (when the claim carries figures) numeric
-    overlap. Pure and side-effect free.
-    """
-    sent_norm = normalize_text(sentence)
-    if not sent_norm or (not claim_content and not claim_numbers):
-        return 0.0
-    sent_content, sent_numbers = tokenize(sentence)
-
-    tok_overlap = (
-        len(claim_content & sent_content) / len(claim_content)
-        if claim_content
-        else 0.0
-    )
-    if claim_numbers:
-        num_overlap = len(claim_numbers & sent_numbers) / len(claim_numbers)
-        score = 0.55 * tok_overlap + 0.45 * num_overlap
-    else:
-        score = tok_overlap
-
-    if len(claim_norm) >= 8 and claim_norm in sent_norm:
-        exact = 0.85 + 0.15 * min(1.0, len(claim_norm) / 120.0)
-        score = max(score, exact)
-    return max(0.0, min(1.0, score))
-
-
-def _confidence(score: float) -> str:
-    if score >= 0.6:
-        return "high"
-    if score >= 0.3:
-        return "medium"
-    return "low"
-
-
-def match_claim_in_source(claim: str, source_text: str) -> dict[str, Any] | None:
-    """Find the best-matching sentence for *claim* inside *source_text*.
-
-    Returns the match record (``text`` / ``paragraphText`` / ``paragraphIndex``
-    / ``sentenceIndex`` / ``score`` / ``confidence``) for the top candidate, or
-    ``None`` when the source has no usable sentence. A weak best match is still
-    returned, flagged ``confidence: "low"`` — the UI presents it as the closest
-    candidate rather than a confirmed source.
-    """
-    claim_norm = normalize_text(claim)
-    claim_content, claim_numbers = tokenize(claim)
-
-    paragraphs = split_paragraphs(source_text)
-    best: dict[str, Any] | None = None
-    best_score = -1.0
-    for p_index, paragraph in enumerate(paragraphs):
-        sentences = split_sentences(paragraph)
-        for s_index, sentence in enumerate(sentences):
-            if _is_boilerplate(sentence, *tokenize(sentence)):
-                continue
-            score = score_sentence(claim_norm, claim_content, claim_numbers, sentence)
-            if score > best_score:
-                best_score = score
-                best = {
-                    "text": sentence[:_MAX_SENTENCE_CHARS],
-                    "paragraphText": _window(sentences, s_index),
-                    "paragraphIndex": p_index,
-                    "sentenceIndex": s_index,
-                    "score": round(score, 4),
-                    "confidence": _confidence(score),
-                }
-    return best
-
-
-def _window(sentences: list[str], index: int) -> str:
-    """Matched sentence plus up to one neighbour each side, capped for the popup."""
-    start = max(0, index - 1)
-    snippet = " ".join(sentences[start : index + 2]).strip()
-    if len(snippet) <= _MAX_PARAGRAPH_CHARS:
-        return snippet
-    # Too long with neighbours — fall back to the matched sentence alone.
-    return sentences[index].strip()[:_MAX_PARAGRAPH_CHARS]
+    if not workspace_id or any(sep in workspace_id for sep in ("/", "\\", "..")):
+        return []
+    evidence_dir = (_workspace_root() / workspace_id / "summary" / "citation_evidence").resolve()
+    candidates: set[str] = set()
+    for stem in stems:
+        candidates.add(stem)
+        try:
+            candidates.add(f"{int(stem):03d}")
+        except (TypeError, ValueError):
+            continue
+    for stem in candidates:
+        path = (evidence_dir / f"{stem}.json").resolve()
+        if path.parent != evidence_dir or not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — missing/corrupt sidecar is non-fatal
+            continue
+        atoms = load_atoms_from_payload(payload)
+        if atoms:
+            return atoms
+    return []
 
 
 # --------------------------------------------------------------------------
@@ -346,7 +285,7 @@ def _summary_dir(workspace_id: str) -> Path | None:
 
 def _strip_markers(line: str) -> str:
     """A batch-summary line with citation markers + leading Markdown removed."""
-    s = _CITATION_MARKER_RE.sub(" ", line)
+    s = CITATION_MARKER_RE.sub(" ", line)
     s = re.sub(r"^[\s>#*\-+]+", " ", s).replace("|", " ")
     return re.sub(r"\s+", " ", s).strip()[:_MAX_CLAIM_CHARS]
 
@@ -372,15 +311,6 @@ def _batch_claims_for_doc(workspace_id: str, stem: str) -> list[str]:
     return claims
 
 
-def _claim_overlap(content: set[str], numbers: set[str], other: str) -> float:
-    denom = len(content) + len(numbers)
-    if denom == 0:
-        return 0.0
-    other_content, other_numbers = tokenize(other)
-    shared = len(content & other_content) + len(numbers & other_numbers)
-    return shared / denom
-
-
 def _resolve_batch_anchor(
     workspace_id: str, stem: str, final_claim: str, source_text: str
 ) -> dict[str, Any] | None:
@@ -398,10 +328,10 @@ def _resolve_batch_anchor(
     final_content, final_numbers = tokenize(final_claim)
     ranked = sorted(
         batch_claims,
-        key=lambda claim: _claim_overlap(final_content, final_numbers, claim),
+        key=lambda claim: claim_overlap(final_content, final_numbers, claim),
         reverse=True,
     )
-    if _claim_overlap(final_content, final_numbers, ranked[0]) < _ANCHOR_CLAIM_MIN_OVERLAP:
+    if claim_overlap(final_content, final_numbers, ranked[0]) < _ANCHOR_CLAIM_MIN_OVERLAP:
         return None
     best: dict[str, Any] | None = None
     best_claim = ""
@@ -412,7 +342,7 @@ def _resolve_batch_anchor(
         # what the user actually clicked. Candidates below the overlap threshold
         # are not anchors, and the winner is chosen by a combined score (source
         # match strength + final-claim overlap) rather than source score alone.
-        overlap = _claim_overlap(final_content, final_numbers, batch_claim)
+        overlap = claim_overlap(final_content, final_numbers, batch_claim)
         if overlap < _ANCHOR_CLAIM_MIN_OVERLAP:
             continue
         candidate = match_claim_in_source(batch_claim, source_text)
@@ -429,6 +359,8 @@ def _resolve_batch_anchor(
     return anchored
 
 
+# Pure scoring helpers are re-exported from :mod:`services.citation_match` so
+# existing callers/tests that import them from here keep working.
 __all__ = [
     "get_citation",
     "normalize_text",

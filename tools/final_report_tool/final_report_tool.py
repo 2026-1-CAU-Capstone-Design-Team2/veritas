@@ -26,6 +26,7 @@ from typing import Any
 from core.latex_cleanup import clean_latex_in_markdown
 from core.prompts import FINAL_PROMPT
 from core.report_markdown_normalizer import normalize_final_report_markdown
+from services.final_citations import build_final_citations
 from tools.tool import BaseTool, ToolResult
 
 
@@ -178,6 +179,7 @@ class FinalReportTool(BaseTool):
             # the table rendering. Pure + idempotent; the rest is untouched.
             final_markdown = normalize_final_report_markdown(final_markdown)
             self._run_store_service.save_final_report(final_markdown)
+            self._persist_final_citations(final_markdown)
 
             return ToolResult(
                 success=True,
@@ -186,6 +188,21 @@ class FinalReportTool(BaseTool):
             )
         except Exception as e:
             return ToolResult(success=False, error=f"Failed to write final report: {e}")
+
+    def _persist_final_citations(self, final_markdown: str) -> None:
+        """Precompute the per-marker resolution map for the saved report.
+
+        Reuses the verified evidence atoms persisted at summary time and the
+        same matcher the live popup uses, so this is a deterministic audit /
+        preview-confidence artifact with no extra LLM call. Best-effort: a
+        failure here must not fail report generation.
+        """
+        try:
+            evidence_by_doc = self._run_store_service.load_all_citation_evidence()
+            payload = build_final_citations(final_markdown, evidence_by_doc)
+            self._run_store_service.save_final_citations(payload)
+        except Exception as e:  # noqa: BLE001 — the audit map is non-essential
+            print(f"[final_report] skipped final_citations map: {e}")
 
 
 __all__ = [

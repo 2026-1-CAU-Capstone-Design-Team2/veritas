@@ -253,7 +253,15 @@ class CitationPopup(QFrame):
 				)
 			return "".join(parts)
 
-		if str(match.get("matchSource") or "") == "batch_anchor":
+		match_source = str(match.get("matchSource") or "")
+		if match_source == "evidence_anchor":
+			# Strongest anchor: a verbatim quote emitted at summary time and
+			# verified against clean_md, reached via the localized claim.
+			parts.append(
+				'<p style="color:#1E7F4F; font-size:12px; margin:0 0 6px 0;">'
+				"문서 요약 단계에서 검증된 원문 근거 문장입니다.</p>"
+			)
+		elif match_source == "batch_anchor":
 			parts.append(
 				'<p style="color:#8A94A6; font-size:12px; margin:0 0 6px 0;">'
 				"이 인용을 뒷받침하는 가장 가까운 원문 근거 문장입니다.</p>"

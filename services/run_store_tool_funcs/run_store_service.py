@@ -327,6 +327,52 @@ class RunStoreService:
     def save_final_report(self, content: str) -> None:
         self.save_text(self.paths.final_path, content)
 
+    @property
+    def citation_evidence_dir(self):
+        return self.paths.citation_evidence_dir
+
+    @property
+    def final_citations_path(self):
+        return self.paths.final_citations_path
+
+    def write_citation_evidence(self, doc_id: str, atoms: list[dict[str, Any]]) -> Path:
+        """Persist a document's verified citation-evidence atoms.
+
+        Always (re)writes the sidecar — an empty ``atoms`` list overwrites any
+        stale file so a re-summarized document never keeps orphaned anchors.
+        Only bounded snippets/offsets are stored, never a raw body.
+        """
+        path = self.paths.citation_evidence_path(doc_id)
+        self.save_json(path, {"doc_id": doc_id, "atoms": list(atoms or [])})
+        return path
+
+    def load_citation_evidence(self, doc_id: str) -> list[dict[str, Any]]:
+        """Read one document's evidence atoms; ``[]`` when missing/corrupt."""
+        path = self.paths.citation_evidence_path(doc_id)
+        if not path.exists():
+            return []
+        try:
+            payload = json.loads(self.read_text_file(str(path)))
+        except Exception:
+            return []
+        atoms = payload.get("atoms") if isinstance(payload, dict) else payload
+        return [a for a in atoms if isinstance(a, dict)] if isinstance(atoms, list) else []
+
+    def load_all_citation_evidence(self) -> dict[str, list[dict[str, Any]]]:
+        """Map each stem (``"000"``) to its evidence atoms for the whole run."""
+        evidence_dir = self.paths.citation_evidence_dir
+        if not evidence_dir.is_dir():
+            return {}
+        out: dict[str, list[dict[str, Any]]] = {}
+        for path in sorted(evidence_dir.glob("*.json")):
+            atoms = self.load_citation_evidence(path.stem)
+            if atoms:
+                out[path.stem] = atoms
+        return out
+
+    def save_final_citations(self, payload: dict[str, Any]) -> None:
+        self.save_json(self.paths.final_citations_path, payload)
+
     def set_batch_counter_from_count(self, count: int) -> None:
         self.batch_counter = count
 

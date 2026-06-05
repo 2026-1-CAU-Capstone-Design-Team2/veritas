@@ -729,3 +729,31 @@ failure modes are:
 - Watch for evidence contamination: final claims must still be grounded only in `[doc_NNN]` source documents.
 - Watch entrypoint separation: chat/search-mode AutoSurvey can use a brief from the active workspace, but research-page AutoSurvey should remain clean unless the user explicitly asks to use memory.
 - Watch prompt leakage: the memory brief must never be printed in `final.md`; it should influence query planning only.
+
+## Review Note: 2026-06-05 Current Diff Citation Evidence Map
+
+### Checklist
+- [ ] Review `git diff` for the current citation-evidence changes across API, tools, run-store services, prompts, CLI, and UI.
+- [ ] Confirm `ARCHITECTURE.md` responsibilities are preserved: UI calls API/controller paths, file artifact access stays in services/tools, and shared run artifact paths stay in `services/run_store_tool_funcs`.
+- [ ] Confirm citation evidence artifacts are bounded metadata/snippets, not raw source-body persistence or a new evidence store outside the run-store abstraction.
+- [ ] Confirm prompt changes do not add a new LLM call and do not allow evidence ids or memory-like context to appear as report evidence.
+- [ ] Confirm `main.py --phase collect` still passes the original user request into collection/source scoring.
+
+### Architecture Constraints
+- `frontend/` must not read `runs/`, `clean_md`, `summary/citation_evidence`, or `summary/final_citations.json` directly.
+- `api/services/document_citation_service.py` may read persisted citation artifacts, but route handlers should remain thin and blocking file scans should not run in `async def` handlers.
+- `tools/document_summarize_tool` and `tools/final_report_tool` may persist sidecar artifacts through `RunStoreService`; direct path construction should remain delegated to `path_manager`.
+- Citation matching must remain deterministic and must not add per-click or per-document LLM/API calls.
+- `final.md` and source markdown must remain presentation/source artifacts; citation linkification and popup lookup must not mutate them.
+
+### Verification Commands
+- `python -m py_compile api/services/document_citation_service.py services/run_store_tool_funcs/path_manager.py services/run_store_tool_funcs/run_store_service.py tools/document_summarize_tool/document_summarize_tool.py tools/final_report_tool/final_report_tool.py main.py`
+- `python -m unittest tests.test_citation_evidence tests.test_document_citations`
+- `python -m unittest tests.test_autosurvey_collect tests.test_autosurvey_source_quality`
+- `python -m unittest discover tests` if the active environment has all UI/API dependencies.
+
+### Review Focus
+- Check for evidence-map regressions where stale or missing sidecars silently downgrade every citation to weak document-level matching.
+- Check for path traversal, workspace/doc id normalization, and direct filesystem access from UI.
+- Check that Source Notes entries stay document-level while body citations prefer evidence anchors.
+- Check that fallback behavior is honest: unresolved citations should not be presented as exact source anchors.

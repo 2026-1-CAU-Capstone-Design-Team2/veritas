@@ -19,6 +19,15 @@ class RunPathManager:
         self.summary_dir = self.root / "summary"
         self.vector_dir = self.root / "chromadb"
 
+        # Per-document verified citation-evidence atoms (localized claim +
+        # verbatim source quote + offsets). Bounded snippets only — never a raw
+        # body. Read by the citation popup to anchor cross-language citations.
+        self.citation_evidence_dir = self.summary_dir / "citation_evidence"
+        # Per-marker resolution map for the rendered final report (audit +
+        # preview confidence): which [doc_NNN] occurrences resolved to a
+        # verified evidence atom vs document-level fallback.
+        self.final_citations_path = self.summary_dir / "final_citations.json"
+
         self.index_path = self.summary_dir / "index.json"
         self.request_path = self.summary_dir / "request.md"
         self.grounding_path = self.summary_dir / "grounding.json"
@@ -39,6 +48,9 @@ class RunPathManager:
 
     def summary_path_for(self, index: int):
         return self.summary_dir / f"doc_{index:03d}.md"
+
+    def citation_evidence_path(self, doc_id: str):
+        return self.citation_evidence_dir / f"{doc_id}.json"
 
     def batch_path(self, batch_index: int):
         return self.summary_dir / f"batch_{batch_index:03d}.md"
