@@ -239,7 +239,10 @@ def main() -> None:
     if args.phase == "collect":
         user_request = args.instruction or run_store_service.load_request()
         plan = workflow.run_plan(user_request, force_plan=args.force_plan)
-        result = workflow.run_collect(plan)
+        # Forward the original request so source-quality scoring/post-fetch
+        # acceptance get the user's intent on this CLI path too (run_collect
+        # builds the core topic from it); omitting it silently weakens the gate.
+        result = workflow.run_collect(plan, user_request=user_request)
         print(f"[done] collected {result['record_count']} record(s)")
         return
 

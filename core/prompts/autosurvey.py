@@ -118,13 +118,22 @@ Return JSON only with this schema:
   "summary": string,
   "key_points": [string, ...],
   "reliability_notes": [string, ...],
-  "keywords": [string, ...]
+  "keywords": [string, ...],
+  "evidence": [
+    {"claim": string, "quote": string},
+    ...
+  ]
 }
 Rules:
 - Keep it concise. Prefer 4-5 sentence summary and 3-5 key points.
 - Write the summary and notes in the original user request language when it is known.
 - If the user request language is Korean, write Korean summaries even when the document title, source metadata, or technical terms are in English.
 - Preserve technical terms, model names, product names, APIs, filenames, and citations in their original form when appropriate.
+Evidence rules (used to anchor citations back to the exact source sentence — no extra cost, fill it from what you already read):
+- Add 2-4 evidence items for the document's most important, source-grounded claims (numbers, definitions, results, named methods). Use [] if the document has no concrete supported claim.
+- "quote" MUST be copied VERBATIM from the document text above — the exact characters, in the document's original language. Do NOT translate, paraphrase, summarize, or fix it. Prefer one sentence (at most two); never invent a quote that is not present in the text.
+- "claim" is a short restatement of what that quote supports, written in the SAME language as the summary (e.g. Korean when the summary is Korean). This is the bridge that lets a localized claim point back to the original-language quote.
+- If you cannot find a verbatim sentence in the text that supports a claim, omit that evidence item rather than fabricating a quote.
 """
 
 # Map step of the long-document map-reduce path: notes are extracted from one
@@ -159,7 +168,11 @@ Return JSON only with this schema:
   "summary": string,
   "key_points": [string, ...],
   "reliability_notes": [string, ...],
-  "keywords": [string, ...]
+  "keywords": [string, ...],
+  "evidence": [
+    {"claim": string, "quote": string},
+    ...
+  ]
 }
 Rules:
 - Synthesize across ALL parts. Merge duplicates and resolve overlap; do not just concatenate the notes.
@@ -167,6 +180,10 @@ Rules:
 - Use only information present in the provided notes. Do not add outside knowledge.
 - Write the summary and notes in the original user request language when it is known. If it is Korean, write Korean even when titles, source metadata, or technical terms are English.
 - Preserve technical terms, model names, product names, APIs, filenames, and citations in their original form when appropriate.
+Evidence rules:
+- Add 2-4 evidence items for the most important supported claims, or [] if none.
+- "quote" MUST be copied VERBATIM from the notes — exact characters, original language, no translation or paraphrase. A downstream step verifies each quote against the source document and silently drops any that cannot be found, so do not fabricate.
+- "claim" restates what the quote supports, in the SAME language as the summary.
 """
 
 BATCH_SUMMARY_PROMPT = """You are given an original user request and the clean Markdown of multiple collected documents.

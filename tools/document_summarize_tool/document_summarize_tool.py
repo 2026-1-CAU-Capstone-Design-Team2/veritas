@@ -12,6 +12,7 @@ from core.prompts import (
     DOC_SUMMARY_PROMPT,
     DOC_SUMMARY_REDUCE_PROMPT,
 )
+from services.citation_evidence import build_evidence_atoms
 from tools.tool import BaseTool, ToolResult
 
 
@@ -261,6 +262,7 @@ class DocumentSummarizeTool(BaseTool):
 
         summary_md = self._render_doc_summary_from_record(record, summary_payload)
         self._run_store_service.write_document_summary(record, summary_md)
+        self._persist_citation_evidence(record, summary_payload)
         self._notify_progress(
             progress_callback,
             "doc_summarized",
@@ -268,6 +270,34 @@ class DocumentSummarizeTool(BaseTool):
             title=record.title or record.doc_id,
         )
         return {"summarized": record.doc_id}
+
+    def _persist_citation_evidence(self, record, summary_payload: dict[str, Any]) -> None:
+        """Verify the summary's evidence quotes against clean_md and persist atoms.
+
+        Best-effort and side-channel: the localized claim + verbatim quote the
+        summary already emitted are anchored to a real source sentence in
+        ``clean_md`` (the same source the citation popup reads) and only verified
+        atoms are kept. A failure here must never fail summarization, so every
+        exception is swallowed. No extra LLM call.
+        """
+        try:
+            source_text = self._read_clean_source(record)
+            atoms = build_evidence_atoms(record.doc_id, summary_payload, source_text)
+            self._run_store_service.write_citation_evidence(record.doc_id, atoms)
+        except Exception as e:  # noqa: BLE001 — evidence is an optional anchor
+            print(f"[summarize][evidence-skip] doc_id={record.doc_id} reason={e}")
+
+    def _read_clean_source(self, record) -> str:
+        """Post-cleanup body for evidence verification, with a raw fallback.
+
+        Mirrors the batch reader: prefer ``clean_md/<id>.md`` (what the popup
+        anchors against), falling back to the pre-cleanup ``text_path`` when a
+        workspace has not run cleanup yet.
+        """
+        clean_path = self._run_store_service.clean_md_dir / f"{record.doc_id}.md"
+        if clean_path.exists():
+            return self._run_store_service.read_text_file(str(clean_path)) or ""
+        return self._run_store_service.read_text_file(record.text_path) or ""
 
     def _notify_progress(
         self,
