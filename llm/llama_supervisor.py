@@ -31,16 +31,87 @@ from pathlib import Path
 
 
 # llama-server flag profile. The hardware-adaptable knobs (-ngl / -c / -np) are
-# read from env at spawn time so a machine without an NVIDIA GPU or with little
-# memory can recover without a code change.
-_DEFAULT_NGL = "99"
+# read from env/settings at spawn time. By default VERITAS does not pass -ngl:
+# recent llama.cpp builds can fit GPU offload to available VRAM unless the user
+# hard-codes n_gpu_layers. Passing -ngl 99 by default makes large GGUFs abort
+# before that fit step can help.
 _DEFAULT_CTX = "32768"
-_DEFAULT_NP = "5"
+_DEFAULT_NP = "1"
 
 
 def _flag(env_name: str, default: str) -> str:
     value = os.getenv(env_name)
     return value if value and value.strip() else default
+
+
+def _ngl_args() -> list[str]:
+    value = os.getenv("VERITAS_LLAMA_NGL")
+    if value and value.strip():
+        return ["-ngl", value.strip()]
+    return []
+
+
+def _np_flag(kind: str = "llm") -> str:
+    try:
+        from llm.model_settings import load_settings
+        from llm.model_catalog import (
+            selected_embedding_from_settings,
+            selected_model_from_settings,
+        )
+
+        settings = load_settings()
+        model = (
+            selected_embedding_from_settings(settings)
+            if kind == "embedding"
+            else selected_model_from_settings(settings)
+        )
+        return str(_parallel_slots_for_model(model, settings))
+    except Exception:
+        return str(_requested_parallel_slots())
+
+
+def _requested_np_flag() -> str:
+    return str(_requested_parallel_slots())
+
+
+def _requested_parallel_slots() -> int:
+    env_value = os.getenv("VERITAS_LLAMA_NP") or os.getenv("VERITAS_LLM_PARALLEL")
+    if env_value and env_value.strip():
+        try:
+            return max(1, min(5, int(env_value)))
+        except ValueError:
+            return int(_DEFAULT_NP)
+    try:
+        from llm.model_settings import load_settings
+
+        settings = load_settings()
+        return max(1, min(5, int(settings.get("llmParallel", _DEFAULT_NP))))
+    except Exception:
+        return int(_DEFAULT_NP)
+
+
+def _parallel_slots() -> int:
+    try:
+        return max(1, min(5, int(_requested_np_flag())))
+    except ValueError:
+        return 1
+
+
+def _parallel_slots_for_model(model, settings: dict) -> int:
+    requested = _requested_parallel_slots()
+    try:
+        from llm.context_settings import effective_context_tokens
+        from llm.hardware_policy import max_parallel_slots
+
+        per_slot = effective_context_tokens(
+            settings,
+            model_limit=getattr(model, "context_tokens", None),
+            model=model,
+            parallel_slots=1,
+        )
+        return max(1, min(requested, max_parallel_slots(model, context_per_slot_tokens=per_slot)))
+    except Exception:
+        return requested
 
 
 def _context_flag(kind: str = "llm") -> str:
@@ -61,12 +132,18 @@ def _context_flag(kind: str = "llm") -> str:
             if kind == "embedding"
             else selected_model_from_settings(settings)
         )
-        return str(
-            effective_context_tokens(
-                settings,
-                model_limit=getattr(model, "context_tokens", None),
-            )
+        parallel_slots = _parallel_slots_for_model(model, settings)
+        per_slot = effective_context_tokens(
+            settings,
+            model_limit=getattr(model, "context_tokens", None),
+            model=model,
+            parallel_slots=parallel_slots,
         )
+        total = per_slot * parallel_slots
+        model_limit = getattr(model, "context_tokens", None)
+        if model_limit and model_limit > 0:
+            total = min(total, int(model_limit))
+        return str(total)
     except Exception:
         return _DEFAULT_CTX
 
@@ -74,21 +151,20 @@ def _context_flag(kind: str = "llm") -> str:
 def _common_args(kind: str = "llm") -> list[str]:
     """Common llama-server flags, with per-machine overrides read from env:
 
-      VERITAS_LLAMA_NGL → -ngl  GPU layers to offload (0 = CPU-only)  [99]
+      VERITAS_LLAMA_NGL → -ngl  GPU layers to offload (0 = CPU-only)  [auto]
       VERITAS_LLAMA_CTX → -c    total context window                 [50000]
       VERITAS_LLAMA_NP  → -np   parallel decode slots                [1]
 
-    ``-ngl 99`` (all GPU layers) + a 50k context are fine defaults on a GPU
-    box, but can make llama-server *exit on load* on a machine with no NVIDIA
-    GPU / little memory. The env overrides let such a machine fall back (e.g.
-    ``VERITAS_LLAMA_NGL=0`` for CPU-only, ``VERITAS_LLAMA_CTX=8192`` for low
-    memory) without touching code. Read at spawn time so they apply per launch.
+    When ``VERITAS_LLAMA_NGL`` is unset we omit ``-ngl`` and let llama.cpp fit
+    GPU offload to available VRAM. The env override still lets a user force a
+    value (e.g. ``VERITAS_LLAMA_NGL=0`` for CPU-only). Read at spawn time so
+    overrides apply per launch.
     """
     return [
-        "-ngl", _flag("VERITAS_LLAMA_NGL", _DEFAULT_NGL),
+        *_ngl_args(),
         "-ub", "1024",
         "-b", "1024",
-        "-np", _flag("VERITAS_LLAMA_NP", _DEFAULT_NP),
+        "-np", _np_flag(kind),
         "--cont-batching",
         "-c", _context_flag(kind),
         "-fa", "on",
@@ -100,6 +176,10 @@ def _common_args(kind: str = "llm") -> list[str]:
 LLAMA_COMMON_ARGS = _common_args()
 LLAMA_LLM_EXTRA_ARGS = ["-ctk", "q8_0", "-ctv", "q4_0"]
 LLAMA_EMBEDDING_EXTRA_ARGS = ["--embeddings"]
+GRANITE_EMBEDDING_TOKENIZER_OVERRIDE = [
+    "--override-kv",
+    "tokenizer.ggml.pre=str:gpt-2",
+]
 
 
 def _expanded_path(value: str | None) -> Path | None:
@@ -168,6 +248,11 @@ def llama_server_bin() -> Path:
         if candidate.exists():
             return candidate
     return candidates[-1]
+
+
+def _needs_granite_embedding_tokenizer_override(model_path: Path) -> bool:
+    normalized = str(model_path).replace("\\", "/").lower()
+    return "granite-embedding" in normalized
 
 
 def _http_ok(url: str, timeout: float = 1.0) -> bool:
@@ -258,6 +343,7 @@ class LlamaServer:
     # -- internals -----------------------------------------------------------
 
     def _args(self, model_path: Path) -> list[str]:
+        model_path = Path(model_path)
         args = [
             str(llama_server_bin()),
             "-m", str(model_path),
@@ -265,7 +351,12 @@ class LlamaServer:
             "--port", str(self.port),
             *_common_args(self.kind),
         ]
-        args += LLAMA_LLM_EXTRA_ARGS if self.kind == "llm" else LLAMA_EMBEDDING_EXTRA_ARGS
+        if self.kind == "llm":
+            args += LLAMA_LLM_EXTRA_ARGS
+        else:
+            args += LLAMA_EMBEDDING_EXTRA_ARGS
+            if _needs_granite_embedding_tokenizer_override(model_path):
+                args += GRANITE_EMBEDDING_TOKENIZER_OVERRIDE
         return args
 
     def _spawn(self, model_path: Path, *, timeout: float) -> None:

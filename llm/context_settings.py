@@ -1,29 +1,27 @@
 from __future__ import annotations
 
-import ctypes
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from .hardware_policy import (
+    RISK_FIT,
+    RISK_RELAXED,
+    RISK_RISKY,
+    MemorySnapshot,
+    detect_memory,
+    estimate_runtime,
+    recommended_context_tokens as recommended_model_context_tokens,
+)
+
+if TYPE_CHECKING:
+    from .model_catalog import ModelSpec
 
 
 CONTEXT_TIERS = (8192, 16384, 32768, 50000, 90000)
 DEFAULT_CONTEXT_MODE = "auto"
 DEFAULT_CONTEXT_TOKENS = 32768
 APP_MAX_CONTEXT_TOKENS = 90000
-
-
-@dataclass(frozen=True)
-class MemorySnapshot:
-    total_bytes: int
-    available_bytes: int
-
-    @property
-    def total_gb(self) -> float:
-        return self.total_bytes / 1024**3 if self.total_bytes > 0 else 0.0
-
-    @property
-    def available_gb(self) -> float:
-        return self.available_bytes / 1024**3 if self.available_bytes > 0 else 0.0
 
 
 @dataclass(frozen=True)
@@ -34,19 +32,25 @@ class ContextOption:
     recommended: bool = False
 
 
-def detect_memory() -> MemorySnapshot:
-    if os.name == "nt":
-        return _windows_memory()
-    return _posix_memory()
-
-
 def recommended_context_tokens(
     *,
     available_bytes: int | None = None,
     model_limit: int | None = None,
+    model: "ModelSpec | None" = None,
+    parallel_slots: int = 1,
 ) -> int:
     if available_bytes is None:
         available_bytes = detect_memory().available_bytes
+    if model is not None:
+        return recommended_model_context_tokens(
+            model,
+            context_tiers=CONTEXT_TIERS,
+            available_bytes=available_bytes,
+            parallel_slots=parallel_slots,
+            model_limit=model_limit,
+            app_limit=APP_MAX_CONTEXT_TOKENS,
+        )
+
     available_gb = max(0.0, float(available_bytes) / 1024**3)
     if available_gb < 8:
         tokens = 8192
@@ -72,6 +76,8 @@ def normalize_context_settings(
     payload: dict[str, Any] | None,
     *,
     model_limit: int | None = None,
+    model: "ModelSpec | None" = None,
+    parallel_slots: int = 1,
 ) -> dict[str, Any]:
     payload = payload if isinstance(payload, dict) else {}
     mode = str(payload.get("mode") or DEFAULT_CONTEXT_MODE).strip().lower()
@@ -81,23 +87,44 @@ def normalize_context_settings(
         tokens = int(payload.get("tokens") or DEFAULT_CONTEXT_TOKENS)
     except (TypeError, ValueError):
         tokens = DEFAULT_CONTEXT_TOKENS
-    auto_tokens = recommended_context_tokens(model_limit=model_limit)
+
+    snapshot = detect_memory()
+    auto_tokens = recommended_context_tokens(
+        available_bytes=snapshot.available_bytes,
+        model_limit=model_limit,
+        model=model,
+        parallel_slots=parallel_slots,
+    )
     if mode == "auto":
         tokens = auto_tokens
     else:
         tokens = clamp_context_tokens(tokens, model_limit=model_limit)
-    return {
+
+    result: dict[str, Any] = {
         "mode": mode,
         "tokens": tokens,
         "lastAutoTokens": auto_tokens,
-        "memory": memory_payload(),
+        "memory": memory_payload(snapshot),
     }
+    if model is not None:
+        estimate = estimate_runtime(
+            model,
+            context_per_slot_tokens=tokens,
+            parallel_slots=parallel_slots,
+            available_bytes=snapshot.available_bytes,
+        )
+        result["risk"] = estimate.risk
+        result["maxParallelSlots"] = estimate.max_parallel_slots
+        result["hardware"] = estimate.to_payload()
+    return result
 
 
 def effective_context_tokens(
     settings: dict[str, Any] | None,
     *,
     model_limit: int | None = None,
+    model: "ModelSpec | None" = None,
+    parallel_slots: int = 1,
 ) -> int:
     env_value = os.getenv("VERITAS_LLAMA_CTX")
     if env_value and env_value.strip():
@@ -106,12 +133,26 @@ def effective_context_tokens(
         except ValueError:
             pass
     llama_context = settings.get("llamaContext") if isinstance(settings, dict) else None
-    normalized = normalize_context_settings(llama_context, model_limit=model_limit)
+    normalized = normalize_context_settings(
+        llama_context,
+        model_limit=model_limit,
+        model=model,
+        parallel_slots=parallel_slots,
+    )
     return int(normalized["tokens"])
 
 
-def context_options(*, model_limit: int | None = None) -> list[ContextOption]:
-    auto_tokens = recommended_context_tokens(model_limit=model_limit)
+def context_options(
+    *,
+    model_limit: int | None = None,
+    model: "ModelSpec | None" = None,
+    parallel_slots: int = 1,
+) -> list[ContextOption]:
+    auto_tokens = recommended_context_tokens(
+        model_limit=model_limit,
+        model=model,
+        parallel_slots=parallel_slots,
+    )
     options: list[ContextOption] = []
     for tokens in CONTEXT_TIERS:
         clamped = clamp_context_tokens(tokens, model_limit=model_limit)
@@ -121,24 +162,45 @@ def context_options(*, model_limit: int | None = None) -> list[ContextOption]:
             ContextOption(
                 tokens=tokens,
                 label=f"{_format_tokens(tokens)} tokens",
-                risk=context_risk(tokens, auto_tokens),
+                risk=context_risk(
+                    tokens,
+                    auto_tokens,
+                    model=model,
+                    parallel_slots=parallel_slots,
+                ),
                 recommended=tokens == auto_tokens,
             )
         )
     return options
 
 
-def context_risk(tokens: int, recommended_tokens: int | None = None) -> str:
-    recommended = recommended_tokens or recommended_context_tokens()
+def context_risk(
+    tokens: int,
+    recommended_tokens: int | None = None,
+    *,
+    model: "ModelSpec | None" = None,
+    parallel_slots: int = 1,
+    available_bytes: int | None = None,
+) -> str:
+    if model is not None:
+        return estimate_runtime(
+            model,
+            context_per_slot_tokens=tokens,
+            parallel_slots=parallel_slots,
+            available_bytes=available_bytes,
+        ).risk
+    recommended = recommended_tokens or recommended_context_tokens(
+        available_bytes=available_bytes
+    )
     if int(tokens) < int(recommended):
-        return "여유"
+        return RISK_RELAXED
     if int(tokens) == int(recommended):
-        return "적합"
-    return "위험"
+        return RISK_FIT
+    return RISK_RISKY
 
 
-def memory_payload() -> dict[str, float | int]:
-    snapshot = detect_memory()
+def memory_payload(snapshot: MemorySnapshot | None = None) -> dict[str, float | int]:
+    snapshot = snapshot or detect_memory()
     return {
         "totalBytes": snapshot.total_bytes,
         "availableBytes": snapshot.available_bytes,
@@ -153,34 +215,3 @@ def _format_tokens(tokens: int) -> str:
     if tokens % 1024 == 0:
         return f"{tokens // 1024}K"
     return str(tokens)
-
-
-def _windows_memory() -> MemorySnapshot:
-    class MEMORYSTATUSEX(ctypes.Structure):
-        _fields_ = [
-            ("dwLength", ctypes.c_ulong),
-            ("dwMemoryLoad", ctypes.c_ulong),
-            ("ullTotalPhys", ctypes.c_ulonglong),
-            ("ullAvailPhys", ctypes.c_ulonglong),
-            ("ullTotalPageFile", ctypes.c_ulonglong),
-            ("ullAvailPageFile", ctypes.c_ulonglong),
-            ("ullTotalVirtual", ctypes.c_ulonglong),
-            ("ullAvailVirtual", ctypes.c_ulonglong),
-            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-        ]
-
-    status = MEMORYSTATUSEX()
-    status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):  # type: ignore[attr-defined]
-        return MemorySnapshot(0, 0)
-    return MemorySnapshot(int(status.ullTotalPhys), int(status.ullAvailPhys))
-
-
-def _posix_memory() -> MemorySnapshot:
-    try:
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
-        pages = int(os.sysconf("SC_PHYS_PAGES"))
-        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
-        return MemorySnapshot(page_size * pages, page_size * available_pages)
-    except (AttributeError, OSError, ValueError):
-        return MemorySnapshot(0, 0)

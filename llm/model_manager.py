@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import fnmatch
 from pathlib import Path
+import re
 import shutil
 
 import httpx
@@ -38,7 +39,10 @@ def available_bytes(path: Path) -> int:
     return shutil.disk_usage(path).free
 
 
-def resolve_hf_filename(spec: ModelSpec, *, timeout: float = 30.0) -> str:
+_SPLIT_GGUF_RE = re.compile(r"^(.*-)(\d{5})-of-(\d{5})(\.gguf)$")
+
+
+def resolve_hf_filenames(spec: ModelSpec, *, timeout: float = 30.0) -> list[str]:
     api_url = f"https://huggingface.co/api/models/{spec.repo_id}"
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
         response = client.get(api_url)
@@ -54,7 +58,7 @@ def resolve_hf_filename(spec: ModelSpec, *, timeout: float = 30.0) -> str:
                 filenames.append(name)
 
     if spec.filename and spec.filename in filenames:
-        return spec.filename
+        return [spec.filename]
 
     matches = [
         name for name in filenames
@@ -63,10 +67,30 @@ def resolve_hf_filename(spec: ModelSpec, *, timeout: float = 30.0) -> str:
     if matches:
         # Prefer a file at the repo root over split files or nested artifacts.
         matches.sort(key=lambda value: ("/" in value, len(value), value))
-        return matches[0]
+        return _expand_split_gguf(matches[0], matches)
 
     expected = spec.filename or spec.filename_glob
     raise RuntimeError(f"No GGUF file matching {expected!r} in {spec.repo_id}")
+
+
+def resolve_hf_filename(spec: ModelSpec, *, timeout: float = 30.0) -> str:
+    return resolve_hf_filenames(spec, timeout=timeout)[0]
+
+
+def _expand_split_gguf(first: str, matches: list[str]) -> list[str]:
+    match = _SPLIT_GGUF_RE.match(first)
+    if match is None:
+        return [first]
+    prefix, _index, count_text, suffix = match.groups()
+    count = int(count_text)
+    available = set(matches)
+    expected = [
+        f"{prefix}{index:05d}-of-{count:05d}{suffix}"
+        for index in range(1, count + 1)
+    ]
+    if all(filename in available for filename in expected):
+        return expected
+    return [first]
 
 
 def download_model(
@@ -75,10 +99,34 @@ def download_model(
     progress: ProgressCallback | None = None,
     hf_token: str | None = None,
 ) -> Path:
-    filename = resolve_hf_filename(spec)
+    filenames = resolve_hf_filenames(spec)
     destination = model_dir(spec)
     destination.mkdir(parents=True, exist_ok=True)
-    target = destination / Path(filename).name
+    first_target: Path | None = None
+    for filename in filenames:
+        target = destination / Path(filename).name
+        if first_target is None:
+            first_target = target
+        _download_one_file(
+            repo_id=spec.repo_id,
+            filename=filename,
+            target=target,
+            progress=progress,
+            hf_token=hf_token,
+        )
+    if first_target is None:
+        raise RuntimeError(f"No GGUF file matching {spec.filename_glob!r} in {spec.repo_id}")
+    return first_target
+
+
+def _download_one_file(
+    *,
+    repo_id: str,
+    filename: str,
+    target: Path,
+    progress: ProgressCallback | None,
+    hf_token: str | None,
+) -> Path:
     partial = target.with_suffix(target.suffix + ".part")
 
     headers: dict[str, str] = {}
@@ -89,7 +137,7 @@ def download_model(
     if resume_from > 0:
         headers["Range"] = f"bytes={resume_from}-"
 
-    url = f"https://huggingface.co/{spec.repo_id}/resolve/main/{filename}"
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
     with httpx.Client(timeout=None, follow_redirects=True) as client:
         with client.stream("GET", url, headers=headers) as response:
             if response.status_code == 416:

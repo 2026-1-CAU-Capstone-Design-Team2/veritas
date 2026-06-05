@@ -729,3 +729,63 @@ failure modes are:
 - Watch for evidence contamination: final claims must still be grounded only in `[doc_NNN]` source documents.
 - Watch entrypoint separation: chat/search-mode AutoSurvey can use a brief from the active workspace, but research-page AutoSurvey should remain clean unless the user explicitly asks to use memory.
 - Watch prompt leakage: the memory brief must never be printed in `final.md`; it should influence query planning only.
+
+## Implementation Plan: 2026-06-05 Model Variants / Quantization / Hardware Policy
+
+### Checklist
+- [ ] Expand the local LLM catalog from fixed model ids to model variants:
+  family, parameter size, quantization, GGUF filename/glob, download size,
+  model context limit, and user-facing label.
+- [ ] Add model-aware hardware estimation before recommending context or
+  parallel slots. The estimator should combine selected GGUF weight size, KV
+  cache for context tokens, runtime buffer, and detected available RAM.
+- [ ] Treat the selected context size as per-request/per-slot context. For
+  llama.cpp, total `-c` must be `context_per_slot * parallel_slots`, then clamped
+  to the selected model's own context limit.
+- [ ] Derive a safe `max_parallel_slots` in the range 1..5 from memory risk and
+  context/model limits. The UI may allow fewer slots than 5 when a large model,
+  heavier quantization, or long context would exceed the safety budget.
+- [ ] Show a consistent memory status label (`여유`, `적합`, `위험`) in install
+  setup, runtime setup, and advanced settings.
+- [ ] Persist model family/variant selection, quantization, context mode/tokens,
+  and parallel slots in the shared settings store.
+- [ ] Keep the existing Granite embedding tokenizer override in
+  `llm/llama_supervisor.py`; this plan is about LLM model diversification, not
+  replacing the embedding model.
+
+### Architecture Constraints
+- `llm/model_catalog.py` remains the source of truth for downloadable GGUF
+  variants. UI code should not hard-code model ids, labels, sizes, or
+  quantization lists.
+- Hardware policy should live in a dedicated module such as
+  `llm/hardware_policy.py` or an expanded `llm/context_settings.py`; launcher,
+  API services, and frontend should call the same functions.
+- The risk calculation must be transparent and deterministic:
+  `estimated_usage = model_weight + kv_cache(context_per_slot, parallel_slots) + runtime_buffer`.
+- RAM tiers alone are no longer enough once 27B/35B and Q2-Q8 variants are
+  selectable. Use RAM tiers only as a fallback when a file size or model spec is
+  missing.
+- `llm/llama_supervisor.py` is the final enforcement point for `-c` and `-np`.
+  UI/API recommendations must be revalidated there because environment
+  overrides can still change settings.
+- Avoid changing AutoSurvey/OpenAI model selection in this increment. This work
+  targets local llama.cpp LLM runtime settings.
+
+### Verification Commands
+- `python -m py_compile llm/model_catalog.py llm/context_settings.py llm/llama_supervisor.py llm/model_settings.py launcher.py api/services/settings_service.py api/repositories/state_repository.py frontend/ui/pages/settings_page.py frontend/controllers/agent_controller.py`
+- `python -m unittest discover tests`
+- Manual: launch with `python launcher.py --console-logs`, select a small model
+  and large model, verify the generated llama.cpp log shows expected `n_ctx`,
+  `n_ctx_seq`, and `n_parallel`.
+- Manual: change model/context/parallel from install setup, startup setup, and
+  advanced settings; confirm the same risk label and max-slot cap are shown.
+
+### Review Focus
+- Check that model context limit is treated as a hard upper bound, independent
+  of available RAM.
+- Check that increasing `parallel_slots` does not silently shrink per-slot
+  context without showing it to the user.
+- Check that Q8/Q6/Q5/Q4/Q3/Q2 variants use the actual GGUF size when available;
+  parameter-size-only estimates should be fallback estimates.
+- Check that failed downloads or missing model files do not crash the settings
+  screen; they should show estimated risk using catalog metadata.

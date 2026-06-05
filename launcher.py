@@ -67,17 +67,15 @@ from llm.model_settings import (
 
 
 LLAMA_COMMON_ARGS = [
-    "-ngl",
-    "99",
     "-ub",
-    "2048",
+    "1024",
     "-b",
-    "2048",
+    "1024",
     "-np",
-    "5",
+    "1",
     "--cont-batching",
     "-c",
-    "90000",
+    "32768",
 ]
 LLAMA_LLM_EXTRA_ARGS = ["-ctk", "q8_0", "-ctv", "q4_0"]
 LLAMA_EMBEDDING_EXTRA_ARGS = ["--embeddings"]
@@ -550,6 +548,8 @@ class ModelSetupDialog(QDialog):
         selected_llm = selected_model_from_settings(self._settings)
         selected_embedding = selected_embedding_from_settings(self._settings)
         self._selected_embedding_id = selected_embedding.id
+        self._context_reviewed_model_id = selected_llm.id
+        self._context_review_required = False
 
         self.workspace_combo = QComboBox(self)
         for workspace in self._workspaces:
@@ -619,6 +619,12 @@ class ModelSetupDialog(QDialog):
         self._sync_context_display()
         self._sync_combo_display()
         self._refresh_status()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # ----- construction helpers (presentation only) -----------------------
     def _build_header(self) -> QWidget:
@@ -1020,9 +1026,29 @@ class ModelSetupDialog(QDialog):
             )
 
     def _sync_primary_button_text(self) -> None:
+        if getattr(self, "_context_review_required", False):
+            self.install_button.setText("컨텍스트 확인 필요")
+            return
         self.install_button.setText(
             "설치하고 시작" if self._required_specs() else "선택하고 시작"
         )
+
+    def _sync_context_review_controls(self) -> None:
+        if not hasattr(self, "install_button"):
+            return
+        if getattr(self, "_context_review_required", False):
+            self.install_button.setEnabled(False)
+            self._sync_primary_button_text()
+            if hasattr(self, "status_label"):
+                self.status_label.setText("모델이 변경되어 컨텍스트 크기를 다시 확인해야 합니다.")
+            return
+        self.install_button.setEnabled(True)
+        self._sync_primary_button_text()
+
+    def _mark_context_reviewed(self) -> None:
+        self._context_reviewed_model_id = self.selected_llm_id()
+        self._context_review_required = False
+        self._refresh_status()
 
     def _sync_workspace_display(self) -> None:
         workspace_id = self.selected_workspace_id()
@@ -1042,35 +1068,63 @@ class ModelSetupDialog(QDialog):
         self._workspace_meta.setText(str(workspace.get("detail") or workspace_id))
 
     def _context_auto_label(self) -> str:
-        tokens = recommended_context_tokens(model_limit=self._selected_model_limit())
+        spec = self._selected_model_spec()
+        tokens = recommended_context_tokens(
+            model_limit=getattr(spec, "context_tokens", None),
+            model=spec,
+        )
         memory = detect_memory()
         return f"자동 권장 · {tokens // 1024 if tokens % 1024 == 0 else tokens // 1000}K · 적합 · 여유 RAM {memory.available_gb:.1f}GB"
 
     def _context_manual_label(self, tokens: int) -> str:
-        auto_tokens = recommended_context_tokens(model_limit=self._selected_model_limit())
-        return f"{tokens // 1024 if tokens % 1024 == 0 else tokens // 1000}K tokens · {context_risk(tokens, auto_tokens)}"
+        spec = self._selected_model_spec()
+        auto_tokens = recommended_context_tokens(
+            model_limit=getattr(spec, "context_tokens", None),
+            model=spec,
+        )
+        return f"{tokens // 1024 if tokens % 1024 == 0 else tokens // 1000}K tokens · {context_risk(tokens, auto_tokens, model=spec)}"
+
+    def _selected_model_spec(self):
+        try:
+            if not hasattr(self, "model_combo"):
+                return selected_model_from_settings(self._settings)
+            return get_model(self.selected_llm_id(), kind="llm")
+        except Exception:
+            return selected_model_from_settings(self._settings)
 
     def _selected_model_limit(self) -> int | None:
         try:
-            if not hasattr(self, "model_combo"):
-                return selected_model_from_settings(self._settings).context_tokens
-            return get_model(self.selected_llm_id(), kind="llm").context_tokens
+            return self._selected_model_spec().context_tokens
         except Exception:
             return None
 
     def _selected_context_payload(self) -> dict:
+        spec = self._selected_model_spec()
         value = str(self.context_combo.currentData() or "auto")
         if value == "auto":
-            return {"mode": "auto", "tokens": recommended_context_tokens(model_limit=self._selected_model_limit())}
+            return {
+                "mode": "auto",
+                "tokens": recommended_context_tokens(
+                    model_limit=getattr(spec, "context_tokens", None),
+                    model=spec,
+                ),
+            }
         try:
             tokens = int(value)
         except ValueError:
-            tokens = recommended_context_tokens(model_limit=self._selected_model_limit())
+            tokens = recommended_context_tokens(
+                model_limit=getattr(spec, "context_tokens", None),
+                model=spec,
+            )
         return {"mode": "manual", "tokens": tokens}
 
     def _sync_context_display(self) -> None:
+        spec = self._selected_model_spec()
         payload = self._selected_context_payload()
-        auto_tokens = recommended_context_tokens(model_limit=self._selected_model_limit())
+        auto_tokens = recommended_context_tokens(
+            model_limit=getattr(spec, "context_tokens", None),
+            model=spec,
+        )
         memory = detect_memory()
         tokens = int(payload["tokens"])
         if payload["mode"] == "auto":
@@ -1081,7 +1135,7 @@ class ModelSetupDialog(QDialog):
         else:
             self._context_name.setText(f"{tokens:,} tokens")
             self._context_meta.setText(
-                f"{context_risk(tokens, auto_tokens)} · 자동 권장 {auto_tokens:,} tokens · 여유 RAM {memory.available_gb:.1f}GB"
+                f"{context_risk(tokens, auto_tokens, model=spec)} · 자동 권장 {auto_tokens:,} tokens · 여유 RAM {memory.available_gb:.1f}GB"
             )
 
     def _sync_combo_display(self) -> None:
@@ -1093,10 +1147,12 @@ class ModelSetupDialog(QDialog):
         self._set_combo_badge(find_model_file(spec) is not None)
 
     def _on_model_changed(self) -> None:
+        self._context_review_required = self.selected_llm_id() != self._context_reviewed_model_id
         self._sync_combo_display()
         self._refresh_context_options()
         self._sync_context_display()
         self._refresh_status()
+        self._sync_context_review_controls()
 
     def _refresh_context_options(self) -> None:
         current = str(self.context_combo.currentData() or "auto")
@@ -1149,6 +1205,7 @@ class ModelSetupDialog(QDialog):
         chosen = menu.exec(pos)
         if chosen is not None and chosen.data() is not None:
             self.context_combo.setCurrentIndex(int(chosen.data()))
+            self._mark_context_reviewed()
 
     def _open_model_menu(self) -> None:
         menu = QMenu(self)
@@ -1209,6 +1266,9 @@ class ModelSetupDialog(QDialog):
         self._sync_primary_button_text()
 
     def _install_or_accept(self) -> None:
+        if getattr(self, "_context_review_required", False):
+            self._sync_context_review_controls()
+            return
         missing = self._required_specs()
         _save_launcher_workspace(self.selected_workspace_id())
         settings = load_settings()
@@ -1362,6 +1422,12 @@ class StartupSplashDialog(QDialog):
         app = QApplication.instance()
         if app is not None:
             app.processEvents()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
