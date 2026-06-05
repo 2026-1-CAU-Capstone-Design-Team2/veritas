@@ -731,6 +731,9 @@ failure modes are:
 - Watch prompt leakage: the memory brief must never be printed in `final.md`; it should influence query planning only.
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 4eae388c59d401c4dc8a67ed3900f21c9e1eded8
 ## Review Note: 2026-06-05 Current Diff Citation Evidence Map
 
 ### Checklist
@@ -1094,6 +1097,7 @@ git check-ignore -v deep_research_bench/results/race/flat_local_web_m15/race_res
 - Do not submit to the DRB leaderboard.
 - Do not commit generated raw articles, official evaluator outputs, or
   `bench_results/drb/`.
+<<<<<<< HEAD
 =======
 ## Implementation Plan: 2026-06-05 Model Variants / Quantization / Hardware Policy
 
@@ -1155,3 +1159,5 @@ git check-ignore -v deep_research_bench/results/race/flat_local_web_m15/race_res
 - Check that failed downloads or missing model files do not crash the settings
   screen; they should show estimated risk using catalog metadata.
 >>>>>>> 205258156653c354e92e8975e21eeeac2498c1f3
+=======
+>>>>>>> 4eae388c59d401c4dc8a67ed3900f21c9e1eded8
