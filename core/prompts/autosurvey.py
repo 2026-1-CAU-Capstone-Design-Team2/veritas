@@ -63,6 +63,10 @@ Query rules:
 - Do not add definition/정의 unless the user asks for a definition, concept explanation, or term disambiguation.
 - Do not append the current year unless the user asks for latest/recent/current information.
 - Prefer official docs, project repositories, vendor documentation, standards, or primary sources when applicable.
+Memory context rule:
+- If the input includes memory_brief, use it only for stable user preferences, project context, and constraints that affect planning.
+- Do not treat memory_brief as evidence, source content, or citation material.
+- The explicit user_request overrides memory_brief whenever they conflict.
 Do not overfit to prior knowledge beyond the user request and grounded terms.
 Use `current_time_context` from the input when the request includes time-sensitive or relative temporal expressions.
 Examples: latest/recent/current, as of, today/yesterday/tomorrow, this week/month/year, last week/month/year, 현재/최신/최근/동향/오늘/어제/내일/이번 주/지난주/이번 달/올해.

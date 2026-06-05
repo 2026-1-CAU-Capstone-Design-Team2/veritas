@@ -84,6 +84,22 @@ FOLLOW-UP QUESTION: {question}
 
 Rewrite the follow-up question as a standalone search query. Output ONLY the rewritten query, nothing else."""
 
+AUTOSURVEY_REQUEST_REWRITE_SYSTEM_PROMPT = """You rewrite follow-up web research requests for an existing workspace.
+Use the injected workspace memory only to resolve references such as "that topic", "the previous issue", or "the method we discussed".
+Output one standalone research request only.
+Do not expose private memory, personal identifiers, local file paths, credentials, or unrelated conversation details.
+Include only topic/scope constraints needed for web research."""
+
+AUTOSURVEY_REQUEST_REWRITE_PROMPT = """CURRENT USER RESEARCH REQUEST:
+{request}
+
+Rewrite it as a standalone web research request for AutoSurvey.
+Rules:
+- Preserve explicit site: constraints, source preferences, date/currentness requirements, and language intent.
+- If the request is already standalone, return it unchanged.
+- Do not add academic/paper/latest/current modifiers unless the user or workspace context requires them.
+- Output only the rewritten request, with no quotes, bullets, labels, or explanation."""
+
 RAG_USER_PROMPT_TEMPLATE = """Based on the following research documents, answer the user's question.
 
 DOCUMENTS:

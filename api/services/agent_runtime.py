@@ -386,6 +386,7 @@ class AgentRuntime:
                 workflow=self.workflow,
                 rag_service=self.rag_service,
                 run_store_service=self.run_store_service,
+                memory_runtime=self.memory_runtime,
                 max_docs_cap=int(os.getenv("VERITAS_API_AUTOSURVEY_MAX_DOCS", "5")),
             )
         )

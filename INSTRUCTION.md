@@ -692,71 +692,40 @@ failure modes are:
   affect kept-document numbering or `maxDocs`.
 - Confirm citation linkification changes are presentation-only and preserve the
   canonical visible marker format `[doc_NNN]`.
-## Implementation Plan: Startup Loading UI, Adaptive Context, and Custom Model Setup
+## Planning Note: 2026-06-05 Chat-Triggered AutoSurvey Memory Brief
 
-### User Requests
-1. The app currently shows no visible boot/loading window while the launcher starts the API, local model servers, and UI.
-2. The llama-server context size is currently fixed. It should be selected from the user's machine memory/hardware situation instead of using one hard-coded value.
-3. The first-install/model setup screen should let users configure a model directly, not only choose from the bundled catalog.
-
-### Brief Plan
-- Add a launcher-owned splash/loading dialog that appears after model setup and remains visible while dependency checks, API startup, llama-server startup, health checks, and UI startup happen.
-- Move context sizing into a single hardware/profile helper used by the API-owned llama supervisor. Persist the selected profile and expose an override path for advanced users.
-- Extend the setup/settings model UI so catalog models and user-provided local GGUF paths share the same validation, persistence, and restart flow.
+### Checklist
+- [x] Add an explicit AutoSurvey memory-brief builder instead of switching AutoSurvey tools from `ask/ask_json` to memory-aware `call`.
+- [x] Use the brief only when AutoSurvey is launched from the chat/search mode (`ChatAgent` -> `AutoSurveyTool`), where an existing workspace and chat memory already represent the user's working context.
+- [x] Keep the standalone/research-page AutoSurvey run memory-free by default. A first survey usually has no relevant KB/memory and should remain a clean request-driven research workflow.
+- [x] Include only stable user preferences and task context: working-context records tagged/category `preference`, `profile`, `constraint`, and `project`.
+- [x] Exclude raw FIFO history, full recall rows, assistant answers, local-private document/table contents, screen captures, and any source text from the memory brief.
+- [x] Pass the brief as a separate labelled section such as `User Research Preferences` / `Non-evidence Context`; never merge it into `user_request`, `grounded_terms`, `clean_md`, `batch_summaries`, or citations.
+- [x] Use the brief only in initial query planning. Do not inject it into final report generation, document cleanup/summarization, citations, source notes, or fetched document acceptance.
+- [x] Persist lightweight provenance metadata (`memory_brief_used`, character count), not the raw memory text, unless a user-visible audit view is intentionally added.
 
 ### Architecture Constraints
-- `launcher.py` should own only the startup UX and environment handoff. Since `VERITAS_MANAGE_LLAMA=1` makes the API own llama-server lifecycle, final llama flags must be computed in `llm/llama_supervisor.py` or a helper it calls.
-- Keep one source of truth for llama-server knobs: context tokens (`-c`), parallel slots (`-np` / `llmParallel`), GPU layer behavior (`-ngl`), and batch/ubatch sizes should not be duplicated between launcher and API paths.
-- Persist user-facing model choices through `llm/model_settings.py` / app-state settings so launcher setup, API settings, and frontend settings stay synchronized.
-- Custom local GGUF support must never copy arbitrary user model paths into the repo. Store only the selected absolute path in app state and validate that it exists, is a file, and has a `.gguf` extension before starting llama-server.
-- Automatic context sizing must be conservative. Prefer a stable app over maximum context. Clamp to model `context_tokens` and a safe upper/lower bound.
-- Environment variables such as `VERITAS_LLAMA_CTX`, `VERITAS_LLAMA_NGL`, and `VERITAS_LLM_PARALLEL` should remain manual overrides and should win over automatic recommendations.
+- AutoSurvey currently runs through `AgentRuntime.run_autosurvey()`: build `autosurvey_llm`, term-ground workspace naming, reserve/publish workspace, build a per-run registry with `autosurvey_llm` for research-generation tools and local `embedding_llm` for RAG indexing, then `AutoSurveyWorkflow.run_all()`.
+- Chat/search-mode AutoSurvey currently runs through `AgentRuntime.answer_chat_selection*()` -> `ChatAgent.ask_explicit_tool("autosurvey", ...)` -> `AutoSurveyTool.run()` against the active workspace's workflow and memory-bearing chat runtime.
+- AutoSurvey tools (`term_grounding`, `query_plan`, `document_cleanup`, `document_summarize`, `final_report`) call `ask()` / `ask_json()`, which are raw passthrough methods on `MemoryAwareLLMClient`; memory is not injected today.
+- Do not route AutoSurvey through `MemoryAwareLLMClient.call()` globally. That would inject FIFO/recall into cleanup/summarization/final prompts and can contaminate evidence, leak private context to OpenAI-backed AutoSurvey, and record survey internals as chat memory.
+- OpenAI AutoSurvey remains an external research-generation role. Any memory sent to it must be treated as exportable user preference text only; local/private evidence remains local-only.
+- Memory brief must be deterministic, bounded, and non-evidence. It can guide query style, language, depth, deliverable format, and project constraints, but fetched documents and their clean Markdown remain the only report evidence.
 
-### Implementation Checklist
-- [ ] Add a small `StartupSplashDialog` or equivalent in `launcher.py` with status text and an indeterminate/progress indicator.
-- [ ] Run the long launcher startup sequence on a worker thread or otherwise keep the Qt event loop alive while startup progresses.
-- [ ] Emit user-visible startup stages: dependency check, API start, model server start/health wait, UI start, failure.
-- [ ] Make failures close/update the splash and show the existing `QMessageBox.critical` with the real error text and log hint.
-- [ ] Inspect and update `llm/llama_supervisor.py`; this is the active API-owned llama-server flag path.
-- [ ] Add a hardware/profile helper, for example `llm/hardware_profile.py`, that reads total/available RAM and, where feasible, GPU/VRAM information.
-- [ ] Compute a recommended context token value from model size, available memory, and model `context_tokens`. Suggested initial tiers: low memory 8192-16384, mid memory 32768, high memory 50000-90000, never above the model limit.
-- [ ] Keep `VERITAS_LLAMA_CTX` as an explicit override. If it is set, skip automatic context sizing and log that the override was used.
-- [ ] Persist the chosen auto profile and last computed context in settings, for display/debugging, without requiring users to understand tokens.
-- [ ] Update downstream context consumers that use hard-coded assumptions only if needed; `llm/llama_server_llm.py` already detects `/props` `n_ctx`, and memory runtime updates from it.
-- [ ] Extend `llm/model_catalog.ModelSpec` or add a parallel custom-model record so selected models can be either catalog IDs or validated local GGUF paths.
-- [ ] Update `selected_model_from_settings()`, `save_selected_models()`, and API repository/settings helpers to round-trip custom local model settings.
-- [ ] Extend the initial `ModelSetupDialog` with a direct local GGUF picker/input and clear validation status.
-- [ ] Ensure custom model selection can skip download while still requiring the bundled embedding model unless a future embedding override is explicitly implemented.
-- [ ] Extend `frontend/ui/pages/settings_page.py` so users can change between catalog models and a custom local GGUF after installation.
-- [ ] On model switch, reuse the existing API settings flow so llama-server restarts and `LLMClient.refresh_model_info()` updates `n_ctx`.
-- [ ] Add clear UX copy for recommended vs custom model path, estimated memory/context profile, and disk/download requirements.
+### Recommended Injection Points
+- `AutoSurveyTool.run()` or the `ChatAgent.ask_explicit_tool("autosurvey", ...)` adapter: build `autosurvey_memory_brief` from the active workspace's `MemoryRuntime` and pass it into the workflow explicitly.
+- `QueryPlanTool.run()`: add `memory_brief` to `planner_input` under a labelled field. Prompt rule: use it only for preference/constraint interpretation and query style, not as source evidence.
+- Do not inject the brief into `FinalReportTool`. Final synthesis should remain driven by the original request, plan summary, run stats, and batch summaries only.
+- Avoid `DocumentCleanupTool` and `DocumentSummarizeTool` injection. Those are source-processing stages and should remain driven only by document text plus the original request.
+- `run_collect()` source ranking may use only explicit request/plan/reference URLs. Do not use memory-only topics to admit pages unless they are promoted into the plan as explicit must-cover constraints.
 
 ### Verification Commands
-- [ ] `python -m py_compile launcher.py llm/llama_supervisor.py llm/model_catalog.py llm/model_settings.py api/services/settings_service.py api/repositories/state_repository.py frontend/ui/pages/settings_page.py`
-- [ ] `python -m unittest discover tests`
-- [ ] Manual: start with no model installed and confirm the setup dialog still works.
-- [ ] Manual: start with models installed and confirm the splash appears while API/model/UI startup is in progress.
-- [ ] Manual: set `VERITAS_LLAMA_CTX=8192` and confirm llama-server starts with the override, not the auto value.
-- [ ] Manual: choose a valid local `.gguf` and confirm startup uses that path without downloading an LLM.
-- [ ] Manual: choose an invalid/nonexistent path and confirm the UI blocks save/start with a clear error.
+- `python -m py_compile services\autosurvey_memory_brief.py tools\autosurvey_tool\autosurvey_tool.py workflows\autosurvey_workflow.py tools\query_plan_tool\query_plan_tool.py core\prompts\autosurvey.py api\services\agent_runtime.py tests\test_autosurvey_memory_brief.py`
+- `python -m unittest tests.test_autosurvey_memory_brief tests.test_autosurvey_collect tests.test_autosurvey_source_quality`
+- Focused tests cover: memory brief category allowlist, no raw recall/FIFO leakage, chat-triggered AutoSurvey passes the brief to planning, and replan/final-adjacent paths do not receive memory.
 
 ### Review Focus
-- Confirm the splash does not freeze, orphan processes, or hide startup failures.
-- Confirm llama-server flags are produced by one active code path; avoid fixing only the inactive `launcher.py start_llama()` path.
-- Confirm auto context selection is conservative and clamped by both hardware estimate and `ModelSpec.context_tokens`.
-- Confirm custom model paths are validated, persisted outside the repo, and never committed or copied into source control.
-- Confirm setup UI and settings UI use the same persisted model shape and do not diverge.
-- Confirm tests cover both catalog model IDs and custom local GGUF settings.
-
-### Context Size Unit Decision
-- The internal unit must be **tokens**, because llama-server's `-c` / context-size flag is token-based and downstream code reads `n_ctx` from `/props`.
-- The user-facing unit should be a profile label plus approximate token count, for example `안정형 (16K tokens)`, `표준형 (32K tokens)`, `확장형 (50K tokens)`, `고용량 (90K tokens)`.
-- Hardware detection should read memory in bytes/GB, then map it to token tiers. Do not ask users to reason directly in RAM math.
-- Recommended first-pass tiers:
-  - available RAM under 8 GB: `8192`
-  - available RAM 8-16 GB: `16384`
-  - available RAM 16-32 GB: `32768`
-  - available RAM 32-64 GB: `50000`
-  - available RAM 64 GB or more: `90000`
-- Always clamp the recommended value to the selected model's `context_tokens` and to an app maximum. Prefer stability over maximum context.
-- `VERITAS_LLAMA_CTX` remains the explicit override and must win over auto sizing.
+- Watch for accidental privacy regressions: memory brief must not contain local document/table text or screen OCR payloads.
+- Watch for evidence contamination: final claims must still be grounded only in `[doc_NNN]` source documents.
+- Watch entrypoint separation: chat/search-mode AutoSurvey can use a brief from the active workspace, but research-page AutoSurvey should remain clean unless the user explicitly asks to use memory.
+- Watch prompt leakage: the memory brief must never be printed in `final.md`; it should influence query planning only.
