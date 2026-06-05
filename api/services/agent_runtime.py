@@ -281,6 +281,21 @@ class AgentRuntime:
         self.llm.refresh_model_info()
         return spec
 
+    def restart_llm_server(self) -> None:
+        """Restart the currently selected LLM server to apply llama flags."""
+        from pathlib import Path as _Path
+
+        from llm.model_catalog import find_model_file, selected_model_from_settings
+        from llm.model_settings import load_settings
+
+        settings = load_settings()
+        spec = selected_model_from_settings(settings)
+        path = find_model_file(spec)
+        if path is None:
+            raise RuntimeError(f"selected model is not downloaded: {spec.name}")
+        self._llm_server.restart(_Path(path))
+        self.llm.refresh_model_info()
+
     def shutdown(self) -> None:
         """Stop any llama-servers this process owns (best effort, idempotent)."""
         proactive = getattr(self, "_proactive_orchestrator", None)

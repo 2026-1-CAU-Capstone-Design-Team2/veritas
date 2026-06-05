@@ -206,6 +206,22 @@ class DocCountStepper(QFrame):
 		if changed:
 			self.valueChanged.emit(self._value)
 
+	def setRange(self, minimum: int, maximum: int) -> None:
+		minimum = int(minimum)
+		maximum = max(minimum, int(maximum))
+		if minimum == self._min and maximum == self._max:
+			return
+		self._min = minimum
+		self._max = maximum
+		self._value_edit.setValidator(QIntValidator(self._min, self._max, self))
+		self._value_edit.setToolTip(
+			f"{self._min}~{self._max} 사이의 값을 직접 입력할 수 있습니다."
+		)
+		self.setValue(self._value)
+
+	def setMaximum(self, maximum: int) -> None:
+		self.setRange(self._min, maximum)
+
 	def _step(self, delta: int) -> None:
 		self.setValue(self._value + delta)
 
