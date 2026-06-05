@@ -757,3 +757,339 @@ failure modes are:
 - Check for path traversal, workspace/doc id normalization, and direct filesystem access from UI.
 - Check that Source Notes entries stay document-level while body citations prefer evidence anchors.
 - Check that fallback behavior is honest: unresolved citations should not be presented as exact source anchors.
+
+## Implementation Plan: DRB AutoSurvey Benchmark Harness
+
+### Goal
+Build a reproducible benchmark harness that compares Veritas AutoSurvey against
+a flat LLM + web-search/fetch baseline on DeepResearch Bench (DRB). The question
+to answer is:
+
+> With the same generator LLM, same web-search/fetch primitive, same fetched
+> document budget, and same report citation format, does Veritas AutoSurvey
+> produce better DRB RACE/FACT scores than a flat one-shot research baseline?
+
+This is an evaluation harness task. Do not tune the production AutoSurvey
+algorithm in this increment.
+
+### Current Repository Decision
+- Keep the existing DRB checkout at `deep_research_bench/`. Do not move it to
+  `vendor/deep_research_bench/` in this increment.
+- Treat `deep_research_bench/` as a temporarily vendored external evaluator
+  tree. It is separate from Veritas production code.
+- Benchmark harness code belongs under `benchmarks/drb/`.
+- Flat-baseline prompts belong under `core/prompts/drb_benchmark.py`.
+- Do not add a GUI page or FastAPI endpoint for this benchmark.
+
+### Systems To Compare First
+- Primary first pair:
+  - `veritas_autosurvey_local_m15`
+  - `flat_local_web_m15`
+- Generator LLM:
+  - Use the currently served local llama-server model first, preferably the
+    team's Qwen3.5-9B-class local model when available.
+  - OpenAI generation models such as `gpt-5-mini` or `gpt-5.4-mini` are optional
+    later variants, not the first required pair.
+- Shared budget:
+  - `max_docs=15`
+  - `scout_docs=3` for AutoSurvey
+  - `batch_size=5` for AutoSurvey
+  - `search_query_count=5` for flat baseline
+  - `fetch_max_chars=100000`
+- Fairness rule:
+  - Same generator LLM for both systems in a comparison.
+  - Same web search provider/tool for both systems.
+  - Same fetch tool and fetched-document cap for both systems.
+  - Flat baseline must use search + fetch, not search snippets only.
+  - Flat baseline must not call `AutoSurveyWorkflow`, `AutoSurveyTool`,
+    `QueryPlanTool`, `DocumentCleanupTool`, `DocumentSummarizeTool`, or
+    `FinalReportTool`.
+
+### Expected Cost And Budget Policy
+- Current available API budget is approximately USD 90. Treat that as a hard
+  planning budget unless the user explicitly increases it.
+- Local generation has no OpenAI generation cost, but still consumes:
+  - local compute time,
+  - web search/fetch time,
+  - DRB judge API calls,
+  - Jina API calls for FACT scraping/validation.
+- DRB's current evaluator defaults are:
+  - RACE judge: `gpt-5.5`
+  - FACT judge: `gpt-5.4-mini`
+  - Both can be overridden with `RACE_MODEL` and `FACT_MODEL`.
+- Cost-control strategy:
+  1. Run unit tests only: no network, no real LLM, no judge cost.
+  2. Run a 2-task smoke for both systems: generation only, no official judge.
+  3. Run a 10-task stratified pilot for both systems with budget judge:
+     - `RACE_MODEL=gpt-5.4-mini`
+     - `FACT_MODEL=gpt-5.4-mini`
+     - Label all outputs as `budget_judge`, not official DRB/leaderboard score.
+  4. If pilot succeeds and observed spend is acceptable, run official
+     confirmation on only 3-5 overlapping tasks:
+     - `RACE_MODEL=gpt-5.5`
+     - `FACT_MODEL=gpt-5.4-mini`
+     - Label this as `official_judge_confirmation`.
+  5. Do not run full 100-task official judging under the USD 90 budget unless
+     explicitly approved after a measured pilot.
+- Expected cost bands are estimates and must be recorded in metadata/report:
+  - 2-task smoke generation: near USD 0 API cost when local generator is used.
+  - 10-task budget judge, two systems: expected to fit within the USD 90 budget,
+    but stop if observed/estimated judge spend exceeds USD 60 before official
+    confirmation.
+  - 3-5 task official confirmation: reserve remaining budget for this.
+  - Full 100-task official judging for two systems is out of scope for this
+    budget and should be marked "not run".
+- Before any official run, verify current model pricing from the provider's
+  pricing page. Model prices are not hard-coded into tests.
+
+### Required Implementation
+- Add `benchmarks/drb/drb_vendor.py`:
+  - default DRB root: `deep_research_bench`
+  - validate required files:
+    - `README.md`
+    - `LICENSE`
+    - `requirements.txt`
+    - `run_benchmark.sh`
+    - `deepresearch_bench_race.py`
+    - `data/prompt_data/query.jsonl`
+    - `utils/`
+    - `prompt/`
+  - build raw output path:
+    - `deep_research_bench/data/test_data/raw_data/<model_name>.jsonl`
+  - reject traversal-like DRB roots for CLIs that should stay repo-internal.
+- Add `benchmarks/drb/drb_io.py`:
+  - robust JSON object iterator using `json.JSONDecoder().raw_decode()`
+  - load tasks from `query.jsonl`
+  - support `limit`, `task_ids`, `languages`, `topics`
+  - validate task fields `id` and `prompt`
+  - preserve `topic` and `language` in in-memory task metadata
+  - write official raw JSONL with only `id`, `prompt`, `article`
+  - write sidecar metadata as `<raw_output>.meta.jsonl`
+  - support resume via completed task ids
+- Add `benchmarks/drb/citation_adapter.py`:
+  - export Veritas workspace `final.md` to a DRB article string
+  - read `summary/index.json` for URL/title metadata
+  - convert `[doc_000]`, `doc_000`, `doc-000`, `doc000` to numeric `[n]`
+  - map citations in deterministic first-appearance order
+  - prefer `final_url`, then `url`
+  - append or normalize `## References`
+  - never mutate `final.md`
+  - leave code fences, inline code, existing links, and URLs intact
+  - record metadata warnings for unmapped doc ids
+- Add `benchmarks/drb/veritas_runner.py`:
+  - module CLI
+  - default `--drb-root deep_research_bench`
+  - default query file: `<drb-root>/data/prompt_data/query.jsonl`
+  - default output: `<drb-root>/data/test_data/raw_data/<model_name>.jsonl`
+  - default work root: `runs/drb/<model_name>`
+  - create one workspace per task under `runs/drb/<model_name>/task_<id>/`
+  - wire AutoSurvey directly like `main.py`:
+    - `LLMClient`
+    - `build_autosurvey_llm()`
+    - `build_registry()`
+    - `AutoSurveyConfig.from_env()`
+    - `AutoSurveyWorkflow.run_all()`
+  - do not call chat-facing `AutoSurveyTool`
+  - do not inject chat memory, RAG state, screen context, local private docs, or
+    proactive state
+  - export DRB article via `citation_adapter`
+  - record sidecar metadata: task id, prompt, language, topic, workspace path,
+    timestamps, elapsed seconds, generator provider/model, budgets, kept/rejected
+    counts when available, success/failure, warnings
+- Add `core/prompts/drb_benchmark.py`:
+  - flat search-query generation prompt
+  - flat final report prompt
+  - require same language as task
+  - require numeric citations `[n]`
+  - require `## References` with URLs
+  - forbid invented URLs and tool-log narration
+- Add `benchmarks/drb/flat_agent.py`:
+  - use injected LLM/search/fetch callables for tests
+  - ask generator for at most `search_query_count` queries
+  - run existing `web_search`
+  - dedupe URLs deterministically
+  - fetch at most `max_docs` pages
+  - build bounded numeric-source packet
+  - ask generator once for final report
+  - no cleanup, source-quality gate, batch summary, gap extraction, replan,
+    RAG indexing, or final-report normalizer
+- Add `benchmarks/drb/flat_runner.py`:
+  - module CLI mirroring Veritas runner
+  - same default `--drb-root`, query file, output path, work root style
+  - same env-driven generator provider/model
+  - metadata analogous to Veritas runner
+  - optional debug source packets only under `runs/drb/`, never official raw JSONL
+- Add `benchmarks/drb/validate_raw_data.py`:
+  - parse raw JSONL
+  - verify only official keys are present by default
+  - verify non-empty article
+  - verify inline numeric citations exist
+  - verify `References` contains URL-like entries
+- Add `benchmarks/drb/analyze_results.py`:
+  - parse DRB RACE and FACT outputs robustly
+  - output under `bench_results/drb/<comparison>/`
+  - produce `summary.csv`, `paired_deltas.csv`, `comparison_report.md`
+  - compute mean delta, median delta, win rate, bootstrap 95% CI with fixed seed
+  - degrade clearly to aggregate-only mode if per-task files are unavailable
+- Add `.gitignore` patterns:
+  - `/deep_research_bench/**/__pycache__/`
+  - `/deep_research_bench/**/*.pyc`
+  - `/deep_research_bench/.pytest_cache/`
+  - `/deep_research_bench/.mypy_cache/`
+  - `/deep_research_bench/.ruff_cache/`
+  - `/deep_research_bench/.env`
+  - `/deep_research_bench/.env.*`
+  - `/deep_research_bench/data/test_data/raw_data/veritas_*.jsonl`
+  - `/deep_research_bench/data/test_data/raw_data/flat_*.jsonl`
+  - `/deep_research_bench/data/test_data/raw_data/*_pilot*.jsonl`
+  - `/deep_research_bench/data/test_data/raw_data/*_smoke*.jsonl`
+  - `/deep_research_bench/data/test_data/raw_data/*.meta.jsonl`
+  - `/deep_research_bench/data/test_data/cleaned_data/veritas_*/`
+  - `/deep_research_bench/data/test_data/cleaned_data/flat_*/`
+  - `/deep_research_bench/results/race/veritas_*/`
+  - `/deep_research_bench/results/race/flat_*/`
+  - `/deep_research_bench/results/fact/veritas_*/`
+  - `/deep_research_bench/results/fact/flat_*/`
+  - `/runs/drb/`
+  - `/bench_results/drb/`
+  - `/benchmarks/drb/out/`
+  - `/benchmarks/drb/cache/`
+
+### Manual Commands
+Use the local `agent` env on this machine:
+
+```powershell
+C:\Users\pc21\miniconda3\envs\agent\python.exe -m benchmarks.drb.veritas_runner `
+  --drb-root deep_research_bench `
+  --model-name veritas_autosurvey_local_m15 `
+  --max-docs 15 `
+  --scout-docs 3 `
+  --batch-size 5 `
+  --limit 2 `
+  --resume
+
+C:\Users\pc21\miniconda3\envs\agent\python.exe -m benchmarks.drb.flat_runner `
+  --drb-root deep_research_bench `
+  --model-name flat_local_web_m15 `
+  --max-docs 15 `
+  --search-query-count 5 `
+  --fetch-max-chars 100000 `
+  --limit 2 `
+  --resume
+
+C:\Users\pc21\miniconda3\envs\agent\python.exe -m benchmarks.drb.validate_raw_data `
+  deep_research_bench\data\test_data\raw_data\veritas_autosurvey_local_m15.jsonl
+
+C:\Users\pc21\miniconda3\envs\agent\python.exe -m benchmarks.drb.validate_raw_data `
+  deep_research_bench\data\test_data\raw_data\flat_local_web_m15.jsonl
+```
+
+Budget judge pilot env:
+
+```powershell
+$env:LLM_BACKEND="openai"
+$env:OPENAI_API_KEY="..."
+$env:JINA_API_KEY="..."
+$env:RACE_MODEL="gpt-5.4-mini"
+$env:FACT_MODEL="gpt-5.4-mini"
+```
+
+Official confirmation env:
+
+```powershell
+$env:LLM_BACKEND="openai"
+$env:OPENAI_API_KEY="..."
+$env:JINA_API_KEY="..."
+$env:RACE_MODEL="gpt-5.5"
+$env:FACT_MODEL="gpt-5.4-mini"
+```
+
+Do not edit `deep_research_bench/run_benchmark.sh` just to set local target
+models. Prefer a documented local shell override, a generated ignored helper, or
+manual temporary edit that is not committed.
+
+### Required Tests
+- `tests/test_drb_vendor_layout.py`
+  - validates current `deep_research_bench/` layout
+  - checks default raw output path
+  - checks traversal rejection
+  - checks representative generated artifacts are ignored, using
+    `git check-ignore` when available
+- `tests/test_drb_benchmark_io.py`
+  - normal JSONL
+  - concatenated JSON object stream
+  - embedded newlines
+  - filters: limit, task ids, language, topic
+  - official raw writer emits only `id`, `prompt`, `article`
+  - resume detects completed ids
+- `tests/test_drb_citation_adapter.py`
+  - Veritas doc markers convert to numeric citations
+  - `final_url` preferred over `url`
+  - duplicate URLs handled deterministically
+  - unmapped docs warn and do not crash
+  - `final.md` is not modified
+  - code/link/URL text is not corrupted
+- `tests/test_drb_flat_baseline.py`
+  - fake LLM/search/fetch only
+  - query count and fetched doc cap enforced
+  - URL dedupe works
+  - final prompt contains numeric source ids and URL references
+  - flat agent does not import/call AutoSurvey orchestration/tools
+- `tests/test_drb_analysis.py`
+  - paired delta calculation
+  - win rate
+  - deterministic bootstrap CI
+  - aggregate-only fallback when per-task outputs are missing
+
+Required verification commands:
+
+```powershell
+C:\Users\pc21\miniconda3\envs\agent\python.exe -m unittest `
+  tests.test_drb_vendor_layout `
+  tests.test_drb_benchmark_io `
+  tests.test_drb_citation_adapter `
+  tests.test_drb_flat_baseline `
+  tests.test_drb_analysis
+
+git check-ignore -v runs/drb/x/final.md
+git check-ignore -v deep_research_bench/data/test_data/raw_data/veritas_autosurvey_local_m15.jsonl
+git check-ignore -v deep_research_bench/results/race/flat_local_web_m15/race_result.txt
+```
+
+### Acceptance Criteria
+- A 2-task smoke can generate raw DRB-compatible JSONL for both systems.
+- Raw JSONL rows contain only `id`, `prompt`, `article`.
+- Sidecar metadata exists and contains no API keys or full fetched bodies.
+- Veritas exported article contains numeric citations, not `[doc_NNN]`.
+- Flat article contains numeric citations and a URL-bearing `## References`.
+- Generated benchmark outputs are ignored by git.
+- Unit tests use fakes and do not hit network or real LLM.
+- DRB judge commands are documented but not run automatically by tests.
+- The final report from Claude explicitly states whether:
+  - DRB official evaluator was run,
+  - budget judge was run,
+  - official confirmation was run,
+  - full 100-task benchmark was not run.
+
+### Review Focus
+- Confirm `deep_research_bench/` remains separate evaluator code and production
+  Veritas code does not import evaluator internals except benchmark harness code.
+- Confirm benchmark code is isolated under `benchmarks/drb/`.
+- Confirm flat baseline does not secretly use AutoSurvey components.
+- Confirm Veritas runner does not call chat-facing `AutoSurveyTool`.
+- Confirm no chat memory, local private docs, screen OCR, RAG chunks, or
+  proactive state enters DRB generation.
+- Confirm same generator model and same document/fetch budget are recorded for
+  both systems.
+- Confirm budget-judge results are labelled as internal pilot results, not
+  official DRB leaderboard results.
+- Confirm no generated raw article corpora, evaluator outputs, logs, `.env`, API
+  keys, or `runs/drb/` artifacts are staged.
+
+### Non-Goals
+- Do not run the full 100-task benchmark in this implementation increment.
+- Do not tune AutoSurvey quality based on DRB scores in this increment.
+- Do not add UI/API surfaces for benchmark results.
+- Do not submit to the DRB leaderboard.
+- Do not commit generated raw articles, official evaluator outputs, or
+  `bench_results/drb/`.

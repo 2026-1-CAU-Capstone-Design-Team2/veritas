@@ -10,3 +10,30 @@ test/
 logs/
 # Generated synthetic test data (tests/fixtures/generate_scenario_data.py)
 /test_data/
+
+# DeepResearch Bench (DRB) benchmark harness — ignore generated artifacts only;
+# the vendored evaluator tree itself stays trackable. (See benchmarks/drb/.)
+/deep_research_bench/**/__pycache__/
+/deep_research_bench/**/*.pyc
+/deep_research_bench/.pytest_cache/
+/deep_research_bench/.mypy_cache/
+/deep_research_bench/.ruff_cache/
+/deep_research_bench/.env
+/deep_research_bench/.env.*
+/deep_research_bench/data/test_data/raw_data/veritas_*.jsonl
+/deep_research_bench/data/test_data/raw_data/flat_*.jsonl
+/deep_research_bench/data/test_data/raw_data/*_pilot*.jsonl
+/deep_research_bench/data/test_data/raw_data/*_smoke*.jsonl
+/deep_research_bench/data/test_data/raw_data/*.meta.jsonl
+/deep_research_bench/data/test_data/cleaned_data/veritas_*/
+/deep_research_bench/data/test_data/cleaned_data/flat_*/
+/deep_research_bench/data/test_data/cleaned_data/veritas_*.jsonl
+/deep_research_bench/data/test_data/cleaned_data/flat_*.jsonl
+/deep_research_bench/results/race/veritas_*/
+/deep_research_bench/results/race/flat_*/
+/deep_research_bench/results/fact/veritas_*/
+/deep_research_bench/results/fact/flat_*/
+/runs/drb/
+/bench_results/drb/
+/benchmarks/drb/out/
+/benchmarks/drb/cache/

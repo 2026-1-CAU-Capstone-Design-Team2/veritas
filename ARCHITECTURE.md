@@ -782,3 +782,45 @@ curl -X POST "http://127.0.0.1:8000/api/v1/proactive/reset?workspaceId=<ws>"
 **테스트 실행**: `test_citation_evidence`(23)+`test_document_citations`(21) 통과, 인접(`final_report_tool`/`final_report_normalizer`/`document_cleanup_modes`/`autosurvey_collect`/`autosurvey_source_quality`) 72 통과, 전체 `discover tests` **385 OK**(신규 회귀 0). 추가 LLM call 없음.
 
 **잔여**: 항목 10(post-cleanup에서 비대/구조-payload `clean_md`를 evidence·요약에서 제외 + 대체 수집)은 본 increment 범위 밖(별도). batch/final이 atom을 직접 인용하도록 강제하는 변경도 의도적으로 하지 않음(프롬프트 안정성 우선).
+
+### 2026-06-05 — DRB AutoSurvey 벤치마크 하니스 (AutoSurvey vs flat baseline)
+
+**기능**: AutoSurvey의 iterative design이 일반 Flat-LLM(web_search+fetch+1-shot) 대비 조사 품질을 정량적으로 얼마나 높이는지 [DeepResearch Bench](https://github.com/Ayanami0730/deep_research_bench)(RACE/FACT)로 측정하는 **평가 전용 하니스**. 동일 generator·동일 search/fetch·동일 문서 budget·동일 citation 형식으로 두 시스템을 비교한다. 프로덕션 AutoSurvey 알고리즘은 변경하지 않는다.
+
+**변경 파일**
+- (vendored) `deep_research_bench/` — 외부 평가자 트리(임시 vendored). DRB 스크립트(`deepresearch_bench_race.py`, `utils/*`)는 그대로 사용하며 하니스가 그 internal을 import하지 않는다.
+- (new) `benchmarks/drb/drb_vendor.py` — DRB root 해석/검증, official raw 경로(`data/test_data/raw_data/<model>.jsonl`) 빌드, traversal·model_name 거부. 순수 path 로직.
+- (new) `benchmarks/drb/drb_io.py` — `json.JSONDecoder().raw_decode` 기반 robust object iterator(JSONL/concatenated/embedded-newline 허용), `query.jsonl` 로드+필터(limit/task_ids/languages/topics), **official writer는 `id`/`prompt`/`article`만** 기록, `.meta.jsonl` sidecar, completed-id resume.
+- (new) `benchmarks/drb/citation_adapter.py` — workspace `final.md`→DRB article: `[doc_NNN]`/bare 마커를 first-appearance 순 numeric `[n]`으로 renumber, `summary/index.json`(final_url>url)로 `## References` 생성, **`final.md` 불변**, code fence/inline code/링크/URL 보존, unmapped doc id는 warning.
+- (new) `core/prompts/drb_benchmark.py` — flat baseline의 query-plan·final-report 프롬프트(동일 언어, numeric `[n]`, URL References, invented URL·tool narration 금지). 프로덕션 `core/prompts/__init__` re-export에는 의도적으로 미포함.
+- (new) `benchmarks/drb/flat_agent.py` — flat 오케스트레이션(주입된 query/search/fetch/report callable): ≤N query → search → URL dedupe → ≤max_docs fetch → numeric source packet → 1회 report. References는 실제 fetched source로 결정론 생성(모델이 쓴 References는 교체 → URL fabrication 방지). **AutoSurvey orchestration/tool import 없음**(정적 테스트로 강제).
+- (new) `benchmarks/drb/veritas_runner.py` — `main.py`처럼 AutoSurvey 직결(`LLMClient`→`build_autosurvey_llm`→`build_registry`→`AutoSurveyConfig.from_env`→`AutoSurveyWorkflow.run_all`), task당 `runs/drb/<model>/task_<id>/` 워크스페이스, `citation_adapter`로 article 추출. chat-facing `AutoSurveyTool` 미사용, memory/RAG/screen/local-private/proactive 미주입(`enable_screen_context=False`).
+- (new) `benchmarks/drb/flat_runner.py` — flat_runner: 동일 generator(`build_autosurvey_llm`) + 동일 `WebSearchTool` + 동일 `fetch_with_crawl4ai`(동일 `--fetch-max-chars`).
+- (new) `benchmarks/drb/validate_raw_data.py` — official key only/non-empty article/inline `[n]`/URL-bearing `## References` 검증 CLI.
+- (new) `benchmarks/drb/analyze_results.py` — RACE per-task(`raw_results.jsonl`)+aggregate(`race_result.txt`), FACT(`fact_result.txt`) 파싱 → `bench_results/drb/<comparison>/`(`summary.csv`/`paired_deltas.csv`/`comparison_report.md`), mean/median delta·win rate·**고정 seed bootstrap 95% CI**, per-task 부재 시 aggregate-only fallback.
+- (new) `benchmarks/{__init__,drb/__init__,drb/README.md}` — 패키지 + 디렉터리 README(실행 명령·budget/judge 정책·fairness·미실행 항목).
+- (edit) `.gitignore` — DRB 생성 산출물만 ignore(벤더 트리 자체는 추적): `raw_data/{veritas,flat}_*.jsonl`·`*.meta.jsonl`·`results/{race,fact}/{veritas,flat}_*/`·`/runs/drb/`·`/bench_results/drb/`·`/benchmarks/drb/{out,cache}/`.
+
+**엔지니어링 결정**
+- *공정성*: 두 arm 모두 동일 generator/search/fetch/budget/citation 형식. flat은 source-quality gate·cleanup·batch·gap·replan·RAG·final normalizer 전부 없음 → iterative design 자체의 효과만 분리.
+- *official 형식 격리*: raw 행은 `id`/`prompt`/`article`만(메타 누출 차단), 모든 run 메타는 `.meta.jsonl` sidecar(키·full body 미저장).
+- *결정론 + no-LLM 분석*: stdlib만(bootstrap은 `random.Random(seed)`), per-task 부재 시 aggregate-only로 정직하게 degrade. judge 비용 라벨(`budget_judge`/`official_judge_confirmation`)은 사용자가 명시, leaderboard score와 혼동 금지.
+- *레이어 격리*: 하니스는 `benchmarks/drb/`에 고립, DRB 평가자 internal 미import. flat_agent는 주입 callable로 테스트(네트워크/LLM 없음).
+
+**테스트**: `test_drb_{vendor_layout,benchmark_io,citation_adapter,flat_baseline,analysis}` 5개 모듈 **47 passed**(전부 fake, 네트워크/LLM/judge 미접속). `git check-ignore`로 생성 산출물 ignore 확인. 전체 `discover tests` **432 OK**(신규 회귀 0).
+
+**미실행(예산/서버 필요, 본 increment 범위 밖)**: 실제 article 생성(2-task smoke 포함, llama-server 필요), DRB RACE/FACT 공식 평가, budget-judge pilot, official confirmation, 100-task full judging — 전부 **미실행**. 명령은 `benchmarks/drb/README.md`에 문서화.
+
+### 2026-06-05 — DRB FACT를 crawl4ai 스크랩으로 (Jina 키 제거) + BOM 견고성
+
+**기능**: DRB FACT 파이프라인(`extract→deduplicate→scrape→validate→stat`)에서 **Jina(`JINA_API_KEY`)가 필요한 scrape 단계만** Veritas의 `fetch_with_crawl4ai`로 대체. FACT를 **Jina 키·비용 없이** 실행 가능. 인용 URL이 어차피 crawl4ai로 수집된 것이라 재스크랩이 내부적으로 일관되고, 양쪽 시스템에 동일 적용되어 A/B delta는 공정(단 비공식 → `fact_crawl4ai_budget` 라벨).
+
+**변경 파일**
+- (new) `benchmarks/drb/crawl4ai_scrape.py` — `utils.scrape` drop-in. 입력 `deduplicated.jsonl`의 각 `citations_deduped[url]['url_content']`를 crawl4ai 페치 텍스트(`"<title>\n\n<content>"`, 실패 시 `"scrape failed: …"` 센티넬)로 채워 `scraped.jsonl`로 출력 → `utils.validate`가 그대로 읽음. resume(완료 id 스킵), URL 미충족분만 스크랩, ThreadPool 동시성. 평가자 트리 **무수정**(scrape 명령만 교체). 어디서 실행하든 import되도록 repo 루트를 `sys.path`에 자가 부트스트랩 + `force_utf8_stdio`.
+- (edit) `benchmarks/drb/drb_io.py` — `iter_json_objects`가 **선행 UTF-8 BOM**(`Set-Content -Encoding utf8` 등이 붙임)을 strip(`_BOM = chr(0xFEFF)`). BOM 때문에 첫 레코드가 누락되던 실버그 수정.
+- (new) `tests/test_drb_crawl4ai_scrape.py` — fake fetch로 url_content 빌드/실패 센티넬/미충족 URL만 스크랩/resume 검증(10). (edit) `tests/test_drb_benchmark_io.py` — 선행 BOM이 첫 레코드를 안 먹는지 회귀.
+- (edit) `benchmarks/drb/{README.md,RUN.md}` — FACT를 crawl4ai 경로로(Jina 불필요), `& $py`(직접 경로) 권장 — `conda run`이 한국어 Windows에서 자식 비-ASCII 출력 재출력 시 cp949 `UnicodeEncodeError`로 죽는 이슈 회피.
+
+**검증(실제 실행)**: 6개 DRB 모듈 **58 passed**. **라이브 스모크**: 합성 `deduplicated.jsonl`(BOM 포함) → `crawl4ai_scrape`가 실제 인터넷에서 2개 URL 스크랩 성공(`url_content` 채워짐) — llama-server 없이 FACT scrape 단계 단독 동작 확인. 추가 LLM/네트워크는 단위테스트에서 미사용(전부 fake).
+
+**주의/한계**: crawl4ai는 HTTP-only(JS/anti-bot 약함). 이 FACT 변형은 **비공식**(leaderboard·타 연구 FACT와 직접 비교 불가) — `fact_crawl4ai_budget`로 라벨, 양쪽 동일 scraper 적용. 공식 Jina 경로는 `utils.scrape` + `JINA_API_KEY`로 그대로 사용 가능(RUN.md 옵션).
