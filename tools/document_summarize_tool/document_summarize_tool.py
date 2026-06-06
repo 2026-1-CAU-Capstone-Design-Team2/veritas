@@ -419,14 +419,23 @@ class DocumentSummarizeTool(BaseTool):
                 build_chunk_prompt,
                 max_chars=budget,
             )
-            note = self._llm.ask(
-                DOC_CHUNK_NOTES_PROMPT,
-                chunk_input,
-                reasoning=False,
-                stream=getattr(self._llm, "stream_summary", False),
-                stream_label=f"summary:{record.doc_id}:chunk{index}/{len(chunks)}",
-                reasoning_effort="medium",
-            )
+            # 한 청크의 실패(context overflow / transient LLM error)는 해당
+            # 청크만 건너뛴다. 문서 전체 요약은 나머지 청크 note로 계속한다.
+            try:
+                note = self._llm.ask(
+                    DOC_CHUNK_NOTES_PROMPT,
+                    chunk_input,
+                    reasoning=False,
+                    stream=getattr(self._llm, "stream_summary", False),
+                    stream_label=f"summary:{record.doc_id}:chunk{index}/{len(chunks)}",
+                    reasoning_effort="medium",
+                )
+            except Exception as e:
+                print(
+                    f"[summarize][chunk-skip] doc_id={record.doc_id} "
+                    f"chunk={index}/{len(chunks)} reason={e}"
+                )
+                continue
             note = (note or "").strip()
             if note and note.lower() != "(no substantive content)":
                 notes.append(f"[Part {index}/{len(chunks)}]\n{note}")
