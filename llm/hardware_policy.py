@@ -230,14 +230,20 @@ def max_parallel_slots(
 
 
 def model_fit_context_tokens(model: ModelSpec, *, app_limit: int | None = None) -> int:
-    """Largest automatic context tier that fits the model size class."""
+    """Largest automatic context tier per model size class.
+
+    Tiers track the pre-hardware-policy generosity (≈50000 total over 5 slots)
+    so per-request memory budgets stay large enough to carry recent chat
+    history; ``recommended_context_tokens`` still downsizes via the RAM-fit
+    check, so weak hardware lands on a smaller tier.
+    """
     params = float(model.parameter_size_b or 0.0)
     if params <= 9.0:
-        target = 8192
-    elif params <= 27.0:
         target = 16384
-    else:
+    elif params <= 27.0:
         target = 32768
+    else:
+        target = 50000
 
     limit = app_limit if app_limit and app_limit > 0 else target
     if model.context_tokens and model.context_tokens > 0:
