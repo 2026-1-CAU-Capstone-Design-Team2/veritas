@@ -289,6 +289,23 @@ def set_document_tools_settings(custom_tools: list[dict[str, Any]]) -> dict[str,
     return STATE["settings"]["documentTools"]
 
 
+def get_document_tools_settings() -> list[dict[str, str]]:
+    """Return the user-defined custom document tools as a list of
+    ``{"name", "identifier"}`` dicts (empty when none configured).
+
+    The screen-context pipeline reads this so a user-registered editor that is
+    not in the hardcoded app list still counts as a document editing app.
+    """
+    _ensure_settings_loaded()
+    tools = STATE["settings"].get("documentTools")
+    if not isinstance(tools, dict):
+        return []
+    custom = tools.get("custom")
+    if not isinstance(custom, list):
+        return []
+    return [tool for tool in custom if isinstance(tool, dict)]
+
+
 def set_research_method_settings(sample_count: int, plan_count: int) -> dict[str, Any]:
     """Persist AutoSurvey pacing — initial scout sample size and per-plan
     collect/batch-summary cycle size — so research runs honor the user's

@@ -179,6 +179,12 @@ class AgentRuntime:
             # successful import the JSON file is renamed out of the way so the
             # migration never repeats.
             self._migrate_legacy_chat_history(output_dir)
+        try:
+            from ..repositories import state_repository
+
+            custom_document_tools = state_repository.get_document_tools_settings()
+        except Exception:
+            custom_document_tools = []
         self.registry, self.run_store_service, self.rag_service = build_registry(
             llm=self.llm,
             run_root=self.output_dir,
@@ -187,6 +193,7 @@ class AgentRuntime:
             enable_screen_context=os.getenv("VERITAS_ENABLE_SCREEN_CONTEXT", "1") != "0",
             screen_interval_sec=float(os.getenv("VERITAS_SCREEN_INTERVAL", "5.0")),
             screen_debug_log=os.getenv("VERITAS_SCREEN_DEBUG", "0") == "1",
+            custom_document_tools=custom_document_tools,
         )
         self.workflow = AutoSurveyWorkflow(
             registry=self.registry,
