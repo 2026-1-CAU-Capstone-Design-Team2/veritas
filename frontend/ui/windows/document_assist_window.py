@@ -547,7 +547,7 @@ class SuggestionCard(QFrame):
 				# preference EMA.
 				self._wrong_anchor_button = QPushButton("위치 다름")
 				self._wrong_anchor_button.setObjectName("AssistWrongAnchorButton")
-				self._wrong_anchor_button.setStyleSheet(_DISLIKE_CHIP_QSS)
+				self._wrong_anchor_button.setStyleSheet(_rate_chip_qss(theme.palette(), "dislike"))
 				self._wrong_anchor_button.setFixedHeight(30)
 				self._wrong_anchor_button.setMinimumWidth(70)
 				self._wrong_anchor_button.setCursor(Qt.PointingHandCursor)
@@ -555,14 +555,14 @@ class SuggestionCard(QFrame):
 				self._wrong_anchor_button.clicked.connect(lambda: self._on_rate("wrong_anchor"))
 				self._dislike_button = QPushButton("거절")
 				self._dislike_button.setObjectName("AssistRejectButton")
-				self._dislike_button.setStyleSheet(_DISLIKE_CHIP_QSS)
+				self._dislike_button.setStyleSheet(_rate_chip_qss(theme.palette(), "dislike"))
 				self._dislike_button.setFixedHeight(30)
 				self._dislike_button.setMinimumWidth(60)
 				self._dislike_button.setCursor(Qt.PointingHandCursor)
 				self._dislike_button.clicked.connect(lambda: self._on_rate("red_reject"))
 				self._retry_button = QPushButton("다시")
 				self._retry_button.setObjectName("AssistRetryButton")
-				self._retry_button.setStyleSheet(_LIKE_CHIP_QSS)
+				self._retry_button.setStyleSheet(_rate_chip_qss(theme.palette(), "like"))
 				self._retry_button.setFixedHeight(30)
 				self._retry_button.setMinimumWidth(60)
 				self._retry_button.setCursor(Qt.PointingHandCursor)
@@ -573,14 +573,14 @@ class SuggestionCard(QFrame):
 			else:
 				self._like_button = QPushButton("도움됨")
 				self._like_button.setObjectName("AssistLikeButton")
-				self._like_button.setStyleSheet(_LIKE_CHIP_QSS)
+				self._like_button.setStyleSheet(_rate_chip_qss(theme.palette(), "like"))
 				self._like_button.setFixedHeight(30)
 				self._like_button.setMinimumWidth(60)
 				self._like_button.setCursor(Qt.PointingHandCursor)
 				self._like_button.clicked.connect(lambda: self._on_rate("like"))
 				self._dislike_button = QPushButton("아쉬움")
 				self._dislike_button.setObjectName("AssistDislikeButton")
-				self._dislike_button.setStyleSheet(_DISLIKE_CHIP_QSS)
+				self._dislike_button.setStyleSheet(_rate_chip_qss(theme.palette(), "dislike"))
 				self._dislike_button.setFixedHeight(30)
 				self._dislike_button.setMinimumWidth(60)
 				self._dislike_button.setCursor(Qt.PointingHandCursor)
@@ -662,11 +662,11 @@ class SuggestionCard(QFrame):
 				if button is not None:
 					button.setEnabled(False)
 		if action == "like" and self._like_button is not None:
-			self._like_button.setStyleSheet(_LIKE_CHIP_CHOSEN_QSS)
+			self._like_button.setStyleSheet(_rate_chip_qss(theme.palette(), "like", chosen=True))
 		elif action in ("dislike", "red_reject") and self._dislike_button is not None:
-			self._dislike_button.setStyleSheet(_DISLIKE_CHIP_CHOSEN_QSS)
+			self._dislike_button.setStyleSheet(_rate_chip_qss(theme.palette(), "dislike", chosen=True))
 		elif action == "wrong_anchor" and self._wrong_anchor_button is not None:
-			self._wrong_anchor_button.setStyleSheet(_DISLIKE_CHIP_CHOSEN_QSS)
+			self._wrong_anchor_button.setStyleSheet(_rate_chip_qss(theme.palette(), "dislike", chosen=True))
 		self.feedbackSubmitted.emit(self._event_id, self._intervention_type, action)
 
 	def set_text(self, text: str) -> None:
