@@ -135,6 +135,11 @@ def send_chat_message_stream(
             collected.append(chunk)
             yield _sse("delta", {"text": chunk})
     except Exception as e:
+        # TEMP diagnostic: the stream generator's exception is otherwise reduced
+        # to str(e) and shown as the chat answer, losing the traceback.
+        from services.diag import log_thread_error
+
+        log_thread_error("chat_stream", e)
         error_text = f"[chat][error] {e}"
         collected.append(error_text)
         yield _sse("error", {"error": str(e)})

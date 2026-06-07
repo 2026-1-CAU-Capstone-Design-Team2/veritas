@@ -181,6 +181,9 @@ class EmbeddingRecallStore:
                 self._index_row(row)
             except Exception as e:
                 print(f"[memory][embedding_recall][warn] async index failed: {type(e).__name__}: {e}")
+                from services.diag import log_thread_error
+
+                log_thread_error("dense_index_worker", e)
             finally:
                 self._index_queue.task_done()
 

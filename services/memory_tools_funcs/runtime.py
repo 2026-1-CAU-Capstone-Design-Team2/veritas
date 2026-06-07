@@ -154,6 +154,9 @@ class MemoryRuntime:
                 mem_debug("embed", f"backfilled {indexed} recall turns into dense index")
         except Exception as e:
             print(f"[memory][embed_backfill][warn] {type(e).__name__}: {e}")
+            from services.diag import log_thread_error
+
+            log_thread_error("embed_backfill_worker", e)
 
     def update_n_ctx(self, max_context_tokens: int) -> None:
         """모델 스왑 후 n_ctx를 갱신한다."""
@@ -448,6 +451,9 @@ class MemoryRuntime:
                     )
             except Exception as e:
                 print(f"[memory][fact_extract][warn] {type(e).__name__}: {e}")
+                from services.diag import log_thread_error
+
+                log_thread_error("fact_worker", e)
             finally:
                 self._fact_queue.task_done()
 
@@ -527,6 +533,9 @@ class MemoryRuntime:
             self._flush_fifo(profile=profile)
         except Exception as e:
             print(f"[memory][bg_flush][warn] {type(e).__name__}: {e}")
+            from services.diag import log_thread_error
+
+            log_thread_error("bg_flush_worker", e)
         finally:
             with self._flush_lock:
                 self._flush_in_progress = False

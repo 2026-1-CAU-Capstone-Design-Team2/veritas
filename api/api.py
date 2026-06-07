@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from core.stdio_utf8 import force_utf8_stdio
+from services.diag import install_excepthooks
 
 from .api_common import new_id
 from .api_routes import (
@@ -35,6 +36,8 @@ from .api_routes import (
 # server's piped stdout defaults to cp949, where such a print raises
 # UnicodeEncodeError — force UTF-8 before uvicorn handles any request.
 force_utf8_stdio()
+# TEMP diagnostic: capture uncaught thread/main exceptions to thread_errors.log.
+install_excepthooks()
 
 app = FastAPI(title="VERITAS API", version="1.0.0")
 app.add_middleware(
