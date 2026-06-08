@@ -52,7 +52,6 @@ from llm.model_catalog import (
     selected_model_from_settings,
 )
 from llm.context_settings import (
-    CONTEXT_TIERS,
     context_risk,
     detect_memory,
     recommended_context_tokens,
@@ -562,16 +561,11 @@ class ModelSetupDialog(QDialog):
         self.workspace_combo.setCurrentIndex(workspace_index)
         self.workspace_combo.hide()
 
+        # 컨텍스트 크기는 auto-only다(사용자가 토큰 수를 직접 선택하지 않음).
+        # 모델/병렬 슬롯/현재 RAM 기준으로 자동 산정한 단일 값만 노출한다.
         self.context_combo = QComboBox(self)
         self.context_combo.addItem(self._context_auto_label(), "auto")
-        for tokens in CONTEXT_TIERS:
-            self.context_combo.addItem(self._context_manual_label(tokens), str(tokens))
-        context_settings = self._settings.get("llamaContext")
-        if isinstance(context_settings, dict) and context_settings.get("mode") == "manual":
-            context_index = self.context_combo.findData(str(context_settings.get("tokens") or ""))
-        else:
-            context_index = self.context_combo.findData("auto")
-        self.context_combo.setCurrentIndex(max(0, context_index))
+        self.context_combo.setCurrentIndex(0)
         self.context_combo.hide()
 
         # Hidden data model behind the styled selector: keeps selected_llm_id()
@@ -813,10 +807,10 @@ class ModelSetupDialog(QDialog):
         return combo
 
     def _build_context_combo(self) -> QWidget:
-        combo = _ClickableFrame()
+        # auto-only: 읽기 전용 정보 카드. 사용자가 토큰 수를 고르지 않으므로
+        # 클릭/드롭다운 없이 자동 산정된 값만 표시한다.
+        combo = QFrame()
         combo.setObjectName("combo")
-        combo.setCursor(Qt.PointingHandCursor)
-        combo.clicked.connect(self._open_context_menu)
         self._context_frame = combo
         lay = QHBoxLayout(combo)
         lay.setContentsMargins(15, 13, 15, 13)
@@ -846,11 +840,6 @@ class ModelSetupDialog(QDialog):
         info.addWidget(self._context_meta)
         info.addStretch(1)
         lay.addWidget(info_w, 1)
-
-        caret = QLabel()
-        caret.setAlignment(Qt.AlignCenter)
-        caret.setPixmap(_svg_pixmap(_line_icon(_ICON_CARET, "#8A94A6", width=2), 18))
-        lay.addWidget(caret, 0, Qt.AlignVCenter)
         return combo
 
     def _build_rows(self, embedding_spec) -> QWidget:
@@ -1046,11 +1035,6 @@ class ModelSetupDialog(QDialog):
         self.install_button.setEnabled(True)
         self._sync_primary_button_text()
 
-    def _mark_context_reviewed(self) -> None:
-        self._context_reviewed_model_id = self.selected_llm_id()
-        self._context_review_required = False
-        self._refresh_status()
-
     def _sync_workspace_display(self) -> None:
         workspace_id = self.selected_workspace_id()
         workspace = next(
@@ -1077,14 +1061,6 @@ class ModelSetupDialog(QDialog):
         memory = detect_memory()
         return f"자동 권장 · {tokens // 1024 if tokens % 1024 == 0 else tokens // 1000}K · 적합 · 여유 RAM {memory.available_gb:.1f}GB"
 
-    def _context_manual_label(self, tokens: int) -> str:
-        spec = self._selected_model_spec()
-        auto_tokens = recommended_context_tokens(
-            model_limit=getattr(spec, "context_tokens", None),
-            model=spec,
-        )
-        return f"{tokens // 1024 if tokens % 1024 == 0 else tokens // 1000}K tokens · {context_risk(tokens, auto_tokens, model=spec)}"
-
     def _selected_model_spec(self):
         try:
             if not hasattr(self, "model_combo"):
@@ -1100,24 +1076,15 @@ class ModelSetupDialog(QDialog):
             return None
 
     def _selected_context_payload(self) -> dict:
+        # auto-only: 항상 자동 권장값을 저장한다(수동 토큰 선택 없음).
         spec = self._selected_model_spec()
-        value = str(self.context_combo.currentData() or "auto")
-        if value == "auto":
-            return {
-                "mode": "auto",
-                "tokens": recommended_context_tokens(
-                    model_limit=getattr(spec, "context_tokens", None),
-                    model=spec,
-                ),
-            }
-        try:
-            tokens = int(value)
-        except ValueError:
-            tokens = recommended_context_tokens(
+        return {
+            "mode": "auto",
+            "tokens": recommended_context_tokens(
                 model_limit=getattr(spec, "context_tokens", None),
                 model=spec,
-            )
-        return {"mode": "manual", "tokens": tokens}
+            ),
+        }
 
     def _sync_context_display(self) -> None:
         spec = self._selected_model_spec()
@@ -1148,7 +1115,7 @@ class ModelSetupDialog(QDialog):
         self._set_combo_badge(find_model_file(spec) is not None)
 
     def _on_model_changed(self) -> None:
-        self._context_review_required = self.selected_llm_id() != self._context_reviewed_model_id
+        # 컨텍스트는 auto-only라 모델이 바뀌면 자동으로 재산정된다 — 별도 확인 불필요.
         self._sync_combo_display()
         self._refresh_context_options()
         self._sync_context_display()
@@ -1156,14 +1123,11 @@ class ModelSetupDialog(QDialog):
         self._sync_context_review_controls()
 
     def _refresh_context_options(self) -> None:
-        current = str(self.context_combo.currentData() or "auto")
+        # auto-only: 자동 권장값 단일 항목만 갱신한다.
         self.context_combo.blockSignals(True)
         self.context_combo.clear()
         self.context_combo.addItem(self._context_auto_label(), "auto")
-        for tokens in CONTEXT_TIERS:
-            self.context_combo.addItem(self._context_manual_label(tokens), str(tokens))
-        index = self.context_combo.findData(current)
-        self.context_combo.setCurrentIndex(max(0, index))
+        self.context_combo.setCurrentIndex(0)
         self.context_combo.blockSignals(False)
 
     def _open_workspace_menu(self) -> None:
@@ -1190,23 +1154,6 @@ class ModelSetupDialog(QDialog):
         chosen = menu.exec(pos)
         if chosen is not None and chosen.data() is not None:
             self.workspace_combo.setCurrentIndex(int(chosen.data()))
-
-    def _open_context_menu(self) -> None:
-        self._refresh_context_options()
-        menu = QMenu(self)
-        menu.setObjectName("modelMenu")
-        menu.setMinimumWidth(self._context_frame.width())
-        current = self.context_combo.currentIndex()
-        for i in range(self.context_combo.count()):
-            action = menu.addAction(self.context_combo.itemText(i))
-            action.setData(i)
-            action.setCheckable(True)
-            action.setChecked(i == current)
-        pos = self._context_frame.mapToGlobal(QPoint(0, self._context_frame.height() + 6))
-        chosen = menu.exec(pos)
-        if chosen is not None and chosen.data() is not None:
-            self.context_combo.setCurrentIndex(int(chosen.data()))
-            self._mark_context_reviewed()
 
     def _open_model_menu(self) -> None:
         menu = QMenu(self)

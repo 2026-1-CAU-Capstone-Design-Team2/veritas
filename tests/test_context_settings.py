@@ -59,7 +59,7 @@ class ContextSettingsTests(unittest.TestCase):
             )
 
         self.assertEqual(context["mode"], "auto")
-        self.assertEqual(context["tokens"], 8_192)
+        self.assertEqual(context["tokens"], 16_384)
         self.assertEqual(context["hardware"]["maxParallelSlots"], 5)
 
     def test_settings_service_skips_restart_when_auto_context_is_unchanged(self) -> None:

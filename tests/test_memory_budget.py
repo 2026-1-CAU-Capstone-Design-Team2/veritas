@@ -115,6 +115,34 @@ class MemoryBudgetTests(unittest.TestCase):
         self.assertNotIn("sum one two three four", system)
         self.assertEqual([m["content"] for m in messages[1:-1]], ["new one two"])
 
+    def test_fifo_floor_survives_working_summary_pressure(self) -> None:
+        # A large working context + summary that would otherwise consume the
+        # whole prompt budget must NOT starve the most recent conversation: the
+        # FIFO floor reserves a slice. Without the floor, FIFO history would be
+        # 0 tokens here and the recent turn would be dropped.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp))
+            counter = _WordCounter()
+            recall = RecallStorage(store)
+            queue = QueueManager(store, counter, recall)
+            working = WorkingContextManager(store, counter)
+            working.save(" ".join(["fact"] * 500))
+            store.append_jsonl(store.summaries_path, {"summary": " ".join(["sum"] * 500)})
+            queue.append_event(
+                role=MemoryRole.USER, content="recent marker turn", source="test"
+            )
+
+            messages = build_messages(
+                req=CallRequest(task_instruction="system", user_content="question"),
+                budget=MemoryBudget(max_context_tokens=512, reserve_output_tokens=0),
+                store=store,
+                working=working,
+                queue=queue,
+            )
+
+        history = [str(m["content"]) for m in messages[1:-1]]
+        self.assertIn("recent marker turn", history)
+
     def test_inject_memory_context_false_skips_all_memory_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp))

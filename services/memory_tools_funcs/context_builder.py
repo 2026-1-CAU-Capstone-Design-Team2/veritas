@@ -51,6 +51,17 @@ def build_messages(
     required_tokens = token_counter.count(base_system_msg) + token_counter.count(req.user_content)
     remaining_tokens = max(0, budget.usable_prompt_tokens - required_tokens)
 
+    # 최근 대화(FIFO history)용 최소 예산을 미리 떼어둔다. 문서가 큰 RAG
+    # 프롬프트가 아래 working/summary/recall 단계에서 예산을 다 먹어 직전 대화가
+    # 0 토큰으로 밀리는 것을 막는다. 여기서는 그 단계들에 floor를 숨기고 FIFO
+    # 주입 시 다시 더해, FIFO는 최소 floor를 보장받되 위 단계가 남긴 만큼 더
+    # 키울 수 있다. grounded(working/summary/recall 미주입)에서는 FIFO가 유일한
+    # 메모리 블록이라 경쟁이 없으므로 floor를 잡지 않는다.
+    fifo_floor = 0
+    if req.use_history and memory_allowed and not c.grounded:
+        fifo_floor = min(budget.fifo_tokens, remaining_tokens // 3)
+        remaining_tokens -= fifo_floor
+
 ###########################################################################################################
 ###########################################################################################################  
     """
@@ -217,8 +228,8 @@ def build_messages(
     """
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_msg}]
 
-    if req.use_history and memory_allowed and remaining_tokens > 0:
-        fifo_cap = min(budget.fifo_tokens, remaining_tokens)
+    if req.use_history and memory_allowed and (remaining_tokens + fifo_floor) > 0:
+        fifo_cap = min(budget.fifo_tokens, remaining_tokens + fifo_floor)
         messages.extend(queue.as_chat_messages(limit=history_limit, max_tokens=fifo_cap))
 
     messages.append({"role": "user", "content": req.user_content})

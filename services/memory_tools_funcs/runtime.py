@@ -69,8 +69,11 @@ class MemoryRuntime:
         self.policy_dispatcher = ProfilePolicyDispatcher()
 
         # bg flush 동시성 제어. 동시 flush 1개로 제한, 다음 prepare는 옛 summary로 진행.
+        # _flush_thread는 진행 중 flush 핸들. configure_workspace/close가
+        # store 교체/종료 전에 이 스레드를 join해 use-after-close를 막는다.
         self._flush_lock = threading.Lock()
         self._flush_in_progress = False
+        self._flush_thread: threading.Thread | None = None
 
         # working-fact 추출 큐. single worker가 FIFO로 처리해 같은 category
         # 교체(예: 이름 변경)가 turn 순서대로 반영되게 한다.
@@ -92,7 +95,13 @@ class MemoryRuntime:
         self._launch_embedding_backfill()
 
     def configure_workspace(self, workspace_root: Path) -> None:
-        """workspace 전환 시 storage 핸들을 새 디렉토리로 교체한다."""
+        """workspace 전환 시 storage 핸들을 새 디렉토리로 교체한다.
+
+        진행 중 bg flush를 먼저 기다린 뒤 store를 닫는다. flush는 self.store/
+        self.queue를 통해 기록하므로, 대기 없이 교체하면 이번 workspace의
+        flush가 닫힌 연결에 쓰거나 새 workspace로 새어들 수 있다.
+        """
+        self._wait_for_flush()
         self.store.close()
         if getattr(self, "embedding_recall", None) is not None:
             self.embedding_recall.close()
@@ -107,6 +116,7 @@ class MemoryRuntime:
         if worker is not None:
             self._fact_queue.put(None)  # drain queued extractions, then stop
             worker.join(timeout=5)
+        self._wait_for_flush()
         self.store.close()
         if getattr(self, "embedding_recall", None) is not None:
             self.embedding_recall.close()
@@ -144,6 +154,9 @@ class MemoryRuntime:
                 mem_debug("embed", f"backfilled {indexed} recall turns into dense index")
         except Exception as e:
             print(f"[memory][embed_backfill][warn] {type(e).__name__}: {e}")
+            from services.diag import log_thread_error
+
+            log_thread_error("embed_backfill_worker", e)
 
     def update_n_ctx(self, max_context_tokens: int) -> None:
         """모델 스왑 후 n_ctx를 갱신한다."""
@@ -438,6 +451,9 @@ class MemoryRuntime:
                     )
             except Exception as e:
                 print(f"[memory][fact_extract][warn] {type(e).__name__}: {e}")
+                from services.diag import log_thread_error
+
+                log_thread_error("fact_worker", e)
             finally:
                 self._fact_queue.task_done()
 
@@ -480,6 +496,10 @@ class MemoryRuntime:
             },
         )
 
+    # configure_workspace/close가 진행 중 flush를 기다리는 상한(초). 요약 LLM
+    # 호출이 멈춰도 workspace 전환이 영구 블록되지 않게 join을 bound한다.
+    _FLUSH_JOIN_TIMEOUT_SEC = 15.0
+
     def _maybe_launch_bg_flush(self, profile: str = "chat") -> None:
         """이미 flush 진행 중이면 skip. 아니면 daemon thread로 fire-and-forget 시작."""
         with self._flush_lock:
@@ -492,7 +512,20 @@ class MemoryRuntime:
             name="memory-bg-flush",
             daemon=True,
         )
+        with self._flush_lock:
+            self._flush_thread = t
         t.start()
+
+    def _wait_for_flush(self, timeout: float | None = None) -> None:
+        """진행 중 bg flush 스레드를 join한다. join은 _flush_lock 밖에서 한다
+        (worker가 종료 시 _flush_lock을 잡으므로 안에서 join하면 deadlock)."""
+        with self._flush_lock:
+            thread = self._flush_thread
+        if thread is None or not thread.is_alive():
+            return
+        thread.join(timeout=self._FLUSH_JOIN_TIMEOUT_SEC if timeout is None else timeout)
+        if thread.is_alive():
+            print("[memory][bg_flush][warn] flush join timed out; proceeding")
 
     def _bg_flush_worker(self, profile: str = "chat") -> None:
         """bg thread 본체. _flush_fifo를 실행하고 lock 풀어준다."""
@@ -500,6 +533,9 @@ class MemoryRuntime:
             self._flush_fifo(profile=profile)
         except Exception as e:
             print(f"[memory][bg_flush][warn] {type(e).__name__}: {e}")
+            from services.diag import log_thread_error
+
+            log_thread_error("bg_flush_worker", e)
         finally:
             with self._flush_lock:
                 self._flush_in_progress = False
@@ -508,9 +544,15 @@ class MemoryRuntime:
 ############################################################################################
 
     def _flush_fifo(self, *, profile: str = "chat") -> None:
-        """FIFO 오래된 prefix를 evict하고 summary로 압축한다."""
-        fifo_before = self.queue.fifo.count() if mem_debug_enabled() else 0
-        evicted_rows = self.queue.select_evicted_rows(
+        """FIFO 오래된 prefix를 evict하고 summary로 압축한다.
+
+        queue/store 핸들을 진입 시점에 캡처한다. 진행 중 workspace 전환이
+        self.queue/self.store를 교체해도 이번 flush는 캡처한 핸들에만 쓴다.
+        """
+        queue_handle = self.queue
+        store_handle = self.store
+        fifo_before = queue_handle.fifo.count() if mem_debug_enabled() else 0
+        evicted_rows = queue_handle.select_evicted_rows(
             budget=MemoryBudget(max_context_tokens=self.max_context_tokens),
             eviction_policy=self.policy_dispatcher.eviction_for(profile),
         )
@@ -523,7 +565,7 @@ class MemoryRuntime:
             f"profile={profile} evicting {len(evicted_rows)} rows "
             f"(FIFO {fifo_before} rows before compaction)",
         )
-        previous_summary = self.store.load_latest_summary()
+        previous_summary = store_handle.load_latest_summary()
         evicted_text = "\n".join(
             f"{row.get('role')}: {row.get('content')}" for row in evicted_rows
         )
@@ -532,11 +574,11 @@ class MemoryRuntime:
             evicted_messages=evicted_text,
         )
         if summary:
-            self.queue.reset_fifo_with_summary(summary, evicted_rows=evicted_rows)
+            queue_handle.reset_fifo_with_summary(summary, evicted_rows=evicted_rows)
             mem_debug(
                 "flush",
                 f"profile={profile} summary written ({self.token_counter.count(summary)} tokens), "
-                f"FIFO now {self.queue.fifo.count() if mem_debug_enabled() else 0} rows",
+                f"FIFO now {queue_handle.fifo.count() if mem_debug_enabled() else 0} rows",
             )
         else:
             mem_debug("flush", f"profile={profile} summarizer returned empty -> FIFO unchanged")

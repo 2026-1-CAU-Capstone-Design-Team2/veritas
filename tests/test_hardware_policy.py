@@ -97,23 +97,23 @@ class HardwarePolicyTests(unittest.TestCase):
     def test_model_fit_context_caps_small_and_mid_models(self) -> None:
         self.assertEqual(
             model_fit_context_tokens(get_model("qwen35-0.8b-q8_0", kind="llm")),
-            8192,
-        )
-        self.assertEqual(
-            model_fit_context_tokens(get_model("qwen35-4b-q4", kind="llm")),
-            8192,
-        )
-        self.assertEqual(
-            model_fit_context_tokens(get_model("qwen35-9b-q4", kind="llm")),
-            8192,
-        )
-        self.assertEqual(
-            model_fit_context_tokens(get_model("qwen35-27b-q4", kind="llm")),
             16384,
         )
         self.assertEqual(
-            model_fit_context_tokens(get_model("qwen35-35b-a3b-q4", kind="llm")),
+            model_fit_context_tokens(get_model("qwen35-4b-q4", kind="llm")),
+            16384,
+        )
+        self.assertEqual(
+            model_fit_context_tokens(get_model("qwen35-9b-q4", kind="llm")),
+            16384,
+        )
+        self.assertEqual(
+            model_fit_context_tokens(get_model("qwen35-27b-q4", kind="llm")),
             32768,
+        )
+        self.assertEqual(
+            model_fit_context_tokens(get_model("qwen35-35b-a3b-q4", kind="llm")),
+            50000,
         )
 
     def test_recommendation_prioritizes_five_parallel_slots_over_max_context(self) -> None:
@@ -126,7 +126,7 @@ class HardwarePolicyTests(unittest.TestCase):
             app_limit=90_000,
             prefer_installed_file=False,
         )
-        self.assertEqual(tokens, 8_192)
+        self.assertEqual(tokens, 16_384)
         self.assertEqual(
             max_parallel_slots(
                 model,
@@ -147,7 +147,7 @@ class HardwarePolicyTests(unittest.TestCase):
             app_limit=90_000,
             prefer_installed_file=False,
         )
-        self.assertEqual(tokens, 32_768)
+        self.assertEqual(tokens, 50_000)
         self.assertEqual(
             max_parallel_slots(
                 model,

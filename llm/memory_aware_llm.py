@@ -115,6 +115,13 @@ class MemoryAwareLLMClient:
     def collect_tool_outputs(self, *args, **kwargs) -> dict[str, Any]:
         return self.raw.collect_tool_outputs(*args, **kwargs)
 
+    def tokenize_count(self, *args, **kwargs) -> int | None:
+        """raw llama-server tokenizer로 토큰 수를 센다. raw에 없으면 None."""
+        fn = getattr(self.raw, "tokenize_count", None)
+        if not callable(fn):
+            return None
+        return fn(*args, **kwargs)
+
     # ── embed / model info / 기타 pass-through ─────────────────────
 
     def embed(self, text: str) -> list[float]:
@@ -156,6 +163,12 @@ class MemoryAwareLLMClient:
     @property
     def n_ctx(self) -> int:
         return self.raw.n_ctx
+
+    @property
+    def stream_summary(self) -> bool:
+        """raw의 stream_summary 설정을 노출한다. 도구가
+        getattr(llm, "stream_summary", False)로 읽어 요약 스트리밍 여부를 정한다."""
+        return bool(getattr(self.raw, "stream_summary", False))
 
     @property
     def max_parallel(self) -> int:

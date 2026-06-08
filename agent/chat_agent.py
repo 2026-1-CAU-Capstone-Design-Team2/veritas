@@ -199,7 +199,16 @@ class ChatAgent:
         # Workspace id doubles as the research subject (the run dir is named after
         # it), so start-phase suggestions can be grounded in the actual topic.
         self.screen_workspace_id = screen_workspace_id
-        self._conversation_lock = threading.RLock()
+        # Serializes one conversation turn at a time. A plain (non-reentrant)
+        # Lock, NOT an RLock: the streaming ask_*_iter generators hold it across
+        # ``yield``s, and FastAPI's StreamingResponse drives successive
+        # ``__next__`` calls on different AnyIO threadpool threads — an RLock
+        # rejects release from a thread other than the one that acquired it
+        # ("cannot release un-acquired lock"), which would leave the lock stuck
+        # and freeze every later turn. A plain Lock releases on any thread.
+        # Because it is non-reentrant, callers that already hold it (ask_auto's
+        # /rag branch) must use the lock-free ``_ask_rag*_unlocked`` cores.
+        self._conversation_lock = threading.Lock()
         self._screen_stop_event = threading.Event()
         self._screen_monitor_thread: threading.Thread | None = None
         self._screen_answer_callback: Callable[[str, dict[str, Any], bool], None] | None = None
@@ -229,16 +238,38 @@ class ChatAgent:
         instead of answering from general knowledge.
         """
         with self._conversation_lock:
-            kwargs = {
-                "stream": stream,
-                "use_history": True,
-                "doc_context": doc_context,
-            }
-            if source_scope_filter != "all" or not include_private_local:
-                kwargs["source_scope_filter"] = source_scope_filter
-                kwargs["include_private_local"] = include_private_local
-            answer = self.rag_service.answer(question, **kwargs)
-            return answer
+            return self._ask_rag_unlocked(
+                question,
+                stream=stream,
+                doc_context=doc_context,
+                source_scope_filter=source_scope_filter,
+                include_private_local=include_private_local,
+            )
+
+    def _ask_rag_unlocked(
+        self,
+        question: str,
+        *,
+        stream: bool = False,
+        doc_context: str = "",
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
+    ) -> str:
+        """Lock-free core of :meth:`ask_rag`.
+
+        Callers already holding ``_conversation_lock`` (ask_auto's ``/rag``
+        branch) call this directly; the non-reentrant lock would self-deadlock
+        on re-acquisition.
+        """
+        kwargs = {
+            "stream": stream,
+            "use_history": True,
+            "doc_context": doc_context,
+        }
+        if source_scope_filter != "all" or not include_private_local:
+            kwargs["source_scope_filter"] = source_scope_filter
+            kwargs["include_private_local"] = include_private_local
+        return self.rag_service.answer(question, **kwargs)
 
     def ask_auto(self, question: str, *, stream: bool = False) -> str:
         """General chat mode with schema-driven optional tool use."""
@@ -254,7 +285,9 @@ class ChatAgent:
                     # off-corpus questions with general knowledge.
                     if not command_text:
                         return "RAG 질문을 입력해 주세요. 예: /rag <질문>"
-                    return self.ask_rag(command_text, stream=stream)
+                    # Already inside _conversation_lock — call the lock-free core
+                    # so the non-reentrant lock does not self-deadlock.
+                    return self._ask_rag_unlocked(command_text, stream=stream)
                 tool_outputs = self._run_explicit_tool_command(
                     command=command,
                     command_text=self._tool_command_text(command, command_text),
@@ -319,7 +352,10 @@ class ChatAgent:
                     if not command_text:
                         yield "RAG 질문을 입력해 주세요. 예: /rag <질문>"
                         return
-                    yield from self.ask_rag_iter(command_text, doc_context=doc_context)
+                    # Already inside _conversation_lock — use the lock-free core.
+                    yield from self._ask_rag_iter_unlocked(
+                        command_text, doc_context=doc_context
+                    )
                     return
                 tool_outputs = self._run_explicit_tool_command(
                     command=command,
