@@ -195,5 +195,93 @@ class ChatAgentRagRoutingTests(unittest.TestCase):
         self.assertEqual(rag.answer_called, 1)
 
 
+class _EmptyIndexRag:
+    """rag_service stub with no indexed documents (empty workspace)."""
+
+    def get_document_count(self, **_kw):
+        return 0
+
+
+class EditorAssistGroundingTests(unittest.TestCase):
+    """The proactive reject-retry uses editor_assist('continue'), a forced-RAG
+    action. With no workspace index it used to raise EditorGroundingUnavailable,
+    so rejecting in an un-indexed workspace produced no retry. additive_grounding
+    relaxes that gate for the proactive caller (plain fallback) while user-clicked
+    quick actions keep failing loudly."""
+
+    def test_forced_continue_raises_without_grounding(self) -> None:
+        from agent import EditorGroundingUnavailable
+
+        agent = ChatAgent(llm=FakeLLM(), rag_service=_EmptyIndexRag(), tool_registry=None)
+        with self.assertRaises(EditorGroundingUnavailable):
+            list(agent.iter_editor_assist("continue", "이어 쓸 문장", use_workspace=True))
+
+    def test_additive_grounding_falls_back_to_plain(self) -> None:
+        agent = ChatAgent(
+            llm=FakeLLM("플레인 생성 결과"),
+            rag_service=_EmptyIndexRag(),
+            tool_registry=None,
+        )
+        out = list(
+            agent.iter_editor_assist(
+                "continue", "이어 쓸 문장", use_workspace=True, additive_grounding=True
+            )
+        )
+        self.assertEqual("".join(out), "플레인 생성 결과")
+
+
+class GhostPrefixEchoTests(unittest.TestCase):
+    """The local model sometimes restates the user's trailing marker/word
+    ('첫 번째로,', a '1.' bullet, a subject) before continuing. strip_prefix_echo
+    removes that echo without corrupting a genuine word-completion."""
+
+    def _strip(self, prefix, suggestion):
+        from agent.chat_agent import strip_prefix_echo
+
+        return strip_prefix_echo(prefix, suggestion)
+
+    def test_marker_echo_stripped(self) -> None:
+        self.assertEqual(
+            self._strip("앞 문장. 첫 번째로,", "첫 번째로, 우리는 시작한다."),
+            " 우리는 시작한다.",
+        )
+
+    def test_numbered_bullet_echo_stripped(self) -> None:
+        self.assertEqual(
+            self._strip("개요\n1. ", "1. 배경 설명"),
+            "배경 설명",
+        )
+
+    def test_subject_echo_stripped(self) -> None:
+        self.assertEqual(self._strip("그는", "그는 떠났다."), " 떠났다.")
+
+    def test_multiword_echo_stripped(self) -> None:
+        # Multi-word verbatim echo — only catchable on the full text, which
+        # editor_service applies (the per-chunk strip is window-capped).
+        self.assertEqual(
+            self._strip("오늘 우리는 회의에서", "오늘 우리는 회의에서 예산을 논의했다."),
+            " 예산을 논의했다.",
+        )
+
+    def test_genuine_word_completion_not_stripped(self) -> None:
+        # 1-char overlap ("다") is below the floor → a real continuation survives.
+        self.assertEqual(self._strip("어제 갔다", " 다음에 또 가자"), " 다음에 또 가자")
+
+    def test_no_overlap_unchanged(self) -> None:
+        self.assertEqual(self._strip("오늘 날씨가", " 좋다."), " 좋다.")
+
+    def test_midword_overlap_not_stripped(self) -> None:
+        # Overlap that does NOT start at a word boundary must be left alone.
+        self.assertEqual(self._strip("가나다", "다라마"), "다라마")
+
+
+class GhostSuggestPromptTests(unittest.TestCase):
+    def test_prompt_forbids_marker_repetition(self) -> None:
+        from core.prompts.editor import SUGGEST_SYSTEM_PROMPT
+
+        self.assertIn("머리표지", SUGGEST_SYSTEM_PROMPT)
+        self.assertIn("첫 번째로", SUGGEST_SYSTEM_PROMPT)
+
+
 if __name__ == "__main__":
     unittest.main()

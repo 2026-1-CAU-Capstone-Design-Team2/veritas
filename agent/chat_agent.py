@@ -93,6 +93,33 @@ def detect_korean_style(text: str) -> str:
     return _STYLE_GUIDANCE_BY_REGISTER[register]
 
 
+_MIN_GHOST_ECHO_CHARS = 2
+
+
+def strip_prefix_echo(prefix: str, suggestion: str) -> str:
+    """Strip a leading verbatim repeat of the prefix's trailing word/marker from
+    a ghost continuation.
+
+    The local model sometimes restates what the user just typed — e.g. after
+    "첫 번째로," it emits "첫 번째로, ..." again, or re-prints a "1." / "-" bullet —
+    instead of continuing from the cursor. This removes that echo so the
+    continuation flows. Only a chunk that begins at a word/line boundary in the
+    prefix (≥2 chars) is stripped, so a genuine word-completion continuation
+    (e.g. prefix "다" → " 다음...") is never corrupted (its 1-char overlap is
+    below the floor)."""
+    if not prefix or not suggestion.strip():
+        return suggestion
+    # Keep the prefix's trailing whitespace so an echoed marker that includes a
+    # space (e.g. "1. ") matches fully and we don't leave a doubled space.
+    p = prefix
+    body = suggestion.lstrip()
+    max_k = min(len(p), len(body))
+    for k in range(max_k, _MIN_GHOST_ECHO_CHARS - 1, -1):
+        if p[-k:] == body[:k] and (k == len(p) or p[-k - 1].isspace()):
+            return body[k:]
+    return suggestion
+
+
 class ChatAgent:
     """General chat orchestration with schema-driven tool use.
 
@@ -539,7 +566,12 @@ class ChatAgent:
                     print("[editor][ghost] declined (NO_SUGGESTION / off-topic)")
                 return
             decided = True
-            yield "".join(buffer)
+            # Strip a leading echo of the prefix's trailing marker/word (the
+            # model occasionally restates "첫 번째로," / a bullet before continuing).
+            # Head-only: later tokens stream raw below.
+            head = strip_prefix_echo(prefix, "".join(buffer))
+            if head:
+                yield head
             buffer = []
         if not decided:
             # Output ended before the decision window — short enough to judge whole.
@@ -548,6 +580,7 @@ class ChatAgent:
                 if self._EDITOR_RAG_DEBUG:
                     print("[editor][ghost] declined (NO_SUGGESTION / off-topic)")
                 return
+            text = strip_prefix_echo(prefix, text)
             if text:
                 yield text
 
@@ -558,15 +591,24 @@ class ChatAgent:
         *,
         max_tokens: int = 400,
         use_workspace: bool = True,
+        additive_grounding: bool = False,
     ) -> Iterator[str]:
         """Stream a quick-action transform.
 
-        Forced-RAG actions (rewrite / continue) are hard-gated: they retrieve
-        workspace grounding and inject [참고 자료], and raise
+        Forced-RAG actions (rewrite / continue) are hard-gated by default: they
+        retrieve workspace grounding and inject [참고 자료], and raise
         ``EditorGroundingUnavailable`` when none is available (empty index or
         the workspace is not the active one — surfaced here as
         ``use_workspace=False``) instead of falling back to a plain generation.
         Every other action runs as a plain LLM call with no retrieval.
+
+        ``additive_grounding=True`` relaxes that hard gate for the *proactive*
+        caller (the reject-ladder retry uses ``continue``): grounding is still
+        used when available, but its absence is no longer fatal — the suggestion
+        falls back to a plain generation. This is what lets a reject in a
+        workspace with no index still produce an expanded-context retry instead
+        of silently erroring out. The user-clicked quick actions keep the hard
+        gate (default ``False``).
         """
         action = (action or "").strip().lower()
         system_prompt = ASSIST_SYSTEM_PROMPTS.get(action)
@@ -574,10 +616,11 @@ class ChatAgent:
             return
         body = (text or "").strip()
         target = body or "(빈 문서)"
-        if action in self._EDITOR_FORCED_RAG_ACTIONS:
-            context = self._editor_context(body) if use_workspace else None
-            if not context:
-                raise EditorGroundingUnavailable(action)
+        grounded_action = action in self._EDITOR_FORCED_RAG_ACTIONS
+        context = self._editor_context(body) if (grounded_action and use_workspace) else None
+        if grounded_action and not context and not additive_grounding:
+            raise EditorGroundingUnavailable(action)
+        if grounded_action and context:
             user_content = ASSIST_GROUNDED_USER_TEMPLATE.format(context=context, text=target)
         else:
             user_content = ASSIST_PLAIN_USER_TEMPLATE.format(text=target)
@@ -747,9 +790,75 @@ class ChatAgent:
         # inject FIFO/recall as separate chat messages for this call. Read the
         # recent turns from the FIFO directly and paste them into the prompt —
         # otherwise the routing LLM sees zero conversational context.
-        return TOOL_CHAT_USER_PROMPT_TEMPLATE.format(
-            history=self._recent_history_text(),
-            question=question,
+        return (
+            TOOL_CHAT_USER_PROMPT_TEMPLATE.format(
+                history=self._recent_history_text(),
+                question=question,
+            )
+            + self._local_table_catalog_block()
+        )
+
+    def _local_table_catalog_block(self) -> str:
+        """Compact catalog of the workspace's registered local .csv/.xlsx files
+        (file names + sheet/column names) appended to the tool-decision prompt.
+
+        Chat tool selection is a *single round* — ``collect_tool_outputs`` does
+        not feed tool results back for a follow-up call — so the model cannot run
+        ``table_query`` ``list_tables`` → ``query`` discovery across turns. Handing
+        it the catalog up front lets it emit ONE correctly-parameterized
+        ``table_query(operation=query, ...)`` call to read specific numeric values
+        from a .csv/.xlsx. This is workspace *context*, not keyword routing — the
+        model still decides whether and how to use the tool.
+
+        Returns ``""`` when there is no registry, no registered tables, or the
+        lookup fails (the common no-local-corpus case is a cheap empty-manifest
+        read).
+        """
+        if self.tool_registry is None:
+            return ""
+        try:
+            result = self.tool_registry.call("table_query", operation="list_tables")
+        except Exception:
+            return ""
+        if not getattr(result, "success", False):
+            return ""
+        data = getattr(result, "data", None) or {}
+        tables = data.get("tables") if isinstance(data, dict) else None
+        if not isinstance(tables, list) or not tables:
+            return ""
+
+        lines: list[str] = []
+        for table in tables[:20]:
+            if not isinstance(table, dict):
+                continue
+            name = str(table.get("file_name") or table.get("source_id") or "").strip()
+            if not name:
+                continue
+            sheets = table.get("sheets")
+            if isinstance(sheets, list) and sheets:
+                parts: list[str] = []
+                for sheet in sheets[:5]:
+                    if not isinstance(sheet, dict):
+                        continue
+                    cols = ", ".join(
+                        str(c) for c in (sheet.get("columns") or [])[:30]
+                    )
+                    sheet_name = str(sheet.get("sheet_name") or "").strip()
+                    parts.append(f"{sheet_name}({cols})" if cols else sheet_name)
+                joined = "; ".join(p for p in parts if p)
+                lines.append(f"- {name} — 시트: {joined}" if joined else f"- {name}")
+            else:
+                cols = ", ".join(str(c) for c in (table.get("columns") or [])[:30])
+                lines.append(f"- {name} — 열: {cols}" if cols else f"- {name}")
+        if not lines:
+            return ""
+
+        return (
+            "\n\n[이 워크스페이스에 등록된 로컬 표 파일 — 값 조회는 table_query 도구 사용]\n"
+            + "\n".join(lines)
+            + "\n위 파일의 구체적 값·합계·평균·개수·필터·정렬이 필요하면 "
+            "table_query(operation=query)를 해당 file_name과 열 이름으로 직접 호출하세요 "
+            "(list_tables를 먼저 호출할 필요 없음)."
         )
 
     def _parse_explicit_command(self, question: str) -> tuple[str, str] | None:

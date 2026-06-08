@@ -65,8 +65,18 @@ Prompt 문자열은 이 디렉토리에 두지 않음. 모두
 ## 3. Native Reject Ladder (이 문서가 주관하는 규칙)
 
 `services/proactive/orchestrator.py`에 in-memory 구현
-(`_anchor_reject_state: dict[anchor_id, _AnchorRejectState]`).
+(`_anchor_reject_state: dict[key, _AnchorRejectState]`).
 JSON 영구화 **안 함** — 세션 단위 UX 게이트이지 학습 상태가 아님.
+
+ladder state는 **anchor_id 정확 일치 → cursor 근접(proximity) 매칭** 순으로 조회된다
+(`_match_state_key_locked`). raw `anchor_id`는 주변 단락 텍스트 해시를 포함하므로 스페이스
+한 번만 쳐도 새 id가 만들어진다 — 그러면 (a) 3-reject cooldown을 타이핑으로 우회할 수 있고
+(b) "ESC → 몇 글자 타이핑 → 재제안" 흐름에서 ladder가 누적되지 않는다. 그래서 ladder는
+**같은 document + cursor가 `NATIVE_ANCHOR_PROXIMITY_CHARS`(기본 24자) 이내**면 동일한
+편집 지점으로 보고 같은 state에 매칭한다 (`VERITAS_PROACTIVE_ANCHOR_PROXIMITY_CHARS`로 조정).
+이 window는 **의도적으로 작다** — 스페이스/소규모 편집은 흡수하되, 사용자가 **다른 문장·
+문단으로 커서를 옮기면 cooldown이 즉시 풀려야** 하기 때문(문장 크기였던 옛 120자는 lock이
+영구처럼 느껴지게 했다).
 
 ### 3.1 규칙
 
@@ -82,17 +92,29 @@ JSON 영구화 **안 함** — 세션 단위 UX 게이트이지 학습 상태가
 [`generator.py:_native_retry_context_block`](generator.py) +
 [`core/prompts/proactive.py:native_retry_lead_in`](../../core/prompts/proactive.py).
 
+retry 경로(level≥1)는 `editor_assist("continue")`를 쓰지만 **additive grounding**으로
+호출된다(`additive_grounding=True`): 워크스페이스 RAG 인덱스가 있으면 근거로 쓰되, 없으면
+plain 생성으로 fallback 한다. 따라서 자료조사/로컬 corpus가 없는 워크스페이스에서 거절해도
+재제안이 `EditorGroundingUnavailable`로 죽지 않는다. (사용자 클릭 quick action은 여전히
+hard-gate.)
+
 Constants (`orchestrator.py` 상단):
 ```python
 NATIVE_ANCHOR_REJECT_LIMIT = 3
 NATIVE_ANCHOR_REJECT_COOLDOWN_S = 180.0
 ```
 
+**`last_rejected_text` 전달**: reject(ESC/타이핑 덮어쓰기)뿐 아니라 "다시"(retry)도 직전
+거절 텍스트를 기억하며, observe는 reject_level과 **무관하게** 이 텍스트를 task metadata로
+전달한다 (retry는 count를 올리지 않으므로 reject_level이 0이어도 전달돼야 함). generator의
+native-retry 경로는 `reject_level >= 1` **또는** non-empty `avoid_text` 중 하나면 발동하므로,
+"다시" 한 번에도 직전 제안을 피한 새 문장이 나온다.
+
 ### 3.2 보장되는 동작
 
-- **다른 anchor는 영향 없음** — `anchor_id`는 (document_id, cursor-80자-bucket, paragraph-hash)의 해시이므로, 사용자가 다른 단락으로 이동하면 새 anchor_id → 새 reject ladder.
-- **돌아와도 cooldown 유지** — 다른 anchor로 떠났다가 돌아오면 같은 anchor_id 복원. ladder state는 계속 살아있음.
-- **Accept 한 번이 ladder를 초기화** — 그 anchor의 reject_count, cooldown_until, last_rejected_text 모두 지움. "사용자가 결국 만족한 신호".
+- **다른 문장/문단으로 이동 시 lock 해제** — proximity window(기본 24자)를 벗어난 cursor는 새 편집 지점 → 새 reject ladder, 기존 cooldown 무영향. (window 안의 작은 편집은 같은 ladder로 누적된다 — §3 상단 참조.)
+- **작은 cursor jitter에도 cooldown 유지** — 3-reject 후 스페이스 한 번(또는 몇 글자 타이핑)으로 anchor_id가 바뀌어도 proximity 매칭으로 같은 cooled state를 찾아 `anchor_reject_cooldown`을 유지한다.
+- **Accept 한 번이 ladder를 초기화** — 그 지점의 reject_count, cooldown_until, last_rejected_text 모두 지움. "사용자가 결국 만족한 신호".
 
 ### 3.3 Adaptation layer와의 관계
 

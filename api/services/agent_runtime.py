@@ -16,7 +16,7 @@ from llm.llama_server_llm import LLMClient
 from llm.llama_supervisor import LlamaServer
 from llm.memory_aware_llm import MemoryAwareLLMClient
 from services.memory_tools_funcs import MemoryRuntime
-from services.proactive.generator import ProactiveGenerator
+from services.proactive.generator import DEFAULT_GHOST_MAX_TOKENS, ProactiveGenerator
 from services.proactive.orchestrator import ProactiveOrchestrator
 from services.proactive.screen_bridge import (
     observe_screen_intervention,
@@ -483,6 +483,12 @@ class AgentRuntime:
                 ghostwrite_iter=self.ghostwrite_iter,
                 editor_assist_iter=self.editor_assist_iter,
                 workspace_is_active=self._workspace_is_active,
+                max_tokens_ghost=int(
+                    os.getenv(
+                        "VERITAS_PROACTIVE_GHOST_MAX_TOKENS",
+                        str(DEFAULT_GHOST_MAX_TOKENS),
+                    )
+                ),
             )
             self._proactive_orchestrator = ProactiveOrchestrator(
                 output_root=self.output_root,
@@ -510,10 +516,20 @@ class AgentRuntime:
         )
 
     def editor_assist_iter(
-        self, action: str, text: str, *, max_tokens: int = 400, use_workspace: bool = True
+        self,
+        action: str,
+        text: str,
+        *,
+        max_tokens: int = 400,
+        use_workspace: bool = True,
+        additive_grounding: bool = False,
     ) -> Iterator[str]:
         return self.chat_agent.iter_editor_assist(
-            action, text, max_tokens=max_tokens, use_workspace=use_workspace
+            action,
+            text,
+            max_tokens=max_tokens,
+            use_workspace=use_workspace,
+            additive_grounding=additive_grounding,
         )
 
     def _migrate_legacy_chat_history(self, output_dir: Path) -> None:

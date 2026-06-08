@@ -363,5 +363,56 @@ class TableQueryToolTests(unittest.TestCase):
         self.assertIn("table_query", ChatAgent.DEFAULT_OPTIONAL_TOOL_NAMES)
 
 
+class ChatTableCatalogTests(unittest.TestCase):
+    """1-4: the chat tool-decision prompt must surface the registered local
+    table files (names + columns) so the model can issue a single
+    table_query(query) for specific .csv/.xlsx values — chat tool selection is a
+    single round and can't run a separate list_tables discovery step first."""
+
+    def _agent_for(self, root: Path, input_dir: Path):
+        from agent.chat_agent import ChatAgent
+        from tools.registry import ToolRegistry
+
+        service = index_workspace(root, input_dir)
+        schema = load_schema(TOOLS_DIR / "table_query_tool" / "tool_schema.json")
+        registry = ToolRegistry()
+        registry.register(
+            TableQueryTool(schema=schema, table_query_service=service, llm=FakeLLM())
+        )
+        return ChatAgent(llm=FakeLLM(), rag_service=None, tool_registry=registry)
+
+    def test_catalog_block_lists_registered_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            write_sales_csv(input_dir / "sales.csv", rows=10)
+            agent = self._agent_for(root, input_dir)
+
+            block = agent._local_table_catalog_block()
+            self.assertIn("sales.csv", block)
+            self.assertIn("amount", block)
+            self.assertIn("table_query", block)
+            # The block must ride along in the tool-decision prompt.
+            prompt = agent._build_tool_decision_prompt("3월 매출 합계 알려줘")
+            self.assertIn("sales.csv", prompt)
+
+    def test_catalog_block_empty_without_local_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            (input_dir / "notes.md").write_text("# notes", encoding="utf-8")
+            agent = self._agent_for(root, input_dir)
+
+            self.assertEqual(agent._local_table_catalog_block(), "")
+
+    def test_catalog_block_empty_without_registry(self) -> None:
+        from agent.chat_agent import ChatAgent
+
+        agent = ChatAgent(llm=FakeLLM(), rag_service=None, tool_registry=None)
+        self.assertEqual(agent._local_table_catalog_block(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

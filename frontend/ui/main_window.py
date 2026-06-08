@@ -179,23 +179,6 @@ class AnimatedStackedWidget(QStackedWidget):
 		self._anim = anim
 
 
-class PlaceholderPage(QWidget):
-	def __init__(self, title: str, detail: str, parent: QWidget | None = None) -> None:
-		super().__init__(parent)
-		root = QVBoxLayout(self)
-		root.setContentsMargins(0, 0, 0, 0)
-		root.setSpacing(12)
-
-		card = CardWidget(title)
-		text = QLabel(detail)
-		text.setWordWrap(True)
-		text.setObjectName("PageSubtitle")
-		card.layout.addWidget(text)
-
-		root.addWidget(card)
-		root.addStretch(1)
-
-
 class MainWindow(QMainWindow):
 	STEP_ORDER = ["research", "document", "verify", "draft", "document_assist", "write"]
 
