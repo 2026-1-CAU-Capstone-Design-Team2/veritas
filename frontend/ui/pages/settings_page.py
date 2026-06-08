@@ -119,6 +119,63 @@ DEFAULT_LLM_PARALLEL = 1
 MIN_LLM_PARALLEL = 1
 MAX_LLM_PARALLEL = 5
 
+class _SettingsCombo(QComboBox):
+	"""QComboBox flattened to match the app's design language.
+
+	Qt's native drop-down button + 3D arrow (the "analog" look) are hidden via
+	the stylesheet (#SettingsInput::drop-down / ::down-arrow) and a crisp
+	chevron is hand-painted on the right edge instead — the same glyph the
+	collapsible-section headers use, so the field reads as part of the same
+	design rather than a raw OS widget. The popup is forced to open *below* the
+	field (``combobox-popup: 0`` in the stylesheet) so a non-zero current
+	selection no longer floats the list up over the top of the box and scrolls.
+	"""
+
+	def __init__(self, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self.setObjectName("SettingsInput")
+		# The chevron colour comes from the theme; repaint it on a toggle.
+		theme.themeChanged.connect(self._apply_theme)
+
+	def _apply_theme(self, *args) -> None:
+		self.update()
+
+	def showPopup(self) -> None:  # type: ignore[override]
+		super().showPopup()
+		# Force the list to drop *below* the field. Even with combobox-popup: 0,
+		# Qt flips the popup above the box when the combo sits low in the window
+		# (why 모델 크기 opened downward but 양자화 didn't); re-anchor the popup
+		# container to the field's bottom edge so it always opens downward.
+		view = self.view()
+		container = view.window() if view is not None else None
+		if container is not None:
+			below = self.mapToGlobal(self.rect().bottomLeft())
+			container.move(below.x(), below.y() + 1)
+
+	def paintEvent(self, event) -> None:  # type: ignore[override]
+		super().paintEvent(event)  # box surface + current text from the stylesheet
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.Antialiasing, True)
+		color = (
+			QColor(theme.color("accent"))
+			if self.underMouse()
+			else QColor(theme.color("text.slate600"))
+		)
+		pen = QPen(color)
+		pen.setWidthF(1.8)
+		pen.setCapStyle(Qt.RoundCap)
+		pen.setJoinStyle(Qt.RoundJoin)
+		painter.setPen(pen)
+		cx = self.width() - 14.0
+		cy = self.height() / 2.0 + 0.5
+		arm = 4.0
+		path = QPainterPath()
+		path.moveTo(cx - arm, cy - arm * 0.55)
+		path.lineTo(cx, cy + arm * 0.55)
+		path.lineTo(cx + arm, cy - arm * 0.55)
+		painter.drawPath(path)
+
+
 class _CollapsibleHeader(QPushButton):
 	"""Flat, full-width header for a CollapsibleSection.
 
@@ -334,8 +391,7 @@ class SettingsPage(QWidget):
 		subtitle.setWordWrap(True)
 		card.layout.addWidget(subtitle)
 
-		self.model_size_combo = QComboBox()
-		self.model_size_combo.setObjectName("SettingsInput")
+		self.model_size_combo = _SettingsCombo()
 		self.model_size_combo.setMinimumWidth(190)
 		for label, size_key in _model_size_options():
 			self.model_size_combo.addItem(label, size_key)
@@ -347,8 +403,7 @@ class SettingsPage(QWidget):
 			)
 		)
 
-		self.model_quant_combo = QComboBox()
-		self.model_quant_combo.setObjectName("SettingsInput")
+		self.model_quant_combo = _SettingsCombo()
 		self.model_quant_combo.setMinimumWidth(190)
 		card.layout.addWidget(
 			self._research_param_row(

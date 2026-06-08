@@ -944,6 +944,52 @@ _MAIN_TMPL = """
 		background-color: %(surface)s;
 	}
 
+	/* combobox-popup: 0 keeps the list a normal drop-down anchored below the
+	   field instead of the menu-style popup that floats over / above the box
+	   and scrolls to the current selection. The native drop-down button + 3D
+	   arrow are hidden; _SettingsCombo hand-paints a flat chevron instead. */
+	QComboBox#SettingsInput {
+		combobox-popup: 0;
+		padding-right: 28px;
+	}
+
+	QComboBox#SettingsInput::drop-down {
+		subcontrol-origin: padding;
+		subcontrol-position: top right;
+		width: 26px;
+		border: none;
+		background: transparent;
+	}
+
+	QComboBox#SettingsInput::down-arrow {
+		image: none;
+		width: 0px;
+		height: 0px;
+	}
+
+	QComboBox#SettingsInput QAbstractItemView {
+		background-color: %(menu.bg)s;
+		border: 1px solid %(menu.border)s;
+		border-radius: 10px;
+		padding: 6px;
+		outline: none;
+		selection-background-color: %(accent.subtle.bg)s;
+		selection-color: %(accent.text)s;
+	}
+
+	QComboBox#SettingsInput QAbstractItemView::item {
+		border: none;
+		border-radius: 6px;
+		padding: 7px 10px;
+		min-height: 22px;
+		color: %(text.primary2)s;
+	}
+
+	QComboBox#SettingsInput QAbstractItemView::item:selected {
+		background-color: %(accent.subtle.bg)s;
+		color: %(accent.text)s;
+	}
+
 	QCheckBox#SettingsCheckbox {
 		color: %(text.strong)s;
 		font-weight: 700;
