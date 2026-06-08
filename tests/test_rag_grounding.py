@@ -195,5 +195,216 @@ class ChatAgentRagRoutingTests(unittest.TestCase):
         self.assertEqual(rag.answer_called, 1)
 
 
+class _EmptyIndexRag:
+    """rag_service stub with no indexed documents (empty workspace)."""
+
+    def get_document_count(self, **_kw):
+        return 0
+
+
+class EditorAssistGroundingTests(unittest.TestCase):
+    """The proactive reject-retry uses editor_assist('continue'), a forced-RAG
+    action. With no workspace index it used to raise EditorGroundingUnavailable,
+    so rejecting in an un-indexed workspace produced no retry. additive_grounding
+    relaxes that gate for the proactive caller (plain fallback) while user-clicked
+    quick actions keep failing loudly."""
+
+    def test_forced_continue_raises_without_grounding(self) -> None:
+        from agent import EditorGroundingUnavailable
+
+        agent = ChatAgent(llm=FakeLLM(), rag_service=_EmptyIndexRag(), tool_registry=None)
+        with self.assertRaises(EditorGroundingUnavailable):
+            list(agent.iter_editor_assist("continue", "이어 쓸 문장", use_workspace=True))
+
+    def test_additive_grounding_falls_back_to_plain(self) -> None:
+        agent = ChatAgent(
+            llm=FakeLLM("플레인 생성 결과"),
+            rag_service=_EmptyIndexRag(),
+            tool_registry=None,
+        )
+        out = list(
+            agent.iter_editor_assist(
+                "continue", "이어 쓸 문장", use_workspace=True, additive_grounding=True
+            )
+        )
+        self.assertEqual("".join(out), "플레인 생성 결과")
+
+
+class GhostPrefixEchoTests(unittest.TestCase):
+    """The local model sometimes restates the user's trailing marker/word
+    ('첫 번째로,', a '1.' bullet, a subject) before continuing. strip_prefix_echo
+    removes that echo without corrupting a genuine word-completion."""
+
+    def _strip(self, prefix, suggestion):
+        from agent.chat_agent import strip_prefix_echo
+
+        return strip_prefix_echo(prefix, suggestion)
+
+    def test_marker_echo_stripped(self) -> None:
+        self.assertEqual(
+            self._strip("앞 문장. 첫 번째로,", "첫 번째로, 우리는 시작한다."),
+            " 우리는 시작한다.",
+        )
+
+    def test_numbered_bullet_echo_stripped(self) -> None:
+        self.assertEqual(
+            self._strip("개요\n1. ", "1. 배경 설명"),
+            "배경 설명",
+        )
+
+    def test_subject_echo_stripped(self) -> None:
+        self.assertEqual(self._strip("그는", "그는 떠났다."), " 떠났다.")
+
+    def test_multiword_echo_stripped(self) -> None:
+        # Multi-word verbatim echo — only catchable on the full text, which
+        # editor_service applies (the per-chunk strip is window-capped).
+        self.assertEqual(
+            self._strip("오늘 우리는 회의에서", "오늘 우리는 회의에서 예산을 논의했다."),
+            " 예산을 논의했다.",
+        )
+
+    def test_genuine_word_completion_not_stripped(self) -> None:
+        # 1-char overlap ("다") is below the floor → a real continuation survives.
+        self.assertEqual(self._strip("어제 갔다", " 다음에 또 가자"), " 다음에 또 가자")
+
+    def test_no_overlap_unchanged(self) -> None:
+        self.assertEqual(self._strip("오늘 날씨가", " 좋다."), " 좋다.")
+
+    def test_midword_overlap_not_stripped(self) -> None:
+        # Overlap that does NOT start at a word boundary must be left alone.
+        self.assertEqual(self._strip("가나다", "다라마"), "다라마")
+
+
+class GhostSuggestPromptTests(unittest.TestCase):
+    def test_prompt_forbids_marker_repetition(self) -> None:
+        from core.prompts.editor import SUGGEST_SYSTEM_PROMPT
+
+        self.assertIn("머리표지", SUGGEST_SYSTEM_PROMPT)
+        self.assertIn("첫 번째로", SUGGEST_SYSTEM_PROMPT)
+
+
+class _Result:
+    def __init__(self, success, data=None, content="", error=""):
+        self.success, self.data, self.content, self.error = success, data, content, error
+
+
+class _FakeTool:
+    schema = {"name": "table_query", "description": "q", "parameters": {"type": "object"}}
+
+
+class _TableRegistry:
+    """Minimal registry exposing only table_query, with a list_tables catalog."""
+
+    def __init__(self, tables):
+        self._tables = tables
+
+    def has(self, name):
+        return name == "table_query"
+
+    def get(self, name):
+        return _FakeTool()
+
+    def call(self, name, **kw):
+        if name == "table_query" and kw.get("operation") == "list_tables":
+            return _Result(True, {"tables": self._tables})
+        return _Result(False, error="unexpected call")
+
+
+class _TableLLM:
+    provider = "local"
+
+    def __init__(self, tool_outputs):
+        self._tool_outputs = tool_outputs
+        self.collect_called = 0
+        self.tool_names = None
+        self.catalog_in_prompt = False
+        self.final_prompt = None
+
+    def collect_tool_outputs(self, system, user, reasoning=False, *, tools, tool_runner,
+                             max_tool_calls=1, stream_label="", timeout_sec=None):
+        self.collect_called += 1
+        self.tool_names = [t.get("name") for t in tools]
+        self.catalog_in_prompt = "sales.csv" in user
+        return {"content": "", "tool_outputs": self._tool_outputs}
+
+    def iter_ask(self, system, prompt, reasoning=False, *, stream_label="", timeout_sec=None, **k):
+        self.final_prompt = prompt
+        yield "99,000원"
+
+    def ask(self, *a, **k):
+        return ""
+
+    def embed(self, _t):
+        return [0.0]
+
+    def embed_batch(self, texts):
+        return [[0.0] for _ in texts]
+
+
+class _RecordRag:
+    def __init__(self):
+        self.iter_called = 0
+
+    def iter_answer(self, q, **k):
+        self.iter_called += 1
+        yield "EMBEDDING_RAG_ANSWER"
+
+    def get_document_count(self):
+        return 1
+
+
+class RagModeTableQueryTests(unittest.TestCase):
+    """The default frontend chat mode ("rag") streams through ask_rag_iter, which
+    is embedding-only. Local .csv/.xlsx exact values aren't embedded, so a
+    table_query pre-step lets the model pull precise numbers there too — without
+    the user switching to the tool ("research") mode. The model still decides."""
+
+    _TABLES = [{"file_name": "sales.csv", "columns": ["month", "region", "amount"]}]
+
+    def test_numeric_question_routes_to_table_query(self) -> None:
+        llm = _TableLLM(tool_outputs=[
+            {"name": "table_query", "content": '{"rows":[{"sum(amount)":99000}]}'}
+        ])
+        rag = _RecordRag()
+        agent = ChatAgent(llm=llm, rag_service=rag, tool_registry=_TableRegistry(self._TABLES))
+        ans = "".join(agent.ask_rag_iter("3월 매출 합계가 얼마야?"))
+        self.assertEqual(llm.collect_called, 1)
+        self.assertEqual(llm.tool_names, ["table_query"])  # ONLY table_query exposed
+        self.assertTrue(llm.catalog_in_prompt)             # catalog handed to the model
+        self.assertEqual(rag.iter_called, 0)               # did NOT use embedding RAG
+        self.assertIn("99000", llm.final_prompt or "")     # precise value fed to answer
+        self.assertEqual(ans, "99,000원")
+
+    def test_falls_through_to_embedding_rag_when_model_declines(self) -> None:
+        llm = _TableLLM(tool_outputs=[])  # model chose not to call table_query
+        rag = _RecordRag()
+        agent = ChatAgent(llm=llm, rag_service=rag, tool_registry=_TableRegistry(self._TABLES))
+        ans = "".join(agent.ask_rag_iter("이 문서들 전반적으로 무슨 내용이야?"))
+        self.assertEqual(rag.iter_called, 1)
+        self.assertIn("EMBEDDING_RAG_ANSWER", ans)
+
+    def test_pre_step_skipped_when_no_tables_registered(self) -> None:
+        # No registered .csv/.xlsx → empty catalog → don't waste an LLM round.
+        llm = _TableLLM(tool_outputs=[])
+        rag = _RecordRag()
+        agent = ChatAgent(llm=llm, rag_service=rag, tool_registry=_TableRegistry([]))
+        ans = "".join(agent.ask_rag_iter("3월 합계?"))
+        self.assertEqual(llm.collect_called, 0)
+        self.assertEqual(rag.iter_called, 1)
+        self.assertIn("EMBEDDING_RAG_ANSWER", ans)
+
+    def test_web_only_scope_does_not_query_local_tables(self) -> None:
+        # If the user restricted RAG to external/web sources, local tables (which
+        # are local_private) must not be consulted.
+        llm = _TableLLM(tool_outputs=[
+            {"name": "table_query", "content": '{"rows":[{"sum(amount)":99000}]}'}
+        ])
+        rag = _RecordRag()
+        agent = ChatAgent(llm=llm, rag_service=rag, tool_registry=_TableRegistry(self._TABLES))
+        ans = "".join(agent.ask_rag_iter("3월 합계?", include_private_local=False))
+        self.assertEqual(llm.collect_called, 0)
+        self.assertEqual(rag.iter_called, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

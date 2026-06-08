@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
-from .db import get_connection
+from .db import get_connection, init_db
 
 _DRAFT_SETTINGS_RE = re.compile(r"^draft_(\d+)_settings\.json$")
 
 
 def get_dashboard_summary() -> dict[str, int]:
+	# Self-initialize like the other db/ repositories — the frontend no longer
+	# calls init_db() (it now reaches this over HTTP), so the API process must
+	# not depend on a prior init for the dashboard's first read.
+	init_db()
 	conn = get_connection()
 	try:
 		row = conn.execute(
@@ -129,6 +134,26 @@ def get_recent_activities(limit: int = 5) -> list[dict[str, object]]:
 			(limit,),
 		).fetchall()
 		return [dict(row) for row in rows]
+	finally:
+		conn.close()
+
+
+def rename_workspace(workspace_id: str, name: str) -> int:
+	"""Rename a workspace in the local ``workspaces`` table. Returns the number
+	of rows updated (0 when the id was not found)."""
+	init_db()
+	conn = get_connection()
+	try:
+		updated = conn.execute(
+			"UPDATE workspaces SET name = ?, updated_at = ? WHERE id = ?",
+			(
+				name,
+				datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+				workspace_id,
+			),
+		).rowcount
+		conn.commit()
+		return int(updated or 0)
 	finally:
 		conn.close()
 

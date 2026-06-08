@@ -1,4 +1,4 @@
-"""Deterministic synthetic-data generator for scenarios.md Scenario B.
+"""Deterministic synthetic-data generator for docs/deprecated/scenarios.md Scenario B.
 
 Scenario B = "대체육(식물성 단백질) 시장 + 가상 식품기업 (주)그린테이블". It exercises
 the local-corpus → cross-check path: internal documents reuse the SAME market

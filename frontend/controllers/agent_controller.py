@@ -51,6 +51,15 @@ class AgentController:
 	def delete_workspace(self, workspace_id: str) -> dict[str, Any]:
 		return api_client.delete(f"/api/v1/workspaces/{workspace_id}")
 
+	def get_dashboard_home(self) -> dict[str, Any]:
+		return api_client.get("/api/v1/dashboard/home")
+
+	def rename_workspace(self, workspace_id: str, name: str) -> dict[str, Any]:
+		return api_client.post(
+			f"/api/v1/dashboard/workspaces/{workspace_id}/rename",
+			{"name": name},
+		)
+
 	def get_chat_history(self, workspace_id: str) -> list[dict[str, Any]]:
 		response = api_client.get(f"/api/v1/chat/sessions/session_{workspace_id}/messages")
 		items = response.get("items", [])
