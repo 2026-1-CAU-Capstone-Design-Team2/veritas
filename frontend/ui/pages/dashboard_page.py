@@ -268,7 +268,11 @@ class DashboardPage(QWidget):
 
 		if parsed.tzinfo is None:
 			parsed = parsed.replace(tzinfo=timezone.utc)
-		return parsed.astimezone(_KST).strftime("%Y년 %m월 %d일 %H시 %M분")
+		kst = parsed.astimezone(_KST)
+		# strftime을 한글 리터럴과 함께 쓰면 Windows에서 시스템 코드페이지가
+		# cp949가 아닐 때 UnicodeEncodeError가 난다. locale에 무관하게 동작하도록
+		# 컴포넌트별로 직접 조립한다.
+		return f"{kst.year}년 {kst.month:02d}월 {kst.day:02d}일 {kst.hour:02d}시 {kst.minute:02d}분"
 
 	def _rename_workspace(self, workspace_id: str, current_name: str) -> None:
 		"""Prompt for a new name and persist it through the backend.
