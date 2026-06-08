@@ -980,3 +980,16 @@ curl -X POST "http://127.0.0.1:8000/api/v1/proactive/reset?workspaceId=<ws>"
 - 검증: offscreen Qt(600×400) — ghost 비문서·document_text clean, IME 조합 내내 remaining 유지+commit마다 축소+정상색, 멀티라인 예약>0+dismiss 시 0, streaming/Tab/분기 전부 통과.
 
 **검증**: `discover -s tests` → **424 OK**(회귀 0). 편집 파일 `py_compile` 통과.
+
+### 2026-06-08 (feat) — RAG 모드에서도 로컬 표(csv/xlsx) 수치 질의 지원 (table_query 사전단계)
+
+**배경(사용자)**: "로컬 폴더 데이터 RAG가 안 됨, csv/xlsx 수치는 어떻게 질의?" 진단: table_query 메커니즘(인덱싱→manifest→list_tables→정확 집계)은 정상이나, **프론트 기본 채팅 모드가 "rag"** → `ask_rag_iter`(임베딩 검색만) → table_query를 절대 안 탐. tool 경로(`ask_auto_iter`, "research" 모드)만 table_query를 썼음. 임베딩엔 정확한 숫자가 없어 RAG 모드 수치 질의가 실패.
+
+**수정** — `agent/chat_agent.py`
+- `_collect_tool_outputs(question, allowed_tool_names=None)`로 파라미터화.
+- `_collect_table_outputs(question)`: registry에 table_query가 있고 **등록된 표가 있을 때만**(빈 카탈로그면 LLM 라운드 생략) `table_query`만 노출해 단일라운드 tool 결정 실행.
+- `ask_rag_iter`: strict RAG 답변 전에 `include_private_local and source_scope_filter in (all,local)`일 때 `_collect_table_outputs` 사전 실행 → 모델이 table_query를 호출했으면 그 정확한 출력으로 `_stream_final_answer`(근거 기반 합성) 후 종료, 아니면 기존 임베딩 RAG로 통과.
+- **불변식 준수**: 키워드 라우팅 아님 — 모델이 카탈로그를 받고 table_query 사용 여부를 스스로 결정. web-only(`include_private_local=False`) 스코프에선 로컬 표 미조회. 채팅은 로컬 LLM 전용이라 local_private 노출 없음.
+- 검증: 임시 워크스페이스 csv 인덱싱→`3월 합계=99000` 정확, mock LLM으로 RAG 모드 수치질문→table_query 라우팅·비표질문→임베딩 통과·무표시 생략·web-only 생략. 신규 회귀 4건(`RagModeTableQueryTests`).
+
+**검증**: `discover -s tests` → **428 OK**(기존 424+4, 회귀 0). 편집 파일 `py_compile` 통과.

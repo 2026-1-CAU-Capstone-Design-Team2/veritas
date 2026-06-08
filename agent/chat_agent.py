@@ -379,8 +379,24 @@ class ChatAgent:
         The frontend "RAG" chat mode streams through here, so off-corpus
         questions get the same "not in this workspace's materials" refusal as the
         one-shot path rather than a permissive general-knowledge answer.
+
+        Local .csv/.xlsx values (exact numbers, sums, filters) are NOT in the
+        embedding index, so before the strict RAG answer we let the model decide
+        whether the question needs a ``table_query`` over a registered local table.
+        If it does, we answer from that precise output; otherwise we fall through
+        to ordinary embedding RAG unchanged.
         """
         with self._conversation_lock:
+            if include_private_local and source_scope_filter in ("all", "local"):
+                table_outputs = self._collect_table_outputs(question)
+                if table_outputs:
+                    yield from self._stream_final_answer(
+                        question=question,
+                        tool_outputs=table_outputs,
+                        doc_context=doc_context,
+                        profile=self._profile_for_tool_outputs(table_outputs),
+                    )
+                    return
             try:
                 kwargs = {"use_history": True, "doc_context": doc_context}
                 if source_scope_filter != "all" or not include_private_local:
@@ -1025,11 +1041,16 @@ class ChatAgent:
             content = str(payload)
         return [{"name": tool_name, "content": content}]
 
-    def _collect_tool_outputs(self, question: str) -> list[dict[str, str]]:
+    def _collect_tool_outputs(
+        self, question: str, allowed_tool_names: tuple[str, ...] | None = None
+    ) -> list[dict[str, str]]:
+        allowed = (
+            allowed_tool_names if allowed_tool_names is not None else self.optional_tool_names
+        )
         llm_tools, llm_tool_runner = build_llm_tooling(
             self.tool_registry,
             stage_label="chat",
-            allowed_tool_names=self.optional_tool_names,
+            allowed_tool_names=allowed,
         )
         if not llm_tools or not llm_tool_runner:
             return []
@@ -1061,6 +1082,21 @@ class ChatAgent:
             if name and content:
                 outputs.append({"name": name, "content": content})
         return outputs
+
+    def _collect_table_outputs(self, question: str) -> list[dict[str, str]]:
+        """RAG-mode pre-step: expose ONLY ``table_query`` so the model can pull
+        precise local .csv/.xlsx values (exact numbers / sums / filters), which
+        the embedding index cannot answer. Returns ``[]`` when no tables are
+        registered or the model decides it doesn't need one — in which case the
+        caller falls through to ordinary embedding RAG. The model still *decides*
+        (it is given table_query + the table catalog); there is no keyword routing.
+        """
+        if self.tool_registry is None or not self.tool_registry.has("table_query"):
+            return []
+        # No registered .csv/.xlsx → empty catalog → skip the extra LLM round.
+        if not self._local_table_catalog_block():
+            return []
+        return self._collect_tool_outputs(question, allowed_tool_names=("table_query",))
 
     def _answer_from_current_turn(
         self,
