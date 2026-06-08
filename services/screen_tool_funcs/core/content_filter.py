@@ -6,6 +6,22 @@ from .models import AppTextResult, FilteredScreenContext, OcrResult, UiAutomatio
 
 
 class ContentFilter:
+    def __init__(self, *, custom_document_tools: list[dict[str, str]] | None = None) -> None:
+        # User-registered document apps from settings (documentTools.custom).
+        # Each entry is {"name", "identifier"}; we treat a window as a
+        # "document" editing app when its process name or title matches one of
+        # these tokens, so an editor not in the hardcoded list below still
+        # qualifies. This is explicit user configuration, not a vocabulary
+        # keyword heuristic — it carries no domain terms.
+        self._custom_doc_tokens: list[str] = []
+        for tool in custom_document_tools or []:
+            if not isinstance(tool, dict):
+                continue
+            for key in ("identifier", "name"):
+                token = str(tool.get(key) or "").strip().lower()
+                if token:
+                    self._custom_doc_tokens.append(token)
+
     def build(
         self,
         *,
@@ -99,7 +115,20 @@ class ContentFilter:
             return "browser"
         if name in {"code.exe", "devenv.exe", "pycharm64.exe"}:
             return "code_editor"
+        if self._matches_custom_document_tool(name, title):
+            return "document"
         return "unknown"
+
+    def _matches_custom_document_tool(self, process_name: str, title: str) -> bool:
+        """True when the active window matches a user-registered document tool.
+
+        ``process_name`` and ``title`` are already lowercased by the caller.
+        A token matches as a substring of either, so the user can register an
+        exe name ("obsidian.exe") or a title keyword ("Obsidian")."""
+        for token in self._custom_doc_tokens:
+            if token in process_name or token in title:
+                return True
+        return False
 
     def _guess_web_editor_type(self, title: str) -> str:
         title = title.lower()

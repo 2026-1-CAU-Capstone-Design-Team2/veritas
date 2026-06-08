@@ -69,6 +69,7 @@ class ScreenContextService:
         crop_bottom: int = 0,
         console_log: bool = False,
         llm=None,
+        custom_document_tools: list[dict[str, str]] | None = None,
     ) -> None:
         self.interval_sec = interval_sec
         self.console_log = console_log
@@ -83,7 +84,7 @@ class ScreenContextService:
         self.ocr_engine = OcrEngine(language=ocr_language, scale=ocr_scale)
         self.powerpoint_reader = PowerPointComReader()
         self.ui_reader = UiAutomationReader()
-        self.content_filter = ContentFilter()
+        self.content_filter = ContentFilter(custom_document_tools=custom_document_tools)
         # console_log(=--screen-debug)면 capture log를 debug/에 기록
         self.store = ScreenContextStore(root, debug=console_log)
 

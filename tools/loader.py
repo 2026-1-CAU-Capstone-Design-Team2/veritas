@@ -30,6 +30,7 @@ def build_registry(
     enable_screen_context: bool = True,
     screen_interval_sec: float = 5.0,
     screen_debug_log: bool = False,
+    custom_document_tools: list[dict[str, Any]] | None = None,
 ):
     from services.run_store_tool_funcs import RunStoreService
     from storage.vector_store import VectorStore
@@ -173,6 +174,7 @@ def build_registry(
                 interval_sec=screen_interval_sec,
                 console_log=screen_debug_log,
                 llm=llm,
+                custom_document_tools=custom_document_tools,
             )
             registry.register(
                 ScreenContextTool(
