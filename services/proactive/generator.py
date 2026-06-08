@@ -53,6 +53,16 @@ from .proposal_models import ProactiveTask
 log = logging.getLogger(__name__)
 
 
+# Ghost continuation token budget. The old default (64) routinely truncated
+# Korean ghostwrites mid-sentence: 64 tokens is barely one short Korean
+# sentence, so a 1~2 sentence continuation hit the cap before the model could
+# emit EOS. The model self-limits to 1~2 sentences via ``SUGGEST_SYSTEM_PROMPT``,
+# so a generous budget just lets EOS — not the length cap — end generation.
+# ``iter_ghostwrite`` clamps to ``min(256, ...)`` so this stays in range.
+# Operators can override with ``VERITAS_PROACTIVE_GHOST_MAX_TOKENS``.
+DEFAULT_GHOST_MAX_TOKENS: int = 192
+
+
 # Card tones map onto render_mode. The frontend reads ``cardTone`` to pick
 # the chip color; we keep both names in the event payload for clarity.
 _CARD_TONE_BY_RENDER: dict[str, str] = {
@@ -134,7 +144,7 @@ class ProactiveGenerator:
         ghostwrite_iter: Callable[..., Iterator[str]],
         editor_assist_iter: Callable[..., Iterator[str]],
         workspace_is_active: Callable[[str], bool] | None = None,
-        max_tokens_ghost: int = 64,
+        max_tokens_ghost: int = DEFAULT_GHOST_MAX_TOKENS,
         max_tokens_assist: int = 400,
     ) -> None:
         self._ghostwrite_iter = ghostwrite_iter
@@ -261,6 +271,9 @@ class ProactiveGenerator:
                     prompt,
                     max_tokens=self.max_tokens_assist,
                     use_workspace=use_workspace,
+                    # Proactive retry must not hard-fail when the workspace has no
+                    # index — ground if available, else fall back to plain.
+                    additive_grounding=True,
                 )
                 return
 
@@ -281,6 +294,9 @@ class ProactiveGenerator:
             text,
             max_tokens=self.max_tokens_assist,
             use_workspace=use_workspace,
+            # Proactive suggestions are additive — grounding helps but never
+            # hard-gates, so an un-indexed workspace still gets a suggestion.
+            additive_grounding=True,
         )
 
     def _compose_body(

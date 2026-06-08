@@ -93,6 +93,33 @@ def detect_korean_style(text: str) -> str:
     return _STYLE_GUIDANCE_BY_REGISTER[register]
 
 
+_MIN_GHOST_ECHO_CHARS = 2
+
+
+def strip_prefix_echo(prefix: str, suggestion: str) -> str:
+    """Strip a leading verbatim repeat of the prefix's trailing word/marker from
+    a ghost continuation.
+
+    The local model sometimes restates what the user just typed — e.g. after
+    "첫 번째로," it emits "첫 번째로, ..." again, or re-prints a "1." / "-" bullet —
+    instead of continuing from the cursor. This removes that echo so the
+    continuation flows. Only a chunk that begins at a word/line boundary in the
+    prefix (≥2 chars) is stripped, so a genuine word-completion continuation
+    (e.g. prefix "다" → " 다음...") is never corrupted (its 1-char overlap is
+    below the floor)."""
+    if not prefix or not suggestion.strip():
+        return suggestion
+    # Keep the prefix's trailing whitespace so an echoed marker that includes a
+    # space (e.g. "1. ") matches fully and we don't leave a doubled space.
+    p = prefix
+    body = suggestion.lstrip()
+    max_k = min(len(p), len(body))
+    for k in range(max_k, _MIN_GHOST_ECHO_CHARS - 1, -1):
+        if p[-k:] == body[:k] and (k == len(p) or p[-k - 1].isspace()):
+            return body[k:]
+    return suggestion
+
+
 class ChatAgent:
     """General chat orchestration with schema-driven tool use.
 
@@ -388,43 +415,43 @@ class ChatAgent:
         The frontend "RAG" chat mode streams through here, so off-corpus
         questions get the same "not in this workspace's materials" refusal as the
         one-shot path rather than a permissive general-knowledge answer.
+
+        Local .csv/.xlsx values (exact numbers, sums, filters) are NOT in the
+        embedding index, so before the strict RAG answer we let the model decide
+        whether the question needs a ``table_query`` over a registered local table.
+        If it does, we answer from that precise output; otherwise we fall through
+        to ordinary embedding RAG unchanged.
         """
         with self._conversation_lock:
-            yield from self._ask_rag_iter_unlocked(
-                question,
-                doc_context=doc_context,
-                source_scope_filter=source_scope_filter,
-                include_private_local=include_private_local,
-            )
-
-    def _ask_rag_iter_unlocked(
-        self,
-        question: str,
-        doc_context: str = "",
-        *,
-        source_scope_filter: str = "all",
-        include_private_local: bool = True,
-    ) -> Iterator[str]:
-        """Lock-free core of :meth:`ask_rag_iter` (see :meth:`_ask_rag_unlocked`)."""
-        try:
-            kwargs = {"use_history": True, "doc_context": doc_context}
-            if source_scope_filter != "all" or not include_private_local:
-                kwargs["source_scope_filter"] = source_scope_filter
-                kwargs["include_private_local"] = include_private_local
-            for chunk in self.rag_service.iter_answer(question, **kwargs):
-                yield chunk
-        except AttributeError:
-            # Defensive: older rag_service without iter_answer — one-shot.
-            kwargs = {
-                "stream": False,
-                "use_history": True,
-                "doc_context": doc_context,
-            }
-            if source_scope_filter != "all" or not include_private_local:
-                kwargs["source_scope_filter"] = source_scope_filter
-                kwargs["include_private_local"] = include_private_local
-            answer = self.rag_service.answer(question, **kwargs)
-            yield answer
+            if include_private_local and source_scope_filter in ("all", "local"):
+                table_outputs = self._collect_table_outputs(question)
+                if table_outputs:
+                    yield from self._stream_final_answer(
+                        question=question,
+                        tool_outputs=table_outputs,
+                        doc_context=doc_context,
+                        profile=self._profile_for_tool_outputs(table_outputs),
+                    )
+                    return
+            try:
+                kwargs = {"use_history": True, "doc_context": doc_context}
+                if source_scope_filter != "all" or not include_private_local:
+                    kwargs["source_scope_filter"] = source_scope_filter
+                    kwargs["include_private_local"] = include_private_local
+                for chunk in self.rag_service.iter_answer(question, **kwargs):
+                    yield chunk
+            except AttributeError:
+                # Defensive: older rag_service without iter_answer — one-shot.
+                kwargs = {
+                    "stream": False,
+                    "use_history": True,
+                    "doc_context": doc_context,
+                }
+                if source_scope_filter != "all" or not include_private_local:
+                    kwargs["source_scope_filter"] = source_scope_filter
+                    kwargs["include_private_local"] = include_private_local
+                answer = self.rag_service.answer(question, **kwargs)
+                yield answer
 
     # -- editor (standalone writer) surfaces ---------------------------------
     # Power the editor window's ghost-writing / quick actions / chat. They reuse
@@ -591,7 +618,12 @@ class ChatAgent:
                     print("[editor][ghost] declined (NO_SUGGESTION / off-topic)")
                 return
             decided = True
-            yield "".join(buffer)
+            # Strip a leading echo of the prefix's trailing marker/word (the
+            # model occasionally restates "첫 번째로," / a bullet before continuing).
+            # Head-only: later tokens stream raw below.
+            head = strip_prefix_echo(prefix, "".join(buffer))
+            if head:
+                yield head
             buffer = []
         if not decided:
             # Output ended before the decision window — short enough to judge whole.
@@ -600,6 +632,7 @@ class ChatAgent:
                 if self._EDITOR_RAG_DEBUG:
                     print("[editor][ghost] declined (NO_SUGGESTION / off-topic)")
                 return
+            text = strip_prefix_echo(prefix, text)
             if text:
                 yield text
 
@@ -610,15 +643,24 @@ class ChatAgent:
         *,
         max_tokens: int = 400,
         use_workspace: bool = True,
+        additive_grounding: bool = False,
     ) -> Iterator[str]:
         """Stream a quick-action transform.
 
-        Forced-RAG actions (rewrite / continue) are hard-gated: they retrieve
-        workspace grounding and inject [참고 자료], and raise
+        Forced-RAG actions (rewrite / continue) are hard-gated by default: they
+        retrieve workspace grounding and inject [참고 자료], and raise
         ``EditorGroundingUnavailable`` when none is available (empty index or
         the workspace is not the active one — surfaced here as
         ``use_workspace=False``) instead of falling back to a plain generation.
         Every other action runs as a plain LLM call with no retrieval.
+
+        ``additive_grounding=True`` relaxes that hard gate for the *proactive*
+        caller (the reject-ladder retry uses ``continue``): grounding is still
+        used when available, but its absence is no longer fatal — the suggestion
+        falls back to a plain generation. This is what lets a reject in a
+        workspace with no index still produce an expanded-context retry instead
+        of silently erroring out. The user-clicked quick actions keep the hard
+        gate (default ``False``).
         """
         action = (action or "").strip().lower()
         system_prompt = ASSIST_SYSTEM_PROMPTS.get(action)
@@ -626,10 +668,11 @@ class ChatAgent:
             return
         body = (text or "").strip()
         target = body or "(빈 문서)"
-        if action in self._EDITOR_FORCED_RAG_ACTIONS:
-            context = self._editor_context(body) if use_workspace else None
-            if not context:
-                raise EditorGroundingUnavailable(action)
+        grounded_action = action in self._EDITOR_FORCED_RAG_ACTIONS
+        context = self._editor_context(body) if (grounded_action and use_workspace) else None
+        if grounded_action and not context and not additive_grounding:
+            raise EditorGroundingUnavailable(action)
+        if grounded_action and context:
             user_content = ASSIST_GROUNDED_USER_TEMPLATE.format(context=context, text=target)
         else:
             user_content = ASSIST_PLAIN_USER_TEMPLATE.format(text=target)
@@ -799,9 +842,75 @@ class ChatAgent:
         # inject FIFO/recall as separate chat messages for this call. Read the
         # recent turns from the FIFO directly and paste them into the prompt —
         # otherwise the routing LLM sees zero conversational context.
-        return TOOL_CHAT_USER_PROMPT_TEMPLATE.format(
-            history=self._recent_history_text(),
-            question=question,
+        return (
+            TOOL_CHAT_USER_PROMPT_TEMPLATE.format(
+                history=self._recent_history_text(),
+                question=question,
+            )
+            + self._local_table_catalog_block()
+        )
+
+    def _local_table_catalog_block(self) -> str:
+        """Compact catalog of the workspace's registered local .csv/.xlsx files
+        (file names + sheet/column names) appended to the tool-decision prompt.
+
+        Chat tool selection is a *single round* — ``collect_tool_outputs`` does
+        not feed tool results back for a follow-up call — so the model cannot run
+        ``table_query`` ``list_tables`` → ``query`` discovery across turns. Handing
+        it the catalog up front lets it emit ONE correctly-parameterized
+        ``table_query(operation=query, ...)`` call to read specific numeric values
+        from a .csv/.xlsx. This is workspace *context*, not keyword routing — the
+        model still decides whether and how to use the tool.
+
+        Returns ``""`` when there is no registry, no registered tables, or the
+        lookup fails (the common no-local-corpus case is a cheap empty-manifest
+        read).
+        """
+        if self.tool_registry is None:
+            return ""
+        try:
+            result = self.tool_registry.call("table_query", operation="list_tables")
+        except Exception:
+            return ""
+        if not getattr(result, "success", False):
+            return ""
+        data = getattr(result, "data", None) or {}
+        tables = data.get("tables") if isinstance(data, dict) else None
+        if not isinstance(tables, list) or not tables:
+            return ""
+
+        lines: list[str] = []
+        for table in tables[:20]:
+            if not isinstance(table, dict):
+                continue
+            name = str(table.get("file_name") or table.get("source_id") or "").strip()
+            if not name:
+                continue
+            sheets = table.get("sheets")
+            if isinstance(sheets, list) and sheets:
+                parts: list[str] = []
+                for sheet in sheets[:5]:
+                    if not isinstance(sheet, dict):
+                        continue
+                    cols = ", ".join(
+                        str(c) for c in (sheet.get("columns") or [])[:30]
+                    )
+                    sheet_name = str(sheet.get("sheet_name") or "").strip()
+                    parts.append(f"{sheet_name}({cols})" if cols else sheet_name)
+                joined = "; ".join(p for p in parts if p)
+                lines.append(f"- {name} — 시트: {joined}" if joined else f"- {name}")
+            else:
+                cols = ", ".join(str(c) for c in (table.get("columns") or [])[:30])
+                lines.append(f"- {name} — 열: {cols}" if cols else f"- {name}")
+        if not lines:
+            return ""
+
+        return (
+            "\n\n[이 워크스페이스에 등록된 로컬 표 파일 — 값 조회는 table_query 도구 사용]\n"
+            + "\n".join(lines)
+            + "\n위 파일의 구체적 값·합계·평균·개수·필터·정렬이 필요하면 "
+            "table_query(operation=query)를 해당 file_name과 열 이름으로 직접 호출하세요 "
+            "(list_tables를 먼저 호출할 필요 없음)."
         )
 
     def _parse_explicit_command(self, question: str) -> tuple[str, str] | None:
@@ -968,11 +1077,16 @@ class ChatAgent:
             content = str(payload)
         return [{"name": tool_name, "content": content}]
 
-    def _collect_tool_outputs(self, question: str) -> list[dict[str, str]]:
+    def _collect_tool_outputs(
+        self, question: str, allowed_tool_names: tuple[str, ...] | None = None
+    ) -> list[dict[str, str]]:
+        allowed = (
+            allowed_tool_names if allowed_tool_names is not None else self.optional_tool_names
+        )
         llm_tools, llm_tool_runner = build_llm_tooling(
             self.tool_registry,
             stage_label="chat",
-            allowed_tool_names=self.optional_tool_names,
+            allowed_tool_names=allowed,
         )
         if not llm_tools or not llm_tool_runner:
             return []
@@ -1004,6 +1118,21 @@ class ChatAgent:
             if name and content:
                 outputs.append({"name": name, "content": content})
         return outputs
+
+    def _collect_table_outputs(self, question: str) -> list[dict[str, str]]:
+        """RAG-mode pre-step: expose ONLY ``table_query`` so the model can pull
+        precise local .csv/.xlsx values (exact numbers / sums / filters), which
+        the embedding index cannot answer. Returns ``[]`` when no tables are
+        registered or the model decides it doesn't need one — in which case the
+        caller falls through to ordinary embedding RAG. The model still *decides*
+        (it is given table_query + the table catalog); there is no keyword routing.
+        """
+        if self.tool_registry is None or not self.tool_registry.has("table_query"):
+            return []
+        # No registered .csv/.xlsx → empty catalog → skip the extra LLM round.
+        if not self._local_table_catalog_block():
+            return []
+        return self._collect_tool_outputs(question, allowed_tool_names=("table_query",))
 
     def _answer_from_current_turn(
         self,

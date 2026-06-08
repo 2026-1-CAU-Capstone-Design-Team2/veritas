@@ -48,12 +48,44 @@ from typing import Any, Callable, Iterator, Optional
 NATIVE_ANCHOR_REJECT_LIMIT: int = 3
 NATIVE_ANCHOR_REJECT_COOLDOWN_S: float = 180.0
 
+# How close (in characters) two cursor positions must be for the reject ladder
+# to treat them as "the same editing spot". The raw ``anchor_id`` folds the
+# surrounding paragraph's text hash into its identity, so a single keystroke
+# (even one space) mints a brand-new anchor_id — which previously let the user
+# bypass the 3-reject cooldown just by typing a character, and stopped the
+# reject ladder from accumulating across "ESC → type a bit → suggest again"
+# cycles. We therefore match ladder state by document + cursor proximity, not by
+# the exact anchor_id, so small edits near the same location stay on the same
+# ladder.
+#
+# The window is deliberately SMALL (a few keystrokes — not a whole sentence): it
+# must absorb a space / minor edit at the same spot, but the cooldown MUST
+# release as soon as the user moves to a different sentence or paragraph.
+# A window the size of a sentence (the old 120) made the lock feel permanent —
+# moving the caret one sentence over still resolved to the cooled entry.
+# Override with ``VERITAS_PROACTIVE_ANCHOR_PROXIMITY_CHARS``.
+def _proximity_chars() -> int:
+    import os
+
+    try:
+        value = int(os.getenv("VERITAS_PROACTIVE_ANCHOR_PROXIMITY_CHARS", "24"))
+    except (TypeError, ValueError):
+        value = 24
+    return max(0, value)
+
+
+NATIVE_ANCHOR_PROXIMITY_CHARS: int = _proximity_chars()
+
 
 @dataclass
 class _AnchorRejectState:
     reject_count: int = 0
     cooldown_until_monotonic: Optional[float] = None
     last_rejected_text: Optional[str] = None
+    # Stored so the ladder can match nearby anchors by cursor proximity even
+    # when the raw anchor_id shifts under small edits (see above).
+    document_id: str = ""
+    cursor_index: Optional[int] = None
 
 from .anchors import ActiveAnchor, compute_anchor_id, confidence_from_source
 from .candidates import PrimitiveSignals, build_candidates
@@ -397,8 +429,8 @@ class ProactiveOrchestrator:
         # vetoed on a per-anchor cooldown.
         decision_id_early = f"pd_{uuid.uuid4().hex[:16]}"
         if observation.surface == "native_editor":
-            reject_level, last_rejected, in_cooldown = self._read_anchor_state(
-                anchor.anchor_id
+            reject_level, last_rejected, in_cooldown = self._read_anchor_state_for(
+                anchor
             )
             if in_cooldown:
                 # Compute primitive minimally so the null log still has the
@@ -559,8 +591,14 @@ class ProactiveOrchestrator:
         # generator uses these for the native-retry path so the LLM gets the
         # previous (rejected) suggestion as a negative example, plus an
         # explicit instruction to vary on reject_level ≥ 1.
-        if observation.surface == "native_editor" and reject_level > 0:
-            best_task.metadata["reject_level"] = int(reject_level)
+        if observation.surface == "native_editor":
+            if reject_level > 0:
+                best_task.metadata["reject_level"] = int(reject_level)
+            # Forward the previously-rejected text whenever we have it — even at
+            # reject_level 0 (a "다시"/retry remembers the text without bumping
+            # the count). The generator's native-retry path engages on either a
+            # reject_level >= 1 OR a non-empty avoid_text, so this is what makes
+            # a "try again" actually avoid repeating the rejected suggestion.
             if last_rejected:
                 best_task.metadata["last_rejected_text"] = str(last_rejected)
         context_bundle = materialize_context(task=best_task, anchor=anchor)
@@ -711,9 +749,11 @@ class ProactiveOrchestrator:
         surface = "external_app"
         task_type: Optional[str] = None
         anchor_id: Optional[str] = None
+        anchor_obj: Optional[ActiveAnchor] = None
         if bundle is not None:
             obs: ProactiveObservation = bundle["observation"]
             surface = obs.surface
+            anchor_obj = bundle.get("anchor")
             prediction = bundle["prediction"]
             if is_task(prediction):
                 task_type = prediction.task_type  # type: ignore[union-attr]
@@ -730,18 +770,27 @@ class ProactiveOrchestrator:
         meta = dict(metadata or {})
         generated_text = str(meta.get("generated_text") or "")
         if surface == "native_editor" and anchor_id:
+            # The ladder matches by cursor proximity, so it needs the anchor's
+            # document + cursor — not just the (edit-fragile) anchor_id. When the
+            # decision cache has rolled, fall back to a minimal anchor carrying
+            # only the id (proximity matching then degrades to exact match).
+            anchor_for_ladder = anchor_obj or ActiveAnchor(
+                document_id="",
+                surface="native_editor",
+                anchor_id=anchor_id,
+            )
             if canonical == "reject":
-                self._bump_anchor_reject(anchor_id, generated_text)
+                self._bump_anchor_reject(anchor_for_ladder, generated_text)
             elif canonical == "retry":
                 # Retry doesn't increment the count — the user wanted the
                 # help, just not THIS rendition. But we DO need to remember
                 # the rejected text so the next observe's generator can
                 # tell the LLM "avoid this".
-                self._remember_anchor_rejected_text(anchor_id, generated_text)
+                self._remember_anchor_rejected_text(anchor_for_ladder, generated_text)
             elif canonical == "accept":
                 # Accept clears the ladder entirely so the next observe at
                 # this anchor gets a fresh attempt.
-                self._clear_anchor_state(anchor_id)
+                self._clear_anchor_state(anchor_for_ladder)
         # ----------------------------------------------------------------
 
         changes = self.store.adaptation.apply_feedback(
@@ -789,27 +838,92 @@ class ProactiveOrchestrator:
 
     # ----------------------------------------------------------- anchor ladder
 
+    def _match_state_key_locked(
+        self,
+        *,
+        anchor_id: str,
+        document_id: str,
+        cursor_index: Optional[int],
+    ) -> Optional[str]:
+        """Return the ladder-state dict key for this anchor, caller holds the
+        lock. Prefers an exact ``anchor_id`` hit; otherwise the nearest existing
+        state in the same document whose stored cursor is within
+        ``NATIVE_ANCHOR_PROXIMITY_CHARS`` of this one. Returns ``None`` when no
+        ladder state is close enough."""
+        if anchor_id in self._anchor_reject_state:
+            return anchor_id
+        if cursor_index is None:
+            return None
+        cur = int(cursor_index)
+        best_key: Optional[str] = None
+        best_dist: Optional[int] = None
+        for key, state in self._anchor_reject_state.items():
+            if state.cursor_index is None:
+                continue
+            if str(state.document_id or "") != str(document_id or ""):
+                continue
+            dist = abs(int(state.cursor_index) - cur)
+            if dist <= NATIVE_ANCHOR_PROXIMITY_CHARS and (
+                best_dist is None or dist < best_dist
+            ):
+                best_key, best_dist = key, dist
+        return best_key
+
     def _read_anchor_state(
         self, anchor_id: str
     ) -> tuple[int, Optional[str], bool]:
-        """Return ``(reject_count, last_rejected_text, in_cooldown)`` for
-        ``anchor_id``. All three are zero/None/False if the anchor has no
-        ladder state yet."""
+        """Exact-match read of ``(reject_count, last_rejected_text,
+        in_cooldown)`` for ``anchor_id``. All three are zero/None/False if the
+        anchor has no ladder state yet. Kept as the by-id accessor for tests and
+        diagnostics; the live observe path uses :meth:`_read_anchor_state_for`
+        so a small edit near the same spot still resolves to the same ladder."""
         with self._anchor_reject_lock:
-            state = self._anchor_reject_state.get(anchor_id)
-            if state is None:
-                return 0, None, False
-            in_cd = (
-                state.cooldown_until_monotonic is not None
-                and time.monotonic() < state.cooldown_until_monotonic
-            )
-            return state.reject_count, state.last_rejected_text, in_cd
+            return self._read_state_locked(self._anchor_reject_state.get(anchor_id))
 
-    def _bump_anchor_reject(self, anchor_id: str, generated_text: str) -> None:
+    def _read_anchor_state_for(
+        self, anchor: ActiveAnchor
+    ) -> tuple[int, Optional[str], bool]:
+        """Proximity-aware read used by observe — see
+        :meth:`_match_state_key_locked`."""
         with self._anchor_reject_lock:
-            state = self._anchor_reject_state.setdefault(
-                anchor_id, _AnchorRejectState()
+            key = self._match_state_key_locked(
+                anchor_id=anchor.anchor_id,
+                document_id=str(anchor.document_id or ""),
+                cursor_index=anchor.cursor_index,
             )
+            state = self._anchor_reject_state.get(key) if key else None
+            return self._read_state_locked(state)
+
+    @staticmethod
+    def _read_state_locked(
+        state: Optional[_AnchorRejectState],
+    ) -> tuple[int, Optional[str], bool]:
+        if state is None:
+            return 0, None, False
+        in_cd = (
+            state.cooldown_until_monotonic is not None
+            and time.monotonic() < state.cooldown_until_monotonic
+        )
+        return state.reject_count, state.last_rejected_text, in_cd
+
+    def _state_for_anchor_locked(self, anchor: ActiveAnchor) -> _AnchorRejectState:
+        """Resolve (proximity) or create the ladder state for ``anchor`` and
+        refresh its stored document/cursor so the proximity window follows the
+        user as they edit near the same spot. Caller holds the lock."""
+        key = self._match_state_key_locked(
+            anchor_id=anchor.anchor_id,
+            document_id=str(anchor.document_id or ""),
+            cursor_index=anchor.cursor_index,
+        ) or anchor.anchor_id
+        state = self._anchor_reject_state.setdefault(key, _AnchorRejectState())
+        state.document_id = str(anchor.document_id or "")
+        if anchor.cursor_index is not None:
+            state.cursor_index = int(anchor.cursor_index)
+        return state
+
+    def _bump_anchor_reject(self, anchor: ActiveAnchor, generated_text: str) -> None:
+        with self._anchor_reject_lock:
+            state = self._state_for_anchor_locked(anchor)
             state.reject_count += 1
             if generated_text:
                 state.last_rejected_text = generated_text
@@ -819,19 +933,25 @@ class ProactiveOrchestrator:
                 )
 
     def _remember_anchor_rejected_text(
-        self, anchor_id: str, generated_text: str
+        self, anchor: ActiveAnchor, generated_text: str
     ) -> None:
         if not generated_text:
             return
         with self._anchor_reject_lock:
-            state = self._anchor_reject_state.setdefault(
-                anchor_id, _AnchorRejectState()
-            )
+            state = self._state_for_anchor_locked(anchor)
             state.last_rejected_text = generated_text
 
-    def _clear_anchor_state(self, anchor_id: str) -> None:
+    def _clear_anchor_state(self, anchor: ActiveAnchor) -> None:
         with self._anchor_reject_lock:
-            self._anchor_reject_state.pop(anchor_id, None)
+            key = self._match_state_key_locked(
+                anchor_id=anchor.anchor_id,
+                document_id=str(anchor.document_id or ""),
+                cursor_index=anchor.cursor_index,
+            )
+            if key is not None:
+                self._anchor_reject_state.pop(key, None)
+            # Also drop any exact-id entry that proximity didn't resolve to.
+            self._anchor_reject_state.pop(anchor.anchor_id, None)
 
     # ----------------------------------------------------------- pending
 

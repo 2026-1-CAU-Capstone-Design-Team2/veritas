@@ -15,9 +15,6 @@ from PySide6.QtWidgets import (
 	QWidget,
 )
 
-from db.dashboard_service import get_dashboard_summary
-from db.db import get_connection, init_db
-
 from ...api_common import ApiError, load_bootstrap_state
 from ...components.cards import CardWidget
 from ...controllers import AgentController, get_job_manager
@@ -96,7 +93,6 @@ class DashboardPage(QWidget):
 
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
-		init_db()
 		self._controller = AgentController()
 
 		self._stat_values: dict[str, QLabel] = {}
@@ -162,18 +158,19 @@ class DashboardPage(QWidget):
 		self.load_dashboard_data()
 
 	def load_dashboard_data(self) -> None:
-		"""Refresh the dashboard from the local DB on a worker thread.
+		"""Refresh the dashboard from the backend on a worker thread.
 
-		``get_dashboard_summary`` opens and queries SQLite; running it inline
-		stutters the UI every few seconds. The result is applied back on the
-		main thread, and an unchanged payload skips the widget rebuild entirely.
+		``GET /api/v1/dashboard/home`` queries SQLite and scans draft files on
+		the API side; fetching it inline stutters the UI every few seconds. The
+		result is applied back on the main thread, and an unchanged payload skips
+		the widget rebuild entirely.
 		"""
 		if self._loading:
 			return
 		self._loading = True
 
 		def _fetch() -> dict:
-			return get_dashboard_summary()
+			return self._controller.get_dashboard_home()
 
 		def _apply(data: object) -> None:
 			self._loading = False
@@ -274,11 +271,11 @@ class DashboardPage(QWidget):
 		return parsed.astimezone(_KST).strftime("%Y년 %m월 %d일 %H시 %M분")
 
 	def _rename_workspace(self, workspace_id: str, current_name: str) -> None:
-		"""Prompt for a new name and persist it to the local workspaces table.
+		"""Prompt for a new name and persist it through the backend.
 
-		The dashboard reads workspace rows straight from ``veritas.db`` (see
-		``db.dashboard_service``), so the rename is applied with a direct
-		``UPDATE`` here and picked up by the next refresh tick.
+		Routed over HTTP (``POST /api/v1/dashboard/workspaces/{id}/rename``) so
+		the frontend never touches the SQLite layer directly; the next refresh
+		tick picks up the new name.
 		"""
 		new_name, ok = QInputDialog.getText(
 			self,
@@ -293,24 +290,12 @@ class DashboardPage(QWidget):
 			return
 
 		try:
-			conn = get_connection()
-			try:
-				updated = conn.execute(
-					"UPDATE workspaces SET name = ?, updated_at = ? WHERE id = ?",
-					(
-						new_name,
-						datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-						workspace_id,
-					),
-				).rowcount
-				conn.commit()
-			finally:
-				conn.close()
-		except Exception as e:  # noqa: BLE001 - surface any DB failure to the user
+			result = self._controller.rename_workspace(workspace_id, new_name)
+		except ApiError as e:
 			QMessageBox.critical(self, "이름 변경 실패", f"워크스페이스 이름을 변경하지 못했습니다.\n\n{e}")
 			return
 
-		if not updated:
+		if not (isinstance(result, dict) and result.get("updated")):
 			QMessageBox.warning(self, "이름 변경 실패", "해당 워크스페이스를 찾을 수 없습니다.")
 			return
 

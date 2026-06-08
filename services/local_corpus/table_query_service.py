@@ -309,8 +309,29 @@ class TableQueryService:
         return header, data_rows
 
     def _csv_header(self, path: str) -> list[str]:
-        header, _ = self._load_csv_rows(path)
-        return header
+        # Header-only read so list_tables / the chat table catalog stay cheap on
+        # large CSVs (the full-file _load_csv_rows is reserved for describe/query).
+        first_row = self._read_first_csv_row(path)
+        return [
+            str(cell or "").strip() or f"column_{index + 1}"
+            for index, cell in enumerate(first_row)
+        ]
+
+    def _read_first_csv_row(self, path: str) -> list[str]:
+        def _first_nonempty(handle) -> list[str]:
+            for row in csv.reader(handle):
+                if any(_cell_to_text(cell) for cell in row):
+                    return list(row)
+            return []
+
+        for encoding in ("utf-8-sig", "cp949"):
+            try:
+                with Path(path).open("r", encoding=encoding, newline="") as handle:
+                    return _first_nonempty(handle)
+            except UnicodeDecodeError:
+                continue
+        with Path(path).open("r", encoding="utf-8", errors="replace", newline="") as handle:
+            return _first_nonempty(handle)
 
     def _xlsx_sheet_headers(self, path: str) -> list[tuple[str, list[str]]]:
         try:

@@ -37,6 +37,7 @@ from typing import Any, Iterator
 from fastapi import HTTPException
 
 from agent import EditorGroundingUnavailable
+from agent.chat_agent import strip_prefix_echo
 
 from ..api_common import new_id, utc_now_iso
 from ..api_models import ProactiveGenerateRequest, ProactiveObserveRequest
@@ -332,10 +333,14 @@ def suggest_stream(
         yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
         return
 
+    # Strip a leading echo of the prefix's trailing word(s)/marker on the FULL
+    # collected text — robust to multi-word echoes that the per-chunk streaming
+    # strip (capped at the decision window) can't catch. Idempotent.
+    text_out = strip_prefix_echo(prefix, "".join(collected))
     # Preserve a single leading space (the model is told to prefix one when the
     # continuation starts a new word) so the suggestion never glues onto the
     # prefix; only trailing/newline padding is trimmed.
-    text_out = "".join(collected).strip("\n").rstrip()
+    text_out = text_out.strip("\n").rstrip()
     if text_out[:1].isspace():
         text_out = " " + text_out.lstrip()
     yield _sse(

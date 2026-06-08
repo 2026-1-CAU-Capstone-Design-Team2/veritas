@@ -21,12 +21,12 @@ Windows에서는 우선 `LOCALAPPDATA` 환경 변수를 사용합니다. 값이 
 
 ## 실행 흐름
 
-1. 앱의 대시보드 화면이 생성될 때 `init_db()`를 호출합니다.
+1. API 프로세스 부팅 시(launcher / `db.workspace_sync`) `init_db()`가 호출됩니다. (대시보드 repository도 첫 조회 시 방어적으로 `init_db()`를 호출합니다.)
 2. DB 디렉터리가 없으면 자동 생성합니다.
 3. `veritas.db` 파일이 없으면 SQLite가 자동 생성합니다.
 4. [schema.py](./schema.py)의 `CREATE TABLE IF NOT EXISTS` 구문으로 필요한 테이블을 생성합니다.
-5. 대시보드는 [dashboard_service.py](./dashboard_service.py)의 `get_dashboard_summary()`를 호출합니다.
-6. service는 [dashboard_repository.py](./dashboard_repository.py)의 SELECT 결과를 UI에서 바로 쓰기 좋은 dict로 가공합니다.
+5. 프론트엔드 대시보드는 코어를 직접 호출하지 않고 **HTTP `GET /api/v1/dashboard/home`** 를 호출합니다. (이름 변경은 `POST /api/v1/dashboard/workspaces/{id}/rename`.)
+6. 해당 라우트는 `api/services/dashboard_service.py`의 `get_home_summary()`로, 이 함수가 [dashboard_repository.py](./dashboard_repository.py)의 SELECT 결과를 UI에서 바로 쓰기 좋은 dict로 가공합니다. (repository는 `db.activity_repository`처럼 db 계층에 남아 API 서비스가 사용합니다.)
 7. PySide6 `QTimer`가 4초마다 대시보드 데이터를 다시 로드합니다.
 
 ## SQLite 설정
@@ -116,7 +116,7 @@ created_at TEXT NOT NULL
 - 최근 작업 워크스페이스: `workspaces.last_worked_at` 최신순 5개
 - 최근 문서/피드백: `activity_logs.created_at` 최신순 5개
 
-[dashboard_service.py](./dashboard_service.py)는 피드백 완료율을 계산합니다.
+`api/services/dashboard_service.py`의 `get_home_summary()`는 피드백 완료율을 계산합니다.
 
 ```text
 feedback_rate = feedback_completed_docs / total_docs * 100
@@ -152,10 +152,10 @@ UI는 service 결과만 사용합니다.
 
 ## UI 연동
 
-대시보드 연동은 [../frontend/ui/pages/dashboard_page.py](../frontend/ui/pages/dashboard_page.py)에 있습니다.
+대시보드 연동은 [../frontend/ui/pages/dashboard_page.py](../frontend/ui/pages/dashboard_page.py)에 있습니다. 프론트엔드는 DB를 직접 import하지 않고 `AgentController`(HTTP)만 사용합니다.
 
-- `init_db()`: 화면 생성 시 DB 초기화
-- `load_dashboard_data()`: service 결과를 카드와 최근 목록에 반영
+- `load_dashboard_data()`: `AgentController.get_dashboard_home()`(HTTP) 결과를 카드와 최근 목록에 반영
+- `_rename_workspace()`: `AgentController.rename_workspace()`(HTTP)로 이름 변경
 - `refresh()`: 문서 추가, 피드백 완료, 작업 완료 같은 이벤트에서 호출할 수 있는 공개 갱신 함수
 - `QTimer`: 4초마다 자동 갱신
 
@@ -170,11 +170,11 @@ UI는 service 결과만 사용합니다.
 ```powershell
 @'
 from db.db import init_db, seed_demo_data
-from db.dashboard_service import get_dashboard_summary
+from api.services.dashboard_service import get_home_summary
 
 init_db()
 seed_demo_data()
-print(get_dashboard_summary())
+print(get_home_summary())
 '@ | python -B -
 ```
 
