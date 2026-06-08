@@ -14,6 +14,7 @@ from core.stdio_utf8 import force_utf8_stdio
 from db.db import get_app_data_dir, get_connection, init_db
 from PySide6.QtCore import (
     QByteArray,
+    QEventLoop,
     QObject,
     QPoint,
     QRectF,
@@ -22,9 +23,10 @@ from PySide6.QtCore import (
     QThread,
     Signal,
 )
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QDialog,
@@ -32,7 +34,8 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
-    QMenu,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -477,14 +480,28 @@ QProgressBar#pbar::chunk {
 }
 #installBtn:disabled { background: #A9BEFF; color: #EAF0FF; }
 
-QMenu#modelMenu {
-    background: #FFFFFF; border: 1px solid #D7DCE5; border-radius: 10px; padding: 6px;
-    menu-scrollable: 1;
+QFrame#scrollMenu {
+    background: #FFFFFF; border: 1px solid #D7DCE5; border-radius: 10px;
 }
-QMenu#modelMenu::item {
-    padding: 9px 14px; border-radius: 7px; color: #0E1726; font-size: 13px;
+QListWidget#scrollMenuList {
+    background: transparent; border: none; outline: none; font-size: 13px;
 }
-QMenu#modelMenu::item:selected { background: #EEF3FF; color: #1E40C8; }
+QListWidget#scrollMenuList::item {
+    padding: 9px 14px; border-radius: 7px; color: #0E1726;
+}
+QListWidget#scrollMenuList::item:selected { background: #EEF3FF; color: #1E40C8; }
+QListWidget#scrollMenuList::item:hover { background: #F3F6FC; }
+QListWidget#scrollMenuList QScrollBar:vertical {
+    background: transparent; width: 10px; margin: 4px 2px 4px 0;
+}
+QListWidget#scrollMenuList QScrollBar::handle:vertical {
+    background: #C7CFDA; border-radius: 5px; min-height: 28px;
+}
+QListWidget#scrollMenuList QScrollBar::handle:vertical:hover { background: #AEB8C7; }
+QListWidget#scrollMenuList QScrollBar::add-line:vertical,
+QListWidget#scrollMenuList QScrollBar::sub-line:vertical { height: 0; }
+QListWidget#scrollMenuList QScrollBar::add-page:vertical,
+QListWidget#scrollMenuList QScrollBar::sub-page:vertical { background: transparent; }
 """
 
 
@@ -529,6 +546,108 @@ class _ClickableFrame(QFrame):
             event.accept()
             return
         super().mousePressEvent(event)
+
+
+class _ScrollMenu(QFrame):
+    """A scrollable dropdown anchored *below* a field, returning the chosen row.
+
+    QMenu was the wrong tool here: it grows with its content, and once the list
+    is taller than the screen (the 42-entry model catalog is) it flips into a
+    screen-anchored scroll mode that fights every attempt to move it back under
+    the field — the "list jumps up and lags" glitch. This popup is a QListWidget
+    with a real scrollbar instead: its height is bounded to the room below the
+    anchor, so it always opens downward and scrolls internally for the rest."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent, Qt.Popup)
+        self.setObjectName("scrollMenu")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(0)
+        self._list = QListWidget(self)
+        self._list.setObjectName("scrollMenuList")
+        self._list.setFrameShape(QFrame.NoFrame)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._list.setMouseTracking(True)
+        self._list.setUniformItemSizes(True)
+        self._list.setIconSize(QSize(18, 18))
+        self._list.itemClicked.connect(self._on_chosen)
+        self._list.itemActivated.connect(self._on_chosen)
+        layout.addWidget(self._list)
+        self._check_on = self._make_check(True)
+        self._check_off = self._make_check(False)
+        self._chosen_row: int | None = None
+        self._loop: QEventLoop | None = None
+
+    @staticmethod
+    def _make_check(on: bool) -> QPixmap:
+        # A check glyph (current row) or a same-size blank, so every row's text
+        # lines up whether or not it carries the mark.
+        pixmap = QPixmap(18, 18)
+        pixmap.fill(Qt.transparent)
+        if on:
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            pen = QPen(QColor("#1E40C8"))
+            pen.setWidthF(2.0)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
+            path = QPainterPath()
+            path.moveTo(4.0, 9.5)
+            path.lineTo(7.5, 13.0)
+            path.lineTo(14.0, 5.5)
+            painter.drawPath(path)
+            painter.end()
+        return pixmap
+
+    def add_row(self, text: str, *, checked: bool = False) -> None:
+        item = QListWidgetItem(QIcon(self._check_on if checked else self._check_off), text)
+        self._list.addItem(item)
+        if checked:
+            self._list.setCurrentItem(item)
+
+    def exec_below(self, anchor: QWidget) -> int | None:
+        """Show the list anchored under ``anchor`` and block until a row is
+        clicked or the popup is dismissed; return the chosen row index or None."""
+        count = self._list.count()
+        if count == 0:
+            return None
+        row_height = self._list.sizeHintForRow(0) or 38
+        content_height = row_height * count + 12  # + 6px top/bottom frame padding
+        top_left = anchor.mapToGlobal(anchor.rect().bottomLeft())
+        screen = anchor.screen() or QApplication.primaryScreen()
+        bottom = screen.availableGeometry().bottom() if screen is not None else top_left.y() + 400
+        top = top_left.y() + 6
+        max_height = max(80, bottom - top - 6)
+        self.setFixedWidth(max(anchor.width(), 320))
+        self.setFixedHeight(min(content_height, max_height))
+        self.move(top_left.x(), top)
+        current = self._list.currentItem()
+        if current is not None:
+            self._list.scrollToItem(current)
+        self._chosen_row = None
+        self._loop = QEventLoop()
+        self.show()
+        self._list.setFocus()
+        self._loop.exec()
+        return self._chosen_row
+
+    def _on_chosen(self, item: QListWidgetItem) -> None:
+        self._chosen_row = self._list.row(item)
+        self.hide()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key_Escape:
+            self.hide()
+            return
+        super().keyPressEvent(event)
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        super().hideEvent(event)
+        if self._loop is not None and self._loop.isRunning():
+            self._loop.quit()
 
 
 class ModelSetupDialog(QDialog):
@@ -1131,9 +1250,7 @@ class ModelSetupDialog(QDialog):
         self.context_combo.blockSignals(False)
 
     def _open_workspace_menu(self) -> None:
-        menu = QMenu(self)
-        menu.setObjectName("modelMenu")
-        menu.setMinimumWidth(self._workspace_frame.width())
+        menu = _ScrollMenu(self)
         current = self.workspace_combo.currentIndex()
         for i in range(self.workspace_combo.count()):
             workspace_id = str(self.workspace_combo.itemData(i) or "")
@@ -1146,37 +1263,28 @@ class ModelSetupDialog(QDialog):
                 {},
             )
             detail = str(workspace.get("detail") or workspace_id)
-            action = menu.addAction(f"{self.workspace_combo.itemText(i)}    ·    {detail}")
-            action.setData(i)
-            action.setCheckable(True)
-            action.setChecked(i == current)
-        pos = self._workspace_frame.mapToGlobal(QPoint(0, self._workspace_frame.height() + 6))
-        chosen = menu.exec(pos)
-        if chosen is not None and chosen.data() is not None:
-            self.workspace_combo.setCurrentIndex(int(chosen.data()))
+            menu.add_row(
+                f"{self.workspace_combo.itemText(i)}    ·    {detail}",
+                checked=(i == current),
+            )
+        chosen = menu.exec_below(self._workspace_frame)
+        if chosen is not None:
+            self.workspace_combo.setCurrentIndex(chosen)
 
     def _open_model_menu(self) -> None:
-        menu = QMenu(self)
-        menu.setObjectName("modelMenu")
-        menu.setMinimumWidth(self._combo_frame.width())
-        # The LLM catalog is 42 entries — cap the height so the menu scrolls
-        # (wheel + scroll arrows) instead of running the full screen height.
-        menu.setMaximumHeight(360)
+        menu = _ScrollMenu(self)
         current = self.model_combo.currentIndex()
         for i in range(self.model_combo.count()):
             spec = get_model(str(self.model_combo.itemData(i)), kind="llm")
             tag = "설치됨" if find_model_file(spec) else "미설치"
-            action = menu.addAction(
+            menu.add_row(
                 f"{spec.name}    ·    {spec.quantization} · "
-                f"{bytes_label(spec.size_bytes)}    ·    {tag}"
+                f"{bytes_label(spec.size_bytes)}    ·    {tag}",
+                checked=(i == current),
             )
-            action.setData(i)
-            action.setCheckable(True)
-            action.setChecked(i == current)
-        pos = self._combo_frame.mapToGlobal(QPoint(0, self._combo_frame.height() + 6))
-        chosen = menu.exec(pos)
-        if chosen is not None and chosen.data() is not None:
-            self.model_combo.setCurrentIndex(int(chosen.data()))
+        chosen = menu.exec_below(self._combo_frame)
+        if chosen is not None:
+            self.model_combo.setCurrentIndex(chosen)
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
