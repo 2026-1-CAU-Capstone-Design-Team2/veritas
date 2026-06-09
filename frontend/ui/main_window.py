@@ -55,6 +55,7 @@ from .pages.write_page import WritePage
 from .sidebar import Sidebar
 from .windows.document_assist_window import DocumentAssistWindow, VeritasTitleBar, render_history_html
 from .windows.editor_window import EditorWindow
+from .windows.win_snap import WindowsSnapMixin
 
 
 def _theme_icon(kind: str, color: str, size: int = 16) -> QIcon:
@@ -179,7 +180,7 @@ class AnimatedStackedWidget(QStackedWidget):
 		self._anim = anim
 
 
-class MainWindow(QMainWindow):
+class MainWindow(WindowsSnapMixin, QMainWindow):
 	STEP_ORDER = ["research", "document", "verify", "draft", "document_assist", "write"]
 
 	def __init__(self) -> None:
@@ -193,7 +194,9 @@ class MainWindow(QMainWindow):
 		self.setMouseTracking(True)
 		self._apply_window_icon()
 		self._apply_default_geometry()
-		self.setMinimumSize(940, 620)
+		# Low enough to snap to a half-screen; the hero subtitle wraps and the
+		# sidebar auto-collapses on narrow widths so the layout floor stays under it.
+		self.setMinimumSize(660, 600)
 
 		# Edge-resize bookkeeping — a frameless window loses the native grips, so we
 		# drive resizing from the central widget's transparent margin (eventFilter).
@@ -242,12 +245,16 @@ class MainWindow(QMainWindow):
 		self._sidebar_expanded_width = 228
 		self._sidebar_collapsed_width = 72
 		self._sidebar_anim_group: QParallelAnimationGroup | None = None
+		# True only while WE auto-collapsed the sidebar (narrow window). Lets us
+		# auto-expand it again when the window widens, without overriding a manual
+		# toggle (the manual handler clears this flag).
+		self._sidebar_auto_collapsed = False
 
 		self.sidebar = Sidebar()
 		self.sidebar.setMinimumWidth(self._sidebar_expanded_width)
 		self.sidebar.setMaximumWidth(self._sidebar_expanded_width)
 		self.sidebar.navRequested.connect(self._navigate)
-		self.sidebar.toggleRequested.connect(self._toggle_sidebar)
+		self.sidebar.toggleRequested.connect(self._on_sidebar_toggle_requested)
 
 		center_panel = QFrame()
 		center_panel.setObjectName("CenterPanel")
@@ -269,6 +276,8 @@ class MainWindow(QMainWindow):
 		self.section_title.setObjectName("SectionTitle")
 		self.section_desc = QLabel("오늘 워크플로우 진행 상태를 한눈에 확인하세요.")
 		self.section_desc.setObjectName("SectionDesc")
+		# Wrap instead of forcing the hero row (and thus the window) wide.
+		self.section_desc.setWordWrap(True)
 		hero_text_col.addWidget(self.section_title)
 		hero_text_col.addWidget(self.section_desc)
 
@@ -386,6 +395,10 @@ class MainWindow(QMainWindow):
 		for title_label in self.title_bar.findChildren(QLabel):
 			title_label.setTextInteractionFlags(Qt.NoTextInteraction)
 		self._navigate("dashboard")
+
+		# Windows 10/11 Snap Layouts · Aero Snap on this frameless window (no-op
+		# elsewhere). Must run after the title bar exists — the mixin hit-tests it.
+		self._install_snap_layout()
 
 	def closeEvent(self, event) -> None:  # type: ignore[override]
 		# The editor/assist windows are now parent-less top-levels, so closing the
@@ -720,9 +733,20 @@ class MainWindow(QMainWindow):
 		self._screen_event_store.clear()
 		self._restart_screen_monitoring_for_workspace_change()
 
-	def _toggle_sidebar(self) -> None:
+	def _toggle_sidebar(self, animate: bool = True) -> None:
 		start = self.sidebar.width()
 		end = self._sidebar_collapsed_width if self.sidebar_visible else self._sidebar_expanded_width
+
+		# Width-driven auto-collapse (animate=False) snaps instantly so the layout
+		# fits the new window size with no transient clip; the manual toggle button
+		# keeps the smooth animation.
+		if not animate:
+			self.sidebar.set_compact(self.sidebar_visible)
+			self.sidebar_visible = not self.sidebar_visible
+			self.sidebar.setMinimumWidth(end)
+			self.sidebar.setMaximumWidth(end)
+			self._sidebar_anim_group = None
+			return
 
 		min_anim = QPropertyAnimation(self.sidebar, b"minimumWidth", self)
 		min_anim.setDuration(220)
@@ -744,6 +768,32 @@ class MainWindow(QMainWindow):
 		self._sidebar_anim_group = group
 		self.sidebar.set_compact(self.sidebar_visible)
 		self.sidebar_visible = not self.sidebar_visible
+
+	def _on_sidebar_toggle_requested(self) -> None:
+		# A manual click takes ownership: clear the auto-collapse flag so the
+		# width-driven logic in resizeEvent never overrides the user's choice
+		# (a manual collapse won't be auto-expanded; a manual expand stays).
+		self._sidebar_auto_collapsed = False
+		self._toggle_sidebar()
+
+	def resizeEvent(self, event) -> None:  # type: ignore[override]
+		# Auto-collapse the sidebar on narrow widths (so the window can shrink to
+		# a half-screen) and restore it when wide again — reusing the existing
+		# animated _toggle_sidebar / Sidebar.set_compact path. A 900/940 px
+		# hysteresis band prevents flapping at the threshold; sidebar_visible
+		# flips synchronously in _toggle_sidebar so each crossing fires once.
+		super().resizeEvent(event)
+		# setGeometry runs in __init__ before the sidebar exists, and a resize can
+		# arrive then — bail until the chrome is built so we never crash on open.
+		if not hasattr(self, "sidebar"):
+			return
+		width = event.size().width()
+		if self.sidebar_visible and width < 900:
+			self._sidebar_auto_collapsed = True
+			self._toggle_sidebar(animate=False)
+		elif (not self.sidebar_visible) and self._sidebar_auto_collapsed and width >= 940:
+			self._sidebar_auto_collapsed = False
+			self._toggle_sidebar(animate=False)
 
 	def _enable_text_selection(self, root: QWidget) -> None:
 		for label in root.findChildren(QLabel):

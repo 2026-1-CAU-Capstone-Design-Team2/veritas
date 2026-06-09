@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from PySide6.QtCore import (
+	QEvent,
 	QPoint,
 	QPointF,
 	QRectF,
@@ -57,6 +58,7 @@ from ...controllers import (
 )
 from ..markdown_view import render_markdown_html
 from ...theme import build_assist_window_qss, theme
+from .win_snap import WindowsSnapMixin
 
 
 def _rate_chip_qss(palette: dict[str, str], kind: str, *, chosen: bool = False) -> str:
@@ -1821,7 +1823,7 @@ class AssistViewToggle(QFrame):
 			self.suggestions_button.setText(self._SUGGESTIONS_LABEL)
 
 
-class DocumentAssistWindow(QWidget):
+class DocumentAssistWindow(WindowsSnapMixin, QWidget):
 	messageSubmitted = Signal(str)
 	visibilityChanged = Signal(bool)
 
@@ -1856,6 +1858,10 @@ class DocumentAssistWindow(QWidget):
 		self._screen_store.cleared.connect(self._hydrate_screen_suggestions)
 		self.suggestion_list.feedbackSubmitted.connect(self._on_screen_feedback)
 		self._hydrate_screen_suggestions()
+
+		# Windows 10/11 Snap Layouts · Aero Snap on this frameless window (no-op
+		# elsewhere). Runs last so the custom title bar is hit-testable.
+		self._install_snap_layout()
 
 	def _install_chat_zoom_shortcuts(self) -> None:
 		"""Ctrl +/- (and Ctrl+0) resize the chat answer text.
@@ -1896,7 +1902,7 @@ class DocumentAssistWindow(QWidget):
 
 		self.title_bar = VeritasTitleBar(self, subtitle=True, status=True, on_close=self.hide)
 
-		content = QFrame()
+		content = self.content = QFrame()
 		content.setObjectName("AssistContent")
 		content_layout = QVBoxLayout(content)
 		content_layout.setContentsMargins(12, 10, 12, 8)
@@ -2094,6 +2100,21 @@ class DocumentAssistWindow(QWidget):
 			event.accept()
 			return
 		super().wheelEvent(event)
+
+	def changeEvent(self, event) -> None:  # type: ignore[override]
+		# Native maximise (snap-to-top, the maximise button, Win+Up) on a
+		# frameless window: drop the floating shadow margin + rounded corners
+		# while full-screen and keep the maximise/restore glyph in sync.
+		if event.type() == QEvent.WindowStateChange and hasattr(self, "title_bar"):
+			maximized = self.isMaximized()
+			margin = 0 if maximized else 10
+			self.layout().setContentsMargins(margin, margin, margin, margin)
+			for widget in (self.panel, self.content, self.title_bar):
+				widget.setProperty("maximized", maximized)
+				widget.style().unpolish(widget)
+				widget.style().polish(widget)
+			self.title_bar.maximize_button.set_role("restore" if maximized else "max")
+		super().changeEvent(event)
 
 	def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
 		if event.button() == Qt.LeftButton:

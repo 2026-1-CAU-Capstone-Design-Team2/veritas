@@ -43,6 +43,12 @@ _TITLEBAR_TMPL = """
 		border-top-right-radius: 16px;
 		border-bottom: 1px solid %(titlebar.border)s;
 	}
+	/* Maximised (native snap / maximise button): the panel fills the screen, so
+	   square off the title-bar corners to match. */
+	QFrame#VeritasTitleBar[maximized="true"] {
+		border-top-left-radius: 0px;
+		border-top-right-radius: 0px;
+	}
 	QLabel#VeritasTitleBrand { color: %(titlebar.brand)s; font-size: 13px; font-weight: 850; letter-spacing: 1px; }
 	QLabel#VeritasTitleSub { color: %(titlebar.sub)s; font-size: 11px; font-weight: 650; }
 	QLabel#VeritasTitleSep { color: %(titlebar.sep)s; font-size: 12px; }
@@ -1160,6 +1166,7 @@ _EDITOR_TMPL = """
 		color: %(editor.text)s;
 	}
 	QFrame#EditorPanel { background-color: %(editor.surface)s; border: 1px solid %(editor.border)s; border-radius: 12px; }
+	QFrame#EditorPanel[maximized="true"] { border-radius: 0px; }
 	QFrame#EditorTitleBar {
 		background-color: %(editor.bar)s; border-top-left-radius: 12px; border-top-right-radius: 12px;
 		border-bottom: 1px solid %(editor.border.soft)s;
@@ -1175,13 +1182,13 @@ _EDITOR_TMPL = """
 	QFrame#EditorMenuRow { background-color: %(editor.surface)s; border-bottom: 1px solid %(editor.border.softer)s; }
 	QToolButton#EditorMenuButton {
 		background-color: transparent; color: %(editor.text.tertiary)s; border: none; border-radius: 6px;
-		padding: 5px 9px; font-weight: 600;
+		padding: 5px 5px; font-weight: 600;
 	}
 	QToolButton#EditorMenuButton:hover { background-color: %(editor.hover)s; }
 	QToolButton#EditorMenuButton::menu-indicator { image: none; width: 0; }
 	QToolButton#EditorExportButton {
 		background-color: %(editor.accent)s; color: %(text.on_accent)s; border: none; border-radius: 8px;
-		padding: 6px 14px; font-weight: 700;
+		padding: 6px 10px; font-weight: 700;
 	}
 	QToolButton#EditorExportButton:hover { background-color: %(editor.accent.hover)s; }
 	QToolButton#EditorExportButton::menu-indicator { image: none; width: 0; }
@@ -1304,6 +1311,11 @@ _ASSIST_TMPL = """
 		background-color: %(surface.muted)s;
 		border: 1px solid %(border.gray)s;
 		border-radius: 16px;
+	}
+	QFrame#AssistPanel[maximized="true"] { border-radius: 0px; }
+	QFrame#AssistContent[maximized="true"] {
+		border-bottom-left-radius: 0px;
+		border-bottom-right-radius: 0px;
 	}
 	QFrame#AssistTitleBar {
 		background-color: %(surface)s;

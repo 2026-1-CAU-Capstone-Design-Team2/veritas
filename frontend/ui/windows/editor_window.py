@@ -20,7 +20,7 @@ import re
 import time
 from collections import deque
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -81,6 +81,7 @@ from .document_assist_window import (
     VeritasTitleBar,
     render_history_html,
 )
+from .win_snap import WindowsSnapMixin
 
 
 # Window-control glyphs. The previous plain-text symbols (－ ▢ ×) render as tofu
@@ -924,7 +925,19 @@ class AssistPanel(QFrame):
         self.history_list.insertItem(0, label)
 
 
-class EditorWindow(QWidget):
+class _ShrinkableRow(QFrame):
+    """A single-line button row whose reported *minimum* width is 0 (its natural
+    height is kept), so a long row of buttons never pins a wide minimum window
+    width. Used for the editor's menu + tool rows so the window can shrink to a
+    half-screen; the tool row additionally folds its extras into a ⋯ overflow
+    menu (EditorWindow._relayout_toolbar) so nothing is clipped at narrow widths."""
+
+    def minimumSizeHint(self):  # type: ignore[override]
+        hint = super().minimumSizeHint()
+        return QSize(0, hint.height())
+
+
+class EditorWindow(WindowsSnapMixin, QWidget):
     EXPORT_FORMATS = [
         ("Microsoft Word (.docx)", "docx", "Word 문서 (*.docx)", ".docx"),
         ("PDF (.pdf)", "pdf", "PDF 문서 (*.pdf)", ".pdf"),
@@ -952,7 +965,10 @@ class EditorWindow(QWidget):
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.resize(1280, 820)
-        self.setMinimumSize(900, 560)
+        # Low enough to snap to a half-screen; the tool row folds extras into a ⋯
+        # overflow menu and both button rows report no min width (see
+        # _ShrinkableRow / _relayout_toolbar), so the body is the only floor.
+        self.setMinimumSize(700, 500)
         self.setMouseTracking(True)
 
         self._workspace_id = current_workspace_id()
@@ -1001,6 +1017,8 @@ class EditorWindow(QWidget):
         self._resize_geometry = None
 
         self._build_ui()
+        # Watch the toolbar's resize so its overflow groups re-fold to fit width.
+        self.toolbar.installEventFilter(self)
         self._apply_stylesheet()
         theme.themeChanged.connect(self._on_theme_changed)
         self._wire_timers()
@@ -1011,6 +1029,10 @@ class EditorWindow(QWidget):
         self._sync_autocomplete_state()
 
         self._connect_chat_bus()
+
+        # Windows 10/11 Snap Layouts · Aero Snap on this frameless window (no-op
+        # elsewhere). Runs last so the custom title bar is hit-testable.
+        self._install_snap_layout()
 
     # ------------------------------------------------------------------ build
 
@@ -1051,11 +1073,11 @@ class EditorWindow(QWidget):
         return button, menu
 
     def _build_menu_row(self) -> QWidget:
-        row = QFrame()
+        row = _ShrinkableRow()
         row.setObjectName("EditorMenuRow")
         layout = QHBoxLayout(row)
-        layout.setContentsMargins(8, 3, 10, 3)
-        layout.setSpacing(2)
+        layout.setContentsMargins(4, 3, 4, 3)
+        layout.setSpacing(1)
 
         file_btn, file_menu = self._menu_button("파일")
         file_menu.addAction("새 문서", self.new_document)
@@ -1140,33 +1162,40 @@ class EditorWindow(QWidget):
         return row
 
     def _build_toolbar(self) -> QWidget:
-        row = QFrame()
+        row = _ShrinkableRow()
         row.setObjectName("EditorToolbar")
+        self.toolbar = row
         layout = QHBoxLayout(row)
-        layout.setContentsMargins(10, 5, 10, 5)
-        layout.setSpacing(4)
+        # Tightened from (10,5,10,5)/spacing 4 — a small width saving with no
+        # behaviour change.
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(3)
+        self._toolbar_layout = layout
 
         # Painter-drawn toolbar icons carry a baked-in colour, so they are tracked
         # and repainted in the new ink colour whenever the theme toggles.
         self._tool_icon_buttons: list[tuple[QPushButton, str]] = []
 
-        def add_sep() -> None:
+        def make_sep() -> QFrame:
             sep = QFrame()
             sep.setObjectName("EditorToolSep")
             sep.setFixedWidth(1)
             sep.setFixedHeight(18)
-            layout.addWidget(sep)
+            return sep
 
-        def add_text_button(label: str, tooltip: str, kind: str) -> None:
+        def add_sep() -> None:
+            layout.addWidget(make_sep())
+
+        def make_text_button(label: str, tooltip: str, kind: str) -> QPushButton:
             button = QPushButton(label)
             button.setObjectName("EditorToolButton")
             button.setCursor(Qt.PointingHandCursor)
             button.setToolTip(tooltip)
             button.setFixedSize(30, 28)
             button.clicked.connect(lambda checked=False, k=kind: self.insert_markdown(k))
-            layout.addWidget(button)
+            return button
 
-        def add_icon_button(icon_kind: str, tooltip: str, handler) -> None:
+        def make_icon_button(icon_kind: str, tooltip: str, handler) -> QPushButton:
             button = QPushButton()
             button.setObjectName("EditorIconButton")
             button.setCursor(Qt.PointingHandCursor)
@@ -1176,7 +1205,7 @@ class EditorWindow(QWidget):
             button.setIconSize(QSize(18, 18))
             button.clicked.connect(lambda checked=False, h=handler: h())
             self._tool_icon_buttons.append((button, icon_kind))
-            layout.addWidget(button)
+            return button
 
         # Left-panel (문서 개요) show/hide toggle, mirroring its position.
         self.outline_toggle_btn = QPushButton("◧ 개요")
@@ -1191,8 +1220,8 @@ class EditorWindow(QWidget):
         add_sep()
 
         # 실행 취소 / 다시 실행 (self.editor is built later → call lazily)
-        add_icon_button("undo", "실행 취소 (Ctrl+Z)", lambda: self.editor.undo())
-        add_icon_button("redo", "다시 실행 (Ctrl+Y)", lambda: self.editor.redo())
+        layout.addWidget(make_icon_button("undo", "실행 취소 (Ctrl+Z)", lambda: self.editor.undo()))
+        layout.addWidget(make_icon_button("redo", "다시 실행 (Ctrl+Y)", lambda: self.editor.redo()))
         add_sep()
 
         # 단락 스타일 드롭다운
@@ -1206,25 +1235,56 @@ class EditorWindow(QWidget):
             style_menu.addAction(label, lambda checked=False, k=kind: self.insert_markdown(k))
         style_button.setMenu(style_menu)
         layout.addWidget(style_button)
-        add_sep()
 
-        for label, tip, kind in (("H1", "제목 1", "h1"), ("H2", "제목 2", "h2"), ("H3", "제목 3", "h3")):
-            add_text_button(label, tip, kind)
-        add_sep()
-        for label, tip, kind in (("B", "굵게", "bold"), ("I", "기울임", "italic"), ("S", "취소선", "strike")):
-            add_text_button(label, tip, kind)
-        add_sep()
-        add_icon_button("quote", "인용", lambda: self.insert_markdown("quote"))
-        add_icon_button("ul", "글머리 목록", lambda: self.insert_markdown("ul"))
-        add_icon_button("ol", "번호 목록", lambda: self.insert_markdown("ol"))
-        add_icon_button("task", "체크리스트", lambda: self.insert_markdown("task"))
-        add_sep()
-        add_icon_button("link", "링크", lambda: self.insert_markdown("link"))
-        add_icon_button("image", "이미지", lambda: self.insert_markdown("image"))
-        add_icon_button("table", "표", lambda: self.insert_markdown("table"))
-        add_icon_button("code", "인라인 코드", lambda: self.insert_markdown("code"))
-        add_icon_button("hr", "구분선", lambda: self.insert_markdown("hr"))
-        add_icon_button("footnote", "각주", lambda: self.insert_markdown("footnote"))
+        # ----- collapsible formatting/insert groups -----
+        # When the window is too narrow these fold into the ⋯ overflow menu
+        # (instead of pinning a wide minimum window width). Each group keeps its
+        # leading separator + buttons + the equivalent menu actions, so nothing
+        # is lost — just relocated. See _relayout_toolbar.
+        self._toolbar_groups: list[dict] = []
+
+        def add_group(specs: list[tuple[str, str, str]]) -> None:
+            # specs: (label_or_iconkind, tooltip, markdown_kind, is_icon)
+            sep = make_sep()
+            layout.addWidget(sep)
+            group = {"widgets": [sep], "actions": []}
+            for icon_or_label, tooltip, kind, is_icon in specs:
+                if is_icon:
+                    btn = make_icon_button(icon_or_label, tooltip, lambda k=kind: self.insert_markdown(k))
+                else:
+                    btn = make_text_button(icon_or_label, tooltip, kind)
+                layout.addWidget(btn)
+                group["widgets"].append(btn)
+                group["actions"].append((tooltip, kind))
+            self._toolbar_groups.append(group)
+
+        add_group([
+            ("H1", "제목 1", "h1", False), ("H2", "제목 2", "h2", False), ("H3", "제목 3", "h3", False),
+        ])
+        add_group([
+            ("B", "굵게", "bold", False), ("I", "기울임", "italic", False), ("S", "취소선", "strike", False),
+        ])
+        add_group([
+            ("quote", "인용", "quote", True), ("ul", "글머리 목록", "ul", True),
+            ("ol", "번호 목록", "ol", True), ("task", "체크리스트", "task", True),
+        ])
+        add_group([
+            ("link", "링크", "link", True), ("image", "이미지", "image", True),
+            ("table", "표", "table", True), ("code", "인라인 코드", "code", True),
+            ("hr", "구분선", "hr", True), ("footnote", "각주", "footnote", True),
+        ])
+
+        # ⋯ overflow button — holds whichever groups don't fit. Hidden until needed.
+        self.toolbar_overflow_btn = QToolButton()
+        self.toolbar_overflow_btn.setText("⋯")
+        self.toolbar_overflow_btn.setObjectName("EditorMenuButton")
+        self.toolbar_overflow_btn.setToolTip("더보기")
+        self.toolbar_overflow_btn.setCursor(Qt.PointingHandCursor)
+        self.toolbar_overflow_btn.setPopupMode(QToolButton.InstantPopup)
+        self.toolbar_overflow_menu = QMenu(self.toolbar_overflow_btn)
+        self.toolbar_overflow_btn.setMenu(self.toolbar_overflow_menu)
+        self.toolbar_overflow_btn.hide()
+        layout.addWidget(self.toolbar_overflow_btn)
 
         layout.addStretch(1)
 
@@ -1253,7 +1313,72 @@ class EditorWindow(QWidget):
         self.assist_toggle_btn.setFixedHeight(28)
         self.assist_toggle_btn.clicked.connect(lambda checked: self._toggle_assist(checked))
         layout.addWidget(self.assist_toggle_btn)
+
+        # Overflow bookkeeping (computed lazily once the row is polished/shown).
+        self._toolbar_metrics_ready = False
+        self._toolbar_shown_groups = -1
         return row
+
+    # --------------------------------------------------- toolbar overflow
+
+    def _ensure_toolbar_metrics(self) -> None:
+        """Measure each collapsible group's pixel width once, so _relayout_toolbar
+        is pure arithmetic (no per-resize relayout — the cause of the prior lag)."""
+        if self._toolbar_metrics_ready:
+            return
+        self.toolbar.ensurePolished()
+        spacing = self._toolbar_layout.spacing()
+        self._toolbar_group_w = [
+            sum(w.sizeHint().width() + spacing for w in g["widgets"])
+            for g in self._toolbar_groups
+        ]
+        full = self.toolbar.sizeHint().width()  # everything except the hidden ⋯
+        self._toolbar_base_w = full - sum(self._toolbar_group_w)
+        self._toolbar_overflow_w = self.toolbar_overflow_btn.sizeHint().width() + spacing
+        self._toolbar_metrics_ready = True
+
+    def _relayout_toolbar(self) -> None:
+        """Fold/unfold the collapsible groups so the toolbar fits the current
+        width; overflowed groups move into the ⋯ menu. Cheap: only touches the
+        layout when the visible-group count actually changes."""
+        if not getattr(self, "_toolbar_groups", None):
+            return
+        self._ensure_toolbar_metrics()
+        avail = self.toolbar.width()
+        if avail <= 0:
+            return
+
+        groups = self._toolbar_groups
+        if self._toolbar_base_w + sum(self._toolbar_group_w) <= avail:
+            shown = len(groups)  # everything fits, no overflow
+        else:
+            budget = avail - self._toolbar_base_w - self._toolbar_overflow_w
+            shown = 0
+            used = 0
+            for gw in self._toolbar_group_w:
+                if used + gw <= budget:
+                    used += gw
+                    shown += 1
+                else:
+                    break
+
+        if shown == self._toolbar_shown_groups:
+            return  # no change — skip the relayout/menu rebuild entirely
+        self._toolbar_shown_groups = shown
+
+        self.toolbar_overflow_menu.clear()
+        for i, group in enumerate(groups):
+            visible = i < shown
+            for widget in group["widgets"]:
+                widget.setVisible(visible)
+            if not visible:
+                if self.toolbar_overflow_menu.actions():
+                    self.toolbar_overflow_menu.addSeparator()
+                for label, kind in group["actions"]:
+                    self.toolbar_overflow_menu.addAction(
+                        label, lambda checked=False, k=kind: self.insert_markdown(k)
+                    )
+        self.toolbar_overflow_btn.setVisible(shown < len(groups))
 
     def _build_body(self) -> QWidget:
         self.main_split = QSplitter(Qt.Horizontal)
@@ -2158,6 +2283,28 @@ class EditorWindow(QWidget):
         if self._dirty and self._doc_id is not None:
             self._save(silent=True)
         super().closeEvent(event)
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        # A frameless window can now maximise natively (snap-to-top, the maximise
+        # button, Win+Up): drop the floating shadow margin + rounded corners while
+        # full-screen and keep the maximise/restore glyph in sync.
+        if event.type() == QEvent.WindowStateChange and hasattr(self, "title_bar"):
+            maximized = self.isMaximized()
+            margin = 0 if maximized else 8
+            self.layout().setContentsMargins(margin, margin, margin, margin)
+            self.panel.setProperty("maximized", maximized)
+            self.panel.style().unpolish(self.panel)
+            self.panel.style().polish(self.panel)
+            self.title_bar.maximize_button.set_role("restore" if maximized else "max")
+        super().changeEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
+        # The toolbar's OWN resize is the reliable trigger for re-folding its
+        # overflow groups: toolbar.width() is current here, but stale if read
+        # from the window's resizeEvent (the layout hasn't propagated yet).
+        if obj is getattr(self, "toolbar", None) and event.type() == QEvent.Resize:
+            self._relayout_toolbar()
+        return super().eventFilter(obj, event)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton and not self.isMaximized():
