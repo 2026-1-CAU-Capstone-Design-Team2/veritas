@@ -16,6 +16,7 @@ to the main app with Qt signals for data; the host owns the instance and calls
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from collections import deque
@@ -1382,6 +1383,41 @@ class EditorWindow(WindowsSnapMixin, QWidget):
 
     # ----------------------------------------------------------- public open
 
+    def _present(self) -> None:
+        """Bring the window up and focus it — restoring it first if it was
+        minimised. A plain ``show()`` on a minimised window leaves it minimised
+        (it stays in the taskbar), which looked like the editor "sometimes not
+        opening" whenever it had last been minimised via the − button rather than
+        closed. Clearing only the minimised bit preserves a maximised state."""
+        if self.isMinimized():
+            self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
+        self._clamp_into_screen()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _clamp_into_screen(self) -> None:
+        """Re-centre the window if its frame is fully off every connected screen.
+
+        The editor is a session-long singleton whose geometry is never reset
+        between opens, so a position left on a monitor that was later
+        disconnected/rearranged would show the window where it can't be seen —
+        another "didn't open". Only acts when fully off-screen (no-op normally)."""
+        if self.isMaximized() or self.isFullScreen():
+            return
+        frame = self.frameGeometry()
+        screens = QApplication.screens()
+        if any(s.geometry().intersects(frame) for s in screens):
+            return
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        self.move(
+            avail.x() + max(0, (avail.width() - self.width()) // 2),
+            avail.y() + max(0, (avail.height() - self.height()) // 2),
+        )
+
     def open_document(
         self,
         workspace_id: str | None = None,
@@ -1390,42 +1426,46 @@ class EditorWindow(WindowsSnapMixin, QWidget):
         seed_markdown: str | None = None,
     ) -> None:
         self._workspace_id = workspace_id or current_workspace_id()
-        self._invalidate_suggestion()
-        self.editor.clear_ghost()
         self._load_token += 1
         token = self._load_token
 
-        # 초안 페이지의 "에디터로 보내기" — 백엔드 호출 없이 전달받은 마크다운으로 바로 시드.
-        if seed_markdown is not None:
-            title = self._title_from_markdown(seed_markdown)
-            self._apply_loaded_document({"content": seed_markdown, "title": title, "source": "draft"})
+        # Show the window FIRST. It is an eagerly-created singleton that is always
+        # ready to display, so presenting before the (throwable) populate steps
+        # guarantees it appears — a raise in rendering/hydration used to abort the
+        # whole method before show(), silently leaving the editor un-opened.
+        self._present()
+
+        try:
+            self._invalidate_suggestion()
+            self.editor.clear_ghost()
+
+            # 초안 페이지의 "에디터로 보내기" — 백엔드 호출 없이 전달받은 마크다운으로 바로 시드.
+            if seed_markdown is not None:
+                title = self._title_from_markdown(seed_markdown)
+                self._apply_loaded_document({"content": seed_markdown, "title": title, "source": "draft"})
+                self._refresh_sources()
+                self._refresh_chat_history()
+                return
+
+            params = {"workspaceId": self._workspace_id, "source": source, "docId": doc_id}
+
+            def _load() -> dict:
+                return api_client.get("/api/v1/editor/document", params)
+
+            def _ok(data: object) -> None:
+                if token == self._load_token:
+                    self._apply_loaded_document(data if isinstance(data, dict) else {})
+
+            def _fail(message: str) -> None:
+                if token == self._load_token:
+                    QMessageBox.warning(self, "불러오기 실패", f"문서를 불러오지 못했습니다.\n{message}")
+
+            self.status_save.setText("● 불러오는 중…")
+            get_job_manager().run_detached(_load, on_success=_ok, on_error=_fail)
             self._refresh_sources()
             self._refresh_chat_history()
-            self.show()
-            self.raise_()
-            self.activateWindow()
-            return
-
-        params = {"workspaceId": self._workspace_id, "source": source, "docId": doc_id}
-
-        def _load() -> dict:
-            return api_client.get("/api/v1/editor/document", params)
-
-        def _ok(data: object) -> None:
-            if token == self._load_token:
-                self._apply_loaded_document(data if isinstance(data, dict) else {})
-
-        def _fail(message: str) -> None:
-            if token == self._load_token:
-                QMessageBox.warning(self, "불러오기 실패", f"문서를 불러오지 못했습니다.\n{message}")
-
-        self.status_save.setText("● 불러오는 중…")
-        get_job_manager().run_detached(_load, on_success=_ok, on_error=_fail)
-        self._refresh_sources()
-        self._refresh_chat_history()
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        except Exception:
+            logging.getLogger(__name__).exception("editor open_document populate failed")
 
     def _apply_loaded_document(self, data: dict) -> None:
         self._doc_id = str(data.get("docId") or "") or None

@@ -55,7 +55,7 @@ from .pages.write_page import WritePage
 from .sidebar import Sidebar
 from .windows.document_assist_window import DocumentAssistWindow, VeritasTitleBar, render_history_html
 from .windows.editor_window import EditorWindow
-from .windows.win_snap import WindowsSnapMixin
+from .windows.win_snap import WindowsSnapMixin, set_window_topmost
 
 
 def _theme_icon(kind: str, color: str, size: int = 16) -> QIcon:
@@ -501,9 +501,26 @@ class MainWindow(WindowsSnapMixin, QMainWindow):
 		self.setGeometry(x, y, width, height)
 
 	def show_document_assist_window(self) -> None:
-		self.document_assist_window.show()
-		self.document_assist_window.raise_()
-		self.document_assist_window.activateWindow()
+		win = self.document_assist_window
+		# Restore first if minimised — a plain show() leaves a minimised window
+		# minimised (it would stay in the taskbar instead of coming up).
+		if win.isMinimized():
+			win.setWindowState(win.windowState() & ~Qt.WindowMinimized)
+		win.show()
+		win.raise_()
+		win.activateWindow()
+		# Re-assert always-on-top (it may have yielded the band when the editor
+		# was last opened — see _yield_assist_topmost).
+		set_window_topmost(int(win.winId()), True)
+
+	def _yield_assist_topmost(self) -> None:
+		"""Let the always-on-top assist window drop out of the topmost z-band so a
+		freshly-opened editor (a normal window) can actually come to the front
+		instead of being rendered underneath it. The assist re-asserts topmost the
+		next time it is shown/toggled (show_document_assist_window)."""
+		win = self.document_assist_window
+		if win.isVisible():
+			set_window_topmost(int(win.winId()), False)
 
 	def toggle_document_assist_window(self) -> None:
 		if self.document_assist_window.isVisible():
@@ -513,14 +530,20 @@ class MainWindow(WindowsSnapMixin, QMainWindow):
 
 	def open_editor_new(self) -> None:
 		"""Open the editor on a fresh blank document for the current workspace."""
+		# Yield the assist's topmost band BEFORE presenting the editor, so the
+		# editor's raise() lands it above the (now non-topmost) assist. Doing it
+		# after would push the just-demoted assist back to the front.
+		self._yield_assist_topmost()
 		self.editor_window.open_document(current_workspace_id(), source="new")
 
 	def _open_editor_from_research(self, workspace_id: str) -> None:
 		"""Open the editor seeded from a workspace's final.md ("이 보고서로 글쓰기")."""
+		self._yield_assist_topmost()
 		self.editor_window.open_document(workspace_id or current_workspace_id(), source="final")
 
 	def _open_editor_from_draft(self, workspace_id: str, markdown: str) -> None:
 		"""Open the editor seeded with a generated draft ("에디터로 보내기")."""
+		self._yield_assist_topmost()
 		self.editor_window.open_document(
 			workspace_id or current_workspace_id(), source="draft", seed_markdown=markdown
 		)
