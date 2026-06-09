@@ -65,6 +65,9 @@ SWP_NOACTIVATE = 0x0010
 SWP_NOOWNERZORDER = 0x0200
 SWP_FRAMECHANGED = 0x0020
 
+HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
+
 SM_CXSIZEFRAME = 32
 SM_CYSIZEFRAME = 33
 SM_CXPADDEDBORDER = 92
@@ -179,6 +182,23 @@ if IS_WINDOWS:
 			return ABE_LEFT if rc.left <= 0 else ABE_RIGHT
 		except Exception:
 			return None
+
+
+def set_window_topmost(hwnd: int, enable: bool) -> None:
+	"""Toggle a window's always-on-top (WS_EX_TOPMOST) z-band via Win32, without
+	recreating the window the way Qt's ``setWindowFlag(WindowStaysOnTopHint)``
+	would. Used so the always-on-top assist window can briefly *yield* the topmost
+	band while the editor is brought up (a normal window can't otherwise rise above
+	a topmost sibling). No-op off Windows / on a falsy handle."""
+	if not IS_WINDOWS or not hwnd:
+		return
+	try:
+		_user32.SetWindowPos(
+			hwnd, HWND_TOPMOST if enable else HWND_NOTOPMOST,
+			0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+		)
+	except Exception:
+		pass
 
 
 class WindowsSnapMixin:
