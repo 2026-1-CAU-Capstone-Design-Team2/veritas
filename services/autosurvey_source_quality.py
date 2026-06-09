@@ -21,6 +21,24 @@ Hard rules (mirrors the cleanup module's generalizability rule):
   (``ai``/``video`` or ``bath``/``bomb``) is pushed down even when it shares the
   generic market words (``market``/``시장``/``규모``) every report repeats.
 
+Two further gates layer on top of the lexical score, both structural (not
+keyword lists):
+
+* **Entity anchor (post-fetch).** A flat token-overlap count cannot tell
+  *삼성전자 실적* from *쿠팡 실적*: both share the generic financial vocabulary
+  (``4분기``/``실적``/``매출``/``영업이익``) and clear the hit threshold, so a
+  wrong-company document slips in. When the run carries *anchor terms* — the
+  named subjects ``term_grounding`` extracted from the user's own request, e.g.
+  ``삼성전자`` — a fetched body must mention at least one of them to be kept.
+  Anchors are per-request and LLM-derived, never a hard-coded vocabulary; an
+  empty anchor set (a purely conceptual request) disables the gate entirely, so
+  conceptual surveys behave exactly as before.
+* **Homepage root (pre-fetch).** A bare site root (``https://site.com/`` — empty
+  or ``/`` path, no query) is navigation chrome, not an evidence document, yet it
+  often echoes the topic in its headlines and would pass every lexical check.
+  Such roots are dropped before fetch on URL *shape* alone. User-pinned
+  reference sites are exempt (the user deliberately pinned that root).
+
 The filter never starves collection: when the topic signal is too thin to judge
 (a degenerate/empty plan) or every candidate scores below threshold, the ranking
 is still applied but nothing is dropped — ``maxDocs`` and the downstream cleanup
@@ -30,7 +48,8 @@ gate remain the real backstops.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 
@@ -62,14 +81,25 @@ _SNIPPET_KEYS = ("snippet", "body", "summary", "description", "content")
 
 @dataclass(frozen=True)
 class TopicTerms:
-    """The on-topic vocabulary, derived from request + plan + query."""
+    """The on-topic vocabulary, derived from request + plan + query.
+
+    ``anchors`` is a separate, *required-presence* set: the named subjects the
+    research must stay about (``term_grounding``'s ``candidate_entities``). Unlike
+    ``content``/``numbers`` — which are counted for an overlap *score* — an anchor
+    is a hard precondition for keeping a fetched body when the set is non-empty.
+    """
 
     content: frozenset[str]
     numbers: frozenset[str]
+    anchors: frozenset[str] = field(default_factory=frozenset)
 
     @property
     def is_thin(self) -> bool:
         return len(self.content) < _MIN_TOPIC_TOKENS
+
+    @property
+    def has_anchors(self) -> bool:
+        return bool(self.anchors)
 
 
 @dataclass(frozen=True)
@@ -98,6 +128,40 @@ def _url_text(url: str) -> str:
     """Path/host words carry topic signal (``/plant-based-meat-market``)."""
     parsed = urlparse(str(url or ""))
     return f"{parsed.netloc} {parsed.path}"
+
+
+def _normalize_anchor_terms(anchor_terms: Iterable[str]) -> frozenset[str]:
+    """Lower-case, de-noise the anchor phrases used for the entity gate.
+
+    Drops empties, single characters, and bare numbers — a year such as
+    ``2024`` is shared by every report and would defeat the gate. Multi-word
+    phrases are kept whole; matching (see :func:`_anchor_present`) handles them.
+    """
+    out: set[str] = set()
+    for term in anchor_terms or ():
+        text = " ".join(str(term or "").lower().split())
+        if len(text) < 2:
+            continue
+        if _NUMBER_RE.fullmatch(text):
+            continue
+        out.add(text)
+    return frozenset(out)
+
+
+def _anchor_present(text_lower: str, anchor: str) -> bool:
+    """Whether *anchor* occurs in already-lower-cased *text_lower*.
+
+    Korean and longer anchors use substring containment, which is robust to the
+    agglutinative particles Korean attaches to a name (``삼성전자의``/``삼성전자가``
+    all contain ``삼성전자``) — exact token equality would miss those. Short
+    Latin/numeric anchors fall back to a word-boundary match so a 2-3 char token
+    like ``ai`` does not spuriously hit inside ``rain``/``training``.
+    """
+    if not anchor:
+        return False
+    if _HANGUL_RE.search(anchor) or len(anchor) >= 4:
+        return anchor in text_lower
+    return re.search(rf"(?<![a-z0-9]){re.escape(anchor)}(?![a-z0-9])", text_lower) is not None
 
 
 def candidate_domain(url: str) -> str:
@@ -130,12 +194,18 @@ def build_topic_terms(
     user_request: str = "",
     plan: dict | None = None,
     query: str = "",
+    anchor_terms: Iterable[str] = (),
 ) -> TopicTerms:
     """Union the on-topic vocabulary from the request, plan, and live query.
 
     Only the human-meaningful plan fields are used (topic / goal / must_cover /
     keywords) — never ``search_queries`` (those are tactics, not topic) and never
     a hard-coded list.
+
+    ``anchor_terms`` are the named subjects the research must remain about (the
+    grounding's ``candidate_entities``). They are carried separately as a
+    *required-presence* set and never folded into the overlap score; an empty
+    set leaves behaviour identical to before.
     """
     plan = plan if isinstance(plan, dict) else {}
     parts: list[str] = [str(user_request or ""), str(query or "")]
@@ -146,7 +216,11 @@ def build_topic_terms(
         if isinstance(value, list):
             parts.extend(str(x) for x in value)
     content, numbers = _tokenize(" ".join(parts))
-    return TopicTerms(content=frozenset(content), numbers=frozenset(numbers))
+    return TopicTerms(
+        content=frozenset(content),
+        numbers=frozenset(numbers),
+        anchors=_normalize_anchor_terms(anchor_terms),
+    )
 
 
 def score_candidate(item: dict, topic: TopicTerms) -> float:
@@ -173,6 +247,19 @@ def topic_hit_count(text: str, topic: TopicTerms) -> int:
     return len(content & topic.content) + len(numbers & topic.numbers)
 
 
+def body_has_anchor(text: str, topic: TopicTerms) -> bool:
+    """Whether *text* mentions at least one of the topic's named-subject anchors.
+
+    Vacuously ``True`` when the topic carries no anchors (conceptual request), so
+    the entity gate is opt-in and never narrows a survey that has no specific
+    named subject to anchor on.
+    """
+    if not topic.anchors:
+        return True
+    text_lower = str(text or "").lower()
+    return any(_anchor_present(text_lower, anchor) for anchor in topic.anchors)
+
+
 def body_is_on_topic(
     text: str, topic: TopicTerms, *, min_hits: int = _MIN_BODY_TOPIC_HITS
 ) -> bool:
@@ -182,10 +269,32 @@ def body_is_on_topic(
     terms with the request/plan is off-topic or empty and should be rejected
     rather than consume a maxDocs slot. Returns ``True`` (never reject) when the
     topic signal is too thin to judge.
+
+    When the topic carries named-subject anchors, the body must additionally
+    mention at least one of them — this is what stops a *쿠팡 실적* page from
+    being kept in a *삼성전자 실적* survey purely on shared financial vocabulary.
     """
     if topic.is_thin:
         return True
+    if not body_has_anchor(text, topic):
+        return False
     return topic_hit_count(text, topic) >= min_hits
+
+
+def is_homepage_root(url: str) -> bool:
+    """Whether *url* is a bare site root (homepage), not a specific document.
+
+    Structural only: a netloc with an empty or ``/`` path and no query string is
+    site navigation chrome (``https://news.site.com/``), never a single piece of
+    evidence. A fragment is ignored (``/#section`` is still the homepage). Any
+    real path segment (``/article/123``) makes it not a root.
+    """
+    parsed = urlparse(str(url or ""))
+    if not parsed.netloc:
+        return False
+    if (parsed.path or "").strip() not in ("", "/"):
+        return False
+    return not (parsed.query or parsed.params)
 
 
 def rank_candidates(
@@ -199,6 +308,8 @@ def rank_candidates(
     """Score, sort (desc, stable), and mark each candidate kept/dropped.
 
     * Reference-site domains are always kept (``reason="reference_site"``).
+    * A bare site root / homepage is dropped on URL shape alone
+      (``"homepage_root"``); reference domains are exempt.
     * A candidate below ``min_score`` is dropped (``"low_relevance"``) — unless
       the topic signal is thin or *every* candidate is below threshold, in which
       case nothing is dropped (collection is never starved).
@@ -229,6 +340,8 @@ def rank_candidates(
 
         if is_reference:
             kept, reason = True, "reference_site"
+        elif is_homepage_root(url):
+            kept, reason = False, "homepage_root"
         elif apply_relevance_gate and score < min_score:
             kept, reason = False, "low_relevance"
         else:
@@ -262,5 +375,7 @@ __all__ = [
     "rank_candidates",
     "candidate_domain",
     "topic_hit_count",
+    "body_has_anchor",
     "body_is_on_topic",
+    "is_homepage_root",
 ]

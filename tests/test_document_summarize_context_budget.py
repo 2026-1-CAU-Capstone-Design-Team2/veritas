@@ -80,7 +80,13 @@ class DocumentSummarizeContextBudgetTests(unittest.TestCase):
         self.assertLess(len(llm.last_user_prompt), 10_000)
 
     def test_batch_prompt_is_trimmed_to_tokenizer_context(self) -> None:
-        llm = _TokenCountingLLM(n_ctx=5000)
+        # tokenize_count == char count here, so n_ctx is in *chars*: it must
+        # exceed the fixed BATCH_SUMMARY_PROMPT system text (~4.8k chars) with
+        # room for the doc bodies, while still being far below the 16k chars of
+        # documents below so trimming is genuinely exercised. (A real model's
+        # n_ctx is in tokens and ~3x larger in char terms, so the system prompt
+        # is never the binding constraint there.)
+        llm = _TokenCountingLLM(n_ctx=6000)
         tool = _tool(llm)
         records = [_record(), _record()]
         records[1].doc_id = "002"

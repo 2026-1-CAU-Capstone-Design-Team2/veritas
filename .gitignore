@@ -10,3 +10,6 @@ test/
 logs/
 # Generated synthetic test data (tests/fixtures/generate_scenario_data.py)
 /test_data/
+# Packaging binaries & setup scripts
+/packaging/
+/dist/

@@ -5,9 +5,12 @@ from __future__ import annotations
 import unittest
 
 from services.autosurvey_source_quality import (
+    _anchor_present,
+    body_has_anchor,
     body_is_on_topic,
     build_topic_terms,
     candidate_domain,
+    is_homepage_root,
     rank_candidates,
     score_candidate,
     topic_hit_count,
@@ -122,6 +125,115 @@ class BodyOnTopicTests(unittest.TestCase):
         body = "This paper studies DiT video diffusion latency optimization on GPUs and TPUs."
         self.assertTrue(body_is_on_topic(body, full))   # query-only match (the bug)
         self.assertFalse(body_is_on_topic(body, core))  # core gate rejects (the fix)
+
+
+# Mirrors the real bug: a 삼성전자 실적 survey collecting 쿠팡/에이블리 earnings
+# pages, which share the generic financial vocabulary but not the entity.
+_SAMSUNG_PLAN = {
+    "topic": "삼성전자 2024년 4분기 잠정 실적",
+    "goal": "삼성전자 분기 매출과 영업이익 확인",
+    "keywords": ["삼성전자", "4분기", "실적", "매출", "영업이익"],
+}
+
+
+def _samsung_topic(anchors=("삼성전자",)):
+    return build_topic_terms(
+        user_request="삼성전자 작년 4분기 잠정 실적 알려줘",
+        plan=_SAMSUNG_PLAN,
+        query="삼성전자 4분기 실적",
+        anchor_terms=anchors,
+    )
+
+
+_SAMSUNG_BODY = (
+    "삼성전자는 2024년 4분기 잠정 실적을 발표했다. 매출 70조 4,600억원, "
+    "영업이익 4조 3,100억원을 기록했다."
+)
+# Shares 4분기/2024/실적/매출/영업이익 with the topic but never names 삼성전자.
+_COUPANG_BODY = (
+    "쿠팡은 2024년 4분기 실적을 공개했다. 매출 88억 달러, 영업이익은 "
+    "전년 동기 대비 크게 줄며 적자로 전환했다."
+)
+
+
+class EntityAnchorTests(unittest.TestCase):
+    def test_wrong_entity_body_clears_old_count_gate(self) -> None:
+        # Without the anchor gate the 쿠팡 body would be kept: it shares enough
+        # generic financial terms to pass the >=2-hit count gate. This is the bug.
+        topic = _samsung_topic()
+        self.assertGreaterEqual(topic_hit_count(_COUPANG_BODY, topic), 2)
+
+    def test_wrong_entity_body_is_rejected_by_anchor_gate(self) -> None:
+        topic = _samsung_topic()
+        self.assertFalse(body_has_anchor(_COUPANG_BODY, topic))
+        self.assertFalse(body_is_on_topic(_COUPANG_BODY, topic))
+
+    def test_right_entity_body_is_kept(self) -> None:
+        topic = _samsung_topic()
+        self.assertTrue(body_has_anchor(_SAMSUNG_BODY, topic))
+        self.assertTrue(body_is_on_topic(_SAMSUNG_BODY, topic))
+
+    def test_anchor_matches_through_korean_particles(self) -> None:
+        # 삼성전자의 / 삼성전자가 are single Hangul runs that exact-token matching
+        # would miss; substring containment keeps the anchor robust.
+        body = "삼성전자의 2024년 4분기 매출과 영업이익이 공개되었다."
+        self.assertTrue(body_has_anchor(body, _samsung_topic()))
+
+    def test_no_anchors_disables_gate(self) -> None:
+        # A conceptual request (no candidate_entities) must behave exactly as
+        # before: the count gate alone decides.
+        topic = _samsung_topic(anchors=())
+        self.assertFalse(topic.has_anchors)
+        self.assertTrue(body_has_anchor(_COUPANG_BODY, topic))
+        self.assertTrue(body_is_on_topic(_COUPANG_BODY, topic))
+
+    def test_bare_year_is_not_a_usable_anchor(self) -> None:
+        # A standalone number must never become an anchor — it would match every
+        # report and defeat the gate.
+        topic = _samsung_topic(anchors=("2024",))
+        self.assertFalse(topic.has_anchors)
+
+    def test_short_latin_anchor_uses_word_boundary(self) -> None:
+        self.assertTrue(_anchor_present("the new ai model", "ai"))
+        self.assertFalse(_anchor_present("heavy rain is training", "ai"))
+
+
+class HomepageRootTests(unittest.TestCase):
+    def test_bare_roots_are_homepages(self) -> None:
+        self.assertTrue(is_homepage_root("https://news.site.com/"))
+        self.assertTrue(is_homepage_root("https://news.site.com"))
+        self.assertTrue(is_homepage_root("https://site.com/#latest"))
+
+    def test_real_paths_and_search_pages_are_not_homepages(self) -> None:
+        self.assertFalse(is_homepage_root("https://site.com/article/123"))
+        self.assertFalse(is_homepage_root("https://site.com/?q=samsung"))
+        self.assertFalse(is_homepage_root("not a url"))
+
+    def test_ontopic_homepage_is_dropped_before_fetch(self) -> None:
+        homepage = _item(
+            "삼성전자 뉴스룸",
+            "https://example-news.com/",
+            "삼성전자 4분기 실적 매출 영업이익 속보",
+        )
+        article = _item(
+            "삼성전자 4분기 실적 상세",
+            "https://example-news.com/articles/samsung-q4",
+            "삼성전자 4분기 매출 영업이익",
+        )
+        ranked = rank_candidates([homepage, article], _samsung_topic())
+        home = next(c for c in ranked if c.item is homepage)
+        self.assertFalse(home.kept)
+        self.assertEqual(home.reason, "homepage_root")
+        art = next(c for c in ranked if c.item is article)
+        self.assertTrue(art.kept)
+
+    def test_reference_root_is_exempt_from_homepage_drop(self) -> None:
+        root = _item("Samsung", "https://samsung.com/", "company site")
+        ranked = rank_candidates(
+            [root], _samsung_topic(), reference_domains=frozenset({"samsung.com"})
+        )
+        self.assertTrue(ranked[0].kept)
+        self.assertEqual(ranked[0].reason, "reference_site")
 
 
 class RankCandidatesTests(unittest.TestCase):

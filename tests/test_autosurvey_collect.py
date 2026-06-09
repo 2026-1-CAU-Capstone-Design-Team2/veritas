@@ -165,6 +165,50 @@ class RejectedNoteTests(unittest.TestCase):
             self.assertNotIn("body", note.lower())  # metadata only, no raw text
 
 
+_SAMSUNG_TOPIC = build_topic_terms(
+    user_request="삼성전자 작년 4분기 잠정 실적 알려줘",
+    plan={
+        "topic": "삼성전자 4분기 실적",
+        "keywords": ["삼성전자", "4분기", "실적", "매출", "영업이익"],
+    },
+    query="삼성전자 4분기 실적",
+    anchor_terms=["삼성전자"],
+)
+_SAMSUNG_BODY = (
+    "삼성전자는 2024년 4분기 잠정 실적을 발표했다. 매출 70조원, 영업이익 4조원을 기록했다."
+)
+# Different company, same generic financial vocabulary, never names 삼성전자.
+_WRONG_ENTITY_BODY = (
+    "쿠팡은 2024년 4분기 실적을 공개했다. 매출 88억 달러, 영업이익은 적자로 전환했다."
+)
+
+
+class EntityAnchorFetchTests(unittest.TestCase):
+    def test_wrong_entity_body_is_rejected_and_keeps_no_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wf, store = _workflow(tmp, _FakeFetched(_WRONG_ENTITY_BODY))
+            result = wf._fetch_one(
+                title_hint="쿠팡 실적",
+                url="https://e.com/coupang-q4",
+                query="4분기 실적",
+                topic=_SAMSUNG_TOPIC,
+            )
+            self.assertEqual(result["status"], "rejected")
+            self.assertEqual(len(store.list_non_duplicate_records()), 0)
+
+    def test_right_entity_body_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wf, store = _workflow(tmp, _FakeFetched(_SAMSUNG_BODY))
+            result = wf._fetch_one(
+                title_hint="삼성전자 실적",
+                url="https://e.com/samsung-q4",
+                query="4분기 실적",
+                topic=_SAMSUNG_TOPIC,
+            )
+            self.assertEqual(result["status"], "fetched")
+            self.assertEqual(len(store.list_non_duplicate_records()), 1)
+
+
 class FetchRejectionTests(unittest.TestCase):
     def test_offtopic_body_is_rejected_and_keeps_no_slot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

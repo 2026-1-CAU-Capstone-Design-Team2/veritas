@@ -227,6 +227,7 @@ class AutoSurveyWorkflow:
         queries: list[str] | None = None,
         phase_label: str = "main",
         user_request: str = "",
+        anchor_terms: list[str] | None = None,
     ) -> dict[str, Any]:
         kept_count = self._kept_record_count()
         remaining_capacity = max(0, self.max_docs - kept_count)
@@ -271,11 +272,24 @@ class AutoSurveyWorkflow:
         consumed_queries: list[str] = []
         skipped_used_queries: list[str] = []
 
+        # Anchor terms = the named subjects ``term_grounding`` pulled from the
+        # user's request (``candidate_entities``). The post-fetch body gate
+        # requires at least one to appear, so a same-domain wrong-entity page
+        # (쿠팡 실적 inside a 삼성전자 실적 survey) is rejected even though it
+        # shares the generic financial vocabulary. Empty → gate disabled.
+        anchors = (
+            anchor_terms
+            if anchor_terms is not None
+            else self._anchor_terms_from_store()
+        )
+
         # Core topic = user request + plan only (NO live query). A replan query
         # can drift toward generic/adjacent terms; ranking may use that drift,
         # but post-fetch *acceptance* must not — otherwise a query-only match
         # lets an off-topic body in. So the body gate uses the core topic.
-        core_topic = build_topic_terms(user_request=user_request, plan=plan, query="")
+        core_topic = build_topic_terms(
+            user_request=user_request, plan=plan, query="", anchor_terms=anchors
+        )
 
         for query in search_queries:
             if len(new_doc_ids) >= target_new_docs:
@@ -313,7 +327,7 @@ class AutoSurveyWorkflow:
             # maxDocs slot. Ranking uses the full topic (core + live query — the
             # query helps surface on-query results). Structural/lexical only.
             full_topic = build_topic_terms(
-                user_request=user_request, plan=plan, query=query
+                user_request=user_request, plan=plan, query=query, anchor_terms=anchors
             )
             ranked = rank_candidates(
                 results,
@@ -577,6 +591,15 @@ class AutoSurveyWorkflow:
             grounding["reference_sites"] = reference_sites
             self.run_store_service.save_grounding(grounding)
 
+        # Named-subject anchors for the post-fetch entity gate (e.g. 삼성전자).
+        # Taken from the grounding we just built, so collect cycles do not have
+        # to re-read grounding.json each time. Empty for a conceptual request.
+        anchor_entities = [
+            str(entity).strip()
+            for entity in (grounding.get("candidate_entities") or [])
+            if str(entity).strip()
+        ]
+
         reference_collect_result = self._collect_reference_sites(reference_sites)
         if reference_collect_result.get("new_doc_count", 0) > 0:
             reference_cleanup_result = self.run_cleanup(
@@ -616,6 +639,7 @@ class AutoSurveyWorkflow:
             queries=scout_queries,
             phase_label="scout",
             user_request=user_request,
+            anchor_terms=anchor_entities,
         )
 
         if scout_collect_result.get("new_doc_count", 0) > 0:
@@ -678,6 +702,7 @@ class AutoSurveyWorkflow:
                 max_new_docs=self.collect_batch_size,
                 phase_label=f"main-{loop_index}",
                 user_request=user_request,
+                anchor_terms=anchor_entities,
             )
 
             if collect_result.get("new_doc_count", 0) == 0:
@@ -1034,6 +1059,24 @@ class AutoSurveyWorkflow:
         ):
             return True, "low_marginal_gain"
         return False, None
+
+    def _anchor_terms_from_store(self) -> list[str]:
+        """Named-subject anchors for the post-fetch entity gate, from grounding.
+
+        Returns the grounding's ``candidate_entities`` — the per-request named
+        subjects the LLM extracted from the user's own request (e.g.
+        ``삼성전자``), never a hard-coded list. The body gate uses them to reject
+        same-domain wrong-entity documents. Returns an empty list (gate disabled)
+        for a conceptual request or when grounding is absent/unreadable.
+        """
+        try:
+            grounding = self.run_store_service.load_grounding()
+        except Exception:
+            return []
+        entities = grounding.get("candidate_entities") if isinstance(grounding, dict) else None
+        if not isinstance(entities, list):
+            return []
+        return [str(entity).strip() for entity in entities if str(entity).strip()]
 
     def _reference_domains(self, plan: dict[str, Any]) -> frozenset[str]:
         """Domains the user explicitly pinned (``site:…``) — exempt from the

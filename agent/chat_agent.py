@@ -423,35 +423,56 @@ class ChatAgent:
         to ordinary embedding RAG unchanged.
         """
         with self._conversation_lock:
-            if include_private_local and source_scope_filter in ("all", "local"):
-                table_outputs = self._collect_table_outputs(question)
-                if table_outputs:
-                    yield from self._stream_final_answer(
-                        question=question,
-                        tool_outputs=table_outputs,
-                        doc_context=doc_context,
-                        profile=self._profile_for_tool_outputs(table_outputs),
-                    )
-                    return
-            try:
-                kwargs = {"use_history": True, "doc_context": doc_context}
-                if source_scope_filter != "all" or not include_private_local:
-                    kwargs["source_scope_filter"] = source_scope_filter
-                    kwargs["include_private_local"] = include_private_local
-                for chunk in self.rag_service.iter_answer(question, **kwargs):
-                    yield chunk
-            except AttributeError:
-                # Defensive: older rag_service without iter_answer — one-shot.
-                kwargs = {
-                    "stream": False,
-                    "use_history": True,
-                    "doc_context": doc_context,
-                }
-                if source_scope_filter != "all" or not include_private_local:
-                    kwargs["source_scope_filter"] = source_scope_filter
-                    kwargs["include_private_local"] = include_private_local
-                answer = self.rag_service.answer(question, **kwargs)
-                yield answer
+            yield from self._ask_rag_iter_unlocked(
+                question,
+                doc_context=doc_context,
+                source_scope_filter=source_scope_filter,
+                include_private_local=include_private_local,
+            )
+
+    def _ask_rag_iter_unlocked(
+        self,
+        question: str,
+        doc_context: str = "",
+        *,
+        source_scope_filter: str = "all",
+        include_private_local: bool = True,
+    ) -> Iterator[str]:
+        """Lock-free streaming core of :meth:`ask_rag_iter`.
+
+        Callers already holding ``_conversation_lock`` (ask_auto_iter's ``/rag``
+        branch) iterate this directly; the non-reentrant lock would self-deadlock
+        on re-acquisition. The streaming twin of :meth:`_ask_rag_unlocked`.
+        """
+        if include_private_local and source_scope_filter in ("all", "local"):
+            table_outputs = self._collect_table_outputs(question)
+            if table_outputs:
+                yield from self._stream_final_answer(
+                    question=question,
+                    tool_outputs=table_outputs,
+                    doc_context=doc_context,
+                    profile=self._profile_for_tool_outputs(table_outputs),
+                )
+                return
+        try:
+            kwargs = {"use_history": True, "doc_context": doc_context}
+            if source_scope_filter != "all" or not include_private_local:
+                kwargs["source_scope_filter"] = source_scope_filter
+                kwargs["include_private_local"] = include_private_local
+            for chunk in self.rag_service.iter_answer(question, **kwargs):
+                yield chunk
+        except AttributeError:
+            # Defensive: older rag_service without iter_answer — one-shot.
+            kwargs = {
+                "stream": False,
+                "use_history": True,
+                "doc_context": doc_context,
+            }
+            if source_scope_filter != "all" or not include_private_local:
+                kwargs["source_scope_filter"] = source_scope_filter
+                kwargs["include_private_local"] = include_private_local
+            answer = self.rag_service.answer(question, **kwargs)
+            yield answer
 
     # -- editor (standalone writer) surfaces ---------------------------------
     # Power the editor window's ghost-writing / quick actions / chat. They reuse

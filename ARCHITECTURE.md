@@ -811,6 +811,36 @@ curl -X POST "http://127.0.0.1:8000/api/v1/proactive/reset?workspaceId=<ws>"
 
 **미실행(예산/서버 필요, 본 increment 범위 밖)**: 실제 article 생성(2-task smoke 포함, llama-server 필요), DRB RACE/FACT 공식 평가, budget-judge pilot, official confirmation, 100-task full judging — 전부 **미실행**. 명령은 `benchmarks/drb/README.md`에 문서화.
 
+### 2026-06-09 (fix) — collect 정합성: entity anchor 게이트 + homepage-root 필터 + batch 노트 가이드
+
+**배경**: 데모 직전 테스트에서 3가지 결함. (1) 배치 요약이 빈약(Repeated Findings·Reliability Notes가 "없음")하고, (2) "삼성전자 4분기 실적" 조사에 **쿠팡·에이블리 등 다른 기업** 문서가 수집·요약되며, (3) 사이트 **메인 페이지(루트 URL)** 가 그대로 fetch·summarize됨. 근본 원인: post-fetch 수용 게이트(`body_is_on_topic`)와 pre-fetch ranking이 **토픽 토큰 겹침 "개수/비율"** 만 보므로, 같은 종류(실적)의 일반 재무어휘(`4분기`/`실적`/`매출`/`영업이익`)만으로 다른 기업 문서가 `_MIN_BODY_TOPIC_HITS=2`를 통과 — **핵심 named entity(삼성전자)의 존재를 어느 게이트도 요구하지 않음**. (1)은 (2)의 증상(서로 다른 기업 3문서라 repeated/cross-source 신호가 구조적으로 비어 있음).
+
+**변경 파일**
+- (edit) `services/autosurvey_source_quality.py` — **entity anchor 게이트(post-fetch)**: `TopicTerms`에 `anchors`(required-presence 집합) 추가, `build_topic_terms(..., anchor_terms=())`. `body_has_anchor()`/`_anchor_present()`(한글·길이≥4는 substring — 조사 `삼성전자의`/`삼성전자가`까지 robust, 짧은 Latin은 word-boundary), `_normalize_anchor_terms()`(빈/1글자/순수 숫자 제거 — 연도 `2024`가 anchor 되어 게이트 무력화되는 것 차단). `body_is_on_topic`은 anchor가 있을 때 **본문에 최소 1개 anchor 포함**을 추가 조건으로 요구. anchor 비면(개념형 요청) 기존 count 게이트 그대로(opt-in, 굶김 없음). **homepage-root 필터(pre-fetch)**: `is_homepage_root(url)`(netloc 있고 path가 `""`/`"/"`, query 없음 — 구조적 URL shape만) → `rank_candidates`에서 reference 다음·relevance 앞에 `reason="homepage_root"` drop. reference 도메인은 면제(루트를 일부러 pin한 것).
+- (edit) `workflows/autosurvey_workflow.py` — `run_collect(..., anchor_terms=None)` 추가, core/full topic 모두 anchor 전달. `_anchor_terms_from_store()`(grounding의 `candidate_entities` 로드, 없으면 빈 리스트). `run_all`은 in-memory grounding에서 `anchor_entities`를 1회 추출해 scout·main collect에 전달(매 cycle 디스크 재독 회피). 키워드/하드코딩 없음 — anchor는 사용자 요청에서 LLM이 뽑은 entity.
+- (edit) `core/prompts/autosurvey.py` — `TERM_GROUNDING_PROMPT`: `candidate_entities`를 "연구가 반드시 다뤄야 하는 핵심 named subject(회사/제품/인물/모델/데이터셋)"로 재정의(모호하지 않아도 주 subject 포함; `삼성전자` 같은 것이 비지 않게). 일반 descriptor(`실적`/`매출`/`market` 등)는 `grounded_terms`로. `BATCH_SUMMARY_PROMPT`: Repeated Findings(배치 내 2+ 문서 독립 지지, 공유 사실 없으면 정직하게 비움)·Reliability Notes(문서 자체의 source-quality 신호: 발행처 권위, 보고 기간/최신성, 공식/감사 vs 자체보고·잠정·추정·홍보, 방법론/표본 caveat, 소스 간 같은 지표 불일치) 정의 1줄씩 보강(키워드 사전 아님, 구조적 정의).
+
+**테스트**
+- (edit) `tests/test_autosurvey_source_quality.py` — `EntityAnchorTests`(쿠팡 본문이 옛 count 게이트는 통과하지만 anchor 게이트는 거부 / 삼성 본문 keep / 조사 robust / anchor 없으면 게이트 무력화 / 순수 연도 anchor 불가 / 짧은 Latin word-boundary), `HomepageRootTests`(루트=homepage·검색페이지·실경로 구분 / on-topic homepage도 pre-fetch drop / reference 루트는 면제).
+- (edit) `tests/test_autosurvey_collect.py` — `EntityAnchorFetchTests`: `_fetch_one`이 anchor 있는 topic에서 다른 기업 본문을 rejected(슬롯 미소비), 삼성 본문은 fetched.
+- (edit) `tests/test_document_summarize_context_budget.py` — batch trim 테스트의 `n_ctx`를 5000→6000(char=token 모델에서 약간 길어진 system 프롬프트 수용; 문서 16k는 여전히 trim 강제 — 의도 보존).
+
+**엔지니어링 결정**
+- *anchor는 본문에만(pre-fetch 미적용)*: 스니펫은 짧아 relevant 결과도 entity가 안 보일 수 있음 → pre-fetch hard-drop은 위험. 본문은 텍스트가 풍부해 entity 유무가 robust. 비용은 오프토픽 1회 fetch뿐(rejected는 슬롯·cleanup·batch 미포함)이라 사용자 가시 버그(배치에 쿠팡 등장)는 완전 차단.
+- *opt-in*: anchor 비면(`대체육 시장` 같은 개념형) 기존 동작 그대로 → 기존 회귀 0. 게이트는 grounding이 entity를 줄 때만 발동.
+- *적용 시점*: `run_all`이 `run_term_grounding(force=True)`로 매 신규 조사마다 재-grounding → 새 프롬프트로 `candidate_entities` 채워짐. **기존 워크스페이스의 stale `grounding.json`(구 프롬프트, candidate_entities 비었을 수 있음)은 재조사 전까지 게이트 미발동** — 데모는 새 조사로 시작.
+
+**테스트 실행**: `test_autosurvey_source_quality`·`test_autosurvey_collect`(40)·`test_document_summarize_context_budget`(3)·`test_autosurvey_memory_brief`(4) 통과. 전체 `discover tests` → **신규 회귀 0**(이 시점의 잔존 2 실패 `test_rag_grounding`·`test_chat_conversation_lock`은 본 변경과 무관한 `ChatAgent._ask_rag_iter_unlocked` 누락 — clean tree에서도 동일 재현, 아래 항목에서 해결). 추가 LLM call 없음.
+
+### 2026-06-09 (fix) — 스트리밍 `/rag` 슬래시 크래시(`_ask_rag_iter_unlocked` 누락)
+
+**배경**: `ChatAgent.ask_auto_iter`(스트리밍 일반 채팅)의 `/rag` 분기가 정의되지 않은 `self._ask_rag_iter_unlocked(...)`를 호출(line 356) → research/auto 모드에서 `/rag <질문>`을 직접 타이핑하면 `AttributeError`. 비스트리밍 `ask_auto`는 존재하는 `_ask_rag_unlocked`를 호출해 정상이라 **iter 변형만 비대칭으로 깨져 있던 latent bug**. 도달 조건이 좁아(모드≠rag + 명시적 `/rag` 슬래시 + 스트리밍) 일반 RAG 데모(RAG 모드→`ask_rag_iter`)에선 안 밟힘.
+
+**변경 파일**
+- (edit) `agent/chat_agent.py` — `ask_rag_iter`의 lock 안쪽 코어(table_query 선처리 → `rag_service.iter_answer` 스트리밍 → 구버전 `AttributeError` 1-shot fallback)를 **`_ask_rag_iter_unlocked` 제너레이터로 추출**. `ask_rag_iter`는 `_conversation_lock`만 잡고 `yield from`으로 위임(반복 동안 lock 유지 — 기존 의미 보존). `ask_auto_iter`의 `/rag` 분기(이미 lock 보유)는 이 lock-free 코어를 직접 iterate해 self-deadlock 회피. `ask_rag`↔`_ask_rag_unlocked` 패턴의 스트리밍 쌍둥이. 동작 변경 없음(순수 extract-method).
+
+**테스트 실행**: `test_chat_conversation_lock`(4: `ask_auto_iter` `/rag` 데드락/크래시 회귀 포함)·`test_rag_grounding`(22, slash→strict 라우팅 포함) → **26 OK**. 추가 LLM call 없음.
+
 ### 2026-06-05 — DRB FACT를 crawl4ai 스크랩으로 (Jina 키 제거) + BOM 견고성
 
 **기능**: DRB FACT 파이프라인(`extract→deduplicate→scrape→validate→stat`)에서 **Jina(`JINA_API_KEY`)가 필요한 scrape 단계만** Veritas의 `fetch_with_crawl4ai`로 대체. FACT를 **Jina 키·비용 없이** 실행 가능. 인용 URL이 어차피 crawl4ai로 수집된 것이라 재스크랩이 내부적으로 일관되고, 양쪽 시스템에 동일 적용되어 A/B delta는 공정(단 비공식 → `fact_crawl4ai_budget` 라벨).

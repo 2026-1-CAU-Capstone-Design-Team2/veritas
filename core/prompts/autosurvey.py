@@ -38,7 +38,16 @@ Rules:
 - Do not add modifiers such as arXiv, paper, conference, benchmark, survey, definition, latest, recent, or a year unless they literally appear in the user's request as important terms.
 - Do not transform the user's intent into a search strategy. Query construction is handled by the initial planner.
 - Keep Korean terms in Korean and English terms in English.
-- Use candidate_entities only for ambiguous names or acronyms.
+- candidate_entities are the core named subjects the research must stay about:
+  the specific companies, organizations, people, products, models, datasets, or
+  named systems the answer is required to be about. Include the main subject
+  even when it is unambiguous (e.g. for "삼성전자 4분기 실적" → "삼성전자"). Use the
+  exact surface form from the request. Leave candidate_entities empty ONLY for a
+  purely conceptual or definitional request that names no specific subject.
+- Do not put generic descriptors (실적, 매출, 시장, 규모, 동향, market, trend,
+  forecast …) in candidate_entities; those belong in grounded_terms. Reserve
+  candidate_entities for the named subject(s) that distinguish this request from
+  every other request of the same kind.
 - Use disambiguation_notes only when ambiguity would affect planning.
 """
 
@@ -202,6 +211,14 @@ Create a markdown batch note with these sections:
 ### Supporting Gap (Lower Priority)
 ### Off-topic / Incidental Gap
 Rules:
+- ## Repeated Findings = a fact stated independently by two or more documents in
+  this batch; cite all of them. Leave it empty when the documents share no fact —
+  never manufacture one.
+- ## Reliability Notes = source-quality signal in the documents themselves:
+  publisher authority, reporting period/recency, whether figures are
+  official/audited vs. self-reported, preliminary ("잠정"), estimated, or
+  promotional, methodology/sample-size caveats, and any source-to-source
+  disagreement on the same metric. Write "- None" only when none is present.
 - Explicitly compare each candidate gap against the original user request before classifying it.
 - Put a gap in Core Gap only when resolving it is directly needed to satisfy the user request.
 - Put useful but non-essential details in Supporting Gap.
