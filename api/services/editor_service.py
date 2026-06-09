@@ -217,6 +217,7 @@ def suggest_stream(
     suffix: str = "",
     max_tokens: int = 64,
     use_workspace: bool = True,
+    document_cursor: int | None = None,
 ) -> Iterator[bytes]:
     """Stream a ghost-writing continuation as SSE.
 
@@ -261,6 +262,12 @@ def suggest_stream(
         documentKey=workspace_id,  # caller didn't provide a doc-level key
         text=text,
         cursor=len(prefix),
+        # ``cursor`` above is the caret offset within the truncated prefix window
+        # (what features.py wants). ``documentCursor`` is the caret's TRUE offset
+        # in the whole document, which the reject ladder keys "same spot" on — it
+        # must not be window-clamped, or one spot's cooldown freezes the whole
+        # doc. Fall back to len(prefix) only when the caller didn't send it.
+        documentCursor=(document_cursor if document_cursor is not None else len(prefix)),
         prefix=prefix,
         suffix=suffix,
         currentSentence=current_sentence,

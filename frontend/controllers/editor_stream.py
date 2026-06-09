@@ -95,6 +95,8 @@ class EditorSuggestWorker(_EditorStreamWorker):
         max_tokens: int = 64,
         use_workspace: bool = True,
         parent: QObject | None = None,
+        *,
+        cursor: int = 0,
     ) -> None:
         super().__init__(
             "/api/v1/editor/suggest",
@@ -104,6 +106,10 @@ class EditorSuggestWorker(_EditorStreamWorker):
                 "suffix": suffix,
                 "maxTokens": max_tokens,
                 "useWorkspace": use_workspace,
+                # True caret offset in the whole document (NOT len(prefix)) so the
+                # backend reject-ladder localizes a 3-reject cooldown to this spot
+                # instead of the whole document. See editor_window._fire_suggestion.
+                "cursor": int(cursor),
             },
             parent,
         )

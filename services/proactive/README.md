@@ -78,6 +78,14 @@ ladder state는 **anchor_id 정확 일치 → cursor 근접(proximity) 매칭** 
 문단으로 커서를 옮기면 cooldown이 즉시 풀려야** 하기 때문(문장 크기였던 옛 120자는 lock이
 영구처럼 느껴지게 했다).
 
+> **이 proximity가 동작하려면 커서가 "문서 전체 기준" offset이어야 한다.** native 편집기는
+> 잘린 prefix 길이(`len(prefix)`, 최대 ~1.5K)가 아니라 **문서 전체에서의 실제 캐럿 offset**을
+> 보낸다: `EditorSuggestRequest.cursor` → `ProactiveObserveRequest.documentCursor` →
+> `ProactiveObservation.doc_cursor` → `_extract_anchor`가 `anchor.cursor_index`로 사용.
+> prefix 길이를 쓰면 캐럿 앞 텍스트가 prefix cap을 넘는 순간 모든 깊은 위치가 같은 값으로
+> 뭉개져 proximity가 문서 전체를 한 지점으로 보고, 한 곳의 3-reject cooldown이 문서 전체를
+> 얼린다. (feature 추출이 읽는 `observation.cursor_index`는 윈도우 내 상대 위치라 그대로 둔다.)
+
 ### 3.1 규칙
 
 | Reject 횟수 (같은 anchor) | 다음 observe에서의 동작 | Prompt에 들어가는 실제 context |

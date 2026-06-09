@@ -112,6 +112,12 @@ class EditorSuggestRequest(BaseModel):
     suffix: str = ""
     maxTokens: int = Field(default=64, ge=8, le=256)
     useWorkspace: bool = True
+    # True caret offset in the *whole* document (not the truncated prefix). The
+    # proactive reject-ladder keys "same editing spot" on this, so it must not be
+    # clamped to the prefix length — otherwise every cursor position past the
+    # prefix cap collapses to one anchor and a 3-reject cooldown blocks the whole
+    # document. Defaults to 0 for backward-compatible callers.
+    cursor: int = Field(default=0, ge=0)
 
 
 class EditorSaveRequest(BaseModel):
@@ -266,6 +272,10 @@ class ProactiveObserveRequest(BaseModel):
     windowTitle: str = ""
     text: str = ""
     cursor: int | None = None
+    # True caret offset in the whole document, used only for reject-ladder
+    # locality (see ProactiveObservation.doc_cursor). ``cursor`` may be a
+    # truncated-window offset; this one must not be.
+    documentCursor: int | None = None
     prefix: str = ""
     suffix: str = ""
     currentSentence: str = ""

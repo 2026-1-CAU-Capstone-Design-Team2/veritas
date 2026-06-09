@@ -841,6 +841,32 @@ curl -X POST "http://127.0.0.1:8000/api/v1/proactive/reset?workspaceId=<ws>"
 
 **테스트 실행**: `test_chat_conversation_lock`(4: `ask_auto_iter` `/rag` 데드락/크래시 회귀 포함)·`test_rag_grounding`(22, slash→strict 라우팅 포함) → **26 OK**. 추가 LLM call 없음.
 
+### 2026-06-09 (fix) — 네이티브 ghost를 paint 오버레이 → **인라인 grey 삽입**으로 (type-along 폐지 + 문단 중간 reflow)
+
+**배경(사용자)**: (1) 받아쓰기(type-along)식 — 사용자가 제안을 그대로 타이핑해 수락하는 — 방식 폐지, **TAB(수락)/ESC(거절)/다시쓰기만** 유지. (2) 문단 **중간**에서 제안 시, paint 오버레이는 문서를 reflow하지 못해 캐럿 뒤 검은 텍스트가 안 밀리고 회색 제안과 **겹침**. 근본 원인: 6/8 increment들이 IME 충돌 회피를 위해 ghost를 문서에 넣지 않고 `paintEvent`로 캐럿 뒤에 그리고 reflow는 **문서 끝 빈 줄 예약**으로 흉내냈는데, end-예약은 캐럿 줄의 우측 텍스트를 밀 수 없다(겹침의 구조적 원인). type-along을 폐지하면 "타이핑이 ghost와 충돌" 문제 자체가 사라지므로 오버레이의 존재 이유가 없어지고, **인라인 삽입**이 reflow를 공짜로 해결한다.
+
+**변경 파일**
+- (rewrite) `frontend/ui/windows/editor_window.py:MarkdownSourceEdit` — 제안을 **캐럿에 grey `QTextCharFormat` span으로 실제 삽입**(`_insert_ghost_span`) → 뒤 텍스트가 자연 reflow(밀림). 캐럿은 span 앞(`_ghost_start`)에 주차. **type-along 전면 제거**(`_evaluate_typealong`/`_end_typealong`/`_ghost_remaining`/`_paint_ghost`/`_set_reservation`/EOF 예약 전부 삭제). TAB=`accept_ghost`(grey span을 normal 포맷으로 재삽입 → 깔끔한 단일 undoable 삽입), ESC/클릭/IME/그 외 키=`_dismiss_ghost`(span 삭제 + `ghostDismissed`), 다시=`_request_retry`. 거절 키는 dismiss 후 `super()`로 통과시켜 입력을 삼키지 않음. 스트리밍은 문서를 토큰마다 안 흔들도록 **완성 시 1회 삽입**(그 전엔 "작성 중" 칩만). `document_text()`는 미수락 span을 strip(미리보기/저장/카운트/다음 제안 prefix가 안 봄 — 옛 예약-strip과 동일 계약). ghost 편집은 signals 차단(수락만 실제 `textChanged`). 소스 편집기엔 `QSyntaxHighlighter`가 없어 grey 포맷이 덮이지 않음(확인).
+- (new) `tests/test_editor_ghost.py` — offscreen Qt 위젯 테스트 8: 최종 삽입 후 `toPlainText`엔 있고 `document_text`엔 없음, **문단 중간 push(head+ghost+tail 순서)**, accept 영속, reject/다시 제거 + 텍스트 보고, 스트리밍은 final까지 문서 불변, clear는 무신호, type-along 없음.
+
+**검증**: `test_editor_ghost`(8) offscreen 통과. `MarkdownSourceEdit` import OK, dangling 옛-속성 참조 0(grep). `py_compile` 통과. (CLAUDE.md/§Proactive의 "native는 next_sentence ghost만 렌더"는 불변 — inline_diff/marker 렌더러는 여전히 미구현이고, 수정계열 task는 그대로 외부 카드로만 렌더.)
+
+### 2026-06-09 (fix) — 네이티브 reject 사다리가 긴 문서에서 문서 전체를 얼리는 문제 (clamped cursor)
+
+**배경(사용자)**: ghostwriting 3회 거절 시 그 anchor에 180s lock이 걸리는데, **완전히 다른 커서 위치(다른 문단/문장)에서도** 제안이 안 뜸. 근본 원인: `/editor/suggest`가 reject 사다리에 넘기는 커서가 `len(prefix)`인데, prefix는 프론트에서 `[-1500:]`·백엔드에서 `[-2000:]`로 잘려 — **캐럿 앞 텍스트가 prefix cap을 넘으면 모든 깊은 위치의 cursor가 동일 값(예: 1500)으로 뭉개짐**. 사다리의 proximity 매칭(`abs(stored-cur) ≤ 24`)이 서로 다른 문단을 같은 지점으로 보고, 한 곳의 cooldown이 문서 전체를 막음. (사다리 로직 자체는 정상 — 테스트가 cursor를 직접 주입해 클램핑을 우회했었음.)
+
+**변경 파일** (윈도우 커서/글로벌 커서 분리: `observation.cursor_index`=feature용 윈도우 상대값 유지, 신규 `doc_cursor`=글로벌 offset로 사다리/anchor_id만 키잉)
+- (edit) `frontend/ui/windows/editor_window.py` `_fire_suggestion` + `frontend/controllers/editor_stream.py:EditorSuggestWorker` — 진짜 캐럿 offset `pos`를 `cursor`로 전송.
+- (edit) `api/api_models.py` — `EditorSuggestRequest.cursor`(true offset), `ProactiveObserveRequest.documentCursor` 추가.
+- (edit) `api/api_routes/editor.py` + `api/services/editor_service.py:suggest_stream(document_cursor=)` — `cursor=len(prefix)`(feature)와 별도로 `documentCursor`=진짜 offset 전달(미전달 시 `len(prefix)` fallback).
+- (edit) `api/services/proactive_service.py` + `services/proactive/models.py:ProactiveObservation.doc_cursor` — 흘려보냄.
+- (edit) `services/proactive/orchestrator.py:_extract_anchor` — anchor의 `cursor_index`를 `doc_cursor`(있으면) 우선으로 설정. anchor_id 버킷(`//80`)·proximity 사다리가 글로벌 위치로 동작. feature가 읽는 `observation.cursor_index`는 무영향.
+- (edit) `services/proactive/README.md` §3 — proximity가 동작하려면 커서가 문서 전체 기준이어야 함을 명시.
+
+**테스트**: `tests/test_proactive_api.py` +3 — `doc_cursor`가 anchor를 글로벌 offset으로 만듦 / 미전달 시 윈도우 cursor fallback / **3-reject cooldown이 먼 위치로 누수되지 않음**(회귀). 기존 사다리 테스트(jitter 유지·이동 시 해제·누적) 전부 통과.
+
+**검증**: 세션에서 건드린 12개 스위트(autosurvey·rag·conversation_lock·proactive 전체·ui_automation·editor_ghost) **132 OK**, 신규 회귀 0. 추가 LLM call 없음.
+
 ### 2026-06-05 — DRB FACT를 crawl4ai 스크랩으로 (Jina 키 제거) + BOM 견고성
 
 **기능**: DRB FACT 파이프라인(`extract→deduplicate→scrape→validate→stat`)에서 **Jina(`JINA_API_KEY`)가 필요한 scrape 단계만** Veritas의 `fetch_with_crawl4ai`로 대체. FACT를 **Jina 키·비용 없이** 실행 가능. 인용 URL이 어차피 crawl4ai로 수집된 것이라 재스크랩이 내부적으로 일관되고, 양쪽 시스템에 동일 적용되어 A/B delta는 공정(단 비공식 → `fact_crawl4ai_budget` 라벨).

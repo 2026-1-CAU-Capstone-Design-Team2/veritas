@@ -227,22 +227,26 @@ def editor_tool_icon(kind: str, size: int = 18, color: str = "#3c4043") -> QIcon
 
 
 class MarkdownSourceEdit(QTextEdit):
-    """Markdown source editor with an inline ghost-writing suggestion + chip.
+    """Markdown source editor with inline AI ghost-writing.
 
-    The ghost suggestion is PAINTED as a grey overlay after the caret
-    (``paintEvent``), NOT inserted into the document — so it stays fully visible
-    the whole time (including through Korean IME composition) while the user's
-    typing never collides with it: they just type real, normal-coloured text and
-    the painted remainder shrinks (``_evaluate_typealong`` compares the typed text
-    to the suggestion). To still REFLOW (an overlay can't grow the document) we
-    reserve blank lines at the document END sized to the grey's height — the ONLY
-    document edit, made strictly when no composition is active (``_set_reservation``
-    is a no-op while composing). ``document_text()`` strips that reservation; the
-    composing grapheme is skipped in the paint (``_paint_skip``) so the preedit
-    char isn't drawn doubled. Typing that diverges from the first char is a reject;
-    ≥1 char then diverging (or Esc after partial) is a partial-accept. Tab accepts
-    the rest, Esc rejects. While the model streams, a "작성 중" indicator shows;
-    once complete, a chip sits below the suggestion.
+    The ghost suggestion is INSERTED into the document as a real, grey-coloured
+    span at the caret — so it reflows the text after the caret naturally: a
+    mid-paragraph suggestion *pushes the following sentence aside* instead of
+    painting over it. There is NO type-along: while a suggestion is shown the
+    only interactions are **Tab** (accept), **Esc** (reject), and **다시**
+    (retry). Any other keystroke / click / IME composition / focus loss rejects
+    it (Copilot-style dismiss-on-type), and a rejecting keystroke still goes
+    through so the user's typing is never swallowed.
+
+    The grey span lives at ``[_ghost_start, _ghost_start + _ghost_len)`` with the
+    caret parked at ``_ghost_start`` (so the suggestion appears *after* the
+    caret). ``document_text()`` strips that span, so previews, word-counts,
+    autosave, and the next suggestion's prefix never see un-accepted text — the
+    same contract the old reflow-reservation honoured, just relocated to the
+    caret. Accept re-inserts the text as normal-coloured (one clean undoable
+    insertion); reject deletes it. Every ghost edit is made with the widget's
+    signals blocked so it neither marks the document dirty nor retriggers the
+    typing pipeline; only an *accept* fires a real ``textChanged``.
     """
 
     ghostAccepted = Signal()
@@ -260,26 +264,18 @@ class MarkdownSourceEdit(QTextEdit):
         self.setObjectName("EditorSource")
         self.setAcceptRichText(False)
         self.setTabChangesFocus(False)
-        # The ghost suggestion is PAINTED as a grey overlay after the caret
-        # (paintEvent), NOT inserted into the document — so the user's typing
-        # (Korean IME composition in particular) never collides with it: they just
-        # type real, normal-coloured text and the painted remainder shrinks.
-        #
-        # The overlay alone cannot grow the document, so to REFLOW we reserve blank
-        # lines at the document END sized to the grey's height (``_reservation_len``)
-        # — that is the ONLY document edit and ``_set_reservation`` refuses to make
-        # it while an IME composition is active. The grey stays fully visible the
-        # whole time, including through composition.
-        self._ghost_remaining = ""   # painted (un-typed) grey; NOT in the document
-        self._ghost_full = ""        # the complete suggestion (for reject feedback)
-        self._ghost_full_norm = ""   # lstripped full, matched against typed text
-        self._ghost_anchor = -1      # doc position where the suggestion continues
-        self._ghost_final = False    # True once streaming is done → typing-along
+        # The suggestion is inserted as a grey span in the document (NOT painted),
+        # so text after the caret reflows around it. State:
+        self._ghost_text = ""        # the complete suggestion currently shown
+        self._ghost_start = -1       # doc position where the grey span begins
+        self._ghost_len = 0          # length of the inserted grey span (0 = none)
+        self._ghost_final = False    # True once a complete suggestion is inserted
+        self._generating = False     # streaming; "작성 중" chip shown, no text yet
         self._composing = False
-        self._mutating = False       # guards self-inflicted reservation edits
-        self._generating = False
-        self._typealong_consumed = 0  # chars of the suggestion typed through so far
-        self._reservation_len = 0    # trailing blank lines reserved for reflow room
+        self._mutating = False       # guards self-inflicted ghost document edits
+        # The char format at the anchor, captured so a removed/accepted ghost
+        # restores the surrounding text's real formatting instead of grey.
+        self._normal_fmt: QTextCharFormat | None = None
         self._chip = self._build_chip()
         self._gen_chip = self._build_gen_chip()
 
@@ -326,248 +322,188 @@ class MarkdownSourceEdit(QTextEdit):
     # -- ghost state ----------------------------------------------------------
 
     def has_ghost(self) -> bool:
-        return bool(self._ghost_remaining) or self._generating
+        return self._ghost_len > 0 or self._generating
 
     def is_composing(self) -> bool:
         return self._composing
 
     def is_typing_along(self) -> bool:
-        """True once the user has typed through ≥1 char of the current suggestion."""
-        return self._typealong_consumed > 0
-
-    def _clear_typealong_state(self) -> None:
-        self._typealong_consumed = 0
+        # Type-along was removed — a suggestion is taken only via Tab / Esc / 다시.
+        # Kept (always False) so callers that still gate on it keep working.
+        return False
 
     def document_text(self) -> str:
-        """The document's real text, i.e. without the trailing reflow reservation
-        (the painted grey was never in the document)."""
+        """The document's real text — WITHOUT the un-accepted grey ghost span.
+        Previews, word counts, autosave and the next suggestion's prefix all read
+        through here, so they never see suggestion text the user hasn't accepted
+        yet (the same contract the old reflow reservation honoured)."""
         full = self.toPlainText()
-        if self._reservation_len > 0:
-            return full[: max(0, len(full) - self._reservation_len)]
+        if self._ghost_len > 0 and self._ghost_start >= 0:
+            start = self._ghost_start
+            return full[:start] + full[start + self._ghost_len :]
         return full
 
-    # -- reflow reservation (blank lines at EOF; only edited when not composing) --
+    # -- grey-span format ------------------------------------------------------
 
-    def _painted_line_count(self, text: str) -> int:
-        """How many visual lines ``text`` wraps to from the caret — mirrors the
-        char-wrap in _paint_ghost so the reservation matches the painted height."""
-        if not text:
-            return 0
-        fm = QFontMetrics(self.font())
-        rect = self.cursorRect(self.textCursor())
-        margin = int(self.document().documentMargin())
-        x = rect.left()
-        max_x = max(margin + 1, self.viewport().width() - margin)
-        lines = 1
-        for ch in text:
-            if ch == "\n":
-                lines += 1
-                x = margin
-                continue
-            w = fm.horizontalAdvance(ch)
-            if x + w > max_x and x > margin:
-                lines += 1
-                x = margin
-            x += w
-        return lines
+    def _ghost_format(self) -> QTextCharFormat:
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(theme.color("editor.ghost")))
+        return fmt
 
-    def _set_reservation(self, want: int) -> None:
-        """Make the document end with exactly ``want`` reserved blank lines. No-op
-        while composing, so an IME preedit is never disturbed."""
-        want = max(0, want)
-        if self._composing or want == self._reservation_len:
-            return
-        caret_pos = self.textCursor().position()
-        self._mutating = True
-        self.blockSignals(True)
-        try:
-            doc_end = len(self.toPlainText())
-            cursor = self.textCursor()
-            if self._reservation_len > 0:
-                cursor.setPosition(max(0, doc_end - self._reservation_len))
-                cursor.setPosition(doc_end, QTextCursor.KeepAnchor)
-                cursor.removeSelectedText()
-            if want > 0:
-                cursor.movePosition(QTextCursor.End)
-                cursor.insertText("\n" * want)
-            caret = self.textCursor()
-            caret.setPosition(min(caret_pos, len(self.toPlainText())))
-            self.setTextCursor(caret)
-        finally:
-            self.blockSignals(False)
-            self._mutating = False
-        self._reservation_len = want
-
-    def _sync_reservation(self) -> None:
-        # Reserve the lines the grey spills BELOW the caret's own line.
-        self._set_reservation(max(0, self._painted_line_count(self._ghost_remaining) - 1))
-
-    def _scroll_ghost_into_view(self) -> None:
-        """Scroll so the reserved space below the caret (where the grey paints) is
-        on screen, keeping the caret where the user types."""
-        caret_pos = self.textCursor().position()
-        self._mutating = True
-        self.blockSignals(True)
-        try:
-            end = self.textCursor()
-            end.movePosition(QTextCursor.End)
-            self.setTextCursor(end)
-            self.ensureCursorVisible()
-            caret = self.textCursor()
-            caret.setPosition(min(caret_pos, len(self.toPlainText())))
-            self.setTextCursor(caret)
-        finally:
-            self.blockSignals(False)
-            self._mutating = False
-
-    # -- ghost state ----------------------------------------------------------
+    # -- ghost lifecycle -------------------------------------------------------
 
     def set_generating(self) -> None:
-        """Show the "작성 중" indicator at the caret while the model streams its
-        first tokens. Anchors the suggestion at the current caret."""
-        self._reset_ghost()
+        """Show the "작성 중" indicator at the caret while the model streams. The
+        suggestion text is inserted only once it is complete (``set_ghost`` with
+        ``final=True``), so the document never reflows token-by-token."""
+        self.clear_ghost()
         self._generating = True
-        self._ghost_final = False
-        self._ghost_anchor = self.textCursor().position()
+        self._ghost_start = self.textCursor().position()
+        self._normal_fmt = self.textCursor().charFormat()
         self._chip.hide()
         self._position_gen_chip()
-        self.viewport().update()
 
     def set_ghost(self, text: str, *, final: bool = False) -> None:
-        """Set / grow the painted grey suggestion. While streaming (``final=False``)
-        the "작성 중" indicator trails the caret; the Tab 수락 / Esc 거부 chip shows
-        once the suggestion is complete (``final=True``)."""
+        """Render the suggestion. Streaming (``final=False``) just keeps the
+        "작성 중" chip up; the complete suggestion (``final=True``) is inserted as
+        a grey span at the anchor and the Tab/Esc/다시 chip appears below it."""
         text = text or ""
+        if not final:
+            # Defer all document mutation to the final call.
+            if self._ghost_len == 0:
+                self._generating = True
+                self._position_gen_chip()
+            return
         if not text:
             self.clear_ghost()
             return
-        if self._ghost_anchor < 0:
-            self._ghost_anchor = self.textCursor().position()
-        self._ghost_remaining = text
-        self._ghost_final = final
-        if final:
-            self._ghost_full = text
-            self._ghost_full_norm = text.lstrip()
-            self._typealong_consumed = 0
-            self._generating = False
-            self._hide_gen_chip()
-        else:
-            self._chip.hide()
-        # The suggestion appears / streams while the user is paused (not composing),
-        # so reserving reflow room here is a safe document edit.
-        self._sync_reservation()
-        self._scroll_ghost_into_view()
-        if final:
-            self._position_chip()
-        else:
-            self._position_gen_chip()
-        self.viewport().update()
+        if self._ghost_start < 0:
+            self._ghost_start = self.textCursor().position()
+            self._normal_fmt = self.textCursor().charFormat()
+        self._insert_ghost_span(text)
+        self._ghost_text = text
+        self._ghost_len = len(text)
+        self._ghost_final = True
+        self._generating = False
+        self._hide_gen_chip()
+        self._position_chip()
 
-    def _reset_ghost(self) -> None:
-        self._set_reservation(0)
-        self._ghost_remaining = ""
-        self._ghost_full = ""
-        self._ghost_full_norm = ""
-        self._ghost_anchor = -1
+    def _insert_ghost_span(self, text: str) -> None:
+        """Insert ``text`` as a grey span at ``_ghost_start`` with the caret left
+        parked before it. Signals are blocked so this self-inflicted edit does
+        not mark the document dirty or retrigger the typing pipeline; the span is
+        stripped back out by :meth:`document_text`."""
+        self._mutating = True
+        self.blockSignals(True)
+        try:
+            cursor = self.textCursor()
+            cursor.beginEditBlock()
+            cursor.setPosition(self._ghost_start)
+            cursor.insertText(text, self._ghost_format())
+            cursor.endEditBlock()
+            caret = self.textCursor()
+            caret.setPosition(self._ghost_start)
+            self.setTextCursor(caret)
+        finally:
+            self.blockSignals(False)
+            self._mutating = False
+        self.ensureCursorVisible()
+
+    def _remove_ghost_span(self) -> None:
+        """Delete the inserted grey span (signals blocked) and restore the
+        anchor's real char format so subsequent typing is normal-coloured."""
+        if self._ghost_len <= 0 or self._ghost_start < 0:
+            return
+        self._mutating = True
+        self.blockSignals(True)
+        try:
+            full_len = len(self.toPlainText())
+            start = min(self._ghost_start, full_len)
+            end = min(self._ghost_start + self._ghost_len, full_len)
+            cursor = self.textCursor()
+            cursor.beginEditBlock()
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.KeepAnchor)
+            cursor.removeSelectedText()
+            if self._normal_fmt is not None:
+                cursor.setCharFormat(self._normal_fmt)
+            cursor.endEditBlock()
+            caret = self.textCursor()
+            caret.setPosition(min(start, len(self.toPlainText())))
+            self.setTextCursor(caret)
+        finally:
+            self.blockSignals(False)
+            self._mutating = False
+
+    def _reset_state(self) -> None:
+        self._ghost_text = ""
+        self._ghost_start = -1
+        self._ghost_len = 0
         self._ghost_final = False
         self._generating = False
-        self._clear_typealong_state()
         self._chip.hide()
         self._hide_gen_chip()
         self.viewport().update()
 
     def clear_ghost(self) -> None:
-        self._reset_ghost()
+        """Silently drop any ghost (no feedback) — used on focus loss, quick
+        actions, and before firing a new suggestion."""
+        self._remove_ghost_span()
+        self._reset_state()
 
     def _dismiss_ghost(self) -> None:
-        # A type-along that already consumed ≥1 char is a *partial accept*, not a
-        # reject. Only an untouched suggestion (0 chars typed through) counts as a
-        # reject toward the backend ladder. Snapshot BEFORE _reset_ghost wipes it.
-        consumed = self._typealong_consumed
-        prev_text = self._ghost_full or self._ghost_remaining or ""
-        had = bool(self._ghost_remaining) or self._generating
-        self._reset_ghost()
-        if not had:
-            return
-        if consumed > 0:
-            self.ghostAccepted.emit()
-        else:
+        """Reject the current suggestion (Esc / click / typing). Removes the span
+        and reports the rejected text to the backend reject ladder."""
+        prev_text = self._ghost_text
+        had = self._ghost_len > 0 or self._generating
+        self._remove_ghost_span()
+        self._reset_state()
+        if had:
             self.ghostDismissed.emit(prev_text)
 
-    # -- type-along -----------------------------------------------------------
-    #
-    # The grey is a paint overlay, so the user's keystrokes / IME commits land as
-    # their own normal-coloured text and never touch the ghost — no collision, no
-    # mis-colouring, ever. We just compare what they've typed since the anchor
-    # against the suggestion and shrink the painted remainder. The only document
-    # edit is the blank-line reservation, which _set_reservation refuses to touch
-    # while composing (it re-syncs the instant composition settles).
-
-    def _evaluate_typealong(self) -> None:
-        if not self._ghost_full_norm:
-            return
-        anchor = self._ghost_anchor
-        body = self.document_text()
-        caret = min(self.textCursor().position(), len(body))
-        if caret < anchor:
-            self._end_typealong()
-            return
-        typed = body[anchor:caret]
-        norm = self._ghost_full_norm
-        if len(typed) < self._typealong_consumed:
-            # Backspaced past what they'd typed through → leave the type-along.
-            self._end_typealong()
-            return
-        if typed == norm:
-            self._typealong_consumed = len(typed)
-            self._end_typealong(accepted=True)
-            return
-        if norm.startswith(typed):
-            self._typealong_consumed = len(typed)
-            self._ghost_remaining = norm[len(typed):]
-            if not self._composing:
-                self._sync_reservation()  # settled → resize reflow room
-                self._position_chip()
-            self.viewport().update()
-            return
-        self._end_typealong()
-
-    def _end_typealong(self, *, accepted: bool = False) -> None:
-        consumed = self._typealong_consumed
-        full = self._ghost_full
-        self._reset_ghost()
-        if accepted or consumed > 0:
-            self.ghostAccepted.emit()
-        else:
-            self.ghostDismissed.emit(full)
-
     def _request_retry(self) -> None:
-        prev_text = self._ghost_full or self._ghost_remaining or ""
-        self._reset_ghost()
+        prev_text = self._ghost_text
+        self._remove_ghost_span()
+        self._reset_state()
         self.ghostRetryRequested.emit(prev_text)
 
     def accept_ghost(self) -> None:
-        if not self._ghost_remaining:
-            self._reset_ghost()
+        if self._ghost_len <= 0:
+            self.clear_ghost()
             return
-        # Tab is pressed when NOT composing → safe. Drop the reservation, then
-        # insert the un-typed remainder as real text at the caret.
-        remaining = self._ghost_remaining
-        caret_pos = self.textCursor().position()
-        self._reset_ghost()
+        text = self._ghost_text
+        start = self._ghost_start
+        ghost_len = self._ghost_len
+        fmt = self._normal_fmt if self._normal_fmt is not None else QTextCharFormat()
+        # Replace the grey span with the same text in the anchor's normal format.
+        # Signals are NOT blocked here — an accept is a real edit the document
+        # should register (dirty / preview / autosave) — but it is wrapped in one
+        # edit block so the host sees a single textChanged for the net insertion.
+        self._reset_state()
         cursor = self.textCursor()
-        cursor.setPosition(min(caret_pos, len(self.toPlainText())))
         cursor.beginEditBlock()
-        cursor.insertText(remaining)
+        full_len = len(self.toPlainText())
+        cursor.setPosition(min(start, full_len))
+        cursor.setPosition(min(start + ghost_len, full_len), QTextCursor.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.insertText(text, fmt)
         cursor.endEditBlock()
-        self.setTextCursor(cursor)
+        caret = self.textCursor()
+        caret.setPosition(min(start + len(text), len(self.toPlainText())))
+        self.setTextCursor(caret)
         self.ghostAccepted.emit()
 
     def _position_chip(self) -> None:
-        if not self._ghost_remaining or not self._ghost_final:
+        if self._ghost_len <= 0 or not self._ghost_final:
             self._chip.hide()
             return
-        rect = self.cursorRect(self.textCursor())
+        # Anchor the chip just below where the grey suggestion *ends*, so it sits
+        # under the suggestion rather than at the (parked) caret.
+        end_cursor = self.textCursor()
+        end_cursor.setPosition(
+            min(self._ghost_start + self._ghost_len, len(self.toPlainText()))
+        )
+        rect = self.cursorRect(end_cursor)
         self._chip.adjustSize()
         x = min(rect.left(), max(0, self.viewport().width() - self._chip.width() - 4))
         y = rect.bottom() + 4
@@ -592,9 +528,10 @@ class MarkdownSourceEdit(QTextEdit):
     # -- input handling -------------------------------------------------------
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
-        # Type-along is offered once a COMPLETE suggestion is shown. While
-        # streaming a partial ghost, a keystroke cancels it.
-        if self._ghost_remaining and self._ghost_final:
+        # A complete suggestion is shown → only Tab / Esc act on it; any other
+        # key rejects it and is then processed normally (so typing is never
+        # swallowed). There is no type-along.
+        if self._ghost_len > 0 and self._ghost_final:
             key = event.key()
             if key == Qt.Key_Tab:
                 event.accept()
@@ -604,49 +541,30 @@ class MarkdownSourceEdit(QTextEdit):
                 event.accept()
                 self._dismiss_ghost()
                 return
-            typed = event.text()
-            is_text = (
-                bool(typed)
-                and typed.isprintable()
-                and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))
-            )
-            if is_text:
-                # The ghost is painted, never in the document → just let Qt insert
-                # the char (normal colour), then re-evaluate the painted remainder.
-                super().keyPressEvent(event)
-                self._evaluate_typealong()
-                return
-            # Navigation / Enter / backspace / control key → real dismissal.
+            # Any other keystroke dismisses the suggestion, then falls through so
+            # the key (a character, Enter, arrow, backspace …) takes effect.
             self._dismiss_ghost()
-        elif self._generating:
-            self._reset_ghost()
+            super().keyPressEvent(event)
+            return
+        if self._generating:
+            # A keystroke before the suggestion lands cancels the pending one.
+            self.clear_ghost()
         super().keyPressEvent(event)
 
     def inputMethodEvent(self, event) -> None:  # type: ignore[override]
-        commit = event.commitString()
         self._composing = bool(event.preeditString())
-        if not self._composing and self._reservation_len and not self._ghost_remaining and not self._generating:
-            # Clear a reservation orphaned when a divergence ended a type-along
-            # mid-composition (the removal was deferred until composition settled).
-            self._set_reservation(0)
-        if self._ghost_remaining and self._ghost_final:
-            # The ghost is a paint overlay → super() handles the commit + preedit
-            # naturally and nothing here touches the document. We re-evaluate on a
-            # committed change; a bare preedit just needs a repaint so the painted
-            # remainder skips the composing grapheme.
+        if self._ghost_len > 0 and self._ghost_final:
+            # Starting an IME composition rejects the suggestion; the composition
+            # then proceeds on the cleared document.
+            self._dismiss_ghost()
             super().inputMethodEvent(event)
-            if commit or not self._composing:
-                self._evaluate_typealong()
-            else:
-                self._position_chip()
-                self.viewport().update()
             return
-        if self._generating and self._composing:
-            self._reset_ghost()
+        if self._generating and (event.commitString() or self._composing):
+            self.clear_ghost()
         super().inputMethodEvent(event)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if self._ghost_remaining or self._generating:
+        if self._ghost_len > 0 or self._generating:
             self._dismiss_ghost()
         super().mousePressEvent(event)
 
@@ -656,58 +574,10 @@ class MarkdownSourceEdit(QTextEdit):
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
-        if self._ghost_remaining and self._ghost_final:
+        if self._ghost_len > 0 and self._ghost_final:
             self._position_chip()
         elif self._generating:
             self._position_gen_chip()
-        self.viewport().update()
-
-    # -- ghost overlay paint --------------------------------------------------
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        if not self._ghost_remaining:
-            return
-        skip = self._paint_skip()
-        text = self._ghost_remaining[skip:]
-        if text:
-            self._paint_ghost(text)
-
-    def _paint_skip(self) -> int:
-        """During IME composition the next grapheme is already shown by the preedit
-        at the caret, so don't also paint it in the ghost (the 'doubled' artefact)."""
-        if not self._composing:
-            return 0
-        g = self._ghost_remaining
-        stripped = g.lstrip()
-        lead = len(g) - len(stripped)
-        return min(lead + 1, len(g)) if stripped else lead
-
-    def _paint_ghost(self, text: str) -> None:
-        painter = QPainter(self.viewport())
-        try:
-            painter.setPen(QColor(theme.color("editor.ghost")))
-            painter.setFont(self.font())
-            fm = QFontMetrics(self.font())
-            rect = self.cursorRect(self.textCursor())  # accounts for any preedit
-            margin = int(self.document().documentMargin())
-            x = rect.left()
-            baseline = rect.top() + fm.ascent()
-            line_h = fm.lineSpacing()
-            max_x = max(margin + 1, self.viewport().width() - margin)
-            for ch in text:
-                if ch == "\n":
-                    x = margin
-                    baseline += line_h
-                    continue
-                w = fm.horizontalAdvance(ch)
-                if x + w > max_x and x > margin:
-                    x = margin
-                    baseline += line_h
-                painter.drawText(x, baseline, ch)
-                x += w
-        finally:
-            painter.end()
 
 
 class OutlinePanel(QFrame):
@@ -1783,7 +1653,13 @@ class EditorWindow(WindowsSnapMixin, QWidget):
         self._active_decision_intervened = False
         self._proactive_timeout_timer.stop()
         partial: list[str] = []
-        worker = EditorSuggestWorker(self._workspace_id, prefix, suffix, 64, self._use_workspace_rag, self)
+        # ``pos`` is the caret's TRUE offset in the whole document; pass it so the
+        # backend reject-ladder keys "same spot" on the real position, not on
+        # len(prefix) (which clamps to the prefix cap and would make a 3-reject
+        # cooldown at one spot freeze suggestions everywhere in a long document).
+        worker = EditorSuggestWorker(
+            self._workspace_id, prefix, suffix, 64, self._use_workspace_rag, self, cursor=pos
+        )
 
         def on_start(_sid: str) -> None:
             if token == self._suggest_token:

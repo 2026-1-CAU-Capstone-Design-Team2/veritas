@@ -34,7 +34,15 @@ class ProactiveObservation:
     # the generator via an in-memory decision cache; persistent state must
     # never carry it. See ``policy_store.ProactiveStore`` invariants.
     text: str = ""
+    # ``cursor_index`` is the caret offset within ``text`` (which may be a
+    # truncated prefix/suffix window) — features.py reads it as a position
+    # *relative to the window*, so it must stay window-scoped. ``doc_cursor`` is
+    # the caret's offset in the WHOLE document; the orchestrator uses it for
+    # anchor identity / reject-ladder locality, where a window-clamped value
+    # would make every deep cursor position collapse to one spot. None for
+    # surfaces (external capture) that can't supply a reliable global offset.
     cursor_index: int | None = None
+    doc_cursor: int | None = None
     prefix: str = ""
     suffix: str = ""
     current_sentence: str = ""

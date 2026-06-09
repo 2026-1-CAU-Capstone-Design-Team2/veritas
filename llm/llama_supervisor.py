@@ -36,7 +36,7 @@ from pathlib import Path
 # exits before becoming healthy. This restores local speed for models that fit
 # in VRAM while still falling back for oversized combinations.
 _DEFAULT_CTX = "32768"
-_DEFAULT_NP = "1"
+_DEFAULT_NP = "5"
 _DEFAULT_NGL_RETRIES = ("99", "32", "16", "8", "0")
 
 

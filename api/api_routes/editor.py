@@ -41,7 +41,12 @@ def editor_save(payload: EditorSaveRequest) -> dict[str, Any]:
 async def editor_suggest(payload: EditorSuggestRequest) -> StreamingResponse:
     return StreamingResponse(
         editor_service.suggest_stream(
-            payload.workspaceId, payload.prefix, payload.suffix, payload.maxTokens, payload.useWorkspace
+            payload.workspaceId,
+            payload.prefix,
+            payload.suffix,
+            payload.maxTokens,
+            payload.useWorkspace,
+            document_cursor=payload.cursor,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

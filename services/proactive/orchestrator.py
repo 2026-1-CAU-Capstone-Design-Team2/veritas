@@ -267,10 +267,25 @@ def _extract_anchor(observation: ProactiveObservation) -> ActiveAnchor:
         has_section=has_section,
     )
 
+    # The anchor's cursor identity must be the caret's offset in the WHOLE
+    # document, not the offset within a truncated prefix/suffix window. The
+    # native editor sends ``doc_cursor`` for exactly this; ``cursor_index`` may
+    # be window-clamped (e.g. len(prefix) capped at ~1.5k), which would make
+    # every deep position resolve to the same anchor and let one spot's 3-reject
+    # cooldown freeze the entire document. Fall back to ``cursor_index`` when no
+    # global offset is available (external captures). Note features.py still
+    # reads the window-scoped ``observation.cursor_index`` directly, so this only
+    # affects anchor identity / the reject ladder.
+    anchor_cursor = (
+        observation.doc_cursor
+        if observation.doc_cursor is not None
+        else observation.cursor_index
+    )
+
     return ActiveAnchor(
         document_id=str(observation.document_id or observation.document_key or ""),
         surface=surface_kind,  # type: ignore[arg-type]
-        cursor_index=observation.cursor_index,
+        cursor_index=anchor_cursor,
         selection_start=(observation.metadata or {}).get("selection_start"),
         selection_end=(observation.metadata or {}).get("selection_end"),
         sentence_text=observation.current_sentence or None,

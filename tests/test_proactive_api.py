@@ -23,6 +23,7 @@ from services.proactive.models import ProactiveObservation
 from services.proactive.orchestrator import (
     NATIVE_ANCHOR_PROXIMITY_CHARS,
     ProactiveOrchestrator,
+    _extract_anchor,
 )
 from services.proactive.proposal_models import is_null, is_task
 
@@ -308,6 +309,75 @@ class FeedbackTests(unittest.TestCase):
                     f"{anchor_id}|{task_type}",
                     orch.store.adaptation.state.anchor_cooldowns,
                 )
+            finally:
+                orch.close()
+
+    def test_doc_cursor_makes_anchor_use_global_offset(self) -> None:
+        """The anchor's cursor identity must come from ``doc_cursor`` (the true
+        whole-document offset), not the window-clamped ``cursor_index`` that
+        feeds features. Two deep positions with identical window cursor_index but
+        different doc_cursor must yield different anchor cursors."""
+        common = dict(
+            surface="native_editor",
+            workspace_id="ws_api",
+            document_key="doc-a",
+            text="문맥 " * 50,
+            cursor_index=1500,  # window-clamped — identical for both
+            current_paragraph="현재 문단",
+            current_sentence="현재 문장.",
+        )
+        anchor_a = _extract_anchor(ProactiveObservation(doc_cursor=5000, **common))
+        anchor_b = _extract_anchor(ProactiveObservation(doc_cursor=9000, **common))
+        self.assertEqual(anchor_a.cursor_index, 5000)
+        self.assertEqual(anchor_b.cursor_index, 9000)
+        # Different true offsets → different anchor ids (no collapse).
+        self.assertNotEqual(anchor_a.anchor_id, anchor_b.anchor_id)
+
+    def test_absent_doc_cursor_falls_back_to_window_cursor(self) -> None:
+        """External captures (and legacy callers) send no doc_cursor — the
+        anchor then falls back to cursor_index, preserving old behavior."""
+        anchor = _extract_anchor(
+            ProactiveObservation(
+                surface="native_editor",
+                workspace_id="ws_api",
+                document_key="doc-a",
+                text="짧은 본문",
+                cursor_index=42,
+                current_paragraph="문단",
+                current_sentence="문장.",
+            )
+        )
+        self.assertEqual(anchor.cursor_index, 42)
+
+    def test_reject_cooldown_does_not_leak_to_distant_position(self) -> None:
+        """Bug regression: in a long document, a 3-reject cooldown at one spot
+        used to freeze suggestions at completely different cursor positions
+        because the ladder saw the same window-clamped cursor for both. With
+        the true doc_cursor, the cooldown stays local to its spot."""
+        common = dict(
+            surface="native_editor",
+            workspace_id="ws_api",
+            document_key="doc-a",
+            text="문맥 " * 50,
+            cursor_index=1500,  # identical window cursor for both spots
+            current_sentence="문장.",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = _build_orch(Path(tmp))
+            try:
+                spot_a = _extract_anchor(
+                    ProactiveObservation(doc_cursor=5000, current_paragraph="문단 A", **common)
+                )
+                spot_b = _extract_anchor(
+                    ProactiveObservation(doc_cursor=9000, current_paragraph="문단 B", **common)
+                )
+                for _ in range(3):
+                    orch._bump_anchor_reject(spot_a, "거절된 제안")
+                # Spot A is cooled down...
+                self.assertTrue(orch._read_anchor_state_for(spot_a)[2])
+                # ...but a distant spot (different paragraph/offset) is NOT — this
+                # is exactly what was broken before the doc_cursor plumbing.
+                self.assertFalse(orch._read_anchor_state_for(spot_b)[2])
             finally:
                 orch.close()
 

@@ -42,6 +42,7 @@ def _request_to_observation(payload: ProactiveObserveRequest) -> ProactiveObserv
         window_title=payload.windowTitle or "",
         text=payload.text or "",
         cursor_index=payload.cursor,
+        doc_cursor=payload.documentCursor,
         prefix=payload.prefix or "",
         suffix=payload.suffix or "",
         current_sentence=payload.currentSentence or "",
