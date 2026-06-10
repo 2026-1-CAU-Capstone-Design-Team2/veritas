@@ -36,6 +36,25 @@ class InterventionDetector:
     EDITING_APP_TYPES = {"document", "presentation", "spreadsheet", "code_editor"}
     # Below this router confidence, decline rather than surface a weak intervention.
     ROUTER_MIN_CONFIDENCE = 0.5
+    # 커서 특정 위치를 가리키는 prose 시나리오. OCR-only 소스에서는 커서를 신뢰있게
+    # 잡지 못해(화면 통째 read) 발화 금지. 전체 검토형(whole_document_review/
+    # long_static_review)·작성상태형(idle/churn/blank)은 위치를 안 가리키므로 제외.
+    _OCR_SUPPRESSED_SCENARIOS = frozenset({
+        "acronym_introduced",
+        "citation_missing",
+        "quote_inserted",
+        "factual_claim_made",
+        "repeated_phrase_in_paragraph",
+        "transition_word_overuse",
+        "weak_modifier_overuse",
+        "heading_added",
+        "numbered_list_growth",
+        "code_block_present",
+        "todo_marker_present",
+        "many_question_marks",
+        "long_paragraph_written",
+        "outline_phase",
+    })
 
     def __init__(
         self,
@@ -212,6 +231,19 @@ class InterventionDetector:
             scenario_results[scenario.name] = scenario.evaluate(scenario_ctx)
 
         ready_names = [name for name, ev in scenario_results.items() if ev.ready]
+        # OCR-only 캡처(app_text/UIA 실패)는 화면 통째를 읽어 커서를 신뢰있게 잡지
+        # 못한다(예: VS Code/터미널을 OCR → 코드·로그·링크가 본문으로 뒤섞임).
+        # 그런 소스에서는 특정 위치를 가리키는 prose 시나리오를 발화시키지 않는다
+        # — 커서 무관한 약어/인용 제안이 OCR 쓰레기 위에 뜨던 문제를 막는다.
+        ready_names, ocr_suppressed = self.filter_ocr_suppressed(
+            ready_names, filtered.current_paragraph_source
+        )
+        # 커서 미확정이면 커서-필수 시나리오(idle/churn) 제거 — native editor처럼
+        # "지금 쓰는 곳"을 알 때만 이어쓰기/재작성 제안.
+        ready_names, unlocated_suppressed = self.filter_unlocated(
+            ready_names, bool(getattr(filtered, "cursor_located", False))
+        )
+        ocr_suppressed = ocr_suppressed + unlocated_suppressed
         scheduler_snapshot: dict[str, Any] | None = None
         scheduler_trace: dict[str, Any] | None = None
         selected_name: str | None = None
@@ -230,6 +262,7 @@ class InterventionDetector:
                     last_fired_at=last_fired_at,
                     now=now,
                     doc_chars=doc_chars,
+                    paragraph_fingerprint=current_snapshot["paragraph_fingerprint"],
                     trace_out=scheduler_trace,
                 )
             else:
@@ -238,6 +271,7 @@ class InterventionDetector:
                     ready_names,
                     now=now,
                     doc_chars=doc_chars,
+                    paragraph_fingerprint=current_snapshot["paragraph_fingerprint"],
                     trace_out=scheduler_trace,
                 )
             scheduler_snapshot = self.scheduler.snapshot(
@@ -262,6 +296,10 @@ class InterventionDetector:
         # Decision-level trace (only when a scenario actually became a candidate,
         # so idle captures stay silent). Shows the ready set with scores and the
         # selection outcome — selected scenario or why nothing fired.
+        if ocr_suppressed:
+            screen_trace(
+                f"ocr_suppressed=[{', '.join(ocr_suppressed)}] (OCR source, no reliable cursor)"
+            )
         if ready_names:
             candidates = ", ".join(
                 f"{name}({scenario_results[name].score:.2f})" for name in ready_names
@@ -274,6 +312,7 @@ class InterventionDetector:
 
         if selected_name is None:
             blockers = [f"scenario:{name}:not_ready" for name in scenario_results if not scenario_results[name].ready]
+            blockers += [f"scenario:{name}:ocr_suppressed" for name in ocr_suppressed]
             # ready 후보가 있었는데 throttle로 막힌 경우, 전역 blocker도 함께 표시
             if scheduler_trace and scheduler_trace.get("rejected_reason") == "global_throttle":
                 blockers.append("global_throttle_active")
@@ -322,21 +361,46 @@ class InterventionDetector:
         last_fired_at: dict[str, float],
         now: float,
         doc_chars: int,
+        paragraph_fingerprint: str | None = None,
         trace_out: dict[str, Any],
     ) -> str | None:
-        """Pick one ready scenario via the LLM router (or decline). The global
-        throttle still gates (anti-spam); a fire is recorded for recency."""
-        if self.scheduler is not None and self.scheduler.is_globally_throttled(document_key, now=now):
-            trace_out["rejected_reason"] = "global_throttle"
-            trace_out["router"] = None
-            screen_trace("router: skipped (global throttle)")
-            return None
+        """Pick one ready scenario via the LLM router (or decline). The adaptive
+        fire gate still applies (anti-spam); a fire is recorded for recency."""
+        if self.scheduler is not None:
+            gate_reason = self.scheduler.global_gate_reason(
+                document_key, doc_chars=doc_chars, now=now
+            )
+            if gate_reason is not None:
+                trace_out["rejected_reason"] = gate_reason
+                trace_out["router"] = None
+                screen_trace(f"router: skipped ({gate_reason})")
+                return None
+            if self.scheduler.is_paragraph_throttled(
+                document_key, paragraph_fingerprint, now=now
+            ):
+                trace_out["rejected_reason"] = "paragraph_cooldown"
+                trace_out["router"] = None
+                screen_trace("router: skipped (paragraph cooldown)")
+                return None
         candidates = [(name, list(scenario_results[name].reasons)) for name in ready_names]
-        recent_text = " ".join(
-            (filtered.current_paragraph_text or filtered.active_editor_text or "").split()
-        )[:1500]
+        # Anchor the router's view of "what the user is writing" to the same
+        # place the dispatcher will: caret paragraph → recent edit → document
+        # TAIL, never the head. ``current_paragraph_text`` can itself be the
+        # whole-document fallback (caret unread), so guard against it and never
+        # slice the document from the front, which would hand the router the
+        # intro while the user is in the conclusion.
+        para = filtered.current_paragraph_text or ""
+        full = filtered.active_editor_text or ""
+        changed = filtered.changed_text or ""
+        if changed:
+            recent_src = changed
+        elif para and para != full:
+            recent_src = para
+        else:
+            recent_src = full[-1500:]
+        recent_text = " ".join(recent_src.split())[:1500]
         focused_text = " ".join(
-            (filtered.changed_text or filtered.current_paragraph_text or "").split()
+            (changed or (para if para != full else "") or full[-400:]).split()
         )[:400]
         decision = self.router.route(
             document_type="the user's working document",
@@ -357,7 +421,13 @@ class InterventionDetector:
         )
         if decision.scenario and decision.confidence >= self.ROUTER_MIN_CONFIDENCE:
             if self.scheduler is not None:
-                self.scheduler.record_fire(document_key, decision.scenario, now=now, doc_chars=doc_chars)
+                self.scheduler.record_fire(
+                    document_key,
+                    decision.scenario,
+                    now=now,
+                    doc_chars=doc_chars,
+                    paragraph_fingerprint=paragraph_fingerprint,
+                )
             return decision.scenario
         trace_out.setdefault("rejected_reason", "router_declined")
         return None
@@ -380,6 +450,38 @@ class InterventionDetector:
             "document_key": self._make_document_key(window),
             "paragraph_fingerprint": self._fingerprint(paragraph),
         }
+
+    # 커서 위치를 알아야만 의미있는 시나리오. cursor_located=False면(꼬리 추정/OCR)
+    # 발화하지 않는다 — "지금 쓰는 곳"을 모르면 이어쓰기/재작성을 제안할 수 없다.
+    # blank_document_start는 빈 문서라 커서가 없어도 시작을 도울 수 있으므로 제외.
+    _CURSOR_REQUIRED_SCENARIOS = frozenset({
+        "idle_after_writing",
+        "paragraph_churn",
+    })
+
+    @classmethod
+    def filter_unlocated(
+        cls, ready_names: list[str], cursor_located: bool
+    ) -> tuple[list[str], list[str]]:
+        """``(kept, dropped)`` — 커서 미확정(cursor_located=False)이면 커서-필수
+        시나리오를 ready set에서 제거."""
+        if cursor_located:
+            return list(ready_names), []
+        kept = [n for n in ready_names if n not in cls._CURSOR_REQUIRED_SCENARIOS]
+        dropped = [n for n in ready_names if n in cls._CURSOR_REQUIRED_SCENARIOS]
+        return kept, dropped
+
+    @classmethod
+    def filter_ocr_suppressed(
+        cls, ready_names: list[str], source: str | None
+    ) -> tuple[list[str], list[str]]:
+        """``(kept, dropped)`` — OCR-only 소스(`ocr_*`)면 위치 특정 prose 시나리오를
+        ready set에서 제거한다. 다른 소스(app_text/UIA)면 그대로."""
+        if not str(source or "").startswith("ocr"):
+            return list(ready_names), []
+        kept = [n for n in ready_names if n not in cls._OCR_SUPPRESSED_SCENARIOS]
+        dropped = [n for n in ready_names if n in cls._OCR_SUPPRESSED_SCENARIOS]
+        return kept, dropped
 
     def _is_editing_app(self, filtered: FilteredScreenContext) -> bool:
         return filtered.active_app_type in self.EDITING_APP_TYPES

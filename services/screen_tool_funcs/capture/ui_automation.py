@@ -37,9 +37,19 @@ class UiAutomationReader:
             selection = self._read_selection_paragraph(auto, text_pattern)
             hover = self._read_hover_paragraph(auto, window)
             browser_url = self._read_browser_url(auto, window)
-            current_text = selection["paragraph_text"] or hover["paragraph_text"]
-            current_source = selection["source"] or hover["source"]
-            current_rect = selection["paragraph_rect"] or hover["paragraph_rect"]
+            # The caret (text selection) paragraph is the ONLY valid anchor for
+            # "what the user is currently writing". Mouse-hover is NOT a caret
+            # proxy: when the user types in the conclusion while the mouse rests
+            # over the intro, a hover-derived paragraph mis-anchors every
+            # suggestion to the intro. We still capture ``hover_text`` separately
+            # (telemetry / possible future "ask about what I'm pointing at"), but
+            # it must never drive ``current_paragraph_text``. When the caret can't
+            # be read the field stays empty and downstream anchors to the recent
+            # edit region / document tail instead (see ContentFilter +
+            # InterventionDispatcher), never to the document head.
+            current_text = selection["paragraph_text"]
+            current_source = selection["source"]
+            current_rect = selection["paragraph_rect"]
 
             result = UiAutomationResult(
                 focused_name=focused.Name or "",

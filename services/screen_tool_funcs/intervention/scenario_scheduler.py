@@ -35,6 +35,20 @@ class ScenarioSchedulerState:
     last_fired_doc_chars: dict[str, int] = field(default_factory=dict)
     # 시나리오 무관 가장 최근 발동 시각. 스케줄러의 전역 rate-limit이 사용.
     last_global_fire_at: float = 0.0
+    # {paragraph_fingerprint: unix_ts} — 그 단락에서 (시나리오 무관) 마지막으로 발동한 시각.
+    # 시나리오별 cooldown은 같은 시나리오의 재발화만 막아서, 24개 시나리오가 같은 단락을
+    # 돌아가며 발화하는 "서로 다른 내용의 카드 폭주"를 못 막는다. 이 맵이 그 cross-scenario
+    # 구멍을 막는다. 단락을 실제로 수정하면 fingerprint가 바뀌어 자연히 풀린다.
+    last_fired_paragraphs: dict[str, float] = field(default_factory=dict)
+    # ---- 적응형 발화 페이스(문서당) ----
+    # 발화 간격 = base × multiplier (clamp [floor, ceil]). multiplier는 카드 반응에
+    # 따라 변하고(수락↓ / 거절·무시↑) 시간이 지나면 1.0으로 반감기 감쇠한다.
+    fire_pace_multiplier: float = 1.0
+    pace_updated_at: float = 0.0
+    # 직전 발화 시점의 정규화 문서 길이 / 단락 fingerprint — "그 뒤로 새 내용을
+    # 썼는가"(조기 해제) 판정 기준. -1 = 기준 없음(레거시 상태).
+    last_global_fire_doc_chars: int = -1
+    last_global_fire_paragraph_fp: str = ""
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -47,10 +61,16 @@ class ScenarioSchedulerState:
             "last_fired_at": dict(self.last_fired_at),
             "last_fired_doc_chars": dict(self.last_fired_doc_chars),
             "last_global_fire_at": self.last_global_fire_at,
+            "last_fired_paragraphs": dict(self.last_fired_paragraphs),
+            "fire_pace_multiplier": self.fire_pace_multiplier,
+            "pace_updated_at": self.pace_updated_at,
+            "last_global_fire_doc_chars": self.last_global_fire_doc_chars,
+            "last_global_fire_paragraph_fp": self.last_global_fire_paragraph_fp,
         }
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "ScenarioSchedulerState":
+        raw_fire_chars = payload.get("last_global_fire_doc_chars")
         return cls(
             document_key=str(payload.get("document_key") or ""),
             initial_vruntimes={
@@ -73,6 +93,18 @@ class ScenarioSchedulerState:
                 for k, v in (payload.get("last_fired_doc_chars") or {}).items()
             },
             last_global_fire_at=float(payload.get("last_global_fire_at") or 0.0),
+            last_fired_paragraphs={
+                str(k): float(v)
+                for k, v in (payload.get("last_fired_paragraphs") or {}).items()
+            },
+            fire_pace_multiplier=float(payload.get("fire_pace_multiplier") or 1.0),
+            pace_updated_at=float(payload.get("pace_updated_at") or 0.0),
+            last_global_fire_doc_chars=(
+                int(raw_fire_chars) if raw_fire_chars is not None else -1
+            ),
+            last_global_fire_paragraph_fp=str(
+                payload.get("last_global_fire_paragraph_fp") or ""
+            ),
         )
 
 
@@ -98,7 +130,12 @@ class ScenarioScheduler:
         reset_idle_sec: float = 3600.0,
         reset_interval_sec: float = 7200.0,
         max_documents: int = 50,
-        min_global_fire_interval_sec: float = 5.0,
+        fire_interval_floor_sec: float = 20.0,
+        fire_interval_base_sec: float = 30.0,
+        fire_interval_ceil_sec: float = 240.0,
+        pace_decay_half_life_sec: float = 600.0,
+        early_release_min_new_chars: int = 80,
+        paragraph_cooldown_sec: float = 180.0,
         console_log: bool = False,
     ) -> None:
         if scenarios is not None and weights is not None:
@@ -121,8 +158,22 @@ class ScenarioScheduler:
         self.reset_idle_sec = max(reset_idle_sec, 0.0)
         self.reset_interval_sec = max(reset_interval_sec, 0.0)
         self.max_documents = max(max_documents, 1)
-        # 시나리오 무관 발화 간 최소 간격. 0 이하면 throttle 비활성.
-        self.min_global_fire_interval_sec = max(min_global_fire_interval_sec, 0.0)
+        # ---- 적응형 발화 페이스 (시나리오 무관, 문서당) ----
+        # 발화 허용 = elapsed ≥ floor AND (elapsed ≥ base×multiplier OR 새 내용).
+        # floor: 어떤 경우에도 지켜지는 발화 간 최소 간격 (스팸 절대 하한).
+        # base×multiplier: 평상시 간격. multiplier는 카드 반응(수락 0.6 / 다시 0.7 /
+        #   거절 1.7 / 무시 1.3)으로 변하고 반감기 감쇠로 1.0에 수렴 — "도움이 됐으면
+        #   더 자주, 방해였으면 더 드물게". clamp [floor, ceil].
+        # 새 내용(조기 해제): 직전 발화 이후 정규화 문서 길이가
+        #   early_release_min_new_chars 이상 변했으면 간격이 안 지났어도 발화 허용
+        #   — 벽시계가 아니라 "도울 거리가 생겼는가"가 기준.
+        self.fire_interval_floor_sec = max(fire_interval_floor_sec, 0.0)
+        self.fire_interval_base_sec = max(fire_interval_base_sec, self.fire_interval_floor_sec)
+        self.fire_interval_ceil_sec = max(fire_interval_ceil_sec, self.fire_interval_base_sec)
+        self.pace_decay_half_life_sec = max(pace_decay_half_life_sec, 0.0)
+        self.early_release_min_new_chars = max(int(early_release_min_new_chars), 0)
+        # 같은 단락(fingerprint)에 시나리오 무관 재발화 금지 시간. 0 이하면 비활성.
+        self.paragraph_cooldown_sec = max(paragraph_cooldown_sec, 0.0)
         self.console_log = console_log
 
         self._cache: dict[str, ScenarioSchedulerState] = {}
@@ -203,6 +254,7 @@ class ScenarioScheduler:
         *,
         now: float | None = None,
         doc_chars: int | None = None,
+        paragraph_fingerprint: str | None = None,
         trace_out: dict[str, Any] | None = None,
     ) -> str | None:
         """Pick the winner and charge its vruntime in a single decay step.
@@ -225,9 +277,18 @@ class ScenarioScheduler:
         trace["selected_vruntime_after"] = None
         trace["global_throttle"] = {
             "active": False,
+            "reason": None,
             "elapsed_since_last_fire_sec": None,
-            "min_interval_sec": self.min_global_fire_interval_sec,
+            "floor_sec": self.fire_interval_floor_sec,
+            "effective_interval_sec": None,
+            "pace_multiplier": None,
+            "early_release": False,
             "last_global_fire_at": 0.0,
+        }
+        trace["paragraph_throttle"] = {
+            "active": False,
+            "fingerprint": paragraph_fingerprint or None,
+            "cooldown_sec": self.paragraph_cooldown_sec,
         }
         trace["rejected_reason"] = None
 
@@ -238,20 +299,40 @@ class ScenarioScheduler:
         with self._lock:
             state = self.get_state(document_key, now=now)
             trace["global_throttle"]["last_global_fire_at"] = state.last_global_fire_at
-            # 시나리오 무관 전역 rate-limit — 직전 발동으로부터 일정 시간 안엔 누구도 발화 X
-            if self.min_global_fire_interval_sec > 0 and state.last_global_fire_at > 0:
-                elapsed = now - state.last_global_fire_at
-                trace["global_throttle"]["elapsed_since_last_fire_sec"] = round(elapsed, 1)
-                if elapsed < self.min_global_fire_interval_sec:
-                    trace["global_throttle"]["active"] = True
-                    trace["rejected_reason"] = "global_throttle"
-                    if self.console_log:
-                        print(
-                            "[screen_context][scheduler] "
-                            f"global throttle: {elapsed:.1f}s < {self.min_global_fire_interval_sec:.1f}s, "
-                            f"ready_names={ready_names}"
-                        )
-                    return None
+            # 시나리오 무관 적응형 발화 게이트 — floor / 적응 간격 / 새 내용 조기 해제.
+            gate_reason = self._global_gate_locked(
+                state,
+                now=now,
+                doc_chars=doc_chars,
+                trace=trace["global_throttle"],
+            )
+            if gate_reason is not None:
+                trace["global_throttle"]["active"] = True
+                trace["global_throttle"]["reason"] = gate_reason
+                trace["rejected_reason"] = gate_reason
+                if self.console_log:
+                    print(
+                        "[screen_context][scheduler] "
+                        f"fire gate ({gate_reason}): "
+                        f"elapsed={trace['global_throttle']['elapsed_since_last_fire_sec']}s "
+                        f"interval={trace['global_throttle']['effective_interval_sec']}s "
+                        f"ready_names={ready_names}"
+                    )
+                return None
+            # 단락 단위 cross-scenario cooldown — 같은 단락에는 시나리오가 달라도
+            # paragraph_cooldown_sec 동안 추가 발화 금지.
+            if self._paragraph_throttled_locked(
+                state, paragraph_fingerprint, now=now
+            ):
+                trace["paragraph_throttle"]["active"] = True
+                trace["rejected_reason"] = "paragraph_cooldown"
+                if self.console_log:
+                    print(
+                        "[screen_context][scheduler] "
+                        f"paragraph cooldown: fp={paragraph_fingerprint} "
+                        f"ready_names={ready_names}"
+                    )
+                return None
             scored: list[tuple[float, float, str]] = []
             for name in ready_names:
                 if name not in self.weights:
@@ -275,23 +356,195 @@ class ScenarioScheduler:
             if doc_chars is not None:
                 # 발동 시점의 문서 길이 기록
                 state.last_fired_doc_chars[selected] = doc_chars
+            self._record_paragraph_fire_locked(state, paragraph_fingerprint, now=now)
+            self._record_global_fire_baseline_locked(
+                state, doc_chars=doc_chars, paragraph_fingerprint=paragraph_fingerprint
+            )
             trace["selected"] = selected
             trace["selected_vruntime_before"] = round(current, 4)
             trace["selected_vruntime_after"] = round(new_vruntime, 4)
             return selected
 
-    def is_globally_throttled(self, document_key: str, *, now: float | None = None) -> bool:
-        """Cheap anti-spam reflex, decoupled from vruntime selection: True when a
-        fire happened within ``min_global_fire_interval_sec``. Used by the LLM
-        router path, which does selection itself but still wants the throttle."""
-        if self.min_global_fire_interval_sec <= 0:
-            return False
+    # 카드 반응 → 페이스 multiplier 계수. 수락/다시 = 더 자주, 거절/무시 = 더 드물게.
+    PACE_FEEDBACK_FACTORS: dict[str, float] = {
+        "accept": 0.6,
+        "retry": 0.7,
+        "reject": 1.7,
+        "ignore": 1.3,
+    }
+    _PACE_MULTIPLIER_MIN = 0.5
+
+    def global_gate_reason(
+        self,
+        document_key: str,
+        *,
+        doc_chars: int | None = None,
+        now: float | None = None,
+    ) -> str | None:
+        """적응형 전역 발화 게이트의 router-path 진입점. 허용이면 None, 차단이면
+        reason 코드(``global_throttle``=floor 미달 / ``adaptive_interval``=적응
+        간격 미달 + 새 내용 없음)."""
         now = now if now is not None else time.time()
         with self._lock:
             state = self.get_state(document_key, now=now)
-            if state.last_global_fire_at <= 0:
-                return False
-            return (now - state.last_global_fire_at) < self.min_global_fire_interval_sec
+            return self._global_gate_locked(state, now=now, doc_chars=doc_chars)
+
+    def _global_gate_locked(
+        self,
+        state: ScenarioSchedulerState,
+        *,
+        now: float,
+        doc_chars: int | None,
+        trace: dict[str, Any] | None = None,
+    ) -> str | None:
+        if state.last_global_fire_at <= 0:
+            return None
+        elapsed = now - state.last_global_fire_at
+        interval, multiplier = self._effective_interval_locked(state, now=now)
+        if trace is not None:
+            trace["elapsed_since_last_fire_sec"] = round(elapsed, 1)
+            trace["effective_interval_sec"] = round(interval, 1)
+            trace["pace_multiplier"] = round(multiplier, 3)
+        # 1) hard floor — 어떤 신호로도 우회 불가한 절대 하한.
+        if elapsed < self.fire_interval_floor_sec:
+            return "global_throttle"
+        # 2) 적응 간격 — 지났으면 통과.
+        if elapsed >= interval:
+            return None
+        # 3) 조기 해제 — 직전 발화 이후 의미 있는 새 편집이 있으면 floor만으로 허용.
+        if self._has_new_content_locked(state, doc_chars=doc_chars):
+            if trace is not None:
+                trace["early_release"] = True
+            return None
+        return "adaptive_interval"
+
+    def _effective_interval_locked(
+        self, state: ScenarioSchedulerState, *, now: float
+    ) -> tuple[float, float]:
+        multiplier = self._decayed_multiplier_locked(state, now=now)
+        interval = self.fire_interval_base_sec * multiplier
+        interval = max(
+            self.fire_interval_floor_sec, min(self.fire_interval_ceil_sec, interval)
+        )
+        return interval, multiplier
+
+    def _decayed_multiplier_locked(
+        self, state: ScenarioSchedulerState, *, now: float
+    ) -> float:
+        multiplier = float(state.fire_pace_multiplier or 1.0)
+        if multiplier <= 0:
+            return 1.0
+        if (
+            multiplier == 1.0
+            or state.pace_updated_at <= 0
+            or self.pace_decay_half_life_sec <= 0
+        ):
+            return multiplier
+        elapsed = max(0.0, now - state.pace_updated_at)
+        return 1.0 + (multiplier - 1.0) * (
+            0.5 ** (elapsed / self.pace_decay_half_life_sec)
+        )
+
+    def _has_new_content_locked(
+        self, state: ScenarioSchedulerState, *, doc_chars: int | None
+    ) -> bool:
+        if self.early_release_min_new_chars <= 0:
+            return False
+        if doc_chars is None:
+            return False
+        if state.last_global_fire_doc_chars < 0:
+            # 기준 없음(레거시/리셋 직후) — 허용 쪽으로.
+            return True
+        return (
+            abs(int(doc_chars) - state.last_global_fire_doc_chars)
+            >= self.early_release_min_new_chars
+        )
+
+    def _record_global_fire_baseline_locked(
+        self,
+        state: ScenarioSchedulerState,
+        *,
+        doc_chars: int | None,
+        paragraph_fingerprint: str | None,
+    ) -> None:
+        state.last_global_fire_doc_chars = (
+            int(doc_chars) if doc_chars is not None else -1
+        )
+        state.last_global_fire_paragraph_fp = str(paragraph_fingerprint or "")
+
+    def record_card_outcome(
+        self, document_key: str, outcome: str, *, now: float | None = None
+    ) -> None:
+        """카드 1장에 대한 사용자 반응을 페이스 multiplier에 반영한다.
+
+        outcome ∈ {accept, retry, reject, ignore}. 그 외 값은 no-op. 누적 전에
+        현재 시점까지의 감쇠를 먼저 접어 넣으므로(consecutive feedback이 감쇠된
+        값 위에 곱해짐) 오래전 거절이 과대 반영되지 않는다."""
+        factor = self.PACE_FEEDBACK_FACTORS.get(str(outcome or "").strip().lower())
+        if factor is None:
+            return
+        now = now if now is not None else time.time()
+        with self._lock:
+            state = self.get_state(document_key, now=now)
+            current = self._decayed_multiplier_locked(state, now=now)
+            multiplier_max = max(
+                1.0,
+                self.fire_interval_ceil_sec / max(self.fire_interval_base_sec, 1e-6),
+            )
+            state.fire_pace_multiplier = min(
+                max(current * factor, self._PACE_MULTIPLIER_MIN), multiplier_max
+            )
+            state.pace_updated_at = now
+
+    def is_paragraph_throttled(
+        self,
+        document_key: str,
+        paragraph_fingerprint: str | None,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """True when *any* scenario fired on this paragraph within
+        ``paragraph_cooldown_sec``. Router-path counterpart of the inline check
+        in :meth:`select_and_charge`."""
+        now = now if now is not None else time.time()
+        with self._lock:
+            state = self.get_state(document_key, now=now)
+            return self._paragraph_throttled_locked(state, paragraph_fingerprint, now=now)
+
+    # 단락 fingerprint 발동 기록 상한 — 한 문서에서 오래된 단락 기록이 무한히 쌓이지 않게.
+    _PARAGRAPH_FIRE_HISTORY_MAX = 32
+
+    def _paragraph_throttled_locked(
+        self,
+        state: ScenarioSchedulerState,
+        paragraph_fingerprint: str | None,
+        *,
+        now: float,
+    ) -> bool:
+        if self.paragraph_cooldown_sec <= 0 or not paragraph_fingerprint:
+            return False
+        last_at = state.last_fired_paragraphs.get(str(paragraph_fingerprint))
+        if last_at is None:
+            return False
+        return (now - last_at) < self.paragraph_cooldown_sec
+
+    def _record_paragraph_fire_locked(
+        self,
+        state: ScenarioSchedulerState,
+        paragraph_fingerprint: str | None,
+        *,
+        now: float,
+    ) -> None:
+        if not paragraph_fingerprint:
+            return
+        state.last_fired_paragraphs[str(paragraph_fingerprint)] = now
+        if len(state.last_fired_paragraphs) > self._PARAGRAPH_FIRE_HISTORY_MAX:
+            ranked = sorted(
+                state.last_fired_paragraphs.items(), key=lambda item: item[1], reverse=True
+            )
+            state.last_fired_paragraphs = dict(
+                ranked[: self._PARAGRAPH_FIRE_HISTORY_MAX]
+            )
 
     def record_fire(
         self,
@@ -300,6 +553,7 @@ class ScenarioScheduler:
         *,
         now: float | None = None,
         doc_chars: int | None = None,
+        paragraph_fingerprint: str | None = None,
     ) -> None:
         """Record that ``name`` fired: updates recency (last_fired_at) + the global
         throttle anchor, WITHOUT charging vruntime. The router, not vruntime, owns
@@ -313,9 +567,37 @@ class ScenarioScheduler:
             state.last_activity_at = now
             if doc_chars is not None:
                 state.last_fired_doc_chars[name] = doc_chars
+            self._record_paragraph_fire_locked(state, paragraph_fingerprint, now=now)
+            self._record_global_fire_baseline_locked(
+                state, doc_chars=doc_chars, paragraph_fingerprint=paragraph_fingerprint
+            )
+
+    def allow_immediate_fire(
+        self,
+        document_key: str,
+        *,
+        scenario_name: str | None = None,
+        paragraph_fingerprint: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """사용자가 카드에 '다시'(retry)를 눌렀을 때 호출 — 다음 캡처가 곧바로
+        새 제안을 만들 수 있게 이 문서의 발화 브레이크를 선별적으로 푼다:
+        전역 throttle 기준점, 해당 단락의 cross-scenario cooldown, 그리고 (알고
+        있다면) 그 카드를 만든 시나리오의 자체 cooldown. 다른 시나리오/단락의
+        cooldown은 건드리지 않는다."""
+        now = now if now is not None else time.time()
+        with self._lock:
+            state = self.get_state(document_key, now=now)
+            state.last_global_fire_at = 0.0
+            if paragraph_fingerprint:
+                state.last_fired_paragraphs.pop(str(paragraph_fingerprint), None)
+            if scenario_name:
+                state.last_fired_at.pop(str(scenario_name), None)
 
     def snapshot(self, document_key: str, *, now: float | None = None) -> dict[str, Any]:
+        now = now if now is not None else time.time()
         state = self.get_state(document_key, now=now)
+        interval, multiplier = self._effective_interval_locked(state, now=now)
         return {
             "document_key": state.document_key,
             "vruntimes": dict(state.vruntimes),
@@ -326,7 +608,13 @@ class ScenarioScheduler:
             "last_fired_at": dict(state.last_fired_at),
             "last_fired_doc_chars": dict(state.last_fired_doc_chars),
             "last_global_fire_at": state.last_global_fire_at,
-            "min_global_fire_interval_sec": self.min_global_fire_interval_sec,
+            "fire_interval_floor_sec": self.fire_interval_floor_sec,
+            "fire_interval_base_sec": self.fire_interval_base_sec,
+            "fire_interval_ceil_sec": self.fire_interval_ceil_sec,
+            "fire_pace_multiplier": round(multiplier, 3),
+            "effective_fire_interval_sec": round(interval, 1),
+            "last_fired_paragraphs": dict(state.last_fired_paragraphs),
+            "paragraph_cooldown_sec": self.paragraph_cooldown_sec,
         }
 
     def flush_all(self) -> None:
@@ -445,10 +733,15 @@ class ScenarioScheduler:
         for name, weight in self.weights.items():
             state.vruntimes[name] = weight.initial_vruntime
             state.initial_vruntimes[name] = weight.initial_vruntime
-        # 발동 기록 초기화 → 모든 cooldown 면제 (전역 throttle 포함)
+        # 발동 기록 초기화 → 모든 cooldown 면제 (전역 throttle + 단락 cooldown 포함)
         state.last_fired_at.clear()
         state.last_fired_doc_chars.clear()
         state.last_global_fire_at = 0.0
+        state.last_fired_paragraphs.clear()
+        state.fire_pace_multiplier = 1.0
+        state.pace_updated_at = 0.0
+        state.last_global_fire_doc_chars = -1
+        state.last_global_fire_paragraph_fp = ""
         state.last_decay_at = now
         state.last_activity_at = now
         state.last_reset_at = now

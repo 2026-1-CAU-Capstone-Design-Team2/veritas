@@ -229,6 +229,25 @@ class ScreenMonitor:
             return {"ok": False, "error": getattr(result, "error", "record_feedback failed")}
         return {"ok": True, "record": result.data}
 
+    def resolve_card(self, *, event_id: str, action: str) -> dict[str, Any]:
+        """Release the capture loop's unresolved-card gate for ``event_id``.
+
+        Called from the feedback route for BOTH proactive (``pd_*``) and legacy
+        ids — the gate stores both as aliases of the same card, so either
+        resolves it. ``action == "retry"`` additionally lifts the document's
+        fire brakes so the next capture can regenerate promptly."""
+        if self._registry is None or not self._registry.has("screen_context"):
+            return {"ok": False, "error": "screen_context tool is not registered"}
+        result = self._registry.call(
+            "screen_context",
+            action="resolve_card",
+            event_id=event_id,
+            feedback_action=action,
+        )
+        if not getattr(result, "success", False):
+            return {"ok": False, "error": getattr(result, "error", "resolve_card failed")}
+        return {"ok": True, **(result.data if isinstance(result.data, dict) else {})}
+
     def record_assist_answer(
         self,
         answer: str,
@@ -268,6 +287,13 @@ class ScreenMonitor:
         )
         if not isinstance(app_context, dict):
             app_context = {}
+        activity_context = (
+            intervention.get("activity_context")
+            if isinstance(intervention, dict)
+            else {}
+        )
+        if not isinstance(activity_context, dict):
+            activity_context = {}
         focused = " ".join(
             str(writing_context.get("focused_sentence") or "").split()
         ).strip()
@@ -307,6 +333,16 @@ class ScreenMonitor:
                 "createdAt": _now_iso(),
                 "capturedAt": intervention.get("captured_at"),
                 "triggerText": trigger_text,
+                # 같은 단락에 대한 새 제안이 이전 카드를 교체할 수 있도록 단락
+                # 식별자를 함께 전달 (frontend SuggestionList의 교체 정책이 사용).
+                "paragraphFingerprint": str(
+                    activity_context.get("paragraph_fingerprint") or ""
+                ),
+                "documentKey": str(
+                    app_context.get("document_key")
+                    or activity_context.get("document_key")
+                    or ""
+                ),
                 "appContext": {
                     "title": app_context.get("title") or app_context.get("window_title"),
                     "processName": app_context.get("process_name"),

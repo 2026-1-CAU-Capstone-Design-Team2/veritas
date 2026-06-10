@@ -643,6 +643,17 @@ class SuggestionCard(QFrame):
 		if self._event_id:
 			self.feedbackSubmitted.emit(self._event_id, self._intervention_type, "copy")
 
+	def show_regenerating(self) -> None:
+		"""'다시'(retry)를 누른 직후 카드 내용을 즉시 비우고 '(재제안 중...)'을
+		띄워 실제 작동 중임을 보여준다. 백엔드 재생성이 같은 event_id로 새 내용을
+		upsert하면 :meth:`set_text`가 이 placeholder를 덮어쓴다."""
+		self._copy_value = ""
+		self._body.setText("(재제안 중...)")
+		self._note.setText("")
+		self._note.setVisible(False)
+		self._copy_button.setVisible(False)
+		self._sync_height()
+
 	def _on_rate(self, action: str) -> None:
 		# One explicit rating per card. Lock the pair (or trio, for proactive
 		# cards) after the first click so a single intervention contributes one
@@ -650,6 +661,11 @@ class SuggestionCard(QFrame):
 		# may want to keep cycling, and the backend creates a fresh decisionId
 		# on each cycle, so we don't lock there.
 		if not self._event_id:
+			return
+		if action == "retry":
+			# 즉시 "(재제안 중...)" 표시 — 백엔드 재생성을 기다리지 않고 작동 신호.
+			self.show_regenerating()
+			self.feedbackSubmitted.emit(self._event_id, self._intervention_type, action)
 			return
 		if self._rated and action != "retry":
 			return
@@ -672,8 +688,13 @@ class SuggestionCard(QFrame):
 		self.feedbackSubmitted.emit(self._event_id, self._intervention_type, action)
 
 	def set_text(self, text: str) -> None:
-		"""Replace the card text in place (used for streaming updates)."""
+		"""Replace the card text in place (used for streaming updates).
+
+		Re-pins the card height to the new wrapped text. 스트리밍으로 텍스트가
+		자랄 때 높이를 다시 맞추지 않으면 본문이 첫 청크 높이에 고정돼 잘려 보인다
+		(상단에 막 추가된 카드가 '깨져' 보이던 원인)."""
 		self._apply_parsed(text)
+		self._sync_height()
 
 	@staticmethod
 	def _strip_markdown(text: str) -> str:
@@ -692,41 +713,102 @@ class SuggestionCard(QFrame):
 		joined = re.sub(r"(?<!\*)\*(?!\*)([^*\n]+)\*(?!\*)", r"\1", joined)  # *italic* -> italic
 		return joined
 
+	# Markers that introduce the (non-pasteable) explanation. The prompt tells the
+	# model to use "설명:"; we accept common variants and also detect it mid-line.
+	_NOTE_MARKERS = (
+		"설명:", "설명 :", "[설명]:", "[설명]", "(설명)", "참고:", "주석:", "Note:", "note:",
+	)
+
 	@staticmethod
 	def _split_content_note(text: str) -> tuple[str, str]:
 		"""Split a screen reply into (pasteable content, commentary note).
 
-		Markdown is stripped first (the local model ignores the plain-text rule).
-		Preferred split is an explicit "설명:" line; when the model omits it (it
-		usually does), trailing document-citation commentary ("[Document 017]
-		참조로, ...") is peeled off as the note so the copy button still takes only
-		the prose the user would paste. No markers at all -> all content (e.g.
-		manual editor cards)."""
+		The card shows ``content`` as the one-click copy-to-paste suggestion and
+		``note`` as a small grey explanation below it. Three layers, in order:
+
+		1. An explicit "설명:"-family marker (the format the prompt asks for) —
+		   honored whether it begins a line or appears mid-line.
+		2. Trailing "[Document ...]" citation commentary (model meta-advice).
+		3. A conservative structural fallback: a short pasteable lead block
+		   followed by a blank line and a trailing block → content + note. Skipped
+		   for bulleted/numbered review lists (pure commentary) and long leads
+		   (likely all pasteable prose), so it never splits real continuation text.
+		"""
 		raw = SuggestionCard._strip_markdown(text or "").strip()
-		lines = raw.split("\n")
-		# Match "설명:" as a line PREFIX, not an exact line — the model usually
-		# writes the note inline ("설명: 해당 문맥은 ...") rather than on its own line.
-		note_prefixes = ("설명:", "설명 :", "[설명]", "[설명]:", "참고:", "Note:", "note:")
-		note_idx = None
-		note_inline = ""
-		for i, ln in enumerate(lines):
-			stripped = ln.strip()
-			matched = next((p for p in note_prefixes if stripped.startswith(p)), None)
-			if matched is not None:
-				note_idx = i
-				note_inline = stripped[len(matched):].strip()
-				break
-		if note_idx is not None:
-			content = "\n".join(lines[:note_idx]).strip()
-			rest = "\n".join(lines[note_idx + 1:]).strip()
-			note = (note_inline + ("\n" + rest if rest else "")).strip()
-		else:
+
+		content, note = SuggestionCard._split_on_note_marker(raw)
+		if content is None:
 			content, note = SuggestionCard._peel_citation_commentary(raw)
+			if not note:
+				content, note = SuggestionCard._peel_trailing_block(content)
+
 		# Drop a stray leading "제안:" label if the model added one anyway.
 		clines = content.split("\n")
 		if clines and clines[0].strip() in ("제안:", "제안", "[제안]", "Suggestion:"):
 			content = "\n".join(clines[1:]).strip()
 		return content.strip(), note.strip()
+
+	@staticmethod
+	def _split_on_note_marker(raw: str) -> tuple[str | None, str]:
+		"""Split on the first "설명:"-family marker, line-leading or mid-line.
+		Returns ``(None, "")`` when no marker is present so the caller can try the
+		structural fallbacks."""
+		lines = raw.split("\n")
+		for i, ln in enumerate(lines):
+			stripped = ln.strip()
+			lead = next(
+				(m for m in SuggestionCard._NOTE_MARKERS if stripped.startswith(m)),
+				None,
+			)
+			if lead is not None:
+				content = "\n".join(lines[:i]).strip()
+				inline = stripped[len(lead):].strip()
+				rest = "\n".join(lines[i + 1:]).strip()
+				note = (inline + ("\n" + rest if rest else "")).strip()
+				return content, note
+			# Mid-line marker, e.g. "제안 문장입니다. 설명: 부연." — split that line.
+			hit = SuggestionCard._find_mid_marker(ln)
+			if hit is not None:
+				marker, idx = hit
+				head = ln[:idx].strip()
+				tail = ln[idx + len(marker):].strip()
+				content = "\n".join(lines[:i] + ([head] if head else [])).strip()
+				rest = "\n".join(lines[i + 1:]).strip()
+				note = (tail + ("\n" + rest if rest else "")).strip()
+				return content, note
+		return None, ""
+
+	@staticmethod
+	def _find_mid_marker(line: str) -> tuple[str, int] | None:
+		"""First "설명:"-family marker that appears past column 0 (a line-leading
+		marker is handled separately), or None."""
+		best: tuple[str, int] | None = None
+		for marker in SuggestionCard._NOTE_MARKERS:
+			idx = line.find(marker)
+			if idx > 0 and (best is None or idx < best[1]):
+				best = (marker, idx)
+		return best
+
+	@staticmethod
+	def _peel_trailing_block(content: str) -> tuple[str, str]:
+		"""Move a blank-line-separated trailing block into the note when the lead
+		looks like a single pasteable suggestion. Conservative — see
+		:meth:`_split_content_note` for the skip conditions."""
+		blocks = re.split(r"\n\s*\n", content.strip(), maxsplit=1)
+		if len(blocks) != 2:
+			return content, ""
+		lead, trailing = blocks[0].strip(), blocks[1].strip()
+		if not lead or not trailing:
+			return content, ""
+		first_line = lead.splitlines()[0].strip()
+		# Bulleted/numbered/Option lists are pure-commentary review output; leave
+		# them whole (they render as the note via the empty-content path).
+		if re.match(r"^([-*•]|\d+[.)]|Option\b|[A-Z]\))", first_line):
+			return content, ""
+		# A long lead is likely all pasteable prose, not prose + explanation.
+		if len(lead) > 240:
+			return content, ""
+		return lead, trailing
 
 	@staticmethod
 	def _peel_citation_commentary(text: str) -> tuple[str, str]:
@@ -769,6 +851,12 @@ class SuggestionList(QFrame):
 	# no trailing gap). Left off, the card keeps the default fill behaviour for
 	# callers that give it a whole panel (e.g. DocumentAssistPage).
 	MAX_HEIGHT_RATIO = 0.55
+
+	# 보관하는 제안 이력 상한. 최신 제안이 **최상단**에 들어오고 지난 제안은 아래로
+	# 쌓이며(사용자가 스크롤로 확인), 이 수를 넘으면 가장 오래된(맨 아래) 카드부터
+	# 제거한다. 메모리 bound용이라 넉넉히 둔다(백엔드의 unresolved-card 게이트가
+	# 발화 자체를 한 번에 하나로 제한하므로 폭주는 이미 막혀 있다).
+	MAX_CARDS = 50
 
 	# Bubbles each card's (event_id, intervention_type, action) up to the host.
 	feedbackSubmitted = Signal(str, str, str)
@@ -847,8 +935,19 @@ class SuggestionList(QFrame):
 		self.count_label.setText(f"{count}개")
 		self.countChanged.emit(count)
 
+	@classmethod
+	def _apply_card_policy(cls, suggestions: list[dict[str, str]]) -> list[dict[str, str]]:
+		"""hydrate 입력(시간순: 오래된→최신)을 **최신 우선(newest-first)** 표시
+		순서로 바꾸고 ``MAX_CARDS``개만 유지한다. 최신이 index 0(최상단), 지난
+		제안은 아래로. 같은 단락 교체는 더 이상 하지 않는다 — 지난 제안도 이력으로
+		남겨 스크롤로 볼 수 있게 한다(백엔드 spot-dedup/게이트가 발화를 이미 절제)."""
+		recent = [dict(item) for item in suggestions][-cls.MAX_CARDS:]
+		recent.reverse()  # 최신이 맨 앞(최상단)
+		return recent
+
 	def set_suggestions(self, suggestions: list[dict[str, str]]) -> None:
-		self._suggestions = [dict(item) for item in suggestions]
+		# _suggestions/_cards/layout 모두 newest-first(index 0 = 최상단) 순서.
+		self._suggestions = self._apply_card_policy(suggestions)
 		self._clear()
 		self._cards = []
 		self._cards_by_id = {}
@@ -862,8 +961,7 @@ class SuggestionList(QFrame):
 				self.updateGeometry()
 			return
 
-		last_index = len(self._suggestions) - 1
-		for index, item in enumerate(self._suggestions):
+		for item in self._suggestions:
 			item_id = str(item.get("id") or "")
 			card = SuggestionCard(
 				item.get("category", "수정"),
@@ -872,21 +970,63 @@ class SuggestionList(QFrame):
 				event_id=item_id,
 				intervention_type=str(item.get("interventionType") or ""),
 			)
-			card.feedbackSubmitted.connect(self.feedbackSubmitted)
+			card.feedbackSubmitted.connect(self._on_card_feedback)
 			card.set_card_width(self._content_width())
 			self._cards.append(card)
 			if item_id:
 				self._cards_by_id[item_id] = card
-			# Every card keeps its natural height so the text box hugs its text.
+			# 최상단부터 순서대로 add → layout 순서 = newest-first.
 			self.layout.addWidget(card)
-		# A trailing stretch soaks up the leftover panel height, so the slack
-		# falls below the list as plain background instead of inflating the
-		# last card and trailing a blank gap under its text.
+		# 맨 아래 stretch가 남는 패널 높이를 흡수(이력이 적을 때 카드가 위쪽에 붙음).
 		self.layout.addStretch(1)
 
 		self._set_count(len(self._suggestions))
 		self.schedule_width_update()
-		self.schedule_scroll_to_bottom()
+		self.schedule_scroll_to_top()
+		if self._hug_content:
+			self.updateGeometry()
+
+	def _remove_card_at(self, index: int) -> None:
+		"""카드 1장을 위젯/모델 양쪽에서 제거. ``_cards``와 ``_suggestions``는
+		항상 같은 순서로 채워지므로 인덱스 기반 제거로 lockstep을 유지한다."""
+		if index < 0 or index >= len(self._cards):
+			return
+		card = self._cards.pop(index)
+		if index < len(self._suggestions):
+			self._suggestions.pop(index)
+		event_id = getattr(card, "_event_id", "")
+		if event_id:
+			self._cards_by_id.pop(event_id, None)
+		self.layout.removeWidget(card)
+		card.setParent(None)
+		card.deleteLater()
+
+	def _on_card_feedback(self, event_id: str, intervention_type: str, action: str) -> None:
+		"""카드 reaction을 받아 UI를 갱신한 뒤 host로 bubble(HTTP 전송용).
+
+		- 거절(red_reject/dislike) → 해당 카드를 즉시 **제거**.
+		- 다시(retry) → 카드는 이미 자체적으로 '(재제안 중...)'을 띄움(여기선 유지).
+		"""
+		if action in ("red_reject", "dislike"):
+			self._remove_card_by_id(event_id)
+		self.feedbackSubmitted.emit(event_id, intervention_type, action)
+
+	def _remove_card_by_id(self, event_id: str) -> None:
+		card = self._cards_by_id.get(event_id) if event_id else None
+		if card is None:
+			return
+		try:
+			index = self._cards.index(card)
+		except ValueError:
+			return
+		self._remove_card_at(index)
+		self._set_count(len(self._suggestions))
+		if not self._cards:
+			# 마지막 카드가 사라지면 빈 상태 placeholder 복원.
+			self._drop_trailing_stretch()
+			self.layout.addWidget(self.empty)
+			self.empty.show()
+			self.layout.addStretch(1)
 		if self._hug_content:
 			self.updateGeometry()
 
@@ -898,27 +1038,28 @@ class SuggestionList(QFrame):
 		*,
 		event_id: str = "",
 		intervention_type: str = "",
+		fingerprint: str = "",
 	) -> None:
-		"""Append a single suggestion card.
+		"""새 제안 카드를 **최상단**에 삽입한다(최신이 맨 위, 지난 제안은 아래로).
 
-		Unlike :meth:`set_suggestions`, this does not tear down and rebuild every
-		existing card. The screen-monitoring poller feeds suggestions in one at a
-		time, so a full rebuild per event would be O(n²) as the list grows.
+		전체 카드 수가 ``MAX_CARDS``를 넘으면 가장 오래된(맨 아래) 카드를 제거한다.
+		전체 재빌드 없이 한 장만 추가 — 폴러가 제안을 한 건씩 흘려보낸다.
 		"""
 		item: dict[str, str] = {"category": category, "text": text, "tone": tone}
 		if event_id:
 			item["id"] = event_id
 		if intervention_type:
 			item["interventionType"] = intervention_type
+		if fingerprint:
+			item["fingerprint"] = fingerprint
 		if not self._cards:
 			# Leaving the empty state: drop the placeholder + its trailing stretch.
 			self._clear()
 		else:
-			# Lift the trailing stretch so the new card lands above it; it gets
-			# re-added below to keep absorbing the leftover panel height.
 			self._drop_trailing_stretch()
 
-		self._suggestions.append(item)
+		# newest-first: 모델·레이아웃 모두 맨 앞(index 0)에 삽입.
+		self._suggestions.insert(0, item)
 		card = SuggestionCard(
 			item["category"],
 			item["text"],
@@ -926,17 +1067,20 @@ class SuggestionList(QFrame):
 			event_id=event_id,
 			intervention_type=intervention_type,
 		)
-		card.feedbackSubmitted.connect(self.feedbackSubmitted)
+		card.feedbackSubmitted.connect(self._on_card_feedback)
 		card.set_card_width(self._content_width())
-		self._cards.append(card)
+		self._cards.insert(0, card)
 		if event_id:
 			self._cards_by_id[event_id] = card
-		self.layout.addWidget(card)
+		self.layout.insertWidget(0, card)
+		# 상한 초과 → 가장 오래된(맨 아래 = 리스트 끝) 카드 제거.
+		while len(self._cards) > self.MAX_CARDS:
+			self._remove_card_at(len(self._cards) - 1)
 		self.layout.addStretch(1)
 
 		self._set_count(len(self._suggestions))
 		self.schedule_width_update()
-		self.schedule_scroll_to_bottom()
+		self.schedule_scroll_to_top()
 
 	def upsert_suggestion(
 		self,
@@ -946,6 +1090,7 @@ class SuggestionList(QFrame):
 		tone: str = "working",
 		*,
 		intervention_type: str = "",
+		fingerprint: str = "",
 	) -> None:
 		"""Update an existing card's text by ``event_id``, or add a new card.
 
@@ -960,25 +1105,31 @@ class SuggestionList(QFrame):
 				if item.get("id") == event_id:
 					item["text"] = text
 					break
-			self.schedule_scroll_to_bottom()
 			return
-		self.add_suggestion(category, text, tone, event_id=event_id, intervention_type=intervention_type)
+		self.add_suggestion(
+			category,
+			text,
+			tone,
+			event_id=event_id,
+			intervention_type=intervention_type,
+			fingerprint=fingerprint,
+		)
 		if self._hug_content:
 			self.updateGeometry()
 
-	def schedule_scroll_to_bottom(self) -> None:
+	def schedule_scroll_to_top(self) -> None:
 		for delay in (0, 25, 80):
-			QTimer.singleShot(delay, self._scroll_to_bottom)
+			QTimer.singleShot(delay, self._scroll_to_top)
 
 	def schedule_width_update(self) -> None:
 		for delay in (0, 25, 80, 160):
 			QTimer.singleShot(delay, self._update_card_widths)
 
-	def _scroll_to_bottom(self) -> None:
+	def _scroll_to_top(self) -> None:
 		self._update_card_widths()
 		self.container.adjustSize()
 		bar = self.scroll.verticalScrollBar()
-		bar.setValue(bar.maximum())
+		bar.setValue(bar.minimum())
 
 	def resizeEvent(self, event) -> None:  # type: ignore[override]
 		super().resizeEvent(event)
@@ -1960,6 +2111,7 @@ class DocumentAssistWindow(WindowsSnapMixin, QWidget):
 				"text": text,
 				"tone": tone,
 				"interventionType": str(item.get("interventionType") or ""),
+				"fingerprint": str(item.get("paragraphFingerprint") or ""),
 			})
 		self.suggestion_list.set_suggestions(suggestions)
 
@@ -1980,6 +2132,7 @@ class DocumentAssistWindow(WindowsSnapMixin, QWidget):
 				text,
 				tone,
 				intervention_type=str(item.get("interventionType") or ""),
+				fingerprint=str(item.get("paragraphFingerprint") or ""),
 			)
 
 	def _on_screen_feedback(self, event_id: str, intervention_type: str, action: str) -> None:

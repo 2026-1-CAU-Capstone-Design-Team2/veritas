@@ -97,6 +97,7 @@ class EditorSuggestWorker(_EditorStreamWorker):
         parent: QObject | None = None,
         *,
         cursor: int = 0,
+        section_heading: str = "",
     ) -> None:
         super().__init__(
             "/api/v1/editor/suggest",
@@ -110,6 +111,10 @@ class EditorSuggestWorker(_EditorStreamWorker):
                 # backend reject-ladder localizes a 3-reject cooldown to this spot
                 # instead of the whole document. See editor_window._fire_suggestion.
                 "cursor": int(cursor),
+                # Heading of the section the cursor sits under — keeps a
+                # long-document continuation on the section's topic even when the
+                # heading scrolled out of the prefix window.
+                "sectionHeading": str(section_heading or ""),
             },
             parent,
         )

@@ -218,6 +218,7 @@ def suggest_stream(
     max_tokens: int = 64,
     use_workspace: bool = True,
     document_cursor: int | None = None,
+    section_heading: str = "",
 ) -> Iterator[bytes]:
     """Stream a ghost-writing continuation as SSE.
 
@@ -274,6 +275,10 @@ def suggest_stream(
         currentParagraph=current_paragraph,
         previousParagraph="",
         confidence=float(use_workspace),
+        # The editor knows the whole document, so it passes the heading of the
+        # section the cursor sits under — the ghost generator injects it as
+        # ``[현재 섹션 제목]`` to keep the continuation on the section's topic.
+        metadata={"section_heading": (section_heading or "").strip()},
     )
 
     try:

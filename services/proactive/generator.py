@@ -277,11 +277,19 @@ class ProactiveGenerator:
                 )
                 return
 
+            # Section heading the cursor sits under (the editor sends it because
+            # it knows the whole document, even when the heading scrolled out of
+            # the prefix window). Anchors the continuation to the section topic.
+            section_heading = ""
+            if observation is not None:
+                meta = getattr(observation, "metadata", None) or {}
+                section_heading = str(meta.get("section_heading") or "").strip()
             yield from self._ghostwrite_iter(
                 prefix,
                 suffix,
                 max_tokens=self.max_tokens_ghost,
                 use_workspace=use_workspace,
+                section_heading=section_heading,
             )
             return
 

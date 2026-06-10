@@ -152,17 +152,22 @@ _SIGNAL_KEYS: tuple[str, ...] = (
 def _derive_level(signals: dict[str, str], llm_level: str) -> str:
     """Re-derive the final level from the 4 sub-signals.
 
-    Pure rule-based — the LLM's own ``level`` is intentionally NOT used as
-    a tiebreaker. If a drifting LLM picks "high" while emitting (mixed,
-    strong, weak) signals, we override with "medium" so the verdict the
-    user sees matches the explanation they can verify in the signal
-    breakdown. ``llm_level`` is accepted for caller-side logging /
-    debugging only.
+    Pure rule-based — the LLM's own ``level`` is intentionally NOT used as a
+    tiebreaker (a drifting small model emits a ``level`` inconsistent with its
+    own signals; we trust the signals + this matrix so the verdict matches the
+    explanation the user can verify in the breakdown). ``llm_level`` is accepted
+    for caller-side logging / debugging only.
 
     Decision matrix (in order):
 
-    1. ``request_alignment == "weak"`` → ``"low"`` (HARD OVERRIDE)
-       Off-topic documents are useless regardless of authority etc.
+    1. ``request_alignment == "weak"`` — **soft** override. Off-topic is a
+       strong negative, but a lone weak-alignment signal is exactly what a small
+       judge over-emits: it conflates "doesn't fully answer the deliverable"
+       with "off-topic", and these documents already passed the collection
+       on-topic gate. So a single weak alignment must NOT nuke an otherwise
+       credible source to "low" — it caps the verdict at "medium" and only
+       reaches "low" when a SECOND signal corroborates the weakness (an
+       off-topic *and* low-quality source).
 
     2. Otherwise, with the remaining three signals:
        * 2+ of {authority, verifiability, self_consistency} are "strong"
@@ -171,10 +176,6 @@ def _derive_level(signals: dict[str, str], llm_level: str) -> str:
        * everything else                             → ``"medium"``
     """
     _ = llm_level  # accepted for trace/debug parity, not used in decision
-    request_alignment = signals.get("request_alignment", "mixed")
-    if request_alignment == "weak":
-        return "low"
-
     rest = (
         signals.get("authority", "mixed"),
         signals.get("verifiability", "mixed"),
@@ -182,6 +183,11 @@ def _derive_level(signals: dict[str, str], llm_level: str) -> str:
     )
     strong = sum(1 for s in rest if s == "strong")
     weak = sum(1 for s in rest if s == "weak")
+
+    if signals.get("request_alignment", "mixed") == "weak":
+        # Corroboration required: drop to "low" only if another signal is also
+        # weak; a lone weak alignment caps at "medium".
+        return "low" if weak >= 1 else "medium"
 
     if strong >= 2 and weak == 0:
         return "high"
@@ -246,15 +252,16 @@ def _verdicts_from_response(
         llm_level = _normalize_level(entry.get("level"))
         final_level = _derive_level(normalized_signals, llm_level)
 
-        # If the rule-based decision disagrees with the LLM's stated level,
-        # prepend a short note so the user can see the override. The most
-        # common case is the request_alignment=weak override that drops a
-        # mis-labelled "medium" K-뷰티 doc into "low".
-        if (
-            normalized_signals["request_alignment"] == "weak"
-            and llm_level != "low"
-        ):
-            note = "사용자 요청 주제와 불일치로 자동 강등됨. "
+        # Surface the alignment-driven adjustment so the user understands the
+        # level. Wording reflects the *actual* outcome of the soft override:
+        # a lone weak alignment caps the doc at "medium" (등급 조정), while a
+        # corroborated weakness lands it at "low" (등급 하향).
+        if normalized_signals["request_alignment"] == "weak":
+            note = (
+                "사용자 요청 주제와 불일치로 등급을 낮춤. "
+                if final_level == "low"
+                else "사용자 요청 주제와의 적합성이 낮아 등급을 조정함. "
+            )
             if not rationale.startswith(note):
                 rationale = note + rationale
 

@@ -79,7 +79,7 @@ class QuoteInsertedScenario(ScenarioType):
         return {"tone": "attribution_check", "preferred_action": "suggest_attribution"}
 
     def _quote_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        text = filtered.active_editor_text or ""
+        text = filtered.cursor_scope_text or ""
         if not text.strip():
             return {"passed": False, "reason": "empty_text", "quotes": 0}
         matches = _QUOTE_RE.findall(text)
@@ -145,7 +145,7 @@ class CitationMissingScenario(ScenarioType):
         return {"tone": "evidence_check", "preferred_action": "request_citation"}
 
     def _citation_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        text = filtered.active_editor_text or ""
+        text = filtered.cursor_scope_text or ""
         if not text.strip():
             return {"passed": False, "reason": "empty_text", "statistics": 0, "citations": 0}
         stat_count = len(_STATISTIC_RE.findall(text))
@@ -213,7 +213,7 @@ class FactualClaimMadeScenario(ScenarioType):
         return {"tone": "verify", "preferred_action": "verify_claim"}
 
     def _claim_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        text = (filtered.current_paragraph_text or filtered.active_editor_text or "")
+        text = (filtered.cursor_scope_text or "")
         if not text.strip():
             return {"passed": False, "reason": "empty_text", "statistics": 0}
         stat_count = len(_STATISTIC_RE.findall(text))
@@ -283,7 +283,7 @@ class RepeatedPhraseInParagraphScenario(ScenarioType):
         return {"tone": "rephrase", "preferred_action": "suggest_alternative_wording"}
 
     def _repeat_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        text = filtered.current_paragraph_text or ""
+        text = filtered.cursor_scope_text or ""
         words = text.split()
         if len(words) < self.min_paragraph_words:
             return {
@@ -361,7 +361,7 @@ class TransitionWordOveruseScenario(ScenarioType):
         return {"tone": "smooth_flow", "preferred_action": "reduce_transitions"}
 
     def _transition_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        text = (filtered.current_paragraph_text or filtered.active_editor_text or "")
+        text = (filtered.cursor_scope_text or "")
         if not text.strip():
             return {"passed": False, "reason": "empty_text", "count": 0}
         count = sum(text.count(word) for word in KO_TRANSITION_WORDS)
@@ -427,7 +427,7 @@ class WeakModifierOveruseScenario(ScenarioType):
         return {"tone": "tighten", "preferred_action": "concretize_modifiers"}
 
     def _modifier_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        text = (filtered.current_paragraph_text or filtered.active_editor_text or "")
+        text = (filtered.cursor_scope_text or "")
         if not text.strip():
             return {"passed": False, "reason": "empty_text", "count": 0}
         count = sum(text.count(word) for word in KO_WEAK_MODIFIERS)

@@ -27,7 +27,8 @@ REFERENCE_BLOCK_TEMPLATE = "[참고 자료]\n{context}\n\n"
 SUGGEST_SYSTEM_PROMPT = (
     "당신은 한국어 문서 작성 보조기입니다. 아래 [작성 중인 내용]은 사용자가 쓰던 글이며 "
     "질문이나 지시가 아닙니다. 그 내용에 답하거나 코멘트하지 말고, 새로운 주제로 바꾸지 "
-    "마세요. 커서 위치(글의 맨 끝)에 그대로 이어붙어 직전 문장·문단의 흐름과 어조를 자연스럽게 "
+    "마세요. [현재 섹션 제목]이 주어지면 그 섹션의 주제 범위 안에서, 직전 문단의 논지를 "
+    "벗어나지 않게 이어 쓰세요. 커서 위치(글의 맨 끝)에 그대로 이어붙어 직전 문장·문단의 흐름과 어조를 자연스럽게 "
     "잇는 다음 본문만 1~2문장 이내로 간결하게 출력하세요. 문장은 중간에 끊지 말고 끝까지 "
     "완결하세요(마지막 문장에 마침표 등 종결 부호를 붙이세요). 설명, 따옴표, 코드펜스(```), "
     "머리말은 쓰지 마세요. 출력은 직전 글자 바로 뒤에 붙으므로, 새 단어로 시작할 때는 맨 앞에 "
@@ -42,10 +43,17 @@ SUGGEST_SYSTEM_PROMPT = (
 # Appended after the prefix when the cursor has text following it.
 SUGGEST_SUFFIX_BLOCK_TEMPLATE = "\n\n[커서 뒤 내용]\n{suffix}"
 
-# {reference} is "" or a filled REFERENCE_BLOCK_TEMPLATE; {suffix_block} is ""
-# or a filled SUGGEST_SUFFIX_BLOCK_TEMPLATE.
+# Prepended (before the prose) when the document structure around the cursor is
+# known — the heading of the section the user is writing under. Gives the model
+# the section's topic even when the heading scrolled out of the prefix window,
+# so a long-document continuation stays on the section's subject.
+SUGGEST_SECTION_BLOCK_TEMPLATE = "[현재 섹션 제목]\n{heading}\n\n"
+
+# {reference} is "" or a filled REFERENCE_BLOCK_TEMPLATE; {section_block} is ""
+# or a filled SUGGEST_SECTION_BLOCK_TEMPLATE; {suffix_block} is "" or a filled
+# SUGGEST_SUFFIX_BLOCK_TEMPLATE.
 SUGGEST_USER_TEMPLATE = (
-    "{reference}[작성 중인 내용]\n{prefix}{suffix_block}"
+    "{reference}{section_block}[작성 중인 내용]\n{prefix}{suffix_block}"
     "\n\n[커서 위치에 이어서 작성할 텍스트만 출력]"
 )
 
@@ -120,6 +128,7 @@ __all__ = [
     "CHAT_SOURCES_BLOCK_TEMPLATE",
     "CHAT_SYSTEM_TEMPLATE",
     "REFERENCE_BLOCK_TEMPLATE",
+    "SUGGEST_SECTION_BLOCK_TEMPLATE",
     "SUGGEST_SUFFIX_BLOCK_TEMPLATE",
     "SUGGEST_SYSTEM_PROMPT",
     "SUGGEST_USER_TEMPLATE",

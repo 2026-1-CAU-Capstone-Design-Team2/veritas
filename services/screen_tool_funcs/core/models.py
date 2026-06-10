@@ -84,6 +84,19 @@ class FilteredScreenContext:
     current_paragraph_text: str = ""
     current_paragraph_source: str = ""
     current_paragraph_rect: BoundingBox | None = None
+    # 사용자가 *지금 쓰고 있는* 텍스트 영역(caret 문단 → 최근 편집영역 → 문서 꼬리).
+    # 위치 특정 시나리오(acronym/citation/quote/heading 등)는 전체 문서가 아니라 이
+    # 필드를 스캔해, 커서에서 먼 곳의 트리거에 발화하지 않는다. 전체 검토형
+    # 시나리오(whole_document_review 등)만 active_editor_text를 그대로 본다.
+    cursor_scope_text: str = ""
+    # 커서 위치를 *신뢰있게* 잡았는가(UIA caret 문단 또는 캡처 간 diff로 확정).
+    # False면 cursor_scope_text는 문서 꼬리 추정치이거나 OCR 잡음이라 "지금 쓰는 곳"이
+    # 아니다. 이어쓰기/재작성 같은 커서-로컬 제안은 이 값이 True일 때만 발화한다
+    # (커서 모르면 아예 제안하지 않는다 — native editor 방식).
+    cursor_located: bool = False
+    # 커서가 속한 섹션의 마크다운 헤딩 제목(문서 머리~커서에서 가장 가까운 #헤딩).
+    # native editor와 동일하게 이어쓰기를 그 섹션 주제 범위 안에 두기 위해 주입한다.
+    section_heading: str = ""
     visible_context: str = ""
     changed_text: str = ""
     confidence: float = 0.0

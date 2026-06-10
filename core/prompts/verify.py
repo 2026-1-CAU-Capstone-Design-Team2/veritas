@@ -10,12 +10,15 @@ Two LLM-driven steps in the verification layer:
 * :data:`RELIABILITY_JUDGE_PROMPT` — grades each collected document on
   four sub-signals (``request_alignment``, ``authority``,
   ``verifiability``, ``self_consistency``) and emits an overall
-  ``high / medium / low`` verdict. ``request_alignment`` is a HARD
-  OVERRIDE — a "weak" value forces the verdict to "low" regardless of
-  the other three, because an off-topic document cannot be trustworthy
-  *for this task*. The client side re-derives the verdict from the
-  signals in :func:`services.verification.reliability.llm_judge._derive_level`
-  so a drifting LLM cannot leak an inconsistent verdict through.
+  ``high / medium / low`` verdict. ``request_alignment`` is a SOFT
+  override — a "weak" value caps the verdict at "medium" and only drops it
+  to "low" when a second signal is also weak (an off-topic *and* low-quality
+  source). A lone weak-alignment signal — which a small judge over-emits by
+  conflating "doesn't fully answer the deliverable" with "off-topic" — must
+  not nuke an otherwise credible source. The client side re-derives the
+  verdict from the signals in
+  :func:`services.verification.reliability.llm_judge._derive_level` so a
+  drifting LLM cannot leak an inconsistent verdict through.
 """
 
 
@@ -23,19 +26,22 @@ RELIABILITY_JUDGE_PROMPT = """You are a senior research analyst assessing the tr
 
 You will receive multiple candidate documents at once. For EACH document, return ONE trust verdict that combines FOUR sub-signals:
 
-1. ``request_alignment`` — Does this document actually address the user's
-   research request, or is it off-topic?
-   This is the most important signal: a perfectly-cited academic paper
-   on the wrong topic is useless to the writer. Read
-   ``original_user_request`` carefully and check whether this document's
-   subject matter is what the user asked about.
-   - "strong": the document is squarely on the user's topic and would be
-     directly cited or paraphrased in the final report.
-   - "mixed": the document is adjacent / partially relevant — useful as
-     background or for one specific sub-question but not the core topic.
-   - "weak": the document is off-topic, was retrieved by mistake (the
-     search query collided with an unrelated domain), or talks about a
-     different field that merely shares vocabulary with the user request.
+1. ``request_alignment`` — Is this document about the SAME SUBJECT / DOMAIN as
+   the user's research request? Judge TOPICAL match, NOT whether this single
+   document fully answers every part of the request — partial coverage of the
+   topic is normal and still counts as relevant. These documents were already
+   kept by an automated on-topic collection filter, so default to at least
+   "mixed" unless the document is plainly about a DIFFERENT field. Read
+   ``original_user_request`` to identify the subject, then check this document's
+   subject against it.
+   - "strong": squarely on the user's subject — a core source for the report.
+   - "mixed": on-subject but covers only part of the request, or is useful as
+     background / for one sub-question. THIS IS THE DEFAULT for an on-topic
+     document that does not by itself answer everything the user asked.
+   - "weak": genuinely off-topic — a different field that merely shares some
+     vocabulary, or a page retrieved by mistake (the search query collided with
+     an unrelated domain). Do NOT mark "weak" just because the document is
+     narrow, high-level, or omits some requested sub-point — that is "mixed".
 
 2. ``authority`` — Does the source look authoritative for the topic at hand?
    - "strong": peer-reviewed academic paper, official documentation,
@@ -59,15 +65,16 @@ You will receive multiple candidate documents at once. For EACH document, return
    - "mixed": brief disclaimers.
    - "weak": no caveats, or overclaiming relative to the evidence shown.
 
-Combine the four sub-signals into the final ``level`` — request_alignment is
-a HARD OVERRIDE, evaluated before anything else:
+Combine the four sub-signals into the final ``level``. ``request_alignment`` is
+decisive but NOT an absolute veto:
 
-  - If ``request_alignment`` is "weak" → ``level`` MUST be "low",
-    no matter how strong authority / verifiability / self_consistency are.
-    An off-topic document cannot be a high-trust source for this task.
-    State the off-topic nature in ``rationale`` first.
-  - Otherwise, with the remaining three signals (authority, verifiability,
-    self_consistency):
+  - If ``request_alignment`` is "weak", the document is at most "medium", and is
+    "low" ONLY when at least one of {authority, verifiability, self_consistency}
+    is ALSO "weak" (an off-topic AND low-quality source). A document that is
+    off-topic but otherwise solid is "medium", not "low". State the topic
+    mismatch in ``rationale`` first.
+  - When ``request_alignment`` is "strong" or "mixed", decide from the other
+    three signals (authority, verifiability, self_consistency):
       * "high"   → at least TWO of the three are "strong" AND none is "weak".
       * "low"    → at least TWO of the three are "weak".
       * "medium" → everything else.

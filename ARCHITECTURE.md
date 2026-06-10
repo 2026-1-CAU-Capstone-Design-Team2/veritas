@@ -867,6 +867,39 @@ curl -X POST "http://127.0.0.1:8000/api/v1/proactive/reset?workspaceId=<ws>"
 
 **검증**: 세션에서 건드린 12개 스위트(autosurvey·rag·conversation_lock·proactive 전체·ui_automation·editor_ghost) **132 OK**, 신규 회귀 0. 추가 LLM call 없음.
 
+### 2026-06-09 (fix) — 검증 신뢰도 과도-"낮음" 완화 (request_alignment 소프트 오버라이드 + 루브릭 재정의)
+
+**배경(사용자)**: 한 워크스페이스(`runs/AI_Agent_산업`)에서 18개 문서 전부 "낮음"으로 분류. 원인: `_derive_level`이 `request_alignment=="weak"`이면 다른 신호와 무관하게 **무조건 "low"**(하드 오버라이드)인데, 0.8B judge가 18개 전부 alignment=weak으로 과판정(rationale은 "on-topic이지만 요청을 완벽히 답하진 않음" — 즉 mixed여야 할 것을 weak으로) → 전부 강등. 가장 판정이 어려운 신호에 절대 거부권을 준 설계가 약한 모델의 과판정을 증폭, 게다가 상류 수집 on-topic 게이트와 모순(이미 on-topic 통과분을 100% off-topic 처리).
+
+**변경 파일**
+- (edit) `services/verification/reliability/llm_judge.py` `_derive_level` — **소프트 오버라이드**: weak alignment는 등급을 **최대 medium으로 cap**하고, `{authority, verifiability, self_consistency}` 중 **하나 이상도 weak일 때만 "low"**(off-topic *이면서* 저품질인 출처). 단일 weak-alignment 신호가 신뢰도 높은 출처를 low로 못 만들게. `_verdicts_from_response`의 자동-조정 note도 실제 결과(medium=등급 조정 / low=등급 하향)에 맞춰 문구 수정.
+- (edit) `core/prompts/verify.py` `RELIABILITY_JUDGE_PROMPT` — `request_alignment`를 "요청을 완벽히 답하나"가 아니라 **"같은 주제/도메인인가"**(topical match)로 재정의. 수집 게이트를 통과한 문서는 **기본 최소 mixed**, weak은 "명백히 다른 분야/오수집"에만. 좁거나 일부만 다룬 문서는 mixed. 조합 규칙도 소프트 오버라이드와 일치하도록 갱신. 모듈 docstring도 SOFT로 갱신.
+
+**테스트**: (new) `tests/test_verify_reliability.py` (9) — lone weak alignment→medium(핵심 회귀), weak+1weak→low, high는 2 strong & 0 weak 필요, on-topic이라도 2 weak supports면 low, llm_level 무시 등.
+
+### 2026-06-09 (feat) — editor 이어쓰기에 문서 구조 주입 + 상대 관련성 grounding 게이트
+
+**배경(사용자/실무 평가)**: ghost 이어쓰기가 (1) 원문 끝 ~2000자 슬라이딩 창만 봐서 섹션 주제/논지를 못 따라가고, (2) grounding을 유사도 하한 없이 top-K 무차별 주입해 약한 모델이 무관 청크에 끌려감. → 사람이 "섹션 맥락에 맞춰" 잇는 방식과 괴리.
+
+**변경 파일**
+- (edit) `agent/chat_agent.py` — **상대 관련성 게이트** `_filter_by_relative_distance`(best 대비 `_EDITOR_RAG_REL_MARGIN=0.08` 이내 청크만, 최대 `_EDITOR_RAG_TOP_K=3`; 절대 cosine 하한이 불안정하므로 best 주변 tight cluster만 유지)를 `_editor_context`에 적용. **구조 헬퍼** `_nearest_heading`/`_current_paragraph`. `iter_ghostwrite(..., section_heading="")`: 섹션 제목(호출자 제공 또는 prefix에서 추출)을 `[현재 섹션 제목]`으로 주입, 검색 쿼리를 raw 꼬리 대신 **섹션 제목+현재 문단**으로.
+- (edit) `core/prompts/editor.py` — `SUGGEST_SECTION_BLOCK_TEMPLATE` 신설 + `SUGGEST_USER_TEMPLATE`에 `{section_block}` + `SUGGEST_SYSTEM_PROMPT`에 "섹션 주제 범위 안에서 이어쓰라" 1문장(`머리표지`/`첫 번째로` 등 기존 계약 유지). `core/prompts/__init__` re-export 추가.
+- (edit) **섹션 제목 배선** (cursor 배선과 동일 패턴): `frontend/ui/windows/editor_window.py`(`_section_heading_before`로 전체 pre-cursor 텍스트에서 추출해 전송) → `frontend/controllers/editor_stream.py`(`sectionHeading`) → `api/api_models.py`(`EditorSuggestRequest.sectionHeading`) → `api/api_routes/editor.py` → `api/services/editor_service.py`(observe `metadata.section_heading`) → `services/proactive/generator.py`(observation에서 읽어 ghostwrite로) → `api/services/agent_runtime.py:ghostwrite_iter`(전달). 긴 문서에서 제목이 prefix 창 밖이어도 유지됨.
+
+**테스트**: (new) `tests/test_editor_ghost_grounding.py` (11) — 상대 거리 게이트(꼬리 drop·top_k cap·distance 없음 fallback·빈 입력), `_nearest_heading`/`_current_paragraph`, `iter_ghostwrite`가 섹션 블록 주입(호출자 제공/ prefix fallback/ 제목 없으면 미주입). (edit) `tests/test_proactive_api.py` fake ghost 2곳에 `section_heading=` kwarg.
+
+**검증**: 직접 관련 스위트(proactive 전체·rag_grounding·editor_ghost·editor_ghost_grounding·verify_reliability·ui_automation) **101 OK**(2회 반복 안정). 세션 전체 14개 스위트 **152 OK**. (대규모 혼합 실행 1회에서 `test_proactive_adaptation`의 1건이 ERROR였으나 재현 안 됨 — orchestrator background monitor 스레드의 비결정적 타이밍에 기인한 **기존 테스트 격리 flake**로, 단독·소규모 조합·재실행 시 전부 통과. 본 변경과 무관.) 추가 LLM call 없음.
+
+### 2026-06-09 (fix) — 조사 진행 타일 "18 / 15건" (분모가 수집수보다 작게 표시)
+
+**배경(사용자)**: 15개 이상(18·20 등) 요청 시 "수집된 문서 수" 타일이 `수집수 / 15`처럼 **분모가 수집수보다 작게** 표시. 원인: 분모 `_max_docs`는 research 페이지의 로컬 값으로 (a) 실행 시작 시 stepper 값, (b) `_render_result`에서 `response.maxDocs`로만 갱신됨(기본 15). 워크스페이스를 **새 페이지에서 다시 열람/복원**할 때 복원 job 레코드에 `maxDocs`가 없거나 stale이면 기본 15에 머문 채, 실제 수집 문서(예: 18개)가 reconcile돼 "18/15". 분자(18)는 실재 kept 수로 정확하고 분모만 stale(수집 상한은 수집수보다 작을 수 없음). 진행률(`total=_max_docs`)도 같은 stale 값을 써서 >100%를 clamp로 가리는 부작용.
+
+**변경 파일**
+- (edit) `frontend/ui/pages/research_page.py` — 순수 헬퍼 `_format_doc_count(collected, target)`: 분모를 **`max(target, collected)`로 clamp**(수집 상한은 수집수 미만일 수 없음). 요청값이 더 크면(early-stop으로 "18/20") 그대로 보존. `_doc_count_text`가 이를 사용. `_render_result`는 reconcile 후 `self._max_docs = max(self._max_docs, len(self._doc_bars))`로 저장값도 현실과 일치시켜 진행률 total도 정상화.
+- (new) `tests/test_research_doc_count.py` (5, offscreen Qt) — stale 낮은 target clamp("18/15"→"18/18"), 더 큰 요청 cap 보존("18/20"), exact, in-progress, 0건.
+
+**검증**: 5개 통과. `py_compile` 통과. 격리된 표시 로직 변경(다른 스위트 무영향).
+
 ### 2026-06-05 — DRB FACT를 crawl4ai 스크랩으로 (Jina 키 제거) + BOM 견고성
 
 **기능**: DRB FACT 파이프라인(`extract→deduplicate→scrape→validate→stat`)에서 **Jina(`JINA_API_KEY`)가 필요한 scrape 단계만** Veritas의 `fetch_with_crawl4ai`로 대체. FACT를 **Jina 키·비용 없이** 실행 가능. 인용 URL이 어차피 crawl4ai로 수집된 것이라 재스크랩이 내부적으로 일관되고, 양쪽 시스템에 동일 적용되어 A/B delta는 공정(단 비공식 → `fact_crawl4ai_budget` 라벨).
@@ -1049,3 +1082,151 @@ curl -X POST "http://127.0.0.1:8000/api/v1/proactive/reset?workspaceId=<ws>"
 - 검증: 임시 워크스페이스 csv 인덱싱→`3월 합계=99000` 정확, mock LLM으로 RAG 모드 수치질문→table_query 라우팅·비표질문→임베딩 통과·무표시 생략·web-only 생략. 신규 회귀 4건(`RagModeTableQueryTests`).
 
 **검증**: `discover -s tests` → **428 OK**(기존 424+4, 회귀 0). 편집 파일 `py_compile` 통과.
+
+### 2026-06-10 (fix) — 외부 앱 카드 폭주(잠깐 멈춘 사이 5~6개) — 3중 발화 브레이크 + 카드 교체 UI
+
+**배경(사용자)**: 외부 문서 앱에서 한 단락을 수정하고 잠시 멈추면 서로 다른 내용의 suggestion 카드가 5~6개 쌓임. 원인(아키텍처): 외부 카드 표시는 rule-based proactive가 아니라 **legacy screen 파이프라인(scenario scheduler)이 결정**하고 proactive는 shadow 관찰만 함(`screen_bridge.py`). 그 파이프라인의 시나리오 무관 브레이크는 `min_global_fire_interval_sec=5초`뿐이고, 시나리오별 cooldown(37.5~150s)은 *같은* 시나리오 재발화만 막는데 한 단락에서 24개 시나리오 중 다수가 동시 ready → CFS 공정성(vruntime 과금)이 매 발화마다 **다른** 시나리오를 뽑아 "서로 다른 내용"의 카드를 5초마다 1개씩 생산. 카드가 떠 있는 동안(미반응) 새 발화를 막는 게이트도 없었고(`_intervention_pipeline_busy`는 LLM 생성 중만 점유), proactive의 `time_since_last_intervention`은 산출만 되고 미사용. UI(`SuggestionList`)는 무제한 append.
+
+**변경 파일** (3중 브레이크: 발화 간격 ↑ / 단락 단위 cooldown / 미해결 카드 게이트 + UI 교체·상한)
+- (edit) `services/screen_tool_funcs/intervention/scenario_scheduler.py` — ① `paragraph_cooldown_sec`(기본 180s): 같은 단락(fingerprint)에는 **시나리오가 달라도** 재발화 금지(`last_fired_paragraphs`, 문서당 32개 bound, 상태 영구화 포함). 단락을 실제 수정하면 fingerprint가 바뀌어 자연 해제. ② `allow_immediate_fire(document_key, scenario_name, paragraph_fingerprint)`: '다시'(retry) 시 전역 throttle 기준점·그 단락 cooldown·그 시나리오 자체 기록만 선별 해제 → retry UX가 상향된 간격에 갇히지 않음. `select_and_charge`/`record_fire`/`is_paragraph_throttled`에 fingerprint 배선, trace에 `paragraph_throttle` 추가.
+- (edit) `services/screen_tool_funcs/intervention/intervention_detector.py` — CFS·LLM router 양 경로에 paragraph_fingerprint 전달(라우터 경로는 `is_paragraph_throttled` 게이트).
+- (edit) `services/screen_tool_funcs/screen_context_service.py` — ① 전역 throttle 기본 5→**60초**(`VERITAS_SCREEN_MIN_FIRE_INTERVAL_S`), 단락 cooldown `VERITAS_SCREEN_PARAGRAPH_COOLDOWN_S`. ② (new class) `UnresolvedCardGate` — 단일 슬롯 미해결 카드 게이트: 카드의 첫 non-empty 청크가 렌더되는 순간 잠기고, 사용자 feedback(복사/거절/다시/위치다름) 또는 `VERITAS_SCREEN_CARD_RESOLVE_TIMEOUT_S`(기본 90s) 무반응 만료로 풀림. `capture_once`가 `pipeline_busy OR gate.active()`면 스케줄 안 함 — 생성 중은 큐 점유(peek-based consumer)가, 표시 후는 게이트가 막아 빈틈 없음. 빈 답변(스킵된 개입)은 마킹 안 됨. `resolve_card(action="retry")`는 `allow_immediate_fire` 호출.
+- (edit) `tools/screen_context_tool/screen_context_tool.py` — `mark_card_shown`(intervention dict)/`resolve_card`(event_id+feedback_action) 액션, status에 `unresolved_card`.
+- (edit) `api/services/agent_runtime.py` — `on_answer`에서 카드별 1회 `mark_card_shown` 호출(pd_* rewrite **이후**라 proactive id + legacy id가 alias로 함께 등록). `resolve_screen_card` facade.
+- (edit) `api/services/screen_monitor.py` — `resolve_card` facade + 이벤트 payload에 `paragraphFingerprint`/`documentKey`(frontend 교체 정책용).
+- (edit) `api/services/screen_monitoring_service.py` — `record_feedback`이 양 경로(pd_*/legacy) 공통으로 게이트를 먼저 resolve(best-effort).
+- (edit) `frontend/ui/windows/document_assist_window.py:SuggestionList` — `MAX_CARDS=3` 상한(초과 시 oldest 제거) + 같은 단락(fingerprint) 새 카드는 기존 카드 **교체**(`_index_by_fingerprint`/`_remove_card_at`, `_cards`↔`_suggestions` lockstep 유지). hydrate(`set_suggestions`)도 동일 정책(`_apply_card_policy`). (edit) `document_assist_window`/`frontend/ui/pages/writing_page.py` 호출부에 fingerprint 전달.
+- (edit) `api/README.md` — 신규 env 3종 표 추가.
+
+**엔지니어링 결정**: 게이팅 권한을 rule-based proactive로 이전하는 구조 수정(C안)은 별도 작업으로 분리(사용자 결정 — A+B 조합 선택). legacy 파이프라인 안에서 페이스 결정권을 "스케줄러의 시계"에서 "사용자의 반응"으로 옮기는 것이 이번 변경의 핵심: 카드 1개 → 반응/만료까지 정지 → 다음 카드. 키워드 라우팅·proactive 금지 원칙 모두 무접촉.
+
+**테스트**: (new) `tests/test_screen_overload_guard.py` (21) — 단락 cooldown(타 시나리오 차단/타 단락 허용/만료/라우터 경로/bound/영구화 round-trip), retry 브레이크 해제 vs 거절 시 유지, UnresolvedCardGate(이중 id resolve/만료/스트리밍 재마킹 시 shown_at 유지), SuggestionList 교체·상한·스트리밍 in-place 갱신(offscreen Qt).
+
+**검증**: `discover -s tests` → **508 OK**(기존 487+21, 회귀 0). 편집 파일 `py_compile` 통과.
+
+### 2026-06-10 (feat) — 외부 앱 발화 페이스를 고정 60초 → **적응형 페이싱**으로 (반응 이력 + 새 내용 기반)
+
+**배경(사용자)**: 직전 수정의 고정 60초 전역 간격이 "터무니없이 길다, 더 똑똑하게" — 고정 벽시계는 (1) 반응 이력(수락하는 사용자 vs 거절/무시하는 사용자), (2) 새 내용 유무(마지막 카드 이후 아무것도 안 썼는데 발화할 이유도, 새 문단을 썼는데 더 기다릴 이유도 없음), (3) 시간 경과 회복을 전부 무시한다. 특히 카드를 빠르게 처리하며 글을 이어 쓰는 **적극 사용자에게 가장 불리**.
+
+**설계** (사용자 결정: ①+② 조합, floor 20s/base 30s): 발화 허용 = `elapsed ≥ floor` **AND** (`elapsed ≥ base×multiplier` **OR** 새 내용). proactive adaptation이 threshold에 쓰는 원리를 legacy 파이프라인의 *페이스*에 적용.
+- **① 참여도 적응형 간격** — `fire_pace_multiplier`(문서당, 영구화): 수락(copy/like) ×0.6 / 다시 ×0.7 / 거절(red_reject/dislike/wrong_anchor) ×1.7 / 무시(카드 90s 만료·timeout) ×1.3, clamp [0.5, ceil/base]. **반감기 감쇠**(기본 600s)로 1.0에 수렴 — 거절 몇 번이 세션을 영구히 얼리지 않음. 결과 간격 clamp [floor 20s, ceil 240s].
+- **② 새 내용 조기 해제** — 직전 발화 시점의 정규화 문서 길이(`last_global_fire_doc_chars`)와 현재의 차가 `early_release_min_new_chars`(80자) 이상이면 적응 간격 전에도 발화 허용(floor는 절대 유지). 새 내용 없이 간격만 지난 경우는 기존 시나리오 게이트(idle/정적 리뷰류)가 판단 — 정적 문서 리뷰 시나리오를 죽이지 않기 위해 조기 해제는 **가속기로만** 쓰고 hard 요구조건으로 안 둠.
+
+**변경 파일**
+- (edit) `services/screen_tool_funcs/intervention/scenario_scheduler.py` — `min_global_fire_interval_sec`/`is_globally_throttled` 제거 → `fire_interval_floor/base/ceil_sec`·`pace_decay_half_life_sec`·`early_release_min_new_chars` + `_global_gate_locked`(floor→적응 간격→조기 해제 순), `record_card_outcome(outcome)`(감쇠 접어넣고 곱셈 누적), `global_gate_reason()`(router 경로용). 상태에 `fire_pace_multiplier`/`pace_updated_at`/`last_global_fire_doc_chars`/`last_global_fire_paragraph_fp`(영구화+reset 포함). trace `global_throttle`에 `effective_interval_sec`/`pace_multiplier`/`early_release`, snapshot에 페이스 필드. reason 코드: floor 미달=`global_throttle`(연속성 유지), 적응 간격 미달=`adaptive_interval`.
+- (edit) `services/screen_tool_funcs/intervention/intervention_detector.py` — router 경로를 `global_gate_reason(doc_chars=…)`로.
+- (edit) `services/screen_tool_funcs/screen_context_service.py` — env 5종 배선(`VERITAS_SCREEN_FIRE_FLOOR_S` 20 / `_BASE_S` 30 / `_CEIL_S` 240 / `_DECAY_HALFLIFE_S` 600 / `VERITAS_SCREEN_EARLY_RELEASE_CHARS` 80; `VERITAS_SCREEN_MIN_FIRE_INTERVAL_S` 폐기). `UnresolvedCardGate.poll()` — 만료 카드를 1회 반환 → `capture_once`가 '무시' outcome으로 페이스에 반영. `resolve_card`가 action→outcome 매핑(`_CARD_OUTCOME_BY_ACTION`, 모듈 상수)으로 `record_card_outcome` 호출(retry는 기존 `allow_immediate_fire` 유지).
+- (edit) `api/README.md` — env 표 갱신.
+
+**체감 효과**: 반응이 좋고 새 글을 쓰는 사용자는 실질 **20초 페이스**까지 내려가고, 무시/거절이 쌓이면 **최대 4분**까지 물러나며, 안 쓰고 있으면 적응 간격을 채워야만(그리고 시나리오 자체 게이트를 통과해야만) 발화한다.
+
+**테스트**: `tests/test_screen_overload_guard.py` 21→**33** — floor가 새 내용으로도 우회 불가 / 적응 간격 차단·새 내용 조기 해제·간격 경과 허용 / 거절 확대·수락 축소·무시 확대 / 반감기 감쇠 수치 / ceil clamp / router 경로 `global_gate_reason` / 페이스 상태 영구화 round-trip / `poll()` 만료 1회 반환 / resolve_card→페이스 연동.
+
+**검증**: `discover -s tests` → **520 OK**(기존 508, 신규 12, 회귀 0). 편집 파일 `py_compile` 통과.
+
+### 2026-06-10 (fix) — 외부 앱 보조가 (1) 커서 위치에 앵커되도록 + (2) 카드 '복사 가능 제안 + 회색 설명' 분리
+
+**배경(사용자)**: (1) 결론을 작성 중인데도 **서론** 문장에 대한 검사 결과가 돌아옴(진입 직후 action 없이도). (2) 복사 시 바로 붙여넣을 수 있는 이어쓰기형 제안이 main이어야 하고, 부연/설명은 회색·작게·아래에 떠야 하는데 분리가 안 됨.
+
+**원인 1 (서론 앵커링)**: 외부 앱의 "현재 작성 위치"(`current_paragraph_text`)가 caret 미검출 시 엉뚱한 곳으로 fallback. ① `ui_automation.py`가 selection(caret) 문단이 없으면 **마우스 hover 위치 문단**을 대용으로 씀 — 키보드로 결론을 쓰는데 마우스가 상단(서론)에 있으면 서론을 읽음. ② caret 완전 실패 시 `current_paragraph`가 **문서 전체**로 fallback되고, dispatcher의 `_focused_sentence`가 `changed_text[:80]`(diff **머리**=문서 맨 앞=서론)을 포함한 문장을 골라 서론 반환. ③ 진입 첫 캡처엔 `previous` 빈 값→`_diff_suffix`가 **문서 전체**를 changed_text로 반환→머리 매칭 발동.
+
+**원인 2 (카드 분리)**: 카드는 이미 `_body`(복사) + `_note`(회색·12px·아래) 구조 + `"설명:"` 분리가 있으나, 원인1로 리뷰형 시나리오가 (서론에) 발동해 순수 코멘트만 나오고, 로컬 0.8B 모델이 `"설명:"` 라벨을 자주 누락해 설명이 복사 본문에 섞임.
+
+**변경 파일**
+- (edit) `services/screen_tool_funcs/capture/ui_automation.py` — `current_paragraph_text`를 **selection(caret) 문단만** 사용. hover는 `hover_text`로 telemetry만 유지하고 앵커로는 쓰지 않음(마우스≠캐럿).
+- (edit) `services/screen_tool_funcs/core/content_filter.py` — `_diff_suffix`(append-suffix / 첫 캡처·non-append 시 문서 전체) → **`_diff_region`**(공통 prefix+suffix trim → 중간 편집도 bounded 영역, 첫 캡처/무변경은 `""`). edit_diff 시나리오는 `filtered.changed_text` 비의존(history 자체 diff)이라 영향 없음.
+- (edit) `services/screen_tool_funcs/intervention/intervention_dispatcher.py` — **`_resolve_anchor`**(caret 문단[전체-문서 fallback 아닐 때] → 최근 편집영역[문서의 `_CHANGE_REGION_MAX_RATIO=0.6` 미만일 때만] → **문서 꼬리**; 머리는 절대 앵커 안 함). `recent_sentences`/`focused_sentence`를 거기에 앵커. `_focused_sentence`는 changed_text **꼬리**(커서 위치)로 매칭(머리 매칭 폐지).
+- (edit) `services/screen_tool_funcs/intervention/intervention_detector.py` — LLM router의 `recent_text`/`focused_text`도 동일 원칙(편집영역→caret 문단→문서 꼬리, 머리 슬라이스 금지)으로.
+- (edit) `core/prompts/chat.py` — `SCREEN_INTERVENTION_SYSTEM_PROMPT_TEMPLATE`의 OUTPUT STRUCTURE 규칙을 예시와 함께 강화: 붙여넣기 가능한 prose FIRST(라벨/메타 없음) → `"설명:"` 줄 → 모든 부연. 순수 코멘트면 `"설명:"`부터.
+- (edit) `frontend/ui/windows/document_assist_window.py:SuggestionCard` — `_split_content_note` 3계층화: `"설명:"`族 마커(라인 선두 **+ 인라인** 모두) → `[Document …]` citation peel → **보수적 빈줄 fallback**(짧은 prose 리드 + 빈줄 + 후행 블록 → content/note 분리; 불릿/번호 리뷰 리스트·240자 초과 리드는 미분할). `_NOTE_MARKERS`/`_split_on_note_marker`/`_find_mid_marker`/`_peel_trailing_block` 추가.
+
+**엔지니어링 결정**: `content_filter._resolve_current_paragraph`의 전체-문서 fallback은 **유지**(stable_paragraph 게이트·시나리오가 `current_paragraph_text` 비어있음에 의존). 앵커링 정정은 전부 소비측(dispatcher/router)에서 가드해 게이팅 동작 불변. 카드 빈줄 fallback은 이어쓰기 prose만 노리고 리뷰 리스트는 보존하도록 보수적으로(불릿/길이 가드).
+
+**테스트**: (new) `tests/test_screen_cursor_anchor.py` (17) — `_diff_region`(첫 캡처/무변경/append/중간편집 bounded), `_resolve_anchor`(caret 우선·전체문서→편집영역·무caret무변경→꼬리), **결론 작성 중 서론이 focus로 안 잡힘**(핵심 회귀), focus가 편집 꼬리에 앵커, 카드 분리(명시 마커·인라인 마커·순수 이어쓰기·빈줄 fallback·리뷰 리스트 보존·긴 리드 보존·citation peel).
+
+**검증**: `discover -s tests` → **537 OK**(기존 520, 신규 17, 회귀 0). 편집 파일 `py_compile` 통과.
+
+### 2026-06-10 (fix) — 외부 앱 시나리오 **발화 위치**를 커서로 스코프 (서론 약어 발화 근절) + 충고형 출력 붙여넣기-우선
+
+**배경(사용자 스크린샷)**: 메모장 커서가 **결론**(Ln 52)인데 카드는 본문 어딘가 "추론형 AI (AI Reasoning)" **약어**에 대한 충고. 직전 fix(anchor)는 LLM이 보는 *텍스트 창*만 커서로 옮겼고, **시나리오 발화 조건**은 그대로 `active_editor_text`(문서 전체) 스캔이라, 커서에서 먼 트리거(본문 약어)에 계속 발화. 또 acronym guidance가 `"On first use, spell out as …"` 충고문을 강제해 복사 본문에 충고가 들어가고 영어("On")까지 누수.
+
+**원인**: 위치 특정 시나리오 다수(`acronym`/`citation_missing`/`quote_inserted`/`factual_claim`/`repeated_phrase`/`transition`/`weak_modifier`/`heading`/`numbered_list`/`code_block`/`todo`/`many_question_marks`)가 트리거를 **문서 전체**에서 탐지 → 커서 무관 발화. (전체 검토형 `whole_document_review`/`long_static_review`/`blank_document_start`만 전체 문서가 정당.)
+
+**변경 파일** (결정: cursor_scope_text 필드 + 시나리오 전환 / 충고 guidance 붙여넣기-우선)
+- (edit) `services/screen_tool_funcs/core/models.py` — `FilteredScreenContext.cursor_scope_text` 추가(사용자가 지금 쓰는 영역).
+- (edit) `services/screen_tool_funcs/core/content_filter.py` — module func **`resolve_cursor_scope(full, caret, changed)`**(caret 문단→bounded 편집영역→문서 꼬리, 머리 금지) + `build`에서 `cursor_scope_text` 채움. dispatcher의 anchor 로직을 이 함수로 통합(단일 소스).
+- (edit) `services/screen_tool_funcs/intervention/intervention_dispatcher.py` — `_resolve_anchor`를 `resolve_cursor_scope` 위임으로 축소(시나리오 스코프 = LLM 앵커 동일 규칙 보장).
+- (edit) `services/screen_tool_funcs/scenario/{markers,text_quality,structure}.py` — 위 위치 시나리오 13종의 트리거 스캔을 `active_editor_text`/`current_paragraph_text` → **`cursor_scope_text`**. 전체 검토형(writing_flow.py)은 `active_editor_text` 유지.
+- (edit) `core/prompts/chat.py` — `acronym_introduced` guidance를 **붙여넣을 첫-등장 형태(예: `추론형 AI (AI Reasoning)`) FIRST → `설명:` 뒤 이유**로 재작성(영어 예시·충고 동사 제거).
+
+**테스트**: `tests/test_screen_cursor_anchor.py` 17→**23** — `resolve_cursor_scope`(caret/편집영역/꼬리, content_filter 채움), **본문 약어가 커서(결론)에 없으면 acronym 시나리오 미발화**(핵심 회귀), 커서 영역 약어면 발화.
+
+**검증**: `discover -s tests` → **543 OK**(기존 537, 신규 6, 회귀 0). 편집 파일 `py_compile` 통과.
+
+### 2026-06-10 (fix) — caret 없을 때 diff-offset 윈도우 + OCR 소스 위치 시나리오 억제 (로그 진단)
+
+**배경(사용자 `--screen-debug` 로그)**: 직전 fix에도 두 실패 노출. ① 메모장: `paragraph_source=uia_full_text_fallback`(notepad UIA가 caret 문단 미제공) → `current_paragraph==전체문서` → 내 `resolve_cursor_scope`가 **작은 diff 한 조각**("로")을 scope로 골라 `recent_sentences="로"` → LLM이 한 글자 받음(쓰레기 제안). **직전 fix 전엔 문서 꼬리(결론 실제 텍스트)였으므로 회귀.** ② VS Code: foreground=`Code.exe`, app_text/UIA 실패 → OCR가 화면 통째(우리 `[screen_debug]` 콘솔·코드·nav 링크) 읽음 → `cursor_scope`가 OCR 깨진 글자 → `acronym`이 그 위에 발화.
+
+**변경 파일** (결정: diff-offset 윈도우 / OCR면 위치 시나리오 억제)
+- (edit) `services/screen_tool_funcs/core/content_filter.py` — `_diff_region`이 `(region, cursor_offset)` 반환(편집 끝=커서 위치). `resolve_cursor_scope(..., cursor_offset)`: caret 없으면 **`full[offset-600:offset]`**(커서 앞 실제 텍스트)를 scope로 — 작은 diff 조각이 아니라. 우선순위 caret 문단 → **diff-offset 윈도우** → 문서 꼬리. `focus_hint`(문장 선택용)는 작은 diff도 그대로. const `CURSOR_SCOPE_CHANGE_MAX_RATIO` export.
+- (edit) `services/screen_tool_funcs/intervention/intervention_dispatcher.py` — `_resolve_anchor`가 ContentFilter가 채운 `filtered.cursor_scope_text`를 **그대로** anchor로(단일 소스; 비면 offset 없이 재계산).
+- (edit) `services/screen_tool_funcs/intervention/intervention_detector.py` — `_OCR_SUPPRESSED_SCENARIOS`(위치 prose 14종) + `filter_ocr_suppressed(ready, source)`: `current_paragraph_source`가 `ocr_*`면 위치 시나리오를 ready set에서 제거(OCR은 커서를 신뢰있게 못 잡음). 전체 검토형·작성상태형(idle/churn/blank)은 유지. blocker/trace 기록.
+
+**테스트**: `tests/test_screen_cursor_anchor.py` 23→**27** — `_diff_region` 튜플(offset), **offset 윈도우가 작은 diff "로" 대신 커서 앞 실제 텍스트**(케이스1 회귀), 긴 문서 윈도우가 서론 배제, `_resolve_anchor`가 cursor_scope_text 사용, `filter_ocr_suppressed`(OCR면 acronym/citation drop·whole_doc 유지 / 비OCR 전부 유지).
+
+**검증**: screen 스위트(cursor_anchor 27 + overload_guard 33) OK. `discover -s tests` 547 중 1 실패는 `test_proactive_*`의 **기존 background-thread 타이밍 flake**(매 실행 다른 proactive 테스트; 단독 26 OK; screen 변경과 무관). 편집 파일 `py_compile` 통과.
+
+### 2026-06-10 (refactor) — 외부 앱 보조를 **native editor 모델**로 단순화 (24시나리오 → 커서-로컬 3종) + KB junk 필터 + 답변 토큰 cap
+
+**배경(사용자 제안 #1/#4)**: native editor(우리 Qt 에디터)는 "caret 기준 prefix/suffix → 이어쓰기 1개 + 설명 분리"로 단순·정확. 외부 앱도 같은 모델로 하면? 그리고 "문제를 너무 어렵게 푸는 것 아닌가 — 24개 시나리오 가정 필요한가?". 결론: **맞다, 과설계.** 24-시나리오(acronym/citation/quote/heading/review/...)는 사실 *문서 전역 리뷰* 제품이라 OCR·문서전역 스캔·CFS 복잡도를 끌어들였고 이번 세션 버그(위치 불일치·OCR 쓰레기·오발화) 대부분의 근원. native 모델로 좁히면 그 버그군 전부 소멸.
+
+**변경 파일** (결정: native 모델 재작성 + KB junk + 잘림 같이)
+- (edit) `services/screen_tool_funcs/screen_context_service.py` — 등록 시나리오 24 → **커서-로컬 flow 3종**: `IdleAfterWriting`(이어쓰기) / `ParagraphChurn`(막힌 문단 재작성) / `BlankDocumentStart`(빈 문서 시작). 나머지 21종은 클래스만 남기고 미등록(추후 명시적 "문서 검토" 기능으로 재도입 가능).
+- (edit) `services/screen_tool_funcs/core/models.py` + `content_filter.py` — `FilteredScreenContext.cursor_located`: OCR-only가 아니고 (진짜 caret 문단 OR 캡처 간 diff)일 때 True. 커서를 신뢰있게 잡았는지.
+- (edit) `services/screen_tool_funcs/intervention/intervention_detector.py` — `filter_unlocated`: `cursor_located=False`면 커서-필수 시나리오(idle/churn) 발화 억제(blank 예외). **커서를 모르면 이어쓰기/재작성 제안 안 함** — native 방식.
+- (edit) `agent/chat_agent.py` — ① `_drop_nav_junk_documents`/`_is_nav_junk`: KB retrieve 결과 중 nav-menu/link-list 청크(스크랩 boilerplate; 로그의 `* [컨퍼런스](https://...)` 류) 제거 → 프롬프트 오염 차단(전부 junk면 "관련 KB 없음"). ② `_screen_call_request`에 `extra_sampling_params.max_tokens`(`VERITAS_SCREEN_ANSWER_MAX_TOKENS`=320) — chat 프로필 기본 cap이 답변을 문장 중간에 자르던 잘림 방지.
+
+**진단(로그)**: ① notepad가 `uia_full_text_fallback`(caret 미제공)이라 직전 fix가 작은 diff "로"를 scope로 → 잘림형 쓰레기(이미 diff-offset 윈도우로 해결). ② foreground가 Code.exe → OCR이 화면 통째(디버그 콘솔·코드·nav 링크) read → cursor_located=False로 차단. ③ `--screen-debug`의 전체 프롬프트+KB 노출은 정상(디버그 플래그, 로컬 콘솔), 단 KB 내용이 nav junk였던 게 진짜 문제 → 필터.
+
+**테스트**: `tests/test_screen_cursor_anchor.py` 27→**38** — `cursor_located`(caret/diff→True, OCR/무편집→False), `filter_unlocated`(idle/churn drop·blank 유지), `_is_nav_junk`(링크리스트 junk·prose 보존·링크1개 prose 생존), `_screen_call_request` max_tokens 명시.
+
+**검증**: `discover -s tests` → **558 OK**(기존 543, 신규 15, 회귀 0, flake 없음). 편집 파일 `py_compile` 통과.
+
+### 2026-06-10 (fix) — cursor_located가 멈춤(pause) 시 idle을 죽이던 회귀 (sticky cursor offset)
+
+**배경(사용자)**: brief를 notepad에 붙여넣고 `## 결론 …`까지 썼는데 보조가 **안 뜸**. 원인: 직전 refactor의 `cursor_located` 게이트가 idle을 깸. idle(이어쓰기)은 **멈춤** 시 발화 = 현재 캡처에 diff 없음. notepad는 caret 미검출(`uia_full_text_fallback`)이라 멈추면 `change_offset=None` → `cursor_located=False` → `filter_unlocated`가 idle 제거 → **영영 안 뜸**. (caret 주는 앱(Word)은 무관 — real caret으로 located.)
+
+**변경 파일**
+- (edit) `services/screen_tool_funcs/core/content_filter.py` — `ContentFilter._sticky_cursor_offset`: 현재 캡처에 변경이 있으면 그 offset 기록, 변경이 없어도 **텍스트가 직전 편집 시점과 동일하면(=멈춤) 기억한 offset 유지**. caret 없는 앱에서도 멈춤 동안 cursor_located·cursor_scope(커서 앞 윈도우)가 유지돼 idle이 발화한다. 텍스트가 (편집 외 이유로) 바뀌면 위치 불명 → None(다른 문서로 안 샘).
+
+**테스트**: `tests/test_screen_cursor_anchor.py` 38→**40** — 편집 후 멈춤 캡처에서 sticky로 located 유지(핵심 회귀), 다른 문서로는 sticky 미적용.
+
+**검증**: `discover -s tests` → **560 OK**(기존 558, 신규 2, 회귀 0). 편집 파일 `py_compile` 통과.
+
+### 2026-06-10 (feat) — 외부 앱 보조를 **native ghostwrite 모델**로: caret-continuation 엔진 (속도 + retry)
+
+**배경(사용자)**: (1) 반응 너무 느림. (2) "다시"가 재제안을 안 함. 요구: native editor ghostwriting과 **동일 로직** — UIA로 caret 위치를 주기적으로 읽고, 최근 N폴링 동안 caret이 안 움직이면 **즉시** 제안(검은 본문 이어쓰기 + 회색 근거).
+
+**진단**: 첫 제안 25~45초 = capture **5s** + dwell **5캡처** + idle **2캡처** + 페이스 floor **20s**. native는 ~1-2초 debounce. dwell/CFS/idle 기계는 느린 OCR 폴링용. **retry는 구조적 불가**: idle 발화 조건이 `changed_before_pause`(히스토리 윈도우 내 최근 편집)라, 카드 뜬 뒤 타이핑 없이 "다시"하면 새 편집이 없어 idle이 재발화 못 함(게다가 ~50초 후 idle 자체 침묵).
+
+**변경 파일** (결정: native caret-poll 엔진 신규, ~2초[1s×2])
+- (new) `services/screen_tool_funcs/intervention/caret_continuation.py` — **`CaretContinuationEngine`**: 연속 캡처의 `cursor_scope_text`가 `stable_polls`(2)회 안정 + `cursor_located`(UIA caret/diff) + prefix 충분 → 즉시 `idle_after_writing` InterventionDecision 발화. **spot-dedup**(같은 fingerprint 재발화 금지, 커서/텍스트 변해야 다음). **retry**: `request_retry(avoid_text)`로 같은 자리 즉시 재발화 + 직전 제안을 avoid로 — idle-gate(새 편집 요구) 미사용이 retry 작동의 핵심.
+- (edit) `services/screen_tool_funcs/screen_context_service.py` — `capture_once`가 `detector.decide` 대신 **engine.observe**로 발화 결정(시나리오/dwell/CFS/scheduler 우회). `UnresolvedCardGate`에 직전 답변 저장(`mark_shown(answer)`) → `resolve_card(retry)`가 `engine.request_retry(avoid_text=card.answer)`.
+- (edit) `services/screen_tool_funcs/intervention/intervention_dispatcher.py` — payload에 `avoid_text`(metadata→consumer) 전달.
+- (edit) `agent/chat_agent.py` — answer 콜백마다 `mark_card_shown(answer_text=…)`로 직전 제안 갱신. `answer_screen_intervention`이 `avoid_text` 있으면 "직전 제안 반복 금지 + 다른 이어쓰기" 지시 주입. consumer poll 2→**1초**.
+- (edit) `tools/screen_context_tool/screen_context_tool.py` — `mark_card_shown` `answer_text` 파라미터.
+- (edit) `api/services/agent_runtime.py` — `VERITAS_SCREEN_INTERVAL` 기본 5→**1.0**. on_answer가 answer 전달.
+
+**효과**: 멈춘 뒤 **~2초** 발화(native 체감). "다시"=같은 자리 즉시 다른 문장. 검은 본문(이어쓰기)+회색 설명(카드 분리 기존). 24시나리오/dwell/CFS/적응페이스는 외부 continuation에서 미사용(코드 잔존). cursor_located로 커서 모르면 발화 안 함.
+
+**테스트**: (new) `tests/test_caret_continuation.py` (9) — N폴 안정 발화·dedup·커서이동 재발화·미확정/짧은prefix 미발화·busy/card 보류·retry 즉시+avoid·문서 독립. (edit) `tests/test_screen_overload_guard.py` `ResolveCardRetryTests` — retry→engine 즉시 재발화(avoid) / 거절→예약 없음 (scheduler-pace 테스트 obsolete 제거).
+
+**검증**: `discover -s tests` → **568 OK**(기존 560, 신규 9 −1 제거, 회귀 0). 편집 파일 `py_compile` 통과.
+
+**후속(같은 날) — retry는 같은 카드 갱신**: "다시" 재발화가 새 카드를 만들지 않고 **원래 카드를 in-place 갱신**하도록. `request_retry(target_event_id)` → 엔진이 `metadata.retry_event_id`로 흘려보냄 → dispatcher payload → `agent_runtime.on_answer`가 retry면 pd_ rewrite를 건너뛰고 **원래 카드 id를 재사용** → `record_assist_answer`가 같은 eventId를 upsert → 프론트가 같은 카드 텍스트만 갱신. 엔진/overload 테스트에 `retry_event_id` 검증 추가. 568 OK 유지.
+
+**후속(같은 날) — 카드 높이 클립 수정 + startup grace**: (a) 스트리밍 갱신 시 카드 본문이 첫 청크 높이에 고정돼 잘려 보이던 문제(상단 새 카드가 "깨져" 보임) — `SuggestionCard.set_text`가 `_apply_parsed` 후 `_sync_height()`로 높이 재계산(upsert가 scroll-to-bottom을 호출하며 높이를 재싱크하던 부수효과를 newest-first 전환 때 잃은 회귀). (b) **진입 직후 1.5초 startup grace** — `start_polling`이 `_monitor_started_at` 기록 + `continuation_engine.reset()`, `capture_once`가 grace 내면 `engine.observe(suppressed=True)`로 **안정만 누적하고 발화 보류**(첫 캡처 caret이 엉뚱한 위치일 수 있어 커서 자리잡을 여유). grace 후 여전히 안정이면 즉시 발화. `VERITAS_SCREEN_START_GRACE_S`(1.5). 테스트 +2(grace suppress·streaming 높이 재싱크). 575 OK.
+
+**후속(같은 날) — 실시간 보조창 카드 UX**: (1) **최신 제안 최상단**(newest-first) — `add_suggestion`이 `insertWidget(0)`로 맨 위 삽입, 지난 제안은 아래로 이력 누적(스크롤로 확인), `MAX_CARDS` 3→**50**(메모리 bound; 초과 시 맨 아래=가장 오래된 것 제거), `set_suggestions`는 store 시간순을 reverse해 표시. 같은 단락 fingerprint 교체 폐기(이력 보존). 스크롤은 top으로. (2) **거절 시 카드 제거** — `SuggestionList._on_card_feedback`이 `red_reject`/`dislike`면 해당 카드 제거 후 host로 bubble(HTTP). (3) **"다시" 즉시 "(재제안 중...)"** — `SuggestionCard.show_regenerating()`가 클릭 즉시 본문을 비우고 placeholder 표시(작동 신호), 백엔드 재생성이 같은 event_id로 새 내용 upsert하면 덮어씀. `frontend/ui/windows/document_assist_window.py`. 테스트 `SuggestionListCardPolicyTests` 재작성(최신최상단·이력·cap·거절제거·다시placeholder). 573 OK.
+
+**후속(같은 날) — 섹션 헤딩 주입 (native와 동일한 문서 구조 인식)**: 커서가 속한 섹션을 이어쓰기에 명시 주입. `ContentFilter._nearest_heading`(native `ChatAgent._nearest_heading`과 동일 규칙)이 **문서 머리~커서**에서 가장 가까운 마크다운 `#`헤딩을 추출 → `FilteredScreenContext.section_heading`(cursor_located일 때만, 전체 prefix 스캔이라 600자 윈도우 밖이어도 유지) → dispatcher writing_context → consumer `_screen_prompt_writing_context`의 `section_heading` 필드 → `SCREEN_INTERVENTION_SYSTEM_PROMPT`에 "section_heading 있으면 그 섹션 역할/주제 범위 안에서 이어쓰라(결론은 결론답게), 헤딩 텍스트 자체는 반복 금지" 규칙. → "## 결론" 아래에서 쓰면 LLM이 결론 작성 중임을 안다. 테스트 `test_screen_cursor_anchor.py` +4(`SectionHeadingTests`). **572 OK**.

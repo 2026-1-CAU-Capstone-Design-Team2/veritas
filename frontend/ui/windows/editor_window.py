@@ -1666,6 +1666,20 @@ class EditorWindow(WindowsSnapMixin, QWidget):
             return self._SUGGEST_DELAY_TYPING_MS
         return self._SUGGEST_DELAY_IDLE_MS
 
+    @staticmethod
+    def _section_heading_before(text_before_cursor: str) -> str:
+        """The nearest Markdown heading at or before the cursor — the title of
+        the section the user is writing in. Sent to the backend so the ghost
+        continuation stays on the section's topic even when the heading is far
+        above the (truncated) prefix window. Returns the heading text without the
+        leading ``#`` markers, or ``""`` when there is no heading above."""
+        heading = ""
+        for line in (text_before_cursor or "").splitlines():
+            match = re.match(r"^\s*(#{1,6})\s+(.*\S)\s*$", line)
+            if match:
+                heading = match.group(2).strip()
+        return heading
+
     def _fire_suggestion(self) -> None:
         if not self._autocomplete_enabled or self.editor.is_composing():
             return
@@ -1693,12 +1707,23 @@ class EditorWindow(WindowsSnapMixin, QWidget):
         self._active_decision_intervened = False
         self._proactive_timeout_timer.stop()
         partial: list[str] = []
+        # Section heading the cursor sits under — found from the WHOLE pre-cursor
+        # text (not the truncated prefix), so a long-document continuation stays
+        # on the section's topic even when the heading scrolled out of `prefix`.
+        section_heading = self._section_heading_before(text[:pos])
         # ``pos`` is the caret's TRUE offset in the whole document; pass it so the
         # backend reject-ladder keys "same spot" on the real position, not on
         # len(prefix) (which clamps to the prefix cap and would make a 3-reject
         # cooldown at one spot freeze suggestions everywhere in a long document).
         worker = EditorSuggestWorker(
-            self._workspace_id, prefix, suffix, 64, self._use_workspace_rag, self, cursor=pos
+            self._workspace_id,
+            prefix,
+            suffix,
+            64,
+            self._use_workspace_rag,
+            self,
+            cursor=pos,
+            section_heading=section_heading,
         )
 
         def on_start(_sid: str) -> None:

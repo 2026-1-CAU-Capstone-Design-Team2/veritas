@@ -74,8 +74,19 @@ python -m uvicorn api.api:app --host 127.0.0.1 --port 8000 --reload
 | `VERITAS_SCOUT_DOCS` | `3` | 초기 scout 단계 문서 수 |
 | `VERITAS_API_AUTOSURVEY_MAX_DOCS` | `5` | chat tool로서의 autosurvey 캡 |
 | `VERITAS_ENABLE_SCREEN_CONTEXT` | `1` | screen_context tool 등록 여부 (`0`이면 비활성) |
-| `VERITAS_SCREEN_INTERVAL` | `5.0` | screen context polling 주기(초) |
+| `VERITAS_SCREEN_INTERVAL` | `1.0` | screen context polling 주기(초). caret-continuation 엔진의 반응 속도 = interval × stable_polls (≈2초) |
+| `VERITAS_SCREEN_STABLE_POLLS` | `2` | cursor_scope가 이만큼 연속 폴링 동안 안정(=커서 멈춤)이면 즉시 이어쓰기 발화 (native debounce 대응) |
+| `VERITAS_SCREEN_MIN_PREFIX_CHARS` | `20` | 이어쓰기를 하기에 충분한 최소 커서 앞 텍스트 길이 |
+| `VERITAS_SCREEN_START_GRACE_S` | `1.5` | 모니터링 시작(보조 진입) 직후 발화 보류 시간(초). 첫 캡처의 caret이 사용자가 쓰려는 곳이 아닐 수 있어 커서가 자리잡을 여유를 줌 |
 | `VERITAS_SCREEN_DEBUG` | `0` | screen context 디버그 로그 |
+| `VERITAS_SCREEN_FIRE_FLOOR_S` | `20.0` | 외부 앱 개입 발화 간 절대 최소 간격(문서당). 어떤 신호로도 우회 불가한 스팸 하한 |
+| `VERITAS_SCREEN_FIRE_BASE_S` | `30.0` | 적응형 발화 간격의 기본값. 실제 간격 = base × multiplier (clamp [floor, ceil]) |
+| `VERITAS_SCREEN_FIRE_CEIL_S` | `240.0` | 적응형 발화 간격의 상한 (거절/무시가 누적됐을 때) |
+| `VERITAS_SCREEN_FIRE_DECAY_HALFLIFE_S` | `600.0` | 페이스 multiplier가 1.0으로 돌아가는 반감기. 거절 몇 번이 세션을 영구히 늦추지 않게 함 |
+| `VERITAS_SCREEN_EARLY_RELEASE_CHARS` | `80` | 직전 발화 이후 정규화 문서 길이가 이만큼 변하면(새 내용) 적응 간격 전에도 발화 허용 (floor는 유지) |
+| `VERITAS_SCREEN_PARAGRAPH_COOLDOWN_S` | `180.0` | 같은 단락(fingerprint)에 시나리오 무관 재발화 금지 시간. 단락을 수정하면 fingerprint가 바뀌어 자연 해제 |
+| `VERITAS_SCREEN_CARD_RESOLVE_TIMEOUT_S` | `90.0` | 표시된 카드에 사용자가 무반응일 때 unresolved-card 게이트가 자동 해제되기까지의 시간 (만료는 '무시' 신호로 페이스를 늦춤) |
+| `VERITAS_SCREEN_ANSWER_MAX_TOKENS` | `320` | 외부 앱 보조 답변 생성 토큰 상한 (이어쓰기 1~2문장 + "설명:" 메모; 문장 중간 잘림 방지) |
 
 ### Agent runtime
 

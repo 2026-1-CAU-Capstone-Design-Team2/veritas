@@ -981,9 +981,24 @@ class ResearchPage(QWidget):
 		self.info_row_widget.setVisible(True)
 		self.workspaceCreated.emit(workspace_id, name)
 
+	@staticmethod
+	def _format_doc_count(collected: int, target: int) -> str:
+		"""'수집된 문서 수' caption — collected vs. the run's document cap.
+
+		The denominator is a *cap*: collection can never keep more documents than
+		``max_docs``, so a denominator below the collected count is always stale
+		(e.g. a workspace re-opened in a fresh page where ``_max_docs`` fell back
+		to the default, or a persisted job that predates the ``maxDocs`` field).
+		Clamp the displayed target to at least the collected count so the tile
+		never shows a nonsensical ``18 / 15``; a genuinely larger requested cap
+		(``18 / 20`` when the run stopped early) is preserved untouched."""
+		collected = max(0, int(collected))
+		denom = max(int(target), collected)
+		return f"{collected} / {denom}건"
+
 	def _doc_count_text(self) -> str:
 		"""Caption for the '수집된 문서 수' tile — collected vs. requested."""
-		return f"{len(self._doc_bars)} / {self._max_docs}건"
+		return self._format_doc_count(len(self._doc_bars), self._max_docs)
 
 	def _add_pending_document_bar(self, detail: dict) -> None:
 		doc_id = str(detail.get("doc_id") or "").strip()
@@ -1222,6 +1237,12 @@ class ResearchPage(QWidget):
 		# Flip any failed documents red. Done after reconcile so it overrides
 		# the default pending/ready state for those rows.
 		self._apply_failed_documents(failed_documents)
+
+		# Keep the stored cap consistent with reality on restore: a job whose
+		# persisted maxDocs is missing/stale must not leave `_max_docs` below the
+		# number actually collected (it drives both the count tile denominator and
+		# the count-progress total). Never lowers a genuinely larger requested cap.
+		self._max_docs = max(self._max_docs, len(self._doc_bars))
 
 		# The document list is always shown when there are bars: a partial
 		# failure must never hide the documents that succeeded.

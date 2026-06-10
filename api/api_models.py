@@ -118,6 +118,10 @@ class EditorSuggestRequest(BaseModel):
     # prefix cap collapses to one anchor and a 3-reject cooldown blocks the whole
     # document. Defaults to 0 for backward-compatible callers.
     cursor: int = Field(default=0, ge=0)
+    # Heading of the section the cursor sits under (the editor knows the whole
+    # document). Injected as ``[현재 섹션 제목]`` so a long-document continuation
+    # stays on the section's topic even when the heading scrolled out of prefix.
+    sectionHeading: str = ""
 
 
 class EditorSaveRequest(BaseModel):

@@ -29,7 +29,7 @@ from services.proactive.proposal_models import is_null, is_task
 
 
 def _gen():
-    def ghost(p, s="", *, max_tokens=64, use_workspace=True):
+    def ghost(p, s="", *, max_tokens=64, use_workspace=True, section_heading=""):
         yield "이어쓰기 본문"
 
     def assist(a, t, *, max_tokens=400, use_workspace=True, additive_grounding=False):
@@ -391,7 +391,7 @@ class GhostTokenBudgetTests(unittest.TestCase):
         self.assertGreaterEqual(DEFAULT_GHOST_MAX_TOKENS, 128)
         captured: dict[str, int] = {}
 
-        def ghost(prefix, suffix="", *, max_tokens=64, use_workspace=True):
+        def ghost(prefix, suffix="", *, max_tokens=64, use_workspace=True, section_heading=""):
             captured["max_tokens"] = max_tokens
             yield "이어 쓸 다음 문장입니다."
 

@@ -191,7 +191,7 @@ class AgentRuntime:
             batch_size=int(os.getenv("VERITAS_BATCH_SIZE", "5")),
             max_context=int(os.getenv("VERITAS_MAX_CONTEXT", "16384")),
             enable_screen_context=os.getenv("VERITAS_ENABLE_SCREEN_CONTEXT", "1") != "0",
-            screen_interval_sec=float(os.getenv("VERITAS_SCREEN_INTERVAL", "5.0")),
+            screen_interval_sec=float(os.getenv("VERITAS_SCREEN_INTERVAL", "1.0")),
             screen_debug_log=os.getenv("VERITAS_SCREEN_DEBUG", "0") == "1",
             custom_document_tools=custom_document_tools,
         )
@@ -509,10 +509,20 @@ class AgentRuntime:
     # chat / document-assist pages, instead of calling the LLM directly.
 
     def ghostwrite_iter(
-        self, prefix: str, suffix: str = "", *, max_tokens: int = 64, use_workspace: bool = True
+        self,
+        prefix: str,
+        suffix: str = "",
+        *,
+        max_tokens: int = 64,
+        use_workspace: bool = True,
+        section_heading: str = "",
     ) -> Iterator[str]:
         return self.chat_agent.iter_ghostwrite(
-            prefix, suffix, max_tokens=max_tokens, use_workspace=use_workspace
+            prefix,
+            suffix,
+            max_tokens=max_tokens,
+            use_workspace=use_workspace,
+            section_heading=section_heading,
         )
 
     def editor_assist_iter(
@@ -1080,9 +1090,22 @@ class AgentRuntime:
         endpoint forwards into the bandit canonical reward path.
         """
         seen_decisions: dict[str, str] = {}
+        # 마지막으로 unresolved-card 게이트에 마킹한 카드 id — 같은 카드의
+        # 스트리밍 청크마다 registry를 다시 부르지 않기 위한 1칸짜리 기억.
+        last_marked_card: list[str] = [""]
 
         def on_answer(answer, intervention, done=True):  # type: ignore[no-untyped-def]
-            if isinstance(intervention, dict) and proactive_screen_enabled():
+            retry_event_id = (
+                str(intervention.get("retry_event_id") or "").strip()
+                if isinstance(intervention, dict)
+                else ""
+            )
+            if retry_event_id:
+                # "다시" 재발화: 새 pd_ 카드를 만들지 않고 원래 카드 id를 재사용 →
+                # 프론트가 같은 카드 내용을 갱신(upsert)한다. pd_ rewrite는 건너뛴다.
+                intervention = dict(intervention)
+                intervention["event_id"] = retry_event_id
+            elif isinstance(intervention, dict) and proactive_screen_enabled():
                 event_id = str(intervention.get("event_id") or "")
                 decision_id = seen_decisions.get(event_id) if event_id else None
                 if decision_id is None:
@@ -1104,6 +1127,29 @@ class AgentRuntime:
                     intervention = dict(intervention)
                     intervention["legacy_event_id"] = event_id
                     intervention["event_id"] = decision_id
+            # 첫 non-empty 청크 = 카드가 실제 렌더되기 시작한 순간. 이 시점에
+            # unresolved-card 게이트를 잠가, 사용자가 반응(또는 만료)하기 전에는
+            # 캡처 루프가 새 개입을 스케줄하지 못하게 한다. 빈 답변(스킵된
+            # 개입)은 카드가 안 생기므로 마킹하지 않는다. pd_* rewrite 이후라
+            # 게이트에는 proactive id와 legacy id가 함께 등록된다.
+            if str(answer or "").strip() and isinstance(intervention, dict):
+                card_id = str(intervention.get("event_id") or "")
+                # 매 청크마다 mark — answer(직전 제안 텍스트)를 게이트에 갱신해
+                # retry의 avoid_text로 쓰게 한다. card_id가 처음일 때만 새 카드로
+                # 등록되고(게이트 내부), 이후는 answer만 최신화된다.
+                if card_id:
+                    is_new = card_id != last_marked_card[0]
+                    last_marked_card[0] = card_id
+                    try:
+                        self.registry.call(
+                            "screen_context",
+                            action="mark_card_shown",
+                            intervention=intervention,
+                            answer_text=str(answer or ""),
+                        )
+                    except Exception as exc:  # noqa: BLE001 — 게이트는 best-effort
+                        if is_new:
+                            print(f"[screen_context][card_gate][warn] mark failed: {exc}")
             self._screen_monitor.record_assist_answer(
                 answer, intervention, workspace_id=self.workspace_id, done=done
             )
@@ -1132,6 +1178,10 @@ class AgentRuntime:
             action=action,
             reward=reward,
         )
+
+    def resolve_screen_card(self, *, event_id: str, action: str) -> dict[str, Any]:
+        """Feedback이 도착한 카드를 unresolved-card 게이트에서 해제한다."""
+        return self._screen_monitor.resolve_card(event_id=event_id, action=action)
 
     def _compact_workflow_result(self, result: Any) -> dict[str, Any]:
         if not isinstance(result, dict):

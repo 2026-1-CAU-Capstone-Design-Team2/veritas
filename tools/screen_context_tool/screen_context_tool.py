@@ -26,6 +26,8 @@ class ScreenContextTool(BaseTool):
         intervention_type: str = "",
         feedback_action: str = "",
         reward: float = 0.0,
+        intervention: dict[str, Any] | None = None,
+        answer_text: str = "",
     ) -> ToolResult:
         try:
             action = str(action or "").strip()
@@ -84,6 +86,28 @@ class ScreenContextTool(BaseTool):
                 consumed = self._screen_context_service.store.consume_pending_interventions(limit=safe_limit)
                 return ToolResult(success=True, data={"interventions": consumed})
 
+            if action == "mark_card_shown":
+                # 카드가 화면에 렌더되기 시작했음을 게이트에 알림 (runtime의
+                # on_answer 콜백 경유). intervention dict가 문서/단락 식별자를 가짐.
+                if not isinstance(intervention, dict):
+                    return ToolResult(success=False, error="mark_card_shown requires intervention dict")
+                self._screen_context_service.mark_card_shown(
+                    intervention, answer=str(answer_text or "")
+                )
+                return ToolResult(
+                    success=True,
+                    data={"unresolved_card": self._screen_context_service.unresolved_card_gate.snapshot()},
+                )
+
+            if action == "resolve_card":
+                event_id = str(event_id or "").strip()
+                if not event_id:
+                    return ToolResult(success=False, error="resolve_card requires event_id")
+                resolved = self._screen_context_service.resolve_card(
+                    event_id, feedback_action=str(feedback_action or "")
+                )
+                return ToolResult(success=True, data={"resolved": resolved})
+
             if action == "record_feedback":
                 event_id = str(event_id or "").strip()
                 if not event_id:
@@ -123,6 +147,7 @@ class ScreenContextTool(BaseTool):
                         "latest_intervention_event_id": latest_intervention.get("event_id"),
                         "latest_intervention_captured_at": latest_intervention.get("captured_at"),
                         "capture_log_path": str(self._screen_context_service.store.capture_log_path),
+                        "unresolved_card": self._screen_context_service.unresolved_card_gate.snapshot(),
                     },
                 )
 

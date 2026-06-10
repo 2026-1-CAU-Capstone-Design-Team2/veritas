@@ -47,6 +47,7 @@ async def editor_suggest(payload: EditorSuggestRequest) -> StreamingResponse:
             payload.maxTokens,
             payload.useWorkspace,
             document_cursor=payload.cursor,
+            section_heading=payload.sectionHeading,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

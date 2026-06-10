@@ -88,7 +88,7 @@ class OutlinePhaseScenario(ScenarioType):
         return {"tone": "outline_expand", "preferred_action": "expand_outline_item"}
 
     def _outline_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        text = (filtered.active_editor_text or "").strip()
+        text = (filtered.cursor_scope_text or "").strip()
         if not text:
             return {"passed": False, "reason": "empty_text", "lines": 0}
         lines = [ln for ln in text.split("\n") if ln.strip()]
@@ -176,8 +176,8 @@ class HeadingAddedScenario(ScenarioType):
         return {"tone": "section_kickoff", "preferred_action": "open_section"}
 
     def _heading_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        # 헤딩은 보통 별도 문단(본문 위)이므로 문서 전반에서 탐지
-        text = (filtered.active_editor_text or filtered.current_paragraph_text or "").strip()
+        # 커서 영역만 검사 — 멀리 떨어진 헤딩이 아니라 지금 쓰는 섹션에만 반응.
+        text = (filtered.cursor_scope_text or "").strip()
         if not text:
             return {"passed": False, "reason": "empty_text", "headings": []}
         matches = _HEADING_RE.findall(text)
@@ -322,7 +322,7 @@ class NumberedListGrowthScenario(ScenarioType):
         return {"tone": "list_extend", "preferred_action": "suggest_list_item"}
 
     def _list_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        text = filtered.active_editor_text or ""
+        text = filtered.cursor_scope_text or ""
         if not text.strip():
             return {"passed": False, "reason": "empty_text", "items": 0}
         items = len(_NUMBERED_ITEM_RE.findall(text))
@@ -395,7 +395,7 @@ class CodeBlockPresentScenario(ScenarioType):
         return {"tone": "code_review", "preferred_action": "comment_on_code"}
 
     def _code_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        text = filtered.active_editor_text or ""
+        text = filtered.cursor_scope_text or ""
         if not text.strip():
             return {"passed": False, "reason": "empty_text", "fences": 0}
         fences = len(_CODE_FENCE_RE.findall(text))

@@ -76,8 +76,9 @@ class AcronymIntroducedScenario(ScenarioType):
         return {"tone": "clarify", "preferred_action": "suggest_definition"}
 
     def _acronym_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        # 약어는 문단 단위가 아니라 문서 전반에서 탐지 (다른 문단에 정의돼 있을 수 있음)
-        text = (filtered.active_editor_text or filtered.current_paragraph_text or "").strip()
+        # 커서 영역(작성 중인 문단/최근 편집)만 검사 — 본문 다른 곳의 약어에
+        # 발화해 커서와 무관한 제안이 뜨던 문제를 막는다.
+        text = (filtered.cursor_scope_text or "").strip()
         if not text:
             return {"passed": False, "reason": "empty_text", "acronyms": []}
         matches = _ACRONYM_RE.findall(text)
@@ -151,7 +152,7 @@ class TodoMarkerPresentScenario(ScenarioType):
         return {"tone": "task_summary", "preferred_action": "summarize_todos"}
 
     def _marker_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        text = filtered.active_editor_text or ""
+        text = filtered.cursor_scope_text or ""
         if not text.strip():
             return {"passed": False, "reason": "empty_text", "markers": []}
         # findall: 그룹 매치 시 그룹 내용 반환, [?] 분기 매치 시 빈 문자열 — 빈 값 제외
@@ -233,7 +234,7 @@ class ManyQuestionMarksScenario(ScenarioType):
         return {"tone": "research_focus", "preferred_action": "highlight_key_questions"}
 
     def _question_status(self, filtered: FilteredScreenContext) -> dict[str, Any]:
-        text = (filtered.current_paragraph_text or filtered.active_editor_text or "")
+        text = (filtered.cursor_scope_text or "")
         if not text.strip():
             return {"passed": False, "reason": "empty_text", "question_marks": 0}
         count = text.count("?")

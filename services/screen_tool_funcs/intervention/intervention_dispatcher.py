@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+from ..core.content_filter import CURSOR_SCOPE_CHANGE_MAX_RATIO, resolve_cursor_scope
 from ..core.models import ScreenContextEvent
 from ..core.store import ScreenContextStore
 from ..scenario import ScenarioType
@@ -51,13 +52,15 @@ class InterventionDispatcher:
         metadata = event.intervention.metadata or {}
         intervention_type = event.intervention.intervention_type or "none"
         activity_context = self._activity_context(metadata)
-        recent_sentences = self._recent_sentences(
-            filtered.current_paragraph_text or filtered.active_editor_text,
-            limit=2,
-        )
+        # Resolve where the user is actively writing. Priority: caret paragraph
+        # → recent edit region → document tail. NEVER the document head — that
+        # is the bug that returned intro-sentence reviews while the user was
+        # writing the conclusion.
+        anchor_block, focus_hint = self._resolve_anchor(filtered)
+        recent_sentences = self._recent_sentences(anchor_block, limit=2)
         focused_sentence = self._focused_sentence(
-            paragraph=filtered.current_paragraph_text,
-            changed_text=filtered.changed_text,
+            paragraph=anchor_block,
+            changed_text=focus_hint,
         )
         if not focused_sentence:
             focused_sentence = self._recent_sentences(recent_sentences, limit=1)
@@ -79,6 +82,10 @@ class InterventionDispatcher:
             "intervention_type": intervention_type,
             "event_id": event.event_id,
             "captured_at": event.captured_at,
+            # retry로 재발화될 때 직전 제안 — 생성기가 같은 문장을 피하도록.
+            "avoid_text": str(metadata.get("avoid_text") or ""),
+            # retry면 원래 카드 id — 새 카드 대신 그 카드를 갱신(upsert)하게 한다.
+            "retry_event_id": str(metadata.get("retry_event_id") or ""),
             "app_context": {
                 "process": window.process_name,
                 "title": window.window_title,
@@ -120,6 +127,8 @@ class InterventionDispatcher:
             "current_paragraph": filtered.current_paragraph_text,
             "recent_sentences": recent_sentences,
             "focused_sentence": focused_sentence,
+            # 커서가 속한 섹션 제목 — 이어쓰기를 그 섹션 주제 범위에 둔다.
+            "section_heading": getattr(filtered, "section_heading", "") or "",
             "paragraph_source": filtered.current_paragraph_source,
             "paragraph_rect": (
                 {
@@ -272,6 +281,30 @@ class InterventionDispatcher:
                     base[key] = value
         return base
 
+    def _resolve_anchor(self, filtered) -> tuple[str, str]:
+        """``(anchor_block, focus_hint)`` — 사용자가 지금 글을 쓰고 있는 텍스트
+        영역과 그 안에서의 최근 편집 힌트.
+
+        ContentFilter가 이미 ``cursor_scope_text``를 (caret/diff-offset 윈도우/꼬리
+        규칙으로) 계산해 두므로 **그 필드를 그대로 anchor로 쓴다** — 시나리오 발화
+        스코프와 LLM 앵커가 동일한 단일 소스. 구버전 캡처라 필드가 비면
+        ``resolve_cursor_scope``로 재계산(offset 없음 → 꼬리 fallback)한다."""
+        scope = (getattr(filtered, "cursor_scope_text", "") or "").strip()
+        full = (getattr(filtered, "active_editor_text", "") or "").strip()
+        changed = (getattr(filtered, "changed_text", "") or "").strip()
+        if not scope:
+            return resolve_cursor_scope(
+                full=full,
+                caret=getattr(filtered, "current_paragraph_text", "") or "",
+                changed=changed,
+            )
+        focus_hint = (
+            changed
+            if changed and len(changed) < max(1, len(full)) * CURSOR_SCOPE_CHANGE_MAX_RATIO
+            else ""
+        )
+        return scope, focus_hint
+
     def _focused_sentence(self, *, paragraph: str, changed_text: str) -> str:
         paragraph = (paragraph or "").strip()
         changed_text = (changed_text or "").strip()
@@ -282,14 +315,20 @@ class InterventionDispatcher:
         if not sentences:
             return paragraph
 
+        # Anchor to the sentence carrying the MOST RECENT edit. The caret sits at
+        # the END of the changed region, so match by its tail (not its head) and
+        # scan from the end of the paragraph so the latest occurrence wins. The
+        # old head-match would, for a whole-document changed_text, resolve to the
+        # intro sentence; ``_resolve_anchor`` already bounds ``paragraph`` and
+        # passes only a bounded ``changed_text`` here, and the tail anchor keeps
+        # the focus on where the user actually is.
         if changed_text:
-            changed_head = changed_text[:80].strip()
-            for sentence in reversed(sentences):
-                if changed_head and changed_head in sentence:
-                    return sentence
-            for sentence in reversed(sentences):
-                if changed_text[:20].strip() and changed_text[:20].strip() in sentence:
-                    return sentence
+            for probe in (changed_text[-80:].strip(), changed_text[-20:].strip()):
+                if not probe:
+                    continue
+                for sentence in reversed(sentences):
+                    if probe in sentence:
+                        return sentence
 
         return sentences[-1]
 

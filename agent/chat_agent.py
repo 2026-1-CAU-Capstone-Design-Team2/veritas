@@ -22,6 +22,7 @@ from core.prompts import (
     SCREEN_SCENARIO_GUIDANCE,
     SCREEN_SCENARIO_GUIDANCE_DEFAULT,
     SCREEN_SKELETON_GUIDANCE,
+    SUGGEST_SECTION_BLOCK_TEMPLATE,
     SUGGEST_SUFFIX_BLOCK_TEMPLATE,
     SUGGEST_SYSTEM_PROMPT,
     SUGGEST_USER_TEMPLATE,
@@ -146,7 +147,7 @@ class ChatAgent:
     )
     TOOL_DECISION_TIMEOUT_SEC = 45
     FINAL_ANSWER_TIMEOUT_SEC = 180
-    SCREEN_INTERVENTION_POLL_SEC = 2.0
+    SCREEN_INTERVENTION_POLL_SEC = 1.0
     SCREEN_INTERVENTION_TIMEOUT_SEC = 180
     SCREEN_INTERVENTION_TTL_SEC = 300.0
     # Start-phase scenarios generate fresh prose/structure, so a generic opener
@@ -490,6 +491,16 @@ class ChatAgent:
     _EDITOR_CONTEXT_MAX_CHARS = 1200
     # Window of the user's recent text used to retrieve additive grounding.
     _EDITOR_RAG_QUERY_CHARS = 300
+    # Relative relevance gate for editor grounding. The multilingual embedder's
+    # cosine floor is unreliable in ABSOLUTE terms (≈0.8 even for unrelated
+    # Korean — see _editor_context), so we cannot threshold on a fixed distance.
+    # Instead we keep only the tight cluster around the best hit: at most
+    # ``_EDITOR_RAG_TOP_K`` chunks whose distance is within
+    # ``_EDITOR_RAG_REL_MARGIN`` of the closest one. This drops the long tail of
+    # marginally-related chunks (which a small model can't reliably ignore and
+    # tends to copy) without needing an absolute floor.
+    _EDITOR_RAG_TOP_K = 3
+    _EDITOR_RAG_REL_MARGIN = 0.08
     # Ghost-writing fires on a writing-situation heuristic (a natural
     # continuation moment), NOT on an embedding-similarity gate. This
     # multilingual embedder's cosine floor is too high (~0.8 even for unrelated
@@ -506,6 +517,54 @@ class ChatAgent:
     # the retrieved similarity) is visible in the API console; set
     # VERITAS_EDITOR_RAG_DEBUG=0 to silence.
     _EDITOR_RAG_DEBUG = os.getenv("VERITAS_EDITOR_RAG_DEBUG", "1") not in ("0", "false", "False")
+
+    @staticmethod
+    def _filter_by_relative_distance(
+        documents: list[dict], *, top_k: int, margin: float
+    ) -> list[dict]:
+        """Keep only the chunks clustered around the closest hit.
+
+        Sorts by ChromaDB distance (= 1 − cosine), then keeps at most ``top_k``
+        whose distance is within ``margin`` of the best. Drops the long tail of
+        loosely-related chunks so off-topic grounding does not pollute the
+        suggestion. Returns the input unchanged when distances are absent (a
+        store that doesn't surface them) so behaviour degrades safely."""
+        if not documents:
+            return documents
+        if any("distance" not in d for d in documents):
+            return documents[:top_k]
+        ordered = sorted(documents, key=lambda d: float(d.get("distance", 1.0)))
+        best = float(ordered[0].get("distance", 1.0))
+        kept = [
+            d for d in ordered if float(d.get("distance", 1.0)) <= best + margin
+        ]
+        return kept[:top_k]
+
+    @staticmethod
+    def _nearest_heading(text: str) -> str:
+        """The closest Markdown heading at or before the end of ``text``.
+
+        Used to give the ghost the title of the section the cursor sits in, so a
+        continuation stays on the section's subject even when the heading
+        scrolled out of the prefix window. Returns the heading text without the
+        leading ``#`` markers, or ``""`` when the text carries no heading."""
+        heading = ""
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            match = re.match(r"^(#{1,6})\s+(.*\S)\s*$", stripped)
+            if match:
+                heading = match.group(2).strip()
+        return heading
+
+    @staticmethod
+    def _current_paragraph(prefix: str) -> str:
+        """The paragraph the cursor is in — the text after the last blank line
+        in ``prefix`` (which ends at the cursor). Used as a topical retrieval
+        query instead of the raw character tail."""
+        tail = (prefix or "").rsplit("\n\n", 1)[-1]
+        # Drop a leading heading line so the query is the prose, not the title.
+        lines = [ln for ln in tail.splitlines() if not re.match(r"^#{1,6}\s+", ln.strip())]
+        return " ".join(" ".join(lines).split())
 
     def _editor_context(self, query: str) -> str | None:
         """Retrieve *additive* grounding context from the workspace RAG index, or
@@ -533,6 +592,16 @@ class ChatAgent:
                     # ChromaDB cosine space → distance = 1 - cosine_similarity.
                     best_distance = min(float(d.get("distance", 1.0)) for d in documents)
                     print(f"[editor][rag] best_similarity={1.0 - best_distance:.3f} (additive grounding)")
+                # Relative relevance gate: keep only the tight cluster around the
+                # best hit so the long tail of loosely-related chunks doesn't
+                # pollute the suggestion (the absolute cosine floor is unreliable).
+                documents = self._filter_by_relative_distance(
+                    documents,
+                    top_k=self._EDITOR_RAG_TOP_K,
+                    margin=self._EDITOR_RAG_REL_MARGIN,
+                )
+                if documents and self._EDITOR_RAG_DEBUG:
+                    print(f"[editor][rag] grounding chunks kept={len(documents)} (relative gate)")
                 if documents:
                     formatted = (self.rag_service.format_retrieved_documents(documents) or "").strip()
                     context = formatted[: self._EDITOR_CONTEXT_MAX_CHARS] or None
@@ -574,11 +643,19 @@ class ChatAgent:
         *,
         max_tokens: int = 64,
         use_workspace: bool = True,
+        section_heading: str = "",
     ) -> Iterator[str]:
         """Stream an inline continuation token-by-token. Fires only at a natural
         continuation moment (the writing frontier with enough recent context);
         RAG is *additive* — workspace grounding is added when available (and
         ``use_workspace`` is set), never used as a hard on/off-topic gate.
+
+        ``section_heading`` is the title of the section the cursor sits in. The
+        caller supplies it (the editor knows the whole document); when omitted we
+        fall back to the nearest heading inside the prefix window. It is injected
+        as ``[현재 섹션 제목]`` so a long-document continuation stays on the
+        section's subject even when the heading scrolled out of the prefix, and
+        it also focuses the grounding-retrieval query.
 
         The NO_SUGGESTION decline (the model emits the sentinel when there is
         nothing natural to add / the workspace context is off-topic) must never
@@ -592,15 +669,26 @@ class ChatAgent:
             if self._EDITOR_RAG_DEBUG:
                 print("[editor][ghost] no suggestion - not a continuation moment")
             return
-        # Additive grounding: add workspace context when present; otherwise still
-        # offer a plain continuation (no hard gate).
-        context = self._editor_context(prefix) if use_workspace else None
+        # Document structure: the section heading (caller-provided, else nearest
+        # heading in the prefix) and the current paragraph anchor the suggestion
+        # to the section's topic rather than to a raw character window.
+        heading = (section_heading or "").strip() or self._nearest_heading(prefix)
+        current_para = self._current_paragraph(prefix)
+        # Additive grounding: retrieve on the section topic + current paragraph
+        # (a more topical query than the raw character tail), gate by relative
+        # relevance, and add when present; otherwise still offer a plain
+        # continuation (no hard gate).
+        grounding_query = " ".join(part for part in (heading, current_para) if part) or prefix
+        context = self._editor_context(grounding_query) if use_workspace else None
         reference = REFERENCE_BLOCK_TEMPLATE.format(context=context) if context else ""
+        section_block = (
+            SUGGEST_SECTION_BLOCK_TEMPLATE.format(heading=heading) if heading else ""
+        )
         if self._EDITOR_RAG_DEBUG:
-            print(f"[editor][ghost] suggestion (grounded={bool(context)})")
+            print(f"[editor][ghost] suggestion (grounded={bool(context)} section={bool(heading)})")
         suffix_block = SUGGEST_SUFFIX_BLOCK_TEMPLATE.format(suffix=suffix) if suffix.strip() else ""
         user_prompt = SUGGEST_USER_TEMPLATE.format(
-            reference=reference, prefix=prefix, suffix_block=suffix_block
+            reference=reference, section_block=section_block, prefix=prefix, suffix_block=suffix_block
         )
         # presence_penalty=0 (vs the client default 1.5): a continuation must pick
         # up the user's own vocabulary/flow, and penalizing reused tokens makes the
@@ -850,6 +938,13 @@ class ChatAgent:
             profile="chat",
             stream_label=stream_label,
             method_hint="screen_context",
+            # 잘림 방지: 이어쓰기/재작성 1~2문장 + "설명:" 짧은 메모면 충분하지만,
+            # chat 프로필 기본 cap이 문장 중간을 자르지 않도록 명시한다.
+            extra_sampling_params={
+                "max_tokens": int(
+                    float(os.getenv("VERITAS_SCREEN_ANSWER_MAX_TOKENS", "320"))
+                )
+            },
             timeout_sec=self.SCREEN_INTERVENTION_TIMEOUT_SEC,
             enable_memory_tools=False,
         )
@@ -1312,6 +1407,14 @@ class ChatAgent:
                 scenario_guidance = SCREEN_SCENARIO_GUIDANCE.get(
                     intervention_type, SCREEN_SCENARIO_GUIDANCE_DEFAULT
                 )
+            # retry("다시")로 재발화된 경우: 직전 제안을 명시적으로 피하라는 지시를
+            # 덧붙인다(native reject ladder와 동일한 의도 — 같은 문장 반복 금지).
+            avoid_text = " ".join(str(intervention.get("avoid_text") or "").split()).strip()
+            if avoid_text:
+                scenario_guidance = (
+                    f"{scenario_guidance}\n\n[직전 제안 — 절대 반복 금지]: {avoid_text[:400]}\n"
+                    "위 직전 제안과 **다른** 내용/표현으로, 같은 커서 위치에 어울리는 새 이어쓰기를 제시하라."
+                )
             # No {history} slot: recent chat turns ride in as separate chat
             # messages via MemoryAwareLLMClient.call/iter_call. Working/recall
             # context is injected into the system message by prepare().
@@ -1647,11 +1750,14 @@ class ChatAgent:
             or changed_text
             or current_paragraph[:1000]
         )
+        section_heading = " ".join(
+            str(writing.get("section_heading") or "").split()
+        ).strip()
         full_text_chars = writing.get(
             "full_text_chars",
             len(str(writing.get("full_text") or "")),
         )
-        return {
+        out = {
             "recent_sentences": scoped_text,
             "focused_sentence": focused_sentence,
             "changed_text": changed_text[:500],
@@ -1661,6 +1767,11 @@ class ChatAgent:
             "confidence": writing.get("confidence", 0.0),
             "scope_note": "Only the latest 1-2 sentences are provided for this intervention.",
         }
+        if section_heading:
+            # 커서가 속한 섹션 제목 — 이어쓰기를 이 섹션 주제 범위 안에 둔다
+            # (native editor의 [현재 섹션 제목] 주입과 동일).
+            out["section_heading"] = section_heading[:120]
+        return out
 
     def _screen_document_type(self, intervention: dict[str, Any]) -> str:
         """Resolve the document type the intervention prompt should assume.
@@ -1716,6 +1827,41 @@ class ChatAgent:
             return False
         return len(self._SKELETON_RE.findall(text)) >= self.SCREEN_SKELETON_MIN_RUNS
 
+    @staticmethod
+    def _is_nav_junk(content: str) -> bool:
+        """True when a retrieved chunk is mostly a website navigation menu /
+        link list (scraped boilerplate), not prose. Such chunks polluted the
+        screen-assist KB context (e.g. ``* [컨퍼런스](https://...)`` runs) and
+        gave the model nothing to ground on."""
+        text = (content or "").strip()
+        if not text:
+            return True
+        links = len(re.findall(r"\]\((?:https?://|/)", text))
+        # Link-dense: many markdown links packed into little prose.
+        if links >= 5 and links * 60 >= len(text):
+            return True
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return True
+        linkish = sum(
+            1 for ln in lines if re.match(r"^[*\-]?\s*\[[^\]]*\]\(", ln)
+        )
+        return len(lines) >= 4 and linkish / len(lines) >= 0.6
+
+    def _drop_nav_junk_documents(self, documents: list[Any]) -> list[Any]:
+        """Filter retrieved chunks that are navigation-menu / link-list junk."""
+        if not isinstance(documents, list):
+            return documents
+        # Empty result is intentional when every chunk is junk: the demo case had
+        # all-nav-menu retrievals, and telling the model "no relevant KB" is far
+        # better than grounding a suggestion on a link list. The filter is
+        # conservative (5+ dense links OR ≥60% link-lines) so real prose survives.
+        return [
+            d
+            for d in documents
+            if not (isinstance(d, dict) and self._is_nav_junk(str(d.get("content") or "")))
+        ]
+
     def _screen_knowledge_context(
         self, query: str, intervention_type: str = "none", *, force_topic: bool = False
     ) -> str:
@@ -1749,6 +1895,7 @@ class ChatAgent:
             if self.rag_service.get_document_count() <= 0:
                 return self._with_topic_label(topic_label, "(The knowledge base is empty.)")
             documents = self.rag_service.retrieve(effective_query, use_history=False)
+            documents = self._drop_nav_junk_documents(documents)
             context = self.rag_service.format_retrieved_documents(documents)
         except Exception as e:
             return self._with_topic_label(topic_label, f"(Knowledge-base lookup failed: {e})")

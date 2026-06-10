@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable
 
 from .capture.ocr_engine import OcrEngine
 from .capture.powerpoint_com import PowerPointComReader
@@ -12,8 +14,15 @@ from .capture.text_extraction_targets import is_text_extraction_target
 from .capture.ui_automation import UiAutomationReader
 from .capture.window_context import WindowContextReader
 from .core.content_filter import ContentFilter
-from .core.models import AppTextResult, OcrResult, ScreenContextEvent, UiAutomationResult
+from .core.models import (
+    AppTextResult,
+    InterventionDecision,
+    OcrResult,
+    ScreenContextEvent,
+    UiAutomationResult,
+)
 from .core.store import ScreenContextStore
+from .intervention.caret_continuation import CaretContinuationEngine
 from .intervention.intervention_detector import InterventionDetector
 from .intervention.intervention_dispatcher import InterventionDispatcher
 from .intervention.llm_router import ScenarioRouter
@@ -50,6 +59,143 @@ producer: ScreenContextService 폴링 스레드 -> decide() -> dispatcher.dispat
 
 consumer: ChatAgent._screen_intervention_loop — 별도 스레드. consume(limit=1) -> answer_screen_intervention()에서 ~30초 블로킹 LLM 호출 -> 반복
 """
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# feedback action → 발화 페이스 outcome. 수락 계열은 더 자주, 거절 계열은 더 드물게.
+_CARD_OUTCOME_BY_ACTION: dict[str, str] = {
+    "copy": "accept",
+    "like": "accept",
+    "retry": "retry",
+    "red_reject": "reject",
+    "reject": "reject",
+    "dislike": "reject",
+    "wrong_anchor": "reject",
+    "timeout": "ignore",
+}
+
+
+class UnresolvedCardGate:
+    """단일 슬롯 '미해결 카드' 게이트.
+
+    외부 앱 suggestion 카드가 화면에 떠 있는데 사용자가 아직 반응(복사/거절/
+    다시/위치다름)하지 않은 동안, 캡처 루프가 새 개입을 스케줄하지 못하게 막는다.
+    이전에는 카드 표시 직후부터 다음 발화가 가능해서, 사용자가 한 단락을 고치고
+    잠시 멈춘 사이 5~6개의 카드가 쌓였다 — "사용자 반응(또는 만료)이 다음 카드의
+    페이스를 결정한다"가 이 게이트의 원칙.
+
+    수명주기:
+    - ``mark_shown``  — ChatAgent 답변 콜백의 첫 non-empty 청크 시점. 생성 중에는
+      큐 점유(`_intervention_pipeline_busy`)가 막고 있으므로 이 시점 마킹으로
+      빈틈이 없다. 빈 답변/스킵된 개입은 마킹되지 않아 헛 quiet-period가 없다.
+    - ``resolve``     — feedback HTTP 경로에서 호출 (pd_* / legacy id 모두 매칭).
+    - 자동 만료       — ``resolve_timeout_sec`` 동안 무반응이면 무시로 간주하고 해제.
+
+    의도적으로 단일 슬롯: 게이트가 동작하는 한 미해결 카드는 항상 최대 1개다.
+    """
+
+    def __init__(
+        self,
+        *,
+        resolve_timeout_sec: float = 90.0,
+        now: Callable[[], float] | None = None,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._now: Callable[[], float] = now or time.time
+        self.resolve_timeout_sec = max(float(resolve_timeout_sec), 0.0)
+        self._card: dict[str, Any] | None = None
+
+    def mark_shown(self, intervention: dict[str, Any], answer: str = "") -> None:
+        if not isinstance(intervention, dict):
+            return
+        event_id = str(intervention.get("event_id") or "").strip()
+        if not event_id:
+            return
+        legacy_id = str(intervention.get("legacy_event_id") or "").strip()
+        ids = {event_id} | ({legacy_id} if legacy_id else set())
+        app_context = intervention.get("app_context")
+        if not isinstance(app_context, dict):
+            app_context = {}
+        activity = intervention.get("activity_context")
+        if not isinstance(activity, dict):
+            activity = {}
+        answer = str(answer or "")
+        with self._lock:
+            current = self._card
+            if current is not None and ids & current["ids"]:
+                # 같은 카드의 스트리밍 갱신 — shown_at은 첫 표시 시점 유지하되,
+                # 최신 답변 텍스트는 갱신(retry의 avoid_text로 쓰임).
+                current["ids"] |= ids
+                if answer:
+                    current["answer"] = answer
+                return
+            self._card = {
+                "ids": ids,
+                "document_key": str(
+                    app_context.get("document_key")
+                    or activity.get("document_key")
+                    or ""
+                ),
+                "paragraph_fingerprint": str(
+                    activity.get("paragraph_fingerprint") or ""
+                ),
+                "intervention_type": str(
+                    intervention.get("intervention_type") or ""
+                ),
+                # 직전 제안 텍스트 — "다시"(retry) 시 avoid_text로 넘겨 새 문장이
+                # 같은 걸 반복하지 않게 한다.
+                "answer": answer,
+                "shown_at": float(self._now()),
+            }
+
+    def resolve(self, event_id: str) -> dict[str, Any] | None:
+        """event_id(또는 alias)가 현재 슬롯과 일치하면 해제하고 카드 정보 반환."""
+        event_id = str(event_id or "").strip()
+        if not event_id:
+            return None
+        with self._lock:
+            card = self._card
+            if card is None or event_id not in card["ids"]:
+                return None
+            self._card = None
+            return dict(card)
+
+    def poll(self) -> tuple[bool, dict[str, Any] | None]:
+        """(게이트 활성?, 방금 만료된 카드). 만료된 카드는 호출자가 '무시(ignore)'
+        신호로 페이싱에 반영할 수 있도록 한 번만 반환된다."""
+        with self._lock:
+            card = self._card
+            if card is None:
+                return False, None
+            if self.resolve_timeout_sec > 0 and (
+                self._now() - card["shown_at"] >= self.resolve_timeout_sec
+            ):
+                # 무반응 만료 — 사용자가 카드를 무시했다고 보고 게이트를 푼다.
+                self._card = None
+                return False, dict(card)
+            return True, None
+
+    def active(self) -> bool:
+        return self.poll()[0]
+
+    def snapshot(self) -> dict[str, Any] | None:
+        with self._lock:
+            card = self._card
+            if card is None:
+                return None
+            return {
+                "event_ids": sorted(card["ids"]),
+                "document_key": card["document_key"],
+                "intervention_type": card["intervention_type"],
+                "shown_at": card["shown_at"],
+                "age_sec": round(self._now() - card["shown_at"], 1),
+            }
 class ScreenContextService:
     """OCR/PID를 주기적으로 수집하고 agent용 최종 context를 저장합니다."""
     # consumer 중단으로 인해 큐에 끼인 항목을 점유로 간주하지 않기 위해 LLM timeout 시간보다 큰 경우에만 큐에 남은 항목을 인플라이트로 간주하도록 함
@@ -94,40 +240,61 @@ class ScreenContextService:
         # used to seed the scheduler and the scheduler was then attached back
         # to the detector via a post-construction setter — which would silently
         # drift if anyone replaced detector.scenarios at runtime.
+        # 등록 시나리오 = **커서-로컬 작성 도움** 3종만. native editor와 동일한
+        # 모델: "지금 커서에서 글쓰기를 돕는다". 문서 전역 리뷰 시나리오(acronym/
+        # citation/quote/heading/outline/list/code/todo/question/repeat/transition/
+        # modifier/edit-diff/whole-doc-review/long-static-review)는 커서와 무관한
+        # 제안을 만들어 위치 불일치·OCR 쓰레기·시나리오 폭주의 근원이었으므로
+        # 외부 surface에서 제거. (클래스는 import 가능하게 남아있음 — 추후 명시적
+        # "문서 검토" 버튼/명령으로 재도입 가능.) idle=이어쓰기, churn=막힌 문단
+        # 재작성, blank=빈 문서 시작 — 셋 다 커서 상태만 보고 다른 곳을 안 가리킨다.
         scenarios = [
-            # Phase 1-3 (기존 5개)
             IdleAfterWritingScenario(),
-            WholeDocumentReviewScenario(),
-            LongStaticReviewScenario(),
             ParagraphChurnScenario(),
             BlankDocumentStartScenario(),
-            # Phase 4 — Tier 1 (현재 캡처 payload 기반, 8개)
-            OutlinePhaseScenario(),
-            AcronymIntroducedScenario(),
-            HeadingAddedScenario(),
-            LongParagraphWrittenScenario(),
-            NumberedListGrowthScenario(),
-            TodoMarkerPresentScenario(),
-            ManyQuestionMarksScenario(),
-            CodeBlockPresentScenario(),
-            # Phase 4 — Tier 2-A (텍스트 패턴, 6개)
-            QuoteInsertedScenario(),
-            CitationMissingScenario(),
-            FactualClaimMadeScenario(),
-            RepeatedPhraseInParagraphScenario(),
-            TransitionWordOveruseScenario(),
-            WeakModifierOveruseScenario(),
-            # Phase 4 — Tier 2-B (캡처간 diff, 4개)
-            ScatteredEditsScenario(),
-            LargeDeletionScenario(),
-            CopyPasteGrowthScenario(),
-            UndoCycleDetectedScenario(),
         ]
+        # 발화 페이스 (env로 운영 튜닝 가능) — 고정 간격이 아니라 적응형:
+        # 발화 허용 = elapsed ≥ floor AND (elapsed ≥ base×multiplier OR 새 내용).
+        # multiplier는 카드 반응(수락↓/거절·무시↑)으로 변하고 반감기 감쇠로 1.0에
+        # 수렴 — 반응이 좋고 새 글을 쓰는 사용자는 floor(20초) 페이스까지,
+        # 무시/거절이 쌓이면 ceil(4분)까지 물러난다.
+        # paragraph_cooldown: 같은 단락(fingerprint)에는 시나리오가 달라도
+        # 일정 시간 재발화 금지 — CFS 공정성이 같은 단락에서 매번 다른
+        # 시나리오를 뽑아 "다양한 스팸"이 되는 구멍을 막는다.
         self.scenario_scheduler = ScenarioScheduler(
             self.store,
             scenarios=scenarios,
+            fire_interval_floor_sec=_env_float("VERITAS_SCREEN_FIRE_FLOOR_S", 20.0),
+            fire_interval_base_sec=_env_float("VERITAS_SCREEN_FIRE_BASE_S", 30.0),
+            fire_interval_ceil_sec=_env_float("VERITAS_SCREEN_FIRE_CEIL_S", 240.0),
+            pace_decay_half_life_sec=_env_float(
+                "VERITAS_SCREEN_FIRE_DECAY_HALFLIFE_S", 600.0
+            ),
+            early_release_min_new_chars=int(
+                _env_float("VERITAS_SCREEN_EARLY_RELEASE_CHARS", 80)
+            ),
+            paragraph_cooldown_sec=_env_float(
+                "VERITAS_SCREEN_PARAGRAPH_COOLDOWN_S", 180.0
+            ),
             console_log=console_log,
         )
+        # 표시된 카드에 사용자가 반응할 때까지(또는 만료까지) 새 발화를 막는 게이트.
+        self.unresolved_card_gate = UnresolvedCardGate(
+            resolve_timeout_sec=_env_float(
+                "VERITAS_SCREEN_CARD_RESOLVE_TIMEOUT_S", 90.0
+            ),
+        )
+        # native-style caret-continuation 엔진 — 발화 결정의 실소유자.
+        # cursor_scope가 N폴 안정 + 커서 확정이면 즉시 이어쓰기 발화. 시나리오/CFS/
+        # idle-gate를 대체해 네이티브 ghostwrite 속도/동작을 외부 앱에 가져온다.
+        self.continuation_engine = CaretContinuationEngine(
+            stable_polls=int(_env_float("VERITAS_SCREEN_STABLE_POLLS", 2)),
+            min_prefix_chars=int(_env_float("VERITAS_SCREEN_MIN_PREFIX_CHARS", 20)),
+        )
+        # 진입 직후 발화 보류 시간(초). 첫 캡처의 caret이 사용자가 쓰려는 곳이
+        # 아닐 수 있어, 커서가 자리잡을 여유를 준다.
+        self._start_grace_sec = _env_float("VERITAS_SCREEN_START_GRACE_S", 1.5)
+        self._monitor_started_at = 0.0
         # LLM-backed selection (replaces CFS vruntime ranking when enabled). Built
         # only when an llm is available; the detector falls back to CFS otherwise.
         self.scenario_router = ScenarioRouter(llm) if llm is not None else None
@@ -188,13 +355,41 @@ class ScreenContextService:
             previous_text=self._previous_active_text,
         )
         history_events = self.store.load_recent(self.intervention_detector.history_window - 1)
+        # 두 점유 게이트: (1) 큐/LLM 생성 중(pipeline_busy), (2) 표시된 카드가
+        # 아직 미해결(unresolved card). 어느 쪽이든 새 개입을 스케줄하지 않는다.
         pipeline_busy = self._intervention_pipeline_busy()
-        intervention = self.intervention_detector.decide(
-            window=window,
-            filtered=filtered,
-            history_events=history_events,
-            schedule=not pipeline_busy,
+        card_unresolved, expired_card = self.unresolved_card_gate.poll()
+        # native-style caret-continuation 엔진이 발화 결정 소유 (시나리오/dwell/CFS
+        # 대체). cursor_scope가 N폴 안정 + 커서 확정이면 즉시 이어쓰기 발화.
+        document_key = self.intervention_detector._make_document_key(window)
+        in_grace = (
+            self._monitor_started_at > 0
+            and self._start_grace_sec > 0
+            and (time.monotonic() - self._monitor_started_at) < self._start_grace_sec
         )
+        fire = self.continuation_engine.observe(
+            document_key=document_key,
+            filtered=filtered,
+            busy=pipeline_busy,
+            card_active=card_unresolved,
+            suppressed=in_grace,
+        )
+        if fire.fire and fire.intervention is not None:
+            intervention = fire.intervention
+            # dispatcher의 activity_context / 프론트 카드 교체 / 카드 게이트 doc
+            # 추적이 쓰는 식별자를 채운다.
+            intervention.metadata.setdefault("document_key", document_key)
+            intervention.metadata.setdefault(
+                "paragraph_fingerprint",
+                self.intervention_detector._fingerprint(filtered.cursor_scope_text or ""),
+            )
+        else:
+            intervention = InterventionDecision(
+                should_consider_llm=False,
+                intervention_type="none",
+                reason_codes=[fire.reason] if fire.reason else [],
+                metadata={"document_key": document_key, "engine": "caret_continuation"},
+            )
         diagnostics = self.diagnose_capture(
             window=window,
             app_text=app_text,
@@ -219,6 +414,31 @@ class ScreenContextService:
         self.intervention_dispatcher.dispatch(event)
         self._log_capture_event(event)
         return event
+
+    # ----------------------------------------------------- unresolved card gate
+
+    def mark_card_shown(self, intervention: dict, answer: str = "") -> None:
+        """카드가 실제로 렌더되기 시작했음을 기록 (ChatAgent 답변 콜백 경유).
+        ``answer``는 직전 제안 텍스트 — retry의 avoid_text로 쓰인다."""
+        self.unresolved_card_gate.mark_shown(intervention, answer=answer)
+
+    def resolve_card(self, event_id: str, *, feedback_action: str = "") -> bool:
+        """사용자 feedback으로 카드를 해결 처리. '다시'(retry)면 caret-continuation
+        엔진에 **즉시 재발화**를 예약하고 직전 제안을 avoid_text로 넘긴다 — 다음
+        폴링(≤1초)에서 같은 자리에 다른 문장이 나온다(idle-gate를 안 거침)."""
+        card = self.unresolved_card_gate.resolve(event_id)
+        if card is None:
+            return False
+        action = str(feedback_action or "").strip().lower()
+        document_key = str(card.get("document_key") or "")
+        if document_key and action == "retry":
+            self.continuation_engine.request_retry(
+                document_key,
+                avoid_text=str(card.get("answer") or ""),
+                # 원래 카드 id를 재사용해 재발화가 새 카드 대신 같은 카드를 갱신.
+                target_event_id=str(event_id or ""),
+            )
+        return True
 
     # 큐에 in-flight 개입이 있으면 True. consumer가 LLM 처리 동안 큐에서 제거하지 않으므로 큐 non-empty = 파이프라인 점유
     # consumer 중단으로 끼인 항목(captured_at age > INTERVENTION_MAX_INFLIGHT_SEC)은 제외
@@ -322,6 +542,11 @@ class ScreenContextService:
         self._stop_event.clear()
         self._debug_stats = self._new_debug_stats()
         self._debug_stats["started_at"] = datetime.now().isoformat(timespec="seconds")
+        # 진입 직후 startup grace 기준점 — 첫 1~2초는 발화 보류(커서 자리잡을 시간).
+        # 방금 창을 전환해 들어온 첫 캡처의 caret이 엉뚱한 위치일 수 있어서.
+        self._monitor_started_at = time.monotonic()
+        # 엔진 상태 초기화 — 이전 세션의 안정/dedup이 남아 즉시 발화하지 않게.
+        self.continuation_engine.reset()
         self.scenario_scheduler.start()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()

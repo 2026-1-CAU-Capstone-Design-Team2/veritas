@@ -75,6 +75,14 @@ def record_feedback(event_id: str, intervention_type: str, action: str) -> dict[
     if not raw_action:
         raise HTTPException(status_code=422, detail="action is required")
 
+    # 어떤 feedback이든 "사용자가 카드에 반응했다"이므로 캡처 루프의
+    # unresolved-card 게이트를 먼저 해제한다 (retry면 즉시 재발화도 허용).
+    # 게이트는 UX 페이싱 장치일 뿐이라 실패해도 feedback 기록은 계속한다.
+    try:
+        get_runtime().resolve_screen_card(event_id=event_id, action=raw_action)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[screen_context][card_gate][warn] resolve failed: {exc}")
+
     if event_id.startswith("pd_"):
         return proactive_service.record_feedback(
             ProactiveFeedbackRequest(

@@ -224,11 +224,20 @@ Rules:
 - Use the screen payload to understand what the user is currently writing or viewing.
 - Placeholder / skeleton text: the writing context is often an outline or skeleton where the real content is only sketched with placeholder fillers - runs of "~", "...", "___", "[ ]", "TODO", or repeated stand-in markers (e.g. "기아는 ~~~하며 ~~~ 하게 된다"). Treat such fillers as NOT-YET-WRITTEN content, never as real words. Do NOT correct their spelling, grammar, punctuation, or word choice, do NOT critique their phrasing, and do NOT attach citations to them. Instead either propose concrete content (grounded in the topic / knowledge base) that would REPLACE the placeholders, or return a brief no-action note. If the latest sentence is essentially all placeholders, prefer the no-action note over forcing a review.
 - Base writing suggestions on the latest 1-2 sentences in the screen writing context; do not restate or rework older document text unless it is explicitly included there.
+- Section awareness: when SCREEN WRITING CONTEXT carries a "section_heading", the user is writing *inside that section* (e.g. heading "결론" → they are writing the conclusion). Keep the continuation within that section's role and subject — a conclusion should conclude/summarize, an intro should set up, a methods section should describe method — and never drift to another section's topic. Do NOT repeat or quote the heading text itself in the pasteable line.
 - Use the knowledge-base context only when it is genuinely relevant to what the user is writing, and cite document IDs in the form [Document <id>] when provided.
 - If the knowledge base does not support a factual claim, do not invent a source and do not substitute general knowledge.
 - Keep the response short and directly usable, and match the output format described in SCENARIO GUIDANCE; do not pad it with preamble or meta-commentary.
 - Output PLAIN TEXT only - no Markdown. Do not use **bold**, *italics*, `backticks`, "#" headings, ">" quotes, or fenced code blocks; the reply is pasted straight into the user's document, so any Markdown symbol becomes literal clutter. When a scenario asks for a list, use plain short lines (a leading "-" or "1." is fine), nothing more.
-- Structure (so the user can copy just the insertable text): put the text the user should paste into the document FIRST, with NO label before it. If you add any explanation or commentary, place it AFTER a line containing exactly "설명:" (on its own line). Everything before "설명:" is the pasteable content (the copy button copies only this); everything after is a note shown but not copied. If your reply is purely commentary with nothing to paste (e.g. a whole-document review, a list of issues, or a no-action note), put ALL of it after "설명:" and leave nothing before it.
+- OUTPUT STRUCTURE (most important formatting rule — the card shows the part before "설명:" as the one-click copy-to-paste suggestion, and the part after "설명:" as a small grey note that is NOT copied):
+  1. FIRST line(s): ONLY the text the user can paste straight into their document — the continuation sentence, the rewrite, the inserted item. No label, no preamble, no quotes around it, nothing else mixed in.
+  2. THEN a line containing exactly "설명:" on its own.
+  3. THEN any explanation, reason, caveat, attribution, citation, or commentary about the suggestion.
+  Put EVERY word of explanation after "설명:". The pasteable part above "설명:" must read as clean document prose with zero meta-talk. Never bury an explanation inside the pasteable part, and never describe the suggestion before giving it.
+  Example (continuation):
+    이러한 규제 변화는 2025년 이후 공급망 재편을 가속할 것으로 보인다.
+    설명: 방금 작성하신 결론 문단의 마지막 문장을 자연스럽게 잇는 한 문장입니다.
+  If your reply is PURELY commentary with nothing to paste (a whole-document review, a list of issues, a no-action note), then output "설명:" first and put everything after it, leaving the pasteable part empty.
 - If the payload indicates no useful action, return a brief no-action explanation.
 - Do not mention implementation details such as OCR, UI Automation, polling, queues, or JSON unless needed to explain uncertainty.
 
@@ -350,10 +359,13 @@ SCREEN_SCENARIO_GUIDANCE = {
         "Stay within the structure the user has established; do not propose new top-level bullets or restructure the outline."
     ),
     "acronym_introduced": (
-        "The user's text contains an acronym (a multi-letter uppercase abbreviation). "
-        "Check whether the surrounding text already defines it on first use, as a report should. "
-        "Output format: one short suggestion giving the spelled-out form, e.g. \"On first use, spell out as <full term> (ABC).\" "
-        "Limit to a single suggestion for the most prominent acronym."
+        "The user's text contains an acronym (a multi-letter uppercase abbreviation) that should be spelled out on first use. "
+        "Pasteable line: ONLY the corrected first-use form the user can drop straight in — the spelled-out term with the original/acronym in parentheses. "
+        "No instruction words ('다음과 같이', '권장합니다', 'spell out as', 'On first use'); the pasteable line is the term itself, nothing else. "
+        "Then '설명:' and one short Korean line on why. Pick the single most prominent acronym. "
+        "Example:\n"
+        "추론형 AI (AI Reasoning)\n"
+        "설명: 첫 등장 시 원어를 괄호로 함께 표기하면 보고서의 정확성이 올라갑니다."
     ),
     "heading_added": (
         "The user has a report section heading visible (Markdown '#'/'##' or numbered '1.'/'2.'). "
